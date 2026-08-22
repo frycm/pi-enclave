@@ -862,7 +862,7 @@ reviewer or sandbox extension *robust* rather than merely careful:
 3. **An execution-boundary hook for custom tools** — or a "run this tool through this
    wrapper" option — so MCP and custom tools can be sandboxed instead of merely allowlisted.
 
-Items 1 and 2 can be prototyped in a fork while the extension ships, then upstreamed with
+Items 1 and 2 can be prototyped in [`frycm/pi`](https://github.com/frycm/pi) (a fork of the upstream at the [baseline](#api-baseline)) while the extension ships, then upstreamed with
 pi-enclave as the motivating use case.
 
 ---
