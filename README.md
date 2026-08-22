@@ -20,12 +20,24 @@ Every integration claim below is made against a specific pi:
 |---|---|
 | Repository | [`earendil-works/pi`](https://github.com/earendil-works/pi) (formerly `badlogic/pi-mono`; not the unrelated `badlogic/pi` GPU-pod CLI) |
 | Package | `@earendil-works/pi-coding-agent` |
-| Minimum version | **0.84.2** — the version this document was written against |
+| Supported range | **`>=0.84.2 <0.85.0`** — bounded on both sides |
 | Reference commit | [`c49906e`](https://github.com/earendil-works/pi/tree/c49906ec77788625aacbdc53ebca6fbe65bd20f5) — all file and doc links in this README are pinned to it |
+| Fork for core changes | [`frycm/pi`](https://github.com/frycm/pi) — always rebased onto the **latest stable upstream release**; carries only the patches listed under [core changes](#core-changes-to-propose-to-pi) |
 
-pi-enclave declares this as a `peerDependency` range and `probe()` refuses to enter auto mode
-on an older pi. When the baseline moves, this table moves with it in the same commit as the
-code.
+pi-enclave declares the range as a `peerDependency` and `probe()` **fails closed outside
+it** — on an older pi *and* on a newer one. A newer minor may change hook semantics (handler
+ordering, `tool_call` result shape, tool operation interfaces) in ways the conformance suite
+has not seen, and "probably fine" is not a sandbox guarantee.
+
+Moving the baseline is one PR that does all of the following together, or none of it:
+
+1. Rebase `frycm/pi` onto the new upstream stable tag and re-apply the core-change patches.
+2. Update this table (range, reference commit) and every pinned link in the README.
+3. Re-run the backend-conformance suite and the platform matrix against the new pi.
+4. Widen the `peerDependency` range.
+
+Until that PR lands, users on the newer pi get a refusal with the exact range and a pointer
+to this section, not a silently different security model.
 
 ---
 
@@ -194,7 +206,7 @@ interface SandboxBackend {
   probe(): Promise<{ ok: boolean; reasons: string[] }>;      // deps, userns, daemon…
   compile(profile: SandboxProfile): Promise<CompiledProfile>; // .sbpl / bwrap argv / docker spec
   run(action: LockedAction, compiled: CompiledProfile,
-      io: { onData(b: Buffer): void; signal?: AbortSignal; env: NodeJS.ProcessEnv })
+      io: { onData(b: Buffer): void; signal?: AbortSignal; env: ChildEnv })
     : Promise<{ exitCode: number | null; violations: Violation[] }>;
   // fs ops backing the read/edit/write/grep/find/ls overrides. Each call is executed by a
   // sandboxed helper process under `compiled` — the pi process never touches the path itself.
@@ -218,11 +230,56 @@ interface SandboxProfile {
   capabilities: "none" | "reviewed";  // may the agent request a one-shot Capability (→ L3)?
   hostExec: "never" | "human";        // may a HUMAN (L4, never L3) approve an unsandboxed run?
   pty: boolean;
+  env?: { passthrough?: string[] };  // extra host vars to forward, by exact name; user-global only
 }
 ```
 
 `hostExec` defaults to `"never"`. There is deliberately no `"reviewer"` value: nothing a model
 says can produce unsandboxed execution.
+
+### The child environment is built, not inherited
+
+Protecting `~/.aws` and `~/.pi/**/auth*` on disk is pointless if `ANTHROPIC_API_KEY` and
+`AWS_SECRET_ACCESS_KEY` arrive in the sandboxed shell through `process.env`: `env`, `$VAR`
+expansion, and every child process would see them, and `echo $KEY > notes.txt` moves them
+into the writable workspace for later disclosure. `backend.run` therefore never receives
+`process.env`. It receives a `ChildEnv` that pi-enclave **constructs** from an allowlist:
+
+```ts
+type ChildEnv = Readonly<Record<string, string>>;  // complete; nothing else is set
+
+const CHILD_ENV_BASE = [
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "LC_CTYPE",
+  "TZ", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+  "COLORTERM", "NO_COLOR", "FORCE_COLOR", "CI",
+];
+```
+
+- **Only the base list and `env.passthrough` are copied** from the pi process, by exact
+  name. Everything else is absent — not unset-then-inherited, but never present in the
+  `execve` environment at all.
+- **`passthrough` is user-global only** (monotonic rule: a project cannot add a variable)
+  and refuses names matching the credential deny pattern below, even if listed.
+- **A credential deny pattern is applied last**, so neither `passthrough` nor a future base
+  addition can leak by mistake: `*_API_KEY`, `*_SECRET*`, `*_TOKEN`, `*PASSWORD*`,
+  `*CREDENTIAL*`, `AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_*`, `OPENAI_*`,
+  `ANTHROPIC_*`, `GH_TOKEN`, `GITHUB_TOKEN`, `NPM_TOKEN`, `SSH_AUTH_SOCK`, `GPG_AGENT_INFO`,
+  `KUBECONFIG`, `DOCKER_HOST`, `PI_*`. The list is the default `envDeny` in `$defaults` and
+  can be extended, never shortened, below user-global.
+- `HOME` and `TMPDIR` are rewritten to the sandbox's view (`$TMPDIR` is a writable root; the
+  real home is not), and `PATH` is filtered to entries under read-allowed roots.
+- **Provider credentials stay in the pi parent.** The reviewer call, the session model and
+  the egress proxy's credential masking all run in pi's process; nothing inside the sandbox
+  needs a credential to do the task, and if a task genuinely does (a deploy key for a
+  `git push` to an allowed host) that is what v2 proxy-side masking is for.
+- The Docker backend builds the same `ChildEnv` into `docker exec -e`; it does not rely on
+  the container having a clean environment by accident.
+
+**Conformance case.** For every backend: set `ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`,
+`GITHUB_TOKEN` and a `passthrough`-listed `FOO_TOKEN` in the pi process, then run `env`,
+`sh -c 'echo $ANTHROPIC_API_KEY'`, `python3 -c 'import os; print(os.environ)'`, and
+`cat /proc/self/environ` (Linux) inside the sandbox. The expected output contains none of
+the four values; `FOO_TOKEN` is additionally rejected at config load with a diagnostic.
 
 ### File and search tools are OS-enforced too
 
@@ -374,7 +431,7 @@ Adopts pi-automode's structure almost verbatim, because it is already right: tie
 | User global | `~/.pi/agent/enclave.json` | Everything: profiles, backend, reviewer model, allow rules, tool allowlist | — |
 | Project local (untracked) | `.pi/enclave.local.json` | Select a profile, add writable roots *inside* the repo, add deny/ask rules | Add allow rules, change the reviewer, disable the sandbox |
 | Project shared (tracked) | `.pi/enclave.json` | Add deny/ask rules, add protected paths, declare the Docker image | Anything that relaxes policy; ignored entirely if the project is not trusted |
-| Environment | `PI_ENCLAVE_*` | Override model, profile, attendance (for CI and ops runners) | — |
+| Environment | `PI_ENCLAVE_*` (three variables, listed below) | Force attendance off; select an *already-defined, narrower* profile; disable auto mode | Name a model, backend or any value not already defined in user-global config; relax anything |
 
 ### Monotonic configuration rule
 
@@ -395,6 +452,20 @@ the result must satisfy `effective ⊑ incoming` under a partial order defined p
 | `rules.allow` | Subset |
 | `tools.allow` | Subset; `readOnly` may become `reviewed`, never the reverse |
 | `reviewer`, `backend` | Immutable below user-global |
+
+Environment variables sit between user-global and project-local in the fold, so they obey
+the same order. These are the only ones that exist:
+
+| Variable | Values | Monotonic direction |
+|---|---|---|
+| `PI_ENCLAVE_ATTENDED` | `off` | Only turns attendance off. Any other value is a config error. |
+| `PI_ENCLAVE_PROFILE` | name of a profile defined in the user-global file | Selection only; the selected profile must be ⊑ the user-global default, exactly as for a project file. It cannot define a profile. |
+| `PI_ENCLAVE_AUTO` | `off` | Refuses to enter auto mode at all (CI smoke runs without a sandbox). There is no `on`. |
+
+There is no `PI_ENCLAVE_MODEL` or `PI_ENCLAVE_BACKEND`: the reviewer and the backend are
+immutable below user-global because whoever controls the process environment of an ops
+runner would otherwise control which model decides and whether a sandbox exists at all.
+An ops runner that needs a different reviewer gets a different user-global file.
 
 Any project-local field that would violate the order is not "clamped" — the whole file is
 rejected with a diagnostic and auto mode refuses to start, because a half-applied config is
@@ -575,8 +646,36 @@ attended: {
 | `mode` | Meaning | Preconditions checked at session start and on every escalation |
 |---|---|---|
 | `"tui"` | A person is at the terminal | `ctx.mode === "tui"` and the process has a controlling TTY; otherwise auto mode refuses to start |
-| `"rpc"` | A person is behind an RPC client that has opted in | The client must complete an **approval-channel handshake**: pi-enclave sends a `enclave/hello` notification with a random nonce, and the client must answer with a signed `enclave/attend` within 10 s declaring it will answer confirms. No handshake → treated as `"off"` for this session, and the status line says so. |
+| `"rpc"` | A person is behind an RPC client that has opted in | The client must complete the **approval-channel handshake** below, built only from `ctx.ui.input` / `ctx.ui.confirm`. No handshake → treated as `"off"` for this session, and the status line says so. |
 | `"off"` | Nobody is there (CI, ops runner, print mode) | Every `ask` is a deny; no dialog is ever attempted |
+
+**The RPC handshake, on pinned pi.** pi 0.84.2 gives an extension exactly the fixed
+[`extension_ui_request` methods](https://github.com/earendil-works/pi/blob/c49906ec77788625aacbdc53ebca6fbe65bd20f5/packages/coding-agent/src/modes/rpc/rpc-types.ts#L238-L283)
+— `select`, `confirm`, `input`, `editor`, plus fire-and-forget — and nothing custom. So the
+handshake is a defined use of `ctx.ui.input`, not a new message type:
+
+1. **Provisioning.** The user runs `pi enclave attend-secret` once on the machine that will
+   run pi. It writes a 256-bit random secret to `~/.pi/agent/enclave/attend.secret` (`0600`,
+   extension-owned, never a writable root). The operator copies that secret to the RPC client
+   through whatever channel they already trust (config file, secret store). The trust model is
+   *possession of the secret = the operator has deliberately wired this client as an attended
+   console*; it is a shared-secret MAC, not PKI, because the client and pi run under the same
+   operator and there is no third party to certify.
+2. **Challenge.** At session start in `"rpc"` mode, pi-enclave issues
+   `ctx.ui.input("pi-enclave attendance", placeholder: "<nonce>")` with a fresh 128-bit nonce
+   in the title and a 10 s `timeout`.
+3. **Response.** The client replies `extension_ui_response { value }` where
+   `value = base64(HMAC-SHA256(secret, nonce || sessionId))`. pi-enclave verifies it with a
+   constant-time compare against its own file.
+4. **Result.** A valid response marks the session attended. A timeout, `cancelled`, a wrong
+   MAC, or a missing secret file means `"off"` for the whole session — it is not retried, so
+   a client cannot brute-force it.
+
+A client that does not know about the handshake sees an `input` prompt it cannot answer and
+times out, which is the safe outcome. The per-escalation `ctx.ui.confirm` is then only sent
+to a client that proved it is a console. This binds *the channel*, not each confirm; binding
+each confirm would need per-request MACs inside `confirm`'s boolean response, which the
+baseline cannot carry — that is item 4 in the [core changes](#core-changes-to-propose-to-pi).
 
 Two rules apply regardless of mode:
 
@@ -610,10 +709,24 @@ in the workspace, which the sandboxed agent can write to.
 | Single use | On resume the record is atomically renamed to `approved/` before execution, then to `consumed/` after. A second resume with the same nonce is a no-op with an audit entry. |
 | Approval | `pi enclave approve <nonce>` displays the canonical action and asks for confirmation *in that terminal*; or, for the `rpc` attendance mode, an `enclave/approve` request over the verified channel. There is no way to approve by editing the file. |
 
-On resume, the action is re-canonicalized from the record, the hash is compared, the current
-policy is re-evaluated (a record cannot bypass a rule that was added in the meantime), and
-the action then runs once under the profile the record names — sandboxed unless the record
-explicitly carries a human `hostExec` approval.
+On resume, the action is re-canonicalized from the record and the hash is compared. Then
+the **current** effective profile is recompiled from the configuration as it is *now*, and
+the resume proceeds only if:
+
+- the current policy still reaches the same decision point (a rule added in the meantime
+  denies; a record cannot bypass it), and
+- the recompiled profile is **equal to or narrower than** the snapshot in the record under
+  the [monotonic order](#monotonic-configuration-rule) — a writable root, a host grant, a
+  capability or a `readDeny` relaxation that the user has since removed is simply not there
+  any more.
+
+If the current profile is *wider* than the snapshot (the user loosened config after the
+record was written), or if the config hash differs in any field the order does not cover,
+the resume is **refused** with a diagnostic and the record is left in `pending/`; the user
+re-runs the task. The action never executes under the recorded profile — the snapshot is
+evidence for the approver and an upper bound for the check, not an execution input.
+Execution is sandboxed unless the record explicitly carries a human `hostExec` approval
+*and* the current profile still has `hostExec: "human"`.
 
 ### Outcome matrix
 
@@ -855,6 +968,8 @@ matrix is what "OS-enforced" means in this document.
 | Attendance `"rpc"` with no handshake, or TTY lost mid-session | `ask` → deny + pending record; never a dialog | 2 |
 | Reviewer `allow` on `allow_write=X`, then the same hash replayed with `allow_write=Y` | Second request is a fresh L3 review, not a replay | 3 |
 | Pending record edited on disk, or mode changed to `0644`, or nonce reused | Refused with an audit entry | 2 |
+| **Environment leak**: provider keys set in the pi process; `env`, `$VAR` expansion, `os.environ`, `/proc/self/environ` inside the sandbox | None of the values appear; a `passthrough` entry matching `envDeny` is rejected at config load | 1 |
+| **Stale resume**: pending record written, user then removes a writable root / re-adds a `readDeny` entry / loosens config; `pi enclave approve` | Narrower config: executes under the *current* profile and the removed grant is absent. Wider config or uncovered hash change: refused, record stays pending | 2 |
 
 ---
 
@@ -871,9 +986,17 @@ reviewer or sandbox extension *robust* rather than merely careful:
    every mode (TUI, RPC, print) behaves identically.
 3. **An execution-boundary hook for custom tools** — or a "run this tool through this
    wrapper" option — so MCP and custom tools can be sandboxed instead of merely allowlisted.
+4. **An authenticated `confirm` for RPC clients** — an optional `challenge` field on the
+   `confirm` request and a matching `proof` on the response — so each approval, not just
+   the channel, can be bound to a secret the client holds.
 
-Items 1 and 2 can be prototyped in [`frycm/pi`](https://github.com/frycm/pi) (a fork of the upstream at the [baseline](#api-baseline)) while the extension ships, then upstreamed with
-pi-enclave as the motivating use case.
+These are prototyped in [`frycm/pi`](https://github.com/frycm/pi) and upstreamed with
+pi-enclave as the motivating use case. The fork's policy is fixed: it is **always rebased
+onto the latest stable upstream release** and carries *only* the patches above as discrete
+commits on top — no divergent features, no long-lived branch. pi-enclave itself targets
+upstream pi at the [baseline](#api-baseline); the fork exists to prove the patches, and
+anything that only works on the fork is marked as such in this document until it lands
+upstream.
 
 ---
 
@@ -913,10 +1036,10 @@ These are accepted, not solved, and the README says so rather than implying othe
 - **Reviewer quality floor.** If no local model qualifies on the user's hardware, Phase 2's
   deterministic auto mode is the fallback: useful, but every soft-deny becomes an `ask`.
   That is the honest offline ceiling and should be presented as such.
-- **RPC attendance handshake.** The `enclave/hello` / `enclave/attend` exchange is a
-  pi-enclave convention layered on pi's RPC extension-UI protocol; it needs a client to
-  implement it before `"rpc"` attendance is usable by anyone. Until then `"rpc"` behaves as
-  `"off"`, which is the safe direction.
+- **RPC attendance handshake.** The HMAC-over-`ctx.ui.input` exchange is a pi-enclave
+  convention; it needs a client to implement it before `"rpc"` attendance is usable by
+  anyone. Until then `"rpc"` behaves as `"off"`, which is the safe direction. It binds the
+  channel, not each confirm; per-confirm binding needs a core change.
 - **Performance.** Seatbelt and bwrap add roughly 10–50 ms per command; `docker exec` adds
   more. File tools now go through the sandboxed helper rather than in-process, so read
   latency is a real number to measure in Phase 1; the helper is long-lived to keep it to one
