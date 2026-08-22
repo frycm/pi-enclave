@@ -147,8 +147,8 @@ exposes everything required: built-in tool overrides with pluggable operations, 
 
 Four layers. The numbering is by *trust*, not by execution order: L1 and L2 are
 deterministic and cannot be talked out of a decision; L3 is a model; L4 is a human. The
-execution order for one action is **L1 → lock → (L3 if the action is mutating or carries a
-capability request) → L2 → (L3 again only for a capability retry after a violation) → L4 on
+execution order for one action is **L1 → lock → (L3 if the action is selected by
+`review.trigger` or carries a capability request) → L2 → (L3 again only for a capability retry after a violation) → L4 on
 any `ask`**. Which L1 survivors go to L3 is decided by the configured `review.trigger`:
 under the `mutating` default read-only actions skip L3; under `all` nothing does. The only
 explicit bypass of the trigger is a `rules.skipReview` match. What stays invariant is that
@@ -158,7 +158,7 @@ L2 always runs and that no layer below L4 can remove it.
 |---|---|---|
 | **L1** | Deterministic rules | Pattern rules on tool and arguments with exactly two verbs: `deny` (never runs, nothing below can override) and `ask` (always a human decision, the reviewer cannot auto-approve it), plus protected paths. Never touches a model. Runs before everything else in under a millisecond. |
 | **L2** | **OS enforcement** | Every shell command **and every file/search operation** executes inside a Seatbelt / bwrap / Docker boundary: read-only root, explicit writable roots, secrets denied for reading, network only via the egress proxy. An L3 `allow` still lands here; so does a `skipReview` match. Sandbox denials are returned to the agent as a structured violation, which is the only way a request can *widen* the profile (via an L3-reviewed capability retry). |
-| **L3** | Isolated model reviewer | For every action L1 did not decide that is either *mutating* (per `review.trigger`) or a request to widen the sandbox by one declared capability (`--allow-write <path>`, `--allow-host <host>`) for one action. Judges it against a **prose rulebook** (`review.environment` / `hard_deny` / `soft_deny` / `allow`) and the user's direct authorization. Fresh completion, own system prompt, structured evidence, strict JSON output with `allow` / `deny` / `ask`. **An L3 `allow` never leaves the sandbox** — it re-runs the locked action under a one-shot profile that is the base profile plus exactly the requested capability. |
+| **L3** | Isolated model reviewer | For every action L1 did not decide that is either selected by `review.trigger` (`mutating` by default; `all` selects read-only actions too; `boundary` selects none) or a request to widen the sandbox by one declared capability (`--allow-write <path>`, `--allow-host <host>`) for one action. Judges it against a **prose rulebook** (`review.environment` / `hard_deny` / `soft_deny` / `allow`) and the user's direct authorization. Fresh completion, own system prompt, structured evidence, strict JSON output with `allow` / `deny` / `ask`. **An L3 `allow` never leaves the sandbox** — it re-runs the locked action under a one-shot profile that is the base profile plus exactly the requested capability. |
 | **L4** | Human escalation | Attended: `ctx.ui.confirm` with the exact canonical action. Unattended: `ask` means deny, stop the turn, and write a resumable "needs approval" record outside the workspace. Unsandboxed host execution, if a profile permits it at all, is reachable **only** from this layer. |
 
 Three cross-cutting mechanisms: the **action lock** (canonical snapshot, hashed, frozen,
@@ -1092,8 +1092,9 @@ with no network. No model involved yet.*
 `rules.ask` plus the sandbox, `review.trigger` pinned to `boundary`, every crossing an `ask`.*
 
 - Pattern `rules` (`deny`, `ask`, `skipReview`) with `$defaults`; monotonic merge with its
-  property test, including rejection of `review.*` below user-global even though nothing
-  reads the lists yet; port guardian's lock, provenance and breaker.
+  property test, including rejection of the four prose lists (`review.environment` /
+  `hard_deny` / `soft_deny` / `allow`) below user-global even though nothing reads them
+  yet, and raise-only `review.trigger`; port guardian's lock, provenance and breaker.
 - `pi enclave rules defaults|config`.
 - Tool allowlist enforcement for custom and MCP tools; untrusted-extension refusal.
 - Attendance contract with RPC handshake; outcome matrix; pending-approval records; audit
