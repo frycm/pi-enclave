@@ -306,6 +306,16 @@ A small in-process HTTP CONNECT and SOCKS5 proxy on localhost, started with the 
 It enforces `network.allowHosts`, logs every connection, and (v2) substitutes masked
 credentials on egress to allowed hosts only.
 
+The proxy is deliberately **deterministic and model-free**. It never consults the reviewer:
+a CONNECT request carries a destination but no evidence of *why*, and a model deciding in the
+connection path would be slow, evidence-blind and reachable by attacker-controlled hostnames.
+Instead, a denied connection is rejected synchronously (not dropped) and logged with the
+current action hash, so the tool output can name the host in its `<sandbox_violation>` block.
+The agent then retries with `allow_host=<host>` and the decision is made at L3, where the
+locked action, the requested host and the direct user authorization are all visible — see the
+[capability retry hatch](#the-capability-retry-hatch). A grant is one host for one action;
+a session-scoped host grant is a possible later option, user-global config only.
+
 In `off` mode it is never started — the default for offline use. Local model endpoints
 (`localhost:11434` and friends) are reached by **pi itself**, not from inside the sandbox,
 so the sandbox needs no network at all for the agent to work.
