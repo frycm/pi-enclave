@@ -87,7 +87,7 @@ classifier — it is the kernel:
 | **macOS** | Seatbelt (`sandbox-exec`) with a generated deny-by-default profile |
 | **Linux** | bubblewrap namespaces + seccomp BPF |
 | **Network** | A local proxy that is the *only* egress path, enforcing a domain allowlist |
-| **Model review** | Reserved for actions that want to cross that boundary |
+| **Model review** | For what the boundary permits but the user might not want — mutations by default, and any action that wants to cross the boundary |
 
 pi-enclave adopts that shape and plugs it into pi's existing extension API — which already
 exposes everything required: built-in tool overrides with pluggable operations, a
@@ -149,8 +149,10 @@ Four layers. The numbering is by *trust*, not by execution order: L1 and L2 are
 deterministic and cannot be talked out of a decision; L3 is a model; L4 is a human. The
 execution order for one action is **L1 → lock → (L3 if the action is mutating or carries a
 capability request) → L2 → (L3 again only for a capability retry after a violation) → L4 on
-any `ask`**. Read-only actions skip L3 entirely. What stays invariant is that L2 always runs
-and that no layer below L4 can remove it.
+any `ask`**. Which L1 survivors go to L3 is decided by the configured `review.trigger`:
+under the `mutating` default read-only actions skip L3; under `all` nothing does. The only
+explicit bypass of the trigger is a `rules.skipReview` match. What stays invariant is that
+L2 always runs and that no layer below L4 can remove it.
 
 | Layer | Name | What it does |
 |---|---|---|
@@ -177,8 +179,9 @@ flowchart TD
     C -->|deny| X[Block]
     C -->|ask| ESC
     C -->|skipReview or no match| D[3. Lock<br/>deep-freeze input, store hash]
-    D -->|read-only or skipReview| E[4. Execute sandboxed L2]
-    D -->|mutating per review.trigger| R
+    D -->|skipReview match| E[4. Execute sandboxed L2]
+    D -->|not selected by review.trigger<br/>e.g. read-only under mutating| E
+    D -->|selected by review.trigger| R
     R -->|allow, no capability| E
     E -->|ok| OK[Return result]
     E -->|violation| V[Return output + sandbox_violation block]
@@ -496,8 +499,8 @@ prose rule reaches an action a pattern `deny` already blocked.
 |---|---|---|---|
 | Built-in defaults | package | — | — |
 | User global | `~/.pi/agent/enclave.json` | Everything: profiles, backend, reviewer model, `rules`, the whole `review` rulebook, tool allowlist | — |
-| Project local (untracked) | `.pi/enclave.local.json` | Select a profile, add writable roots *inside* the repo, add `rules.deny` / `rules.ask`, add protected paths | Touch `rules.skipReview` or **any `review.*` field**, change the reviewer, disable the sandbox |
-| Project shared (tracked) | `.pi/enclave.json` | Add `rules.deny` / `rules.ask`, add protected paths, declare the Docker image | Anything that relaxes policy, and any `review.*` field; ignored entirely if the project is not trusted |
+| Project local (untracked) | `.pi/enclave.local.json` | Select a profile, add writable roots *inside* the repo, add `rules.deny` / `rules.ask`, add protected paths, raise `review.trigger` | Touch `rules.skipReview` or **any of the four prose lists** `review.environment` / `hard_deny` / `soft_deny` / `allow`, change the reviewer, disable the sandbox |
+| Project shared (tracked) | `.pi/enclave.json` | Add `rules.deny` / `rules.ask`, add protected paths, raise `review.trigger`, declare the Docker image | Anything that relaxes policy, and any of the four prose lists; ignored entirely if the project is not trusted |
 | Environment | `PI_ENCLAVE_*` (three variables, listed below) | Force attendance off; select an *already-defined, narrower* profile; disable auto mode | Name a model, backend or any value not already defined in user-global config; relax anything |
 
 ### Monotonic configuration rule
@@ -517,7 +520,7 @@ the result must satisfy `effective ⊑ incoming` under a partial order defined p
 | `sandbox.capabilities` / `hostExec` | `none ⊑ reviewed`, `never ⊑ human`; may only move left |
 | `rules.deny` / `rules.ask` / `rules.protectedPaths.*` | Superset |
 | `rules.skipReview` | Subset — user-global only; any project-file entry rejects the file |
-| `review.*` (all prose lists) | **Immutable below user-global.** Prose has no partial order a merge can check: "append only" is a syntactic superset, not a semantic tightening, and a project-supplied string inside the reviewer prompt is the repo-to-reviewer injection path the threat model excludes. A project file that contains any `review.*` key is rejected whole. |
+| `review.environment` / `hard_deny` / `soft_deny` / `allow` (the four prose lists) | **Immutable below user-global.** Prose has no partial order a merge can check: "append only" is a syntactic superset, not a semantic tightening, and a project-supplied string inside the reviewer prompt is the repo-to-reviewer injection path the threat model excludes. A project file that contains any of these four keys is rejected whole. `review.trigger` is the only `review` key a project may set. |
 | `review.trigger` | `boundary ⊑ mutating ⊑ all`; a project file may move it right (review more), never left |
 | `tools.allow` | Subset; `readOnly` may become `reviewed`, never the reverse |
 | `reviewer`, `backend` | Immutable below user-global |
@@ -546,6 +549,7 @@ sandboxed agent can write to: the worst the agent can do is tighten its own leas
 The fold is only sound for fields with a checkable partial order. Prose has none, which is
 why the `review.*` lists follow Claude Code exactly: they are read from the user-global file
 and nowhere else, so nothing a repository can write ever reaches the reviewer system prompt.
+(`review.trigger` is an enum with a partial order, so it stays project-raisable.)
 What a project *can* do to tighten review is deterministic and structured: add `rules.deny`
 / `rules.ask` patterns, add protected paths, and raise `review.trigger`. "Treat `infra/` as
 production" is therefore expressed as `"protectedPaths": { "ask": ["infra/**"] }`, not as
@@ -1097,7 +1101,7 @@ with no network. No model involved yet.*
 
 ### Phase 3 — Reviewer
 
-*Outcome: boundary crossings get a model opinion, and small local models are admitted only
+*Outcome: mutations and boundary crossings get a model opinion, and small local models are admitted only
 after passing the eval.*
 
 - Structured-evidence prompt, two-stage flow, `allow`/`deny`/`ask`, capability retry hatch
@@ -1145,7 +1149,7 @@ matrix is what "OS-enforced" means in this document.
 | **Parallel batch termination**: three tool calls in one batch, the second trips the breaker | All three are blocked, `terminate` fires once, the audit log shows one batch outcome, no call from that batch executes after the trip | 2 |
 | **Crash / recovery**: kill pi mid-action, resume the session | The lock table and breaker state are restored from session entries; a half-written pending record is invisible (atomic rename); the audit chain verifies up to the last complete line; the helper and any container are reaped (`--die-with-parent`, `--rm`) | 2 |
 | Project-local config that selects a wider profile / adds `rules.skipReview` or `review.allow` / adds a trust entry to `review.environment` / changes the reviewer | Whole file rejected, auto mode refuses to start, diagnostic names the field | 2 |
-| Project-shared or project-local config contains any `review.*` key (even a `soft_deny` that reads as tightening) | Whole file rejected, auto mode refuses to start, diagnostic names the key; the reviewer system prompt is byte-identical to the user-global-only render | 2 |
+| Project-shared or project-local config contains any of `review.environment` / `hard_deny` / `soft_deny` / `allow` (even a `soft_deny` that reads as tightening) | Whole file rejected, auto mode refuses to start, diagnostic names the key; the reviewer system prompt is byte-identical to the user-global-only render | 2 |
 | Project file raises `review.trigger` from `mutating` to `all` | Accepted; lowering it is rejected | 2 |
 | Canonical action matches `rules.deny` *and* `rules.skipReview` | Denied at L1, never executed, audit record names both matches | 2 |
 | Canonical action matches `rules.ask` *and* `rules.skipReview` | Goes to L4, never fast-pathed | 2 |
