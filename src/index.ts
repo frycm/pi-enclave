@@ -33,9 +33,11 @@ import { OWNED_TOOLS } from "./config/defaults.ts";
 import { createDevProfile, toBackendProfile } from "./config/profile.ts";
 import { type LoadedSource, loadConfig } from "./config/sources.ts";
 import type { EffectiveProfile, Provenance } from "./config/types.ts";
+import { BREAKER_ENTRY_TYPE, CircuitBreaker, isBreakerState, steerMessage } from "./gate/breaker.ts";
 import { decide, type GateDecision } from "./gate/gate.ts";
 import { ActionLock } from "./gate/lock.ts";
 import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
+import { PROVENANCE_ENTRY_TYPE, ProvenanceTracker } from "./gate/provenance.ts";
 import { formatProbeReport } from "./probe.ts";
 import { probeHost } from "./probe-host.ts";
 import { BASH_PROMPT_GUIDELINES, createEnclaveBashOperations } from "./tools/bash.ts";
@@ -56,6 +58,16 @@ import { runSandboxedGrep } from "./tools/grep.ts";
  * extension can also claim.
  */
 const OWN_SOURCE_PATH = fileURLToPath(import.meta.url);
+
+/** The text of a user message, whatever content shape pi used for it. */
+function messageText(message: { content?: unknown }): string {
+	const content = message.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((part) => (part && typeof part === "object" && "text" in part ? String((part as { text: unknown }).text) : ""))
+		.join("");
+}
 
 export default function (pi: ExtensionAPI): void {
 	const report = probeHost(PI_VERSION ?? null);
@@ -84,7 +96,11 @@ export default function (pi: ExtensionAPI): void {
 	 * executing any of them: a call gated before something went wrong is already
 	 * prepared when it does, and blocking cannot un-prepare it.
 	 */
-	const lock = new ActionLock();
+	const breaker = new CircuitBreaker({ consecutive: 3, window: [10, 50] });
+	const directInput = new ProvenanceTracker();
+	const lock = new ActionLock({ breakerOpen: () => breaker.open });
+	/** Set by turn_start; every decision is attributed to the turn it happened in. */
+	let currentTurn = 0;
 
 	/**
 	 * When the lock is not the right thing to complain about.
@@ -122,6 +138,7 @@ export default function (pi: ExtensionAPI): void {
 		...(effective ? { effective } : {}),
 		...(provenance ? { provenance } : {}),
 		...(sources ? { sources } : {}),
+		breaker: { open: breaker.open, consecutive: breaker.state.consecutive, limit: effective?.breaker.consecutive ?? 3 },
 		// A configuration refusal and an ownership refusal are both "auto mode
 		// will not start"; the status line shows whichever came first.
 		...(configError !== undefined
@@ -254,11 +271,65 @@ export default function (pi: ExtensionAPI): void {
 				lock,
 				owned: OWNED_TOOLS,
 				toolSource: (tool) => pi.getAllTools?.().find((entry) => entry.name === tool)?.sourceInfo?.path,
+				breakerOpen: () => breaker.open,
+				onDecision: (result) => {
+					if (effective?.auto) breaker.record(currentTurn, result.adverse);
+				},
 			},
 		);
 		refreshStatusLine?.();
 		if (!decision.block) return {};
 		return { block: true, reason: decision.reason ?? "denied", ...(decision.terminate ? { terminate: true } : {}) };
+	});
+
+	// ---------------------------------------------------------------------
+	// Turn lifecycle: a batch is a turn, and a turn contributes one strike.
+	// ---------------------------------------------------------------------
+
+	pi.on("turn_start", (event) => {
+		currentTurn = event.turnIndex;
+	});
+
+	pi.on("turn_end", async (event, ctx) => {
+		if (!breaker.finishTurn(event.turnIndex)) return;
+		// pi honours `terminate` only when every finalized result in the batch
+		// carries it, and the calls already prepared will not. Aborting is what
+		// actually stops the turn; the message is what stops the next attempt.
+		ctx.abort();
+		pi.sendUserMessage(steerMessage(), { deliverAs: "followUp" });
+		pi.appendEntry(BREAKER_ENTRY_TYPE, breaker.state);
+		refreshStatusLine?.();
+	});
+
+	// ---------------------------------------------------------------------
+	// Provenance. Phase 2's only consumer is the breaker reset; Phase 3's is
+	// the reviewer's authorization evidence.
+	// ---------------------------------------------------------------------
+
+	pi.on("input", (event) => {
+		directInput.observe({
+			text: event.text,
+			source: event.source,
+			...(event.streamingBehavior ? { streamingBehavior: event.streamingBehavior } : {}),
+		});
+	});
+
+	pi.on("before_agent_start", (event) => {
+		directInput.confirmPrompt(event.prompt);
+	});
+
+	pi.on("message_start", (event) => {
+		if (event.message.role !== "user") return;
+		const text = messageText(event.message);
+		const record = directInput.recordForMessage(text, Date.now());
+		if (!record) return;
+		pi.appendEntry(PROVENANCE_ENTRY_TYPE, record);
+		// A person said something, so the count starts again. Only a *direct*
+		// message resets it: an extension calling sendUserMessage reaches the
+		// same event with source "extension", and letting that clear a trip
+		// would hand the reset to the process the breaker exists to stop.
+		breaker.reset();
+		refreshStatusLine?.();
 	});
 
 	// One call is finished, so its lock entry is spent. `edit` reads and then
@@ -309,6 +380,17 @@ export default function (pi: ExtensionAPI): void {
 			return;
 		}
 		ownershipError = undefined;
+
+		// The breaker survives a resume. Guardian deliberately drops its counters
+		// at session start; here they persist, because an unattended run that is
+		// resumed after tripping should not get three fresh attempts at whatever
+		// tripped it.
+		directInput.reset();
+		lock.reset();
+		for (const entry of ctx.sessionManager.getEntries()) {
+			if (entry.type !== "custom" || entry.customType !== BREAKER_ENTRY_TYPE) continue;
+			if (isBreakerState(entry.data)) breaker.restore(entry.data);
+		}
 
 		compiled = await backend.compile(profile);
 		refreshStatusLine = () => ctx.ui.setStatus?.("enclave", renderStatusLine(state()));

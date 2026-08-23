@@ -38,6 +38,8 @@ export interface EnclaveState {
 	 * the status line and every tool refusal can quote the same diagnosis.
 	 */
 	configError?: string;
+	/** Breaker counters, for the footer. Absent before the gate is running. */
+	breaker?: { open: boolean; consecutive: number; limit: number };
 }
 
 /** What the sandbox covers, and what it does not. Shown in `status`. */
@@ -69,6 +71,13 @@ export function renderStatusLine(state: EnclaveState): string {
 	// and escalation are running" and "only the kernel is", and someone reading
 	// this line to decide whether to walk away needs to see it without asking.
 	if (state.effective && !state.effective.auto) parts.push("L1 off");
+	else if (state.effective) parts.push(`L4:${state.effective.attended.mode}`);
+	// The breaker is shown only once it has something to say. A permanent
+	// "0/3" would be noise, and a silent trip would be the opposite.
+	if (state.breaker?.open) parts.push("BREAKER OPEN");
+	else if (state.breaker && state.breaker.consecutive > 0) {
+		parts.push(`breaker ${state.breaker.consecutive}/${state.breaker.limit}`);
+	}
 	if (state.violations.length > 0) parts.push(`${state.violations.length} denied`);
 	return `enclave: ${parts.join(" · ")}`;
 }
@@ -104,6 +113,7 @@ export function renderStatus(state: EnclaveState): string {
 			`rules:      ${state.effective.rules.deny.length} deny, ${state.effective.rules.ask.length} ask, ${state.effective.rules.skipReview.length} skipReview`,
 			`reviewer:   ${state.effective.reviewer.model} (deterministic mode: every crossing is an ask)`,
 			`attended:   ${state.effective.attended.mode}`,
+			`breaker:    ${state.breaker?.open ? "OPEN -- the turn is stopped" : `${state.breaker?.consecutive ?? 0} of ${state.effective.breaker.consecutive} consecutive`}`,
 		);
 		if (state.sources) lines.push("sources:", renderSources(state.sources));
 	}
