@@ -72,10 +72,12 @@ describe("renderStatusLine", () => {
 		expect(renderStatusLine(state())).toBe("enclave: seatbelt · workspace-write · net off");
 	});
 
-	it("says NOT ACTIVE when nothing compiled and the probe refused", () => {
-		// The most important line in the whole UI: if the sandbox is not running,
-		// nothing else on screen should suggest otherwise.
-		expect(renderStatusLine(state({ report: FAILED_REPORT, compiled: undefined }))).toContain("NOT ACTIVE");
+	it("says every tool is refused when the probe failed", () => {
+		// The most important line in the whole UI: with no sandbox the tools are
+		// still pi-enclave's and refuse every call, and nothing on screen should
+		// suggest either that they are enforcing or that they have fallen back to
+		// pi's unsandboxed built-ins.
+		expect(renderStatusLine(state({ report: FAILED_REPORT, compiled: undefined }))).toContain("REFUSING ALL TOOLS");
 	});
 
 	it("shows that the profile has not compiled yet", () => {
@@ -87,7 +89,7 @@ describe("renderStatusLine", () => {
 		// sandbox is demonstrably enforcing. Claiming NOT ACTIVE there invites
 		// someone to assume nothing is enforced and act on it.
 		const line = renderStatusLine(state({ report: FAILED_REPORT, weakened: true }));
-		expect(line).not.toContain("NOT ACTIVE");
+		expect(line).not.toContain("REFUSING");
 		expect(line).toContain("WEAKENED");
 		expect(line).toContain("seatbelt");
 	});

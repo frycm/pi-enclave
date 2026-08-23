@@ -46,7 +46,7 @@ export const COVERAGE_NOTE =
  */
 export function renderStatusLine(state: EnclaveState): string {
 	if (!state.compiled) {
-		return state.report.ok ? "enclave: starting" : "enclave: NOT ACTIVE (probe failed)";
+		return state.report.ok ? "enclave: starting" : "enclave: REFUSING ALL TOOLS (probe failed)";
 	}
 
 	const parts = [state.backendName, state.profile.mode, `net ${state.profile.network}`];

@@ -79,36 +79,55 @@ export default function (pi: ExtensionAPI): void {
 		process.stderr.write(`${formatProbeReport(report)}\n`);
 	}
 
+	/**
+	 * The profile in force, or the reason there is none.
+	 *
+	 * Every tool below resolves this per call rather than capturing it: tools
+	 * are registered before any profile is compiled, and `backend.fs()` retires
+	 * the helper when the profile changes. It is also the fail-closed gate. When
+	 * the probe failed there is no profile and never will be, and the refusal
+	 * carries the probe's own diagnosis so the agent and the user see the same
+	 * remediation the stderr line gave.
+	 */
+	const requireCompiled = (): CompiledProfile => {
+		if (!report.ok) throw new Error(`pi-enclave: refusing to run unsandboxed.\n${formatProbeReport(report)}`);
+		if (!compiled) throw new Error("pi-enclave: sandbox is not ready");
+		return compiled;
+	};
+
 	const operations = createEnclaveBashOperations({
 		backend,
-		// Compiled at session start, so the operations object is registered before
-		// the profile exists and resolves it per call.
-		getCompiled: () => {
-			if (!compiled) throw new Error("pi-enclave: sandbox is not ready");
-			return compiled;
-		},
+		getCompiled: requireCompiled,
 		onViolations: recordViolations,
 	});
 
-	/**
-	 * The filesystem helper for the profile currently in force.
-	 *
-	 * Called per operation, never captured: tools are registered before any
-	 * profile is compiled, and `backend.fs()` retires the helper when the profile
-	 * changes.
-	 */
-	const fsClient = () => {
-		if (!compiled) throw new Error("pi-enclave: sandbox is not ready");
-		return backend.fs(compiled);
-	};
+	const fsClient = () => backend.fs(requireCompiled());
 
-	if (report.ok) {
+	// Registered unconditionally. pi's registry starts with every built-in tool
+	// and an extension only displaces one by registering the same name, so
+	// skipping the overrides when the probe fails would leave pi's own `bash`
+	// and file tools running with the user's full privileges -- the one outcome a
+	// fail-closed probe exists to prevent. A failed probe therefore still takes
+	// the tools over; they just refuse every call with the diagnosis.
+	{
 		const base = createBashTool(cwd, { operations });
 		pi.registerTool({ ...base, label: "bash (sandboxed)", promptGuidelines: BASH_PROMPT_GUIDELINES });
 
 		// `!` and `!!` reach the same operations object rather than a parallel
 		// path, so there is no shortcut that bypasses the sandbox by construction.
-		pi.on("user_bash", () => ({ operations }));
+		// With no sandbox the shortcut is answered outright rather than left to a
+		// throwing exec, so the user sees the diagnosis and not a stack trace.
+		pi.on("user_bash", () => {
+			if (report.ok) return { operations };
+			return {
+				result: {
+					output: `pi-enclave: refusing to run unsandboxed.\n${formatProbeReport(report)}\n`,
+					exitCode: 1,
+					cancelled: false,
+					truncated: false,
+				},
+			};
+		});
 
 		// The five tools whose operations objects pi lets us replace outright.
 		// Each closes over fsClient() rather than a captured client, so a
@@ -134,6 +153,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		if (!report.ok) {
 			ctx.ui.notify(formatProbeReport(report), "error");
+			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
 			return;
 		}
 		compiled = await backend.compile(profile);
