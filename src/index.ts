@@ -27,7 +27,9 @@ import {
 import { SrtBackend } from "./backend/srt.ts";
 import type { CompiledProfile, Violation } from "./backend/types.ts";
 import { type EnclaveState, handleEnclaveCommand, renderStatusLine } from "./commands/enclave.ts";
-import { createDevProfile } from "./config/profile.ts";
+import { createDevProfile, toBackendProfile } from "./config/profile.ts";
+import { type LoadedSource, loadConfig } from "./config/sources.ts";
+import type { EffectiveProfile, Provenance } from "./config/types.ts";
 import { formatProbeReport } from "./probe.ts";
 import { probeHost } from "./probe-host.ts";
 import { BASH_PROMPT_GUIDELINES, createEnclaveBashOperations } from "./tools/bash.ts";
@@ -44,7 +46,16 @@ export default function (pi: ExtensionAPI): void {
 	const report = probeHost(PI_VERSION ?? null);
 	const cwd = process.cwd();
 	const backend = new SrtBackend();
-	const profile = createDevProfile({ cwd });
+
+	// The zero-configuration profile until the fold runs at session start. It is
+	// never what a session executes under -- session_start replaces it -- but a
+	// tool that somehow ran before then would run under the built-in defaults
+	// rather than under nothing.
+	let profile = createDevProfile({ cwd });
+	let effective: EffectiveProfile | undefined;
+	let provenance: Provenance | undefined;
+	let sources: readonly LoadedSource[] | undefined;
+	let configError: string | undefined;
 
 	let compiled: CompiledProfile | undefined;
 	const violations: Violation[] = [];
@@ -57,6 +68,10 @@ export default function (pi: ExtensionAPI): void {
 		profile,
 		compiled,
 		violations,
+		...(effective ? { effective } : {}),
+		...(provenance ? { provenance } : {}),
+		...(sources ? { sources } : {}),
+		...(configError ? { configError } : {}),
 	});
 
 	/** Set by session_start, so denials can refresh the footer as they happen. */
@@ -91,6 +106,10 @@ export default function (pi: ExtensionAPI): void {
 	 */
 	const requireCompiled = (): CompiledProfile => {
 		if (!report.ok) throw new Error(`pi-enclave: refusing to run unsandboxed.\n${formatProbeReport(report)}`);
+		// A rejected configuration is a refusal, not a fallback to the defaults.
+		// Falling back would run the session under a profile nobody chose, which
+		// is exactly the "half-applied configuration" the loader refuses to build.
+		if (configError) throw new Error(configError);
 		if (!compiled) throw new Error("pi-enclave: sandbox is not ready");
 		return compiled;
 	};
@@ -159,6 +178,26 @@ export default function (pi: ExtensionAPI): void {
 			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
 			return;
 		}
+
+		// Configuration is loaded here rather than at extension load because it
+		// depends on `ctx.isProjectTrusted()`, which only exists once there is a
+		// context. Refusals still go to stderr as well as to notify: in --print
+		// mode the notify is delivered and returns cleanly but never reaches the
+		// user, and unattended is where a silent fail-closed does most damage.
+		const loaded = loadConfig({ cwd, projectTrusted: ctx.isProjectTrusted() });
+		sources = loaded.sources;
+		if (!loaded.ok) {
+			configError = loaded.message;
+			process.stderr.write(`${loaded.message}\n`);
+			ctx.ui.notify(loaded.message, "error");
+			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
+			return;
+		}
+		configError = undefined;
+		effective = loaded.profile;
+		provenance = loaded.provenance;
+		profile = toBackendProfile(loaded.profile);
+
 		compiled = await backend.compile(profile);
 		refreshStatusLine = () => ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
 		refreshStatusLine();

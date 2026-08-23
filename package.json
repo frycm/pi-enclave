@@ -33,6 +33,7 @@
 		"@biomejs/biome": "2.3.11",
 		"@earendil-works/pi-coding-agent": "0.84.2",
 		"@types/node": "22.10.2",
+		"fast-check": "^3.23.2",
 		"tsx": "4.19.2",
 		"typescript": "5.7.2",
 		"vitest": "2.1.8"

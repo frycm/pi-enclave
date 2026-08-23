@@ -14,6 +14,10 @@
  * in the detailed report nobody opens.
  */
 import type { BackendName, CompiledProfile, Profile, Violation } from "../backend/types.ts";
+import { renderConfig, renderDefaults } from "../config/render.ts";
+import type { LoadedSource } from "../config/sources.ts";
+import { renderSources } from "../config/sources.ts";
+import type { EffectiveProfile, Provenance } from "../config/types.ts";
 import { formatProbeReport, type ProbeReport } from "../probe.ts";
 
 export interface EnclaveState {
@@ -25,6 +29,15 @@ export interface EnclaveState {
 	/** Undefined until the profile is compiled at session start. */
 	compiled: CompiledProfile | undefined;
 	violations: readonly Violation[];
+	/** The configured profile, once the fold has run. */
+	effective?: EffectiveProfile;
+	provenance?: Provenance;
+	sources?: readonly LoadedSource[];
+	/**
+	 * Why the configuration was refused, if it was. Held rather than thrown so
+	 * the status line and every tool refusal can quote the same diagnosis.
+	 */
+	configError?: string;
 }
 
 /** What the sandbox covers, and what it does not. Shown in `status`. */
@@ -45,12 +58,17 @@ export const COVERAGE_NOTE =
  * it invites someone to assume nothing is enforced and act accordingly.
  */
 export function renderStatusLine(state: EnclaveState): string {
+	if (state.configError) return "enclave: REFUSING ALL TOOLS (config rejected)";
 	if (!state.compiled) {
 		return state.report.ok ? "enclave: starting" : "enclave: REFUSING ALL TOOLS (probe failed)";
 	}
 
 	const parts = [state.backendName, state.profile.mode, `net ${state.profile.network}`];
 	if (state.weakened) parts.push("WEAKENED");
+	// L1 off is not a detail. It is the difference between "the pattern rules
+	// and escalation are running" and "only the kernel is", and someone reading
+	// this line to decide whether to walk away needs to see it without asking.
+	if (state.effective && !state.effective.auto) parts.push("L1 off");
 	if (state.violations.length > 0) parts.push(`${state.violations.length} denied`);
 	return `enclave: ${parts.join(" · ")}`;
 }
@@ -76,6 +94,19 @@ export function renderStatus(state: EnclaveState): string {
 		`violations: ${state.violations.length} this session`,
 		`coverage:   ${COVERAGE_NOTE}`,
 	);
+
+	if (state.configError) {
+		lines.push("", "configuration REJECTED -- every tool refuses:", state.configError);
+	} else if (state.effective) {
+		lines.push(
+			"",
+			`config:     profile "${state.effective.name}"${state.effective.auto ? "" : "   L1/L4 disabled by PI_ENCLAVE_AUTO=off"}`,
+			`rules:      ${state.effective.rules.deny.length} deny, ${state.effective.rules.ask.length} ask, ${state.effective.rules.skipReview.length} skipReview`,
+			`reviewer:   ${state.effective.reviewer.model} (deterministic mode: every crossing is an ask)`,
+			`attended:   ${state.effective.attended.mode}`,
+		);
+		if (state.sources) lines.push("sources:", renderSources(state.sources));
+	}
 	return lines.join("\n");
 }
 
@@ -112,7 +143,32 @@ export interface CommandOutput {
 	level: CommandLevel;
 }
 
-const USAGE = "usage: /enclave [status|backend|violations]";
+const USAGE = "usage: /enclave [status|backend|violations|rules defaults|rules config]";
+
+/**
+ * `rules defaults` and `rules config`.
+ *
+ * `config` needs a folded configuration, so it reports the refusal rather than
+ * printing a profile that is not in force -- the one moment someone runs this
+ * command is when they are trying to find out why something was denied.
+ */
+function renderRules(state: EnclaveState, argv: readonly string[]): CommandOutput {
+	const verb = argv[0] ?? "config";
+	switch (verb) {
+		case "defaults":
+			return {
+				text: renderDefaults({ cwd: state.profile.writableRoots[0] ?? process.cwd() }, argv.includes("--readonly")),
+				level: "info",
+			};
+		case "config":
+			if (state.configError) return { text: state.configError, level: "error" };
+			if (!state.effective || !state.provenance)
+				return { text: "configuration has not been loaded yet", level: "warning" };
+			return { text: renderConfig(state.effective, state.provenance), level: "info" };
+		default:
+			return { text: `unknown rules subcommand "${verb}"\n${USAGE}`, level: "warning" };
+	}
+}
 
 export function handleEnclaveCommand(state: EnclaveState, args: string): CommandOutput {
 	const sub = args.trim().split(/\s+/)[0] || "status";
@@ -124,6 +180,8 @@ export function handleEnclaveCommand(state: EnclaveState, args: string): Command
 			return { text: renderBackend(state), level: "info" };
 		case "violations":
 			return { text: renderViolations(state), level: "info" };
+		case "rules":
+			return renderRules(state, args.trim().split(/\s+/).slice(1));
 		default:
 			return { text: `unknown subcommand "${sub}"\n${USAGE}`, level: "warning" };
 	}
