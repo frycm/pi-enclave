@@ -376,14 +376,62 @@ artefact the kernel was given rather than our description of it.
 enclave: bwrap · workspace-write · net off · WEAKENED · 1 denied
 ```
 
-### Step 9 — Matrix sign-off and measurement
+### Step 9 — Matrix sign-off and measurement ✅ done
 
-- Full conformance suite green on both backends in CI; README's platform matrix rows
-  marked 1 link to their test IDs.
-- Measure: `read` of a 1 MB file and `grep` over the pi repo via the helper vs. direct,
-  on both platforms; record numbers in the README ("read latency is measured in Phase 1").
-- Update the README's *Status* box from "no implementation" to "Phase 1 complete,
-  Phase 2 in progress" and list known gaps.
+The README stops being a pure proposal. Its status box separates what is built — the
+OS-enforced sandbox — from what is still design, and links the known gaps rather than
+leaving a reader to infer coverage from the architecture sections.
+
+**Two claims the spike disproved are corrected in place:** `network.mode: "off"` is not
+kernel-absolute (raw sockets and DNS die at the kernel; HTTP reaches a loopback proxy that
+refuses it, which is userspace), and reads are a **deny-list**, not the allow-list
+"read-only root" implied.
+
+**Phase-1 matrix rows name the scenario that proves them** (C1–C12, F1–F5), with a note on
+why scenarios assert the security property rather than exit codes, and on the two rows the
+noop control cannot falsify.
+
+**Measured against the same operation done directly in the pi process**, since the multiple
+is the part a faster machine will not improve away:
+
+| | macOS / Seatbelt | Linux / bwrap |
+|---|---|---|
+| profile compile (once per session) | 25 ms | 145 ms |
+| helper startup (once per profile) | 62 ms | 24 ms |
+| read 4 KB | 0.073 ms · 3.4x direct | 0.146 ms · 20x direct |
+| read 1 MB | 1.85 ms · 22x direct | 6.78 ms · 48x direct |
+| `grep` over the source tree | *(no `rg` on the host)* | 4.3 ms |
+
+The multiples look alarming; the absolute numbers are what matter. A read costs tens of
+microseconds more, and an agent waits on the model by four orders of magnitude more than on
+the sandbox.
+
+**Gaps recorded rather than smoothed over:** MCP tools are unsandboxed, a denied read
+through `bash` is invisible on Linux, weaker nested mode leaves capabilities, CI has not run
+on a real Linux host, `rg`/`fd` must be on PATH, and only one profile can be in force.
+
+---
+
+## Phase 1: done, with one thing outstanding
+
+Steps 0–9 are complete. 188 tests, green on macOS and in a privileged Linux container;
+`tsc` and biome clean.
+
+**Exit criteria:**
+
+| # | Criterion | State |
+|---|---|---|
+| 1 | Phase-1 matrix rows pass as automated tests | ✅ both backends |
+| 2 | All seven tools and `user_bash` go through the backend | ✅ |
+| 3 | Denials reach the model as a structured `Violation` | ✅ — with the Linux `bash`-read gap recorded |
+| 4 | `/enclave status` and `backend` work; status line shows backend and mode | ✅ |
+| 5 | Helper latency measured and recorded | ✅ above and in the README |
+| 6 | `probe()` fails closed | ✅ — and now checks namespace nesting functionally |
+
+**Outstanding: the CI run on a real Linux host.** Everything was verified on macOS and in a
+privileged container, and the container cannot verify the capability drop (C12) because no
+container mode on this host gives capability-bearing nested user namespaces. That is the one
+claim in the matrix still resting on inference rather than a passing test.
 
 ## Package layout
 
