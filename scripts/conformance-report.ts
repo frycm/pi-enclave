@@ -20,8 +20,9 @@ const backend: SandboxBackend = which === "srt" ? new SrtBackend({ weakerNestedS
 
 const restore = plantSecrets();
 const started = Date.now();
-// The fs rows need the helper, which only a real backend can run.
-const rows = await runConformance(backend, createFixture, { includeFs: which === "srt" });
+// The helper rows run against both: a real backend must pass them, and the
+// noop backend's fs client is the real filesystem, so it must leak through them.
+const rows = await runConformance(backend, createFixture, { includeFs: true });
 const elapsed = Date.now() - started;
 restore();
 await backend.dispose();

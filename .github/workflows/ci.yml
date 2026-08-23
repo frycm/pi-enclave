@@ -41,6 +41,13 @@ jobs:
           # fd ships as fdfind on Debian/Ubuntu; the helper looks for `fd`.
           sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
 
+      # The search rows (F6, F7) and their falsifiability control drive rg and fd
+      # for real. Without them the helper's grep and glob paths never execute
+      # on this platform, and the rows would skip rather than prove anything.
+      - name: Install search tools
+        if: runner.os == 'macOS'
+        run: brew install ripgrep fd
+
       # ubuntu-latest is 24.04, which ships
       # kernel.apparmor_restrict_unprivileged_userns=1. That permits
       # unshare(CLONE_NEWUSER) but strips capabilities from the resulting

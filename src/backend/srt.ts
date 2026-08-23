@@ -46,6 +46,11 @@ function resolveSearchTools(): Record<string, string> {
 	return env;
 }
 
+/** Single-quote a string for a POSIX shell; the only safe quoting for arbitrary paths. */
+export function shellQuote(value: string): string {
+	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 /** The helper script, resolved relative to this module so it moves with the package. */
 const HELPER_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "fs", "helper.mjs");
 
@@ -249,8 +254,11 @@ export class SrtBackend implements SandboxBackend {
 		// Prepared here because the helper spawner must be synchronous, and because
 		// a helper wrapped by a stale configuration would be exactly the hazard
 		// assertCurrent exists to prevent.
+		// The command is a shell string that /bin/bash -c will parse, so both
+		// paths are quoted: a checkout under "Application Support" or a node
+		// under a directory with a space would otherwise split into arguments.
 		const helper = await SandboxManager.wrapWithSandboxArgv(
-			`exec ${process.execPath} ${HELPER_PATH}`,
+			`exec ${shellQuote(process.execPath)} ${shellQuote(HELPER_PATH)}`,
 			undefined,
 			undefined,
 			undefined,

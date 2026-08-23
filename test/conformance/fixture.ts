@@ -160,6 +160,11 @@ export function hostHoldsCapabilities(): boolean {
 	return value !== null && /[1-9a-fA-F]/.test(value);
 }
 
+/** Are `rg` and `fd` on PATH, so the unsandboxed search control can actually search? */
+export function hostHasSearchTools(): boolean {
+	return ["rg", "fd"].every((bin) => spawnSync(bin, ["--version"], { stdio: "ignore" }).status === 0);
+}
+
 /** Set the secret variables in this process, returning a restore function. */
 export function plantSecrets(): () => void {
 	const previous = new Map<string, string | undefined>();

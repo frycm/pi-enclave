@@ -31,6 +31,19 @@ class NoopCompiledProfile implements CompiledProfile {
 	}
 }
 
+/** Run a search tool in this process, with no sandbox anywhere near it. */
+function run(bin: string, args: string[]): Promise<{ stdout: string; exitCode: number | null }> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+		let stdout = "";
+		child.stdout.on("data", (d: Buffer) => {
+			stdout += d;
+		});
+		child.on("error", reject);
+		child.on("close", (exitCode) => resolve({ stdout, exitCode }));
+	});
+}
+
 export class NoopBackend implements SandboxBackend {
 	readonly name = "seatbelt" as const;
 
@@ -82,8 +95,18 @@ export class NoopBackend implements SandboxBackend {
 					return false;
 				}
 			},
-			glob: async () => [],
-			grep: async () => ({ stdout: "", exitCode: 0 }),
+			// Real searches, unsandboxed, so the search rows can fail here. A stub
+			// that returned nothing would pass F6 and F7 against a backend that
+			// enforces nothing, which is the exact vacuity the control exists to
+			// catch.
+			glob: async (pattern, cwd, options) => {
+				const args = ["--glob", "--color=never", "--hidden", "--max-results", String(options.limit)];
+				if (pattern.includes("/")) args.push("--full-path");
+				args.push("--", pattern, cwd);
+				const { stdout } = await run("fd", args);
+				return stdout.split("\n").filter(Boolean);
+			},
+			grep: async (args) => run("rg", [...args]),
 		};
 	}
 

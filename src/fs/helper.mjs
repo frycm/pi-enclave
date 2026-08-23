@@ -33,7 +33,16 @@ import { basename, dirname, resolve } from "node:path";
 
 const HEADER_BYTES = 4;
 const MAX_FRAME_BYTES = 64 * 1024 * 1024;
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
+/**
+ * The most a single read returns. Base64 inflates by a third, and a frame the
+ * client must reject takes down the helper and every operation in flight, so
+ * the bound is applied here, before encoding, and reported as an error the
+ * caller can act on rather than a crash nobody can.
+ */
+const MAX_READ_BYTES = 32 * 1024 * 1024;
+/** The most search output a single grep or glob may accumulate before the tool is stopped. */
+const MAX_SEARCH_OUTPUT_BYTES = 16 * 1024 * 1024;
 
 function writeFrame(message) {
 	const payload = Buffer.from(JSON.stringify(message), "utf8");
@@ -56,22 +65,64 @@ const TOOL_PATHS = {
 	fd: process.env.PI_ENCLAVE_FD || "fd",
 };
 
-/** Run a search tool and collect its output. Spawned here so it runs under the profile. */
-function runTool(bin, args) {
+/** Search tools still running, by request id, so a cancel can reach them. */
+const running = new Map();
+
+/**
+ * Run a search tool and collect its output. Spawned here so it runs under the
+ * profile.
+ *
+ * Bounded in two ways, because a search over `/` would otherwise accumulate
+ * the whole filesystem in memory before the client ever saw a match limit:
+ * `stopAfterLines(line)` is consulted per output line and kills the tool once
+ * it returns true, and the output is capped in bytes regardless. Both are
+ * reported in the result so the caller can say so.
+ */
+function runTool(requestId, bin, args, stopAfterLines) {
 	return new Promise((resolve) => {
 		const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+		running.set(requestId, child);
 		let stdout = "";
 		let stderr = "";
+		let partial = "";
+		let stopped = false;
+		let capped = false;
+		const stop = (why) => {
+			if (stopped) return;
+			stopped = true;
+			if (why === "cap") capped = true;
+			child.kill("SIGKILL");
+		};
 		child.stdout.on("data", (d) => {
+			if (stopped) return;
 			stdout += d;
+			if (stdout.length > MAX_SEARCH_OUTPUT_BYTES) {
+				stop("cap");
+				return;
+			}
+			if (!stopAfterLines) return;
+			partial += d;
+			const lines = partial.split("\n");
+			partial = lines.pop() ?? "";
+			for (const line of lines) {
+				if (stopAfterLines(line)) {
+					stop("limit");
+					return;
+				}
+			}
 		});
 		child.stderr.on("data", (d) => {
 			stderr += d;
 		});
-		child.on("error", (error) =>
-			resolve({ stdout: "", stderr: String(error.message), exitCode: null, code: error.code }),
-		);
-		child.on("close", (exitCode) => resolve({ stdout, stderr, exitCode }));
+		child.on("error", (error) => {
+			running.delete(requestId);
+			resolve({ stdout: "", stderr: String(error.message), exitCode: null, code: error.code });
+		});
+		child.on("close", (exitCode) => {
+			running.delete(requestId);
+			// A tool we stopped ourselves exited on our signal, not on an error.
+			resolve({ stdout, stderr, exitCode: stopped ? 0 : exitCode, stopped, capped });
+		});
 	});
 }
 
@@ -79,9 +130,17 @@ async function handle(request) {
 	switch (request.op) {
 		case "ping":
 			return "pong";
-		case "readFile":
+		case "readFile": {
+			const size = statSync(request.path).size;
+			if (size > MAX_READ_BYTES) {
+				throw Object.assign(
+					new Error(`${request.path} is ${size} bytes; the sandboxed read tool returns at most ${MAX_READ_BYTES}`),
+					{ code: "EFBIG" },
+				);
+			}
 			// Base64 so arbitrary bytes survive a JSON frame.
 			return readFileSync(request.path).toString("base64");
+		}
 		case "writeFile":
 			writeFileSync(request.path, request.content, "utf8");
 			return null;
@@ -101,9 +160,18 @@ async function handle(request) {
 			try {
 				accessSync(request.path, constants.F_OK);
 				return true;
-			} catch {
-				return false;
+			} catch (error) {
+				// Only "not there" is a false. A permission error is the answer to a
+				// different question, and swallowing it here would turn a denied
+				// directory into "Path not found" before the client could classify.
+				if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return false;
+				throw error;
 			}
+		case "cancel": {
+			const child = running.get(request.target);
+			if (child) child.kill("SIGKILL");
+			return null;
+		}
 		case "glob": {
 			// A deliberately conservative flag set. `--no-require-git`, which pi
 			// passes, does not exist in fd 8.x -- and an unknown flag makes fd exit
@@ -112,8 +180,20 @@ async function handle(request) {
 			// supported fd understands.
 			const args = ["--glob", "--color=never", "--hidden"];
 			for (const pattern of request.ignore ?? []) args.push("--exclude", pattern);
-			args.push("--max-results", String(request.limit ?? 1000), request.pattern, request.cwd);
-			const result = await runTool(TOOL_PATHS.fd, args);
+			args.push("--max-results", String(request.limit ?? 1000));
+			// fd --glob matches the basename unless --full-path is set, and in
+			// --full-path mode a relative pattern like `src/**/*.spec.ts` needs a
+			// leading `**/` to match anything. Same normalisation as pi's own tool,
+			// so the patterns its description advertises keep working here.
+			// Same reasoning as grep: fd's "Operation not permitted" is prose.
+			accessSync(request.cwd, constants.R_OK);
+			let pattern = request.pattern;
+			if (pattern.includes("/")) {
+				args.push("--full-path");
+				if (!pattern.startsWith("/") && !pattern.startsWith("**/") && pattern !== "**") pattern = `**/${pattern}`;
+			}
+			args.push("--", pattern, request.cwd);
+			const result = await runTool(request.id, TOOL_PATHS.fd, args);
 			if (result.code === "ENOENT")
 				throw Object.assign(new Error(`fd is not available (looked for ${TOOL_PATHS.fd})`), { code: "ENOENT" });
 			// fd exits 1 when nothing matched, which is a real answer. Anything
@@ -127,7 +207,19 @@ async function handle(request) {
 			return result.stdout.split("\n").filter(Boolean);
 		}
 		case "grep": {
-			const result = await runTool(TOOL_PATHS.rg, request.args);
+			// rg reports a refused search root as "exit 2" with the errno in prose,
+			// which nothing downstream can classify. Ask the kernel directly first
+			// -- on this side of the boundary, so it is the same answer rg got --
+			// and let a refusal travel as the errno it is.
+			accessSync(request.path, constants.R_OK);
+			// Stop rg at the match limit rather than buffering everything it would
+			// ever print; `--json` emits one event per line, so matches can be
+			// counted as they arrive.
+			let matches = 0;
+			const limit = request.limit > 0 ? request.limit : Infinity;
+			const result = await runTool(request.id, TOOL_PATHS.rg, request.args, (line) =>
+				line.includes('"type":"match"') ? ++matches >= limit : false,
+			);
 			if (result.code === "ENOENT")
 				throw Object.assign(new Error(`rg is not available (looked for ${TOOL_PATHS.rg})`), { code: "ENOENT" });
 			// Same reasoning as glob: rg exits 1 for "no matches", and anything
@@ -137,7 +229,13 @@ async function handle(request) {
 					code: "EIO",
 				});
 			}
-			return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
+			return {
+				stdout: result.stdout,
+				stderr: result.stderr,
+				exitCode: result.exitCode,
+				limitReached: Boolean(result.stopped && !result.capped),
+				capped: Boolean(result.capped),
+			};
 		}
 		default:
 			throw Object.assign(new Error(`unknown operation: ${request.op}`), { code: "EINVAL" });
@@ -181,6 +279,9 @@ function resolveForReport(path) {
 	return path;
 }
 
+/** Operations whose success on bwrap may be the masking tmpfs talking, not the real directory. */
+const MASKABLE = new Set(["exists", "readdir", "stat", "glob", "grep"]);
+
 let buffer = Buffer.alloc(0);
 
 process.stdin.on("data", (chunk) => {
@@ -208,7 +309,18 @@ process.stdin.on("data", (chunk) => {
 		// Requests are served concurrently and answered by id, so one slow search
 		// does not stall every read behind it.
 		void handle(request).then(
-			(result) => writeFrame({ id: request.id, ok: true, result }),
+			(result) =>
+				writeFrame({
+					id: request.id,
+					ok: true,
+					result,
+					// For the operations a masking tmpfs can answer "successfully" --
+					// an empty listing of a denied directory -- the client needs to
+					// know where the answer came from to say what it really means.
+					...(MASKABLE.has(request.op) && typeof (request.path ?? request.cwd) === "string"
+						? { resolvedPath: resolveForReport(request.path ?? request.cwd) }
+						: {}),
+				}),
 			(error) =>
 				writeFrame({
 					id: request.id,
@@ -216,7 +328,9 @@ process.stdin.on("data", (chunk) => {
 					code: error?.code,
 					syscall: error?.syscall,
 					message: String(error?.message ?? error),
-					...(typeof request.path === "string" ? { resolvedPath: resolveForReport(request.path) } : {}),
+					...(typeof (request.path ?? request.cwd) === "string"
+						? { resolvedPath: resolveForReport(request.path ?? request.cwd) }
+						: {}),
 				}),
 		);
 	}

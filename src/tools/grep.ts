@@ -71,6 +71,7 @@ export function parseRipgrepJson(stdout: string, limit: number): { matches: Ripg
 export interface SandboxedGrepOptions {
 	fs: FsClient;
 	cwd: string;
+	signal?: AbortSignal;
 }
 
 /**
@@ -82,7 +83,7 @@ export interface SandboxedGrepOptions {
  * privileges.
  */
 export async function runSandboxedGrep(options: SandboxedGrepOptions, args: GrepArgs): Promise<GrepOutcome> {
-	const { fs, cwd } = options;
+	const { fs, cwd, signal } = options;
 	const searchPath = args.path ?? cwd;
 	const limit = args.limit && args.limit > 0 ? args.limit : DEFAULT_LIMIT;
 	const context = args.context && args.context > 0 ? args.context : 0;
@@ -94,8 +95,15 @@ export async function runSandboxedGrep(options: SandboxedGrepOptions, args: Grep
 	rgArgs.push("--", args.pattern, searchPath);
 
 	let stdout: string;
+	let capped = false;
 	try {
-		({ stdout } = await fs.grep(rgArgs));
+		// The limit travels with the request so rg is stopped at the limit inside
+		// the sandbox, rather than buffering everything it would ever print.
+		({ stdout, capped = false } = await fs.grep(rgArgs, {
+			limit,
+			path: searchPath,
+			...(signal ? { signal } : {}),
+		}));
 	} catch (error) {
 		if (error instanceof SandboxDenied) {
 			return {
@@ -159,6 +167,7 @@ export async function runSandboxedGrep(options: SandboxedGrepOptions, args: Grep
 		notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
 		details.truncation = truncation;
 	}
+	if (capped) notices.push("search output limit reached inside the sandbox; refine the pattern or path");
 	if (linesTruncated) details.linesTruncated = true;
 	if (notices.length > 0) text += `\n\n[${notices.join(". ")}]`;
 

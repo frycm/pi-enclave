@@ -28,6 +28,7 @@ import {
 	createFixture,
 	hostCapEff,
 	hostHasNetwork,
+	hostHasSearchTools,
 	hostHoldsCapabilities,
 	plantSecrets,
 	SECRET_ENV,
@@ -42,16 +43,17 @@ describe("conformance suite falsifiability", () => {
 
 	beforeAll(async () => {
 		restoreSecrets = plantSecrets();
-		rows = await runConformance(new NoopBackend(), createFixture);
+		// The helper rows too: the noop backend's fs client is the real
+		// filesystem, so F1-F3 and F6-F8 must leak through it.
+		rows = await runConformance(new NoopBackend(), createFixture, { includeFs: true });
 	}, 180_000);
 
 	afterAll(() => {
 		restoreSecrets?.();
 	});
 
-	it("runs every non-fs scenario", () => {
-		const expected = SCENARIOS.filter((s) => s.surface !== "fs").map((s) => s.id);
-		expect(rows.map((r) => r.id)).toEqual(expected);
+	it("runs every scenario, helper rows included", () => {
+		expect(rows.map((r) => r.id)).toEqual(SCENARIOS.map((s) => s.id));
 	});
 
 	it("every falsifiable denial scenario FAILS without a sandbox", () => {
@@ -67,13 +69,17 @@ describe("conformance suite falsifiability", () => {
 		// the host, not a suite that stopped testing anything, and the row still
 		// separates secure bwrap from the weaker nested mode there.
 		const capabilityControlAvailable = hostHoldsCapabilities();
+		// F6 and F7 drive rg and fd unsandboxed; without them on the host the
+		// search does not happen and the row passes for the wrong reason.
+		const searchControlAvailable = hostHasSearchTools();
 		const wronglyPassing = rows.filter(
 			(row) =>
 				row.expectation === "denied" &&
 				row.falsifiableByNoop &&
 				row.ok &&
 				!(row.id === "C5" && !networkControlAvailable) &&
-				!(row.id === "C12" && !capabilityControlAvailable),
+				!(row.id === "C12" && !capabilityControlAvailable) &&
+				!((row.id === "F6" || row.id === "F7") && !searchControlAvailable),
 		);
 		expect(
 			wronglyPassing,
@@ -86,7 +92,7 @@ describe("conformance suite falsifiability", () => {
 		// Guards against a row silently dropping out: nothing fails when a test
 		// stops running, so the absence has to be asserted explicitly.
 		const ran = new Set(rows.filter((r) => r.expectation === "denied" && r.falsifiableByNoop).map((r) => r.id));
-		for (const id of ["C1", "C2", "C2b", "C3", "C4", "C5", "C8"]) {
+		for (const id of ["C1", "C2", "C2b", "C3", "C4", "C5", "C8", "F1", "F2", "F3", "F8"]) {
 			expect(ran.has(id), `${id} is not in the falsifiable denial set`).toBe(true);
 		}
 	});
@@ -117,6 +123,7 @@ describe("conformance suite falsifiability", () => {
 		const capEff = hostCapEff();
 		const notes = [
 			`C5 network control: ${hostHasNetwork() ? "ran" : "skipped -- host has no egress"}`,
+			`F6/F7 search control: ${hostHasSearchTools() ? "ran" : "skipped -- rg or fd not on PATH"}`,
 			`C12 capability control: ${
 				hostHoldsCapabilities()
 					? `ran -- host CapEff=${capEff}`
@@ -126,6 +133,7 @@ describe("conformance suite falsifiability", () => {
 			}`,
 		];
 		console.log(`falsifiability controls on this host:\n  ${notes.join("\n  ")}`);
+		expect(notes).toHaveLength(3);
 
 		// The row itself must carry the baseline, not just this log line: the
 		// conformance report is what a reviewer reads, and "no capabilities" means

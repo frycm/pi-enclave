@@ -19,6 +19,7 @@ import { join } from "node:path";
 import type { CompiledProfile, SandboxBackend, ViolationKind } from "../../src/backend/types.ts";
 import { SandboxDenied } from "../../src/backend/types.ts";
 import { buildChildEnv } from "../../src/env/child-env.ts";
+import { type GrepOutcome, runSandboxedGrep } from "../../src/tools/grep.ts";
 import { type Fixture, hostCapEff, OUTSIDE_FILE_CONTENT, SECRET_ENV, SECRET_FILE_CONTENT } from "./fixture.ts";
 
 export interface ScenarioContext {
@@ -438,6 +439,97 @@ SCENARIOS.push(
 			const ok =
 				back === "written by the helper" && entries.includes("helper-made.txt") && stats.isDirectory() === true;
 			return { ok, detail: ok ? "helper round-trips normal operations" : "helper broke ordinary work" };
+		},
+	},
+);
+
+// ---------------------------------------------------------------------------
+// The two search tools. grep is re-implemented precisely because pi's would
+// read a credential directory with the user's full privileges, and find's
+// glob is the operation that stops pi spawning fd itself -- so each gets a
+// row against the real backend, not only a unit test against a fake fs.
+// ---------------------------------------------------------------------------
+
+SCENARIOS.push(
+	{
+		id: "F6",
+		title: "grep tool: a search over a read-denied directory returns no secret",
+		surface: "fs",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ backend, compiled, fixture }) {
+			const fs = backend.fs(compiled);
+			let outcome: GrepOutcome;
+			try {
+				outcome = await runSandboxedGrep(
+					{ fs, cwd: fixture.workspace },
+					{
+						pattern: SECRET_FILE_CONTENT.slice(0, 12),
+						path: fixture.deniedHome,
+					},
+				);
+			} catch (error) {
+				if (error instanceof SandboxDenied) return { ok: true, detail: `grep denied (${error.violation.kind})` };
+				throw error;
+			}
+			const text = outcome.content[0].text;
+			if (text.includes(SECRET_FILE_CONTENT)) return { ok: false, detail: "SECRET LEAKED through the grep tool" };
+			// Either a classified denial or nothing found is acceptable; on bwrap the
+			// directory is a tmpfs and rg finds nothing, on seatbelt rg is refused.
+			return { ok: true, detail: `grep returned no secret: ${text.split("\n")[0]?.slice(0, 60)}` };
+		},
+	},
+	{
+		id: "F7",
+		title: "find tool: a glob over a read-denied directory lists nothing",
+		surface: "fs",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ backend, compiled, fixture }) {
+			const fs = backend.fs(compiled);
+			let found: string[];
+			try {
+				found = await fs.glob("**/*", fixture.deniedHome, { ignore: [], limit: 100 });
+			} catch (error) {
+				if (error instanceof SandboxDenied) return { ok: true, detail: `glob denied (${error.violation.kind})` };
+				throw error;
+			}
+			const leaked = found.some((entry) => entry.includes("id_ed25519") || entry.includes("credentials"));
+			return {
+				ok: !leaked,
+				detail: leaked ? `LISTED the denied directory: ${found.slice(0, 3).join(", ")}` : "nothing listed",
+			};
+		},
+	},
+	{
+		id: "F8",
+		title: "ls tool: a read-denied directory is reported as denied, not empty",
+		surface: "fs",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ backend, compiled, fixture }) {
+			// On bwrap the denied directory is an empty tmpfs, so exists() is true
+			// and readdir() is [] -- "ls ~/.ssh: (empty)" would be a lie the agent
+			// acts on. On seatbelt the probe itself is refused.
+			const fs = backend.fs(compiled);
+			const target = join(fixture.deniedHome, ".ssh");
+			try {
+				const present = await fs.exists(target);
+				const entries = present ? await fs.readdir(target) : [];
+				const leaked = entries.includes("id_ed25519");
+				return {
+					ok: false,
+					detail: leaked
+						? "LISTED the denied directory"
+						: `reported as ${present ? "empty" : "missing"} rather than denied`,
+				};
+			} catch (error) {
+				const denied = error instanceof SandboxDenied;
+				return {
+					ok: denied,
+					detail: denied ? "classified as a denial" : `NOT CLASSIFIED: ${String(error).slice(0, 80)}`,
+				};
+			}
 		},
 	},
 );

@@ -11,10 +11,11 @@
  * not spawned per operation.
  */
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { classifyErrno } from "../backend/errno.ts";
+import { classifyErrno, kindForOp } from "../backend/errno.ts";
+import { isUnderAny } from "../backend/paths.ts";
 import type { CompiledProfile, FsClient, Violation } from "../backend/types.ts";
 import { SandboxDenied } from "../backend/types.ts";
-import { encodeFrame, FrameDecoder, type FsCall, type FsResponse } from "./protocol.ts";
+import { encodeFrame, FrameDecoder, type FsCall, type FsResponse, PROTOCOL_VERSION } from "./protocol.ts";
 
 /** How long a single operation may take before it is abandoned. */
 const DEFAULT_CALL_TIMEOUT_MS = 30_000;
@@ -94,6 +95,17 @@ export class HelperFsClient implements FsClient {
 				for (const message of messages) {
 					if (isReady(message)) {
 						clearTimeout(timer);
+						if (message.protocol !== PROTOCOL_VERSION) {
+							// A helper speaking another version would answer with shapes
+							// this side misreads, which is worse than not answering.
+							const error = new Error(
+								`pi-enclave: the filesystem helper speaks protocol ${message.protocol}, this client speaks ${PROTOCOL_VERSION}`,
+							);
+							this.failAll(error);
+							reject(error);
+							child.kill("SIGKILL");
+							return;
+						}
 						// A successful start clears the budget: a crash after hours of work
 						// deserves the same three attempts as one at startup.
 						this.restarts = 0;
@@ -106,6 +118,13 @@ export class HelperFsClient implements FsClient {
 
 			// The helper's stderr is diagnostic only; its answers all arrive on stdout.
 			child.stderr.on("data", () => {});
+
+			// A write after the helper has gone surfaces as EPIPE on this stream. With
+			// no listener that is an uncaught exception in the pi process -- precisely
+			// in the window the restart logic exists for.
+			child.stdin.on("error", (error) => {
+				this.failAll(error);
+			});
 
 			child.on("error", (error) => {
 				clearTimeout(timer);
@@ -157,7 +176,15 @@ export class HelperFsClient implements FsClient {
 	// Request plumbing
 	// -------------------------------------------------------------------------
 
-	private async call(request: FsCall): Promise<unknown> {
+	/** Send a frame, turning a closed stream into a rejection rather than an event nobody handles. */
+	private send(child: ChildProcessWithoutNullStreams, frame: Buffer): void {
+		if (child.stdin.destroyed || child.stdin.writableEnded) {
+			throw new Error("pi-enclave: the filesystem helper is no longer accepting requests");
+		}
+		child.stdin.write(frame);
+	}
+
+	private async call(request: FsCall, signal?: AbortSignal): Promise<unknown> {
 		if (this.disposed) throw new Error("pi-enclave: the filesystem helper was shut down");
 		await this.start();
 
@@ -167,16 +194,57 @@ export class HelperFsClient implements FsClient {
 		const id = ++this.sequence;
 		const timeoutMs = this.options.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
 
+		// A search abandoned on this side keeps running on the other unless told
+		// otherwise, so abort and timeout both send a cancel for it.
+		const cancel = () => {
+			try {
+				this.send(child, encodeFrame({ op: "cancel", target: id, id: ++this.sequence }));
+			} catch {
+				// The helper is gone; there is nothing left to cancel.
+			}
+		};
+
 		const response = await new Promise<FsResponse>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(id);
+				cancel();
 				reject(new Error(`pi-enclave: ${request.op} timed out after ${timeoutMs}ms`));
 			}, timeoutMs);
-			this.pending.set(id, { resolve, reject, timer });
-			child.stdin.write(encodeFrame({ ...request, id }));
+			const onAbort = () => {
+				clearTimeout(timer);
+				this.pending.delete(id);
+				cancel();
+				reject(new Error("Operation aborted"));
+			};
+			if (signal?.aborted) {
+				onAbort();
+				return;
+			}
+			signal?.addEventListener("abort", onAbort, { once: true });
+			this.pending.set(id, {
+				resolve: (r) => {
+					signal?.removeEventListener("abort", onAbort);
+					resolve(r);
+				},
+				reject: (e) => {
+					signal?.removeEventListener("abort", onAbort);
+					reject(e);
+				},
+				timer,
+			});
+			try {
+				this.send(child, encodeFrame({ ...request, id }));
+			} catch (error) {
+				clearTimeout(timer);
+				this.pending.delete(id);
+				reject(error instanceof Error ? error : new Error(String(error)));
+			}
 		});
 
-		if (response.ok) return response.result;
+		if (response.ok) {
+			this.refuseMaskedSuccess(request, response.resolvedPath);
+			return response.result;
+		}
 
 		// The helper reports the errno; the profile decides what it means. On Linux
 		// an ENOENT under a read-denied root is a denial and anywhere else is a
@@ -185,7 +253,7 @@ export class HelperFsClient implements FsClient {
 		// spelled: a read through a workspace symlink into a denied directory
 		// fails on the target. The helper resolved it inside the sandbox; it is
 		// evidence for the verdict, and nothing here enforces on it.
-		const requested = "path" in request ? (request as { path: string }).path : "";
+		const requested = "path" in request ? request.path : "cwd" in request ? request.cwd : "";
 		const path = response.resolvedPath ?? requested;
 		const violation = classifyErrno({
 			error: {
@@ -203,6 +271,29 @@ export class HelperFsClient implements FsClient {
 			throw new SandboxDenied(violation);
 		}
 		throw Object.assign(new Error(response.message), response.code ? { code: response.code } : {});
+	}
+
+	/**
+	 * On bwrap a read-denied directory is an empty tmpfs: `exists` answers true,
+	 * `readdir` answers `[]`, `stat` says "directory", and `fd` finds nothing --
+	 * each a success that would tell the agent `~/.ssh` is simply empty. The
+	 * kernel has already refused; this only refuses to misdescribe it. A path
+	 * comparison here never permits anything.
+	 */
+	private refuseMaskedSuccess(request: FsCall, resolvedPath: string | undefined): void {
+		if (this.options.compiled.backend !== "bwrap") return;
+		const path = resolvedPath ?? ("path" in request ? request.path : "cwd" in request ? request.cwd : undefined);
+		if (!path || !isUnderAny(path, this.options.compiled.profile.readDeny)) return;
+		const violation: Violation = {
+			source: "errno",
+			kind: kindForOp(request.op),
+			op: request.op,
+			path,
+			backend: "bwrap",
+			raw: "masked (deny-read tmpfs)",
+		};
+		this.options.onViolation?.(violation);
+		throw new SandboxDenied(violation);
 	}
 
 	// -------------------------------------------------------------------------
@@ -242,12 +333,23 @@ export class HelperFsClient implements FsClient {
 		return (await this.call({ op: "glob", pattern, cwd, ignore: options.ignore, limit: options.limit })) as string[];
 	}
 
-	async grep(args: readonly string[]): Promise<{ stdout: string; exitCode: number | null }> {
-		return (await this.call({ op: "grep", args: [...args] })) as { stdout: string; exitCode: number | null };
+	async grep(
+		args: readonly string[],
+		options: { limit?: number; signal?: AbortSignal; path?: string } = {},
+	): Promise<{ stdout: string; exitCode: number | null; limitReached?: boolean; capped?: boolean }> {
+		return (await this.call(
+			{ op: "grep", args: [...args], limit: options.limit ?? 0, path: options.path ?? "" },
+			options.signal,
+		)) as {
+			stdout: string;
+			exitCode: number | null;
+			limitReached?: boolean;
+			capped?: boolean;
+		};
 	}
 }
 
-function isReady(message: unknown): boolean {
+function isReady(message: unknown): message is { ready: true; protocol: number } {
 	return typeof message === "object" && message !== null && (message as { ready?: boolean }).ready === true;
 }
 

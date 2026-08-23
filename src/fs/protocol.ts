@@ -42,7 +42,8 @@ export type FsCall =
 	| { op: "readdir"; path: string }
 	| { op: "exists"; path: string }
 	| { op: "glob"; pattern: string; cwd: string; ignore: string[]; limit: number }
-	| { op: "grep"; args: string[] }
+	| { op: "grep"; args: string[]; limit: number; path: string }
+	| { op: "cancel"; target: number }
 	| { op: "ping" };
 
 export type FsRequest = FsCall & { id: number };
@@ -75,6 +76,12 @@ export interface FsSuccess {
 	ok: true;
 	/** Base64 for `readFile`; otherwise a JSON-representable result. */
 	result?: unknown;
+	/**
+	 * For `exists`, `stat`, `readdir` and `glob`: where the answer came from. On
+	 * bwrap a denied directory is an empty tmpfs, so these can "succeed" against
+	 * the mask; the client uses this to tell an empty directory from a denied one.
+	 */
+	resolvedPath?: string;
 }
 
 export type FsResponse = FsSuccess | FsFailure;
@@ -87,7 +94,7 @@ export interface FsReady {
 }
 
 /** Bumped whenever the message shapes change incompatibly. */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 // ---------------------------------------------------------------------------
 // Framing

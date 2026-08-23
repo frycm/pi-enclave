@@ -145,8 +145,11 @@ export default function (pi: ExtensionAPI): void {
 		pi.registerTool({
 			...grepBase,
 			label: "grep (sandboxed)",
-			execute: async (_id: string, params: unknown) =>
-				runSandboxedGrep({ fs: fsClient(), cwd }, params as Parameters<typeof runSandboxedGrep>[1]),
+			execute: async (_id: string, params: unknown, signal?: AbortSignal) =>
+				runSandboxedGrep(
+					{ fs: fsClient(), cwd, ...(signal ? { signal } : {}) },
+					params as Parameters<typeof runSandboxedGrep>[1],
+				),
 		} as Parameters<typeof pi.registerTool>[0]);
 	}
 
