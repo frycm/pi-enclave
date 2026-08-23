@@ -60,16 +60,19 @@ Results that change the steps below:
   `ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY` and `GITHUB_TOKEN` set in the parent.
 - **Violations arrive three ways** — errno (fs helper), kernel log line (bash), proxy
   (network) — so `Violation` needs a `source` field, and `SandboxViolationEvent` is a raw
-  log line that must be parsed. **The fs helper needs no log parsing at all**: `EPERM` is
+  log line that must be parsed. **The fs helper needs no log parsing at all**: the errno is
   exact and synchronous.
-- **The long-lived helper works**: 40 ms startup, 0.02 ms per round-trip, enforcement
-  intact. Step 6's design stands; the per-call-spawn fallback is not needed.
+- **The long-lived helper works on both backends**: 40 ms startup / 0.02 ms per round-trip
+  on macOS, 28 ms / 0.08 ms on Linux, enforcement intact. Step 6's design stands; the
+  per-call-spawn fallback is not needed.
 - **Symlink races are already denied on the resolved path**, so C3/C4 pass through plain
   `bash` — they move from step 6 to steps 4/5.
 - **Per-invocation `customConfig`** widens one command without leaking into the next —
   Phase 3's capability retry hatch is confirmed to work.
-- **Noise is real**: benign `sysctl-read` denials on nearly every command, 62 spurious
-  `__pycache__` violations from one Python call. A `violations.length > 0` check is wrong.
+- **Noise is real, and differs per backend**: benign `sysctl-read` denials on nearly every
+  macOS command and 62 spurious `__pycache__` violations from one Python call; 30
+  `/dev/shm/sem.*` violations from the same test on Linux, which *succeeded*. A
+  `violations.length > 0` check is wrong.
 - **PTYs are denied by default** (`allowPty`), and `sudo`/`su` are denied with *no*
   violation event.
 - **The backends deny with different errnos** — `EPERM` on macOS, but `EROFS` (writes),
