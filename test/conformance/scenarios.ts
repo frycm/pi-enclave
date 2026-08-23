@@ -331,15 +331,17 @@ SCENARIOS.push(
 					detail: leakedBytes ? "SECRET LEAKED through the helper" : "read returned no secret",
 				};
 			} catch (error) {
-				// A denial is the expected outcome. It must be reported AS a denial:
-				// on Linux the raw errno is ENOENT, and surfacing that unclassified
-				// would tell the agent the credential store does not exist.
-				const denied = error instanceof SandboxDenied;
+				// A denial is the expected outcome, and it must be reported AS a
+				// denial: on Linux the raw errno is ENOENT, and surfacing that
+				// unclassified would tell the agent the credential store does not
+				// exist. So the classification is the verdict, not a footnote --
+				// an unclassified error here fails the row.
+				const denied = error instanceof SandboxDenied && error.violation.kind === "read";
 				return {
-					ok: true,
+					ok: denied,
 					detail: denied
 						? `denied and classified as ${(error as SandboxDenied).violation.kind}`
-						: `denied, but NOT classified: ${String(error).slice(0, 90)}`,
+						: `NOT CLASSIFIED as a read denial: ${String(error).slice(0, 90)}`,
 				};
 			}
 		},
@@ -380,8 +382,17 @@ SCENARIOS.push(
 				const content = await backend.fs(compiled).readFile(via);
 				const leakedBytes = content.toString("utf8").includes(SECRET_FILE_CONTENT);
 				return { ok: !leakedBytes, detail: leakedBytes ? "SECRET LEAKED via symlink" : "no secret returned" };
-			} catch {
-				return { ok: true, detail: "denied on the resolved path" };
+			} catch (error) {
+				// Same standard as F1. The caller's path is inside the workspace, so
+				// classifying on it would call this a missing file; the helper must
+				// report the path the kernel judged.
+				const denied = error instanceof SandboxDenied;
+				return {
+					ok: denied,
+					detail: denied
+						? `denied on the resolved path (${(error as SandboxDenied).violation.path})`
+						: `NOT CLASSIFIED as a denial: ${String(error).slice(0, 90)}`,
+				};
 			}
 		},
 	},

@@ -17,7 +17,19 @@
  * depending on it.
  */
 import { spawn } from "node:child_process";
-import { accessSync, constants, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+	accessSync,
+	constants,
+	lstatSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	readlinkSync,
+	realpathSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 
 const HEADER_BYTES = 4;
 const MAX_FRAME_BYTES = 64 * 1024 * 1024;
@@ -132,6 +144,43 @@ async function handle(request) {
 	}
 }
 
+/**
+ * Where a failed operation actually landed.
+ *
+ * A denied read reached through a symlink inside the workspace fails with the
+ * caller's path, which is not under any deny root, so the pi process cannot
+ * classify it. Resolving here -- on this side of the boundary, with the same
+ * view of the filesystem the failing syscall had -- gives it the path the
+ * kernel judged. `realpath` alone is not enough: on Linux a denied directory is
+ * an empty tmpfs, so the final components do not exist and realpath fails.
+ * Resolve the deepest existing ancestor, follow a dangling link at the
+ * frontier, and re-join what is left.
+ */
+function resolveForReport(path) {
+	let current = path;
+	let remainder = "";
+	for (let depth = 0; depth < 64; depth++) {
+		try {
+			return remainder ? resolve(realpathSync(current), remainder) : realpathSync(current);
+		} catch {
+			// Fall through to the ancestor or the link target.
+		}
+		try {
+			if (lstatSync(current).isSymbolicLink()) {
+				current = resolve(dirname(current), readlinkSync(current));
+				continue;
+			}
+		} catch {
+			// Absent: step up.
+		}
+		const parent = dirname(current);
+		if (parent === current) return path;
+		remainder = remainder ? `${basename(current)}/${remainder}` : basename(current);
+		current = parent;
+	}
+	return path;
+}
+
 let buffer = Buffer.alloc(0);
 
 process.stdin.on("data", (chunk) => {
@@ -167,6 +216,7 @@ process.stdin.on("data", (chunk) => {
 					code: error?.code,
 					syscall: error?.syscall,
 					message: String(error?.message ?? error),
+					...(typeof request.path === "string" ? { resolvedPath: resolveForReport(request.path) } : {}),
 				}),
 		);
 	}

@@ -61,6 +61,13 @@ export interface FsFailure {
 	code?: string;
 	syscall?: string;
 	message: string;
+	/**
+	 * The path the kernel actually acted on, with symlinks in the existing
+	 * ancestors resolved -- computed inside the sandbox, so it is evidence for
+	 * classification and never an input to enforcement. Absent when the
+	 * operation has no path or resolution itself failed.
+	 */
+	resolvedPath?: string;
 }
 
 export interface FsSuccess {

@@ -7,6 +7,7 @@
  * anything on the strength of a path check -- the OS does that -- so a
  * mis-comparison here degrades a message, it does not open a hole.
  */
+import { realpathSync } from "node:fs";
 import { resolve, sep } from "node:path";
 
 /** Resolve to an absolute path with no trailing separator (except for root itself). */
@@ -28,7 +29,23 @@ export function isUnder(path: string, root: string): boolean {
 	return p.startsWith(r.endsWith(sep) ? r : r + sep);
 }
 
-/** True when `path` is under any of `roots`. An empty list matches nothing. */
+/**
+ * True when `path` is under any of `roots`. An empty list matches nothing.
+ *
+ * Each root is compared in both its configured and its canonical spelling: the
+ * helper reports the path the kernel judged, which on macOS is `/private/var/…`
+ * for a root configured as `/var/…`, and on any platform the target of a
+ * symlinked home. Resolving the root here is a comparison aid only -- a root
+ * that cannot be resolved is simply compared as written.
+ */
 export function isUnderAny(path: string, roots: readonly string[]): boolean {
-	return roots.some((root) => isUnder(path, root));
+	return roots.some((root) => isUnder(path, root) || isUnder(path, canonical(root)));
+}
+
+function canonical(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return path;
+	}
 }

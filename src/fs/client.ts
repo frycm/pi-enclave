@@ -181,7 +181,12 @@ export class HelperFsClient implements FsClient {
 		// The helper reports the errno; the profile decides what it means. On Linux
 		// an ENOENT under a read-denied root is a denial and anywhere else is a
 		// missing file, and only this side knows which.
-		const path = "path" in request ? (request as { path: string }).path : "";
+		// Classify against the path the kernel judged, not the one the caller
+		// spelled: a read through a workspace symlink into a denied directory
+		// fails on the target. The helper resolved it inside the sandbox; it is
+		// evidence for the verdict, and nothing here enforces on it.
+		const requested = "path" in request ? (request as { path: string }).path : "";
+		const path = response.resolvedPath ?? requested;
 		const violation = classifyErrno({
 			error: {
 				...(response.code ? { code: response.code } : {}),
