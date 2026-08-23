@@ -63,8 +63,12 @@ export function shellQuote(value: string): string {
  * itself and the extra entry is redundant. Recomputed on every translation, so
  * a retargeted link is re-denied at its new target by the re-wrap.
  */
-function withResolvedTargets(readDeny: readonly string[]): string[] {
+function withResolvedTargets(readDeny: readonly string[], platform: NodeJS.Platform = process.platform): string[] {
 	const out = [...readDeny];
+	// Linux only needs the link: sandbox-runtime canonicalises it and masks the
+	// target itself, and listing both makes bwrap try to mount a tmpfs on the
+	// link as well, which fails at startup.
+	if (platform !== "darwin") return out;
 	for (const path of readDeny) {
 		try {
 			if (!lstatSync(path).isSymbolicLink()) continue;
@@ -223,7 +227,7 @@ export function toSrtConfig(
 		// by the kernel.
 		network: { allowedDomains: [], deniedDomains: [] },
 		filesystem: {
-			denyRead: withResolvedTargets(profile.readDeny),
+			denyRead: withResolvedTargets(profile.readDeny, platform),
 			allowWrite: [...profile.writableRoots],
 			denyWrite: denied,
 		},

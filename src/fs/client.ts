@@ -145,9 +145,12 @@ export class HelperFsClient implements FsClient {
 				if (this.child !== child) return;
 				this.child = undefined;
 				this.ready = undefined;
-				if (!this.disposed) {
-					this.failAll(new Error(`pi-enclave: the filesystem helper exited (code ${code})`));
-				}
+				const error = new Error(`pi-enclave: the filesystem helper exited (code ${code})`);
+				if (!this.disposed) this.failAll(error);
+				// A helper that dies before its ready frame must fail the start now,
+				// not when the ready timeout gets round to it: with three restarts
+				// per call that silence was minutes, not seconds.
+				reject(error);
 			});
 		});
 

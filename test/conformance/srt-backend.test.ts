@@ -138,7 +138,7 @@ describe.skipIf(!supported)("sandbox-runtime profile translation", () => {
 		const profile = effectiveProfile(requested);
 		expect(profile.writableRoots).toContain(srtTmpDir());
 		const { denied } = partitionSrtDefaults(profile.writableRoots);
-		expect(denied.filter((p) => p.endsWith("/tmp/claude"))).toEqual([]);
+		expect(denied).not.toContain(srtTmpDir());
 		expect(toSrtConfig(profile).filesystem.allowWrite).toEqual(["/tmp/ws", srtTmpDir()]);
 	});
 
