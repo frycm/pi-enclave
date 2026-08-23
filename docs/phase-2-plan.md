@@ -99,7 +99,7 @@ Steps are ordered so that the piece everything else depends on — the canonical
 the gate — exists before any policy is written against it, and so that every step leaves
 `main` shippable: Phase 1 behaviour is the floor at all times.
 
-### Step 1 — Configuration: schema, sources, `$defaults`, the monotonic fold
+### Step 1 — Configuration: schema, sources, `$defaults`, the monotonic fold ✅ done
 
 Produces `src/config/schema.ts`, `src/config/sources.ts`, `src/config/merge.ts`,
 `src/config/defaults.ts`, and replaces `createDevProfile` with the loader.
@@ -137,7 +137,7 @@ Verified by unit tests against fixture files for each row of the configuration-s
 table, by the property test, and by the Phase-2 matrix rows on config rejection (P4, P5,
 P6 in step 8).
 
-### Step 2 — The canonical action
+### Step 2 — The canonical action ✅ done
 
 Produces `src/policy/canonical.ts`, `src/policy/shell.ts`, `src/policy/paths.ts`,
 `src/policy/match.ts`.
@@ -177,7 +177,7 @@ one mutating member, redirections and typo-squatted subcommands — and by golde
 that fail if the serialization changes. The matcher's tests are adapted from automode's
 suite with attribution.
 
-### Step 3 — The gate and the lock
+### Step 3 — The gate and the lock ✅ done
 
 Produces `src/gate/gate.ts`, `src/gate/lock.ts`, `src/gate/ownership.ts`,
 `src/gate/tools.ts`; wires one `pi.on("tool_call")` in `index.ts`.
@@ -218,7 +218,7 @@ sequences (a small harness, `test/harness/fake-pi.ts`, reused by every later ste
 that mutates `event.input` from a second handler and asserts the `TypeError` and the
 blocked result, and a test that calls `operations.exec` for a hash the table has not seen.
 
-### Step 4 — Provenance and the circuit breaker
+### Step 4 — Provenance and the circuit breaker ✅ done
 
 Produces `src/gate/provenance.ts`, `src/gate/breaker.ts`.
 
@@ -249,7 +249,7 @@ batch where the second call trips (P2: all three blocked or refused, `terminate`
 block, abort called once, one batch outcome in the audit), and by a resume test that
 reconstructs the breaker from entries and asserts the next call is blocked.
 
-### Step 5 — State directory, audit log, retention
+### Step 5 — State directory, audit log, retention ✅ done
 
 Produces `src/state/dir.ts`, `src/state/audit.ts`, `src/state/redact.ts`; the
 `pi-enclave audit [verify]` command and `/enclave audit`.
@@ -279,7 +279,7 @@ truncated file, on an edited middle line, and on a file with a torn final line; 
 assertions per credential shape, including a key split across a `write` body and a
 `bash` argument; refusal on a `0644` directory and on a symlinked one.
 
-### Step 6 — Attendance contract
+### Step 6 — Attendance contract ✅ done
 
 Produces `src/escalate/attendance.ts`, `src/escalate/handshake.ts`,
 `src/escalate/confirm.ts`; `pi-enclave attend-secret`.
@@ -308,7 +308,7 @@ Verified by unit tests with a fake UI context for each cell of the outcome matri
 Phase-2 columns, a handshake test with a correct MAC, a wrong MAC, a replayed nonce, a
 missing file and a timeout (P9), and a test that `tui` with no TTY refuses.
 
-### Step 7 — Pending-approval records and resume
+### Step 7 — Pending-approval records and resume ✅ done
 
 Produces `src/escalate/pending.ts`, `src/escalate/resume.ts`; `pi-enclave approve <nonce>`
 and `/enclave approve <nonce>`.
@@ -343,7 +343,7 @@ refuses and leaves the record pending), tamper cases (P10: edited body, `0644`, 
 nonce), and an end-to-end test through the `bin` against the real backend on both
 platforms.
 
-### Step 8 — Policy conformance suite, commands, status, README sign-off
+### Step 8 — Policy conformance suite, commands, status, README sign-off ✅ done
 
 Produces `test/policy/scenarios.ts` + runner, the `bin/pi-enclave.ts` entry, the `/enclave`
 verbs, and the README update.
@@ -465,3 +465,52 @@ All three were confirmed by the project owner; they are requirements, not option
    confirm, unattended gets a pending record. `backend.extend` is pulled forward from
    Phase 3 for the **`write` capability only** — step 0 already confirmed SRT's
    per-invocation `customConfig` does this — and `read` and `host` stay Phase 3/4.
+
+---
+
+## Phase 2: done
+
+Steps 1–8 are complete. 625 tests, green on macOS; `tsc` and biome clean. The Phase-1
+conformance suite still passes unchanged, which is the property that matters most: nothing
+in this phase touched the backend interface or the sandbox path.
+
+**Exit criteria:**
+
+| # | Criterion | State |
+|---|---|---|
+| 1 | Phase-2 matrix rows pass with a control that fails | ✅ P1–P11, `npm run policy:report` |
+| 2 | `merge(a, b) ⊑ a` holds; project violations reject the whole file | ✅ property test at 500 runs, plus a generator-reach assertion |
+| 3 | One gate canonicalizes, evaluates L1, locks and records; unlisted tools denied | ✅ |
+| 4 | With `reviewer.model: "none"`, every `ask` and capability request reaches L4 | ✅ confirm when attended, pending record when not |
+| 5 | A pending record survives a crash, is refused when tampered with, resumes only under an equal-or-narrower profile | ✅ P3, P10, P11 |
+| 6 | The audit log chains, `verify` detects truncation and edits, redaction asserted | ✅ |
+| 7 | Status line and report say what is active | ✅ backend, mode, `L1 off`, attendance in force, breaker, audit path |
+
+### Mutation checks
+
+Every step's mechanisms were checked by breaking them one at a time and requiring the tests
+to notice. Thirty-two mutations were applied and reverted; **twenty-eight failed between one
+and eleven tests**. The four that survived are the interesting ones, because each was a real
+gap in the tests rather than a redundant check:
+
+| # | Mutation that survived | What it revealed | Fixed by |
+|---|---|---|---|
+| M4 | `writableRoots` merged by replacement instead of union | Dropping a root is a *narrowing*, which the order accepts, so a project file naming `build/` would silently remove the workspace and `$TMPDIR` from the writable roots | A test asserting the union |
+| M7 | `skipReview`'s overflow policy flipped to `match` | The asymmetry was tested on the matcher but not through `evaluateRules`, so nothing caught an oversized command being fast-pathed | Three tests through the evaluator |
+| M17 | The audit write queue removed | Not falsifiable: `appendFileSync` plus a synchronous seq/hash block cannot interleave under JavaScript's threading model | The module comment now says the queue is what keeps the chain safe if the write ever becomes asynchronous, rather than implying a test covers it |
+| M32 | The `pending → approved` rename moved after execution | The tests only looked at the final state, so the crash-evidence property was untested | A test that observes the directory *during* execution |
+
+### Two defects the work found in itself
+
+- **The fold resolved a profile selection before registering the definitions from the same
+  file**, so the ordinary `{ profile, profiles }` shape could not find a profile three lines
+  below it.
+- **One comparison of two default profiles took 1.8 seconds.** `canonical()` was
+  re-resolving the same paths quadratically, and on macOS `/home` is an autofs mount point
+  where each failed probe costs milliseconds. A literal-first pass with a per-comparison
+  cache fixes it; the cache deliberately does not outlive the comparison, because a longer
+  one would answer from a filesystem that has since changed.
+
+And one regression, caught by a Phase-1 test: with a failed probe the execute-time guard
+fired before `requireCompiled`, so the agent received "this call did not pass the policy
+gate" instead of the probe diagnosis telling it what to fix.

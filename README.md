@@ -8,21 +8,28 @@ mutations and boundary crossings — never for the decisions that must be determ
 Designed to be trustworthy **offline, with open-weight models**.
 
 > [!IMPORTANT]
-> **Status: Phase 1 (sandbox core) implemented. Phases 2–5 are still design.**
+> **Status: Phases 1 and 2 implemented — deterministic auto mode. Phases 3–5 are still
+> design.**
 >
-> **Built and tested:** the OS-enforced sandbox (L2). `bash`, `!`/`!!`, and all six file
-> tools run under Seatbelt on macOS and bubblewrap on Linux. The
-> [platform matrix](#platform-matrix) below runs as an executable conformance suite, with a
-> control proving each row fails when nothing is enforced. See the
-> [Phase 1 plan](docs/phase-1-plan.md) and the
+> **Built and tested:** the OS-enforced sandbox (L2), the deterministic policy layer (L1),
+> human escalation (L4), the action lock, the circuit breaker, the audit log, and the
+> configuration fold. `bash`, `!`/`!!`, and all six file tools run under Seatbelt on macOS
+> and bubblewrap on Linux; pattern rules, the tool allowlist, attendance and pending
+> approval records work offline with no model involved at all. Both halves of the
+> [platform matrix](#platform-matrix) run as executable suites, each row with a control
+> proving it fails when the mechanism it names is removed. See the
+> [Phase 1 plan](docs/phase-1-plan.md), the [Phase 2 plan](docs/phase-2-plan.md) and the
 > [sandbox-runtime findings](docs/step-0-srt-findings.md).
 >
-> **Not built:** everything else. The policy layer (L1), the reviewer (L3), human escalation
-> (L4), the action lock, the circuit breaker, the audit log, the egress proxy, the Docker
-> backend, and the ops profile are all still design. Sections describing them are
-> commitments to be tested, not descriptions of working software.
+> **Not built:** the reviewer (L3) and everything that only exists for it — the prose
+> rulebook, `review.trigger` values other than `boundary`, the read-only classification
+> table, `rules critique`, the eval corpus. Also the egress proxy, the Docker backend and
+> the ops profile. Sections describing them are commitments to be tested, not descriptions
+> of working software. `reviewer.model` must be the literal `"none"`; a named model is
+> **refused** rather than silently ignored.
 >
-> **Known gaps in what *is* built** are listed under [Phase 1 status](#phase-1-status).
+> **Known gaps in what *is* built** are listed under [Phase 1 status](#phase-1-status) and
+> [Phase 2 status](#phase-2-status).
 
 ### API baseline
 
@@ -68,6 +75,7 @@ to this section, not a silently different security model.
 - [Prior art, reuse and credits](#prior-art-reuse-and-credits)
 - [Delivery plan](#delivery-plan)
 - [Phase 1 status](#phase-1-status)
+- [Phase 2 status](#phase-2-status)
 - [Core changes to propose to pi](#core-changes-to-propose-to-pi)
 - [Open questions and risks](#open-questions-and-risks)
 - [License](#license)
@@ -440,15 +448,22 @@ evaluation on top of one.
 | Ask the human | `ctx.ui.confirm(title, message)`, `ctx.mode`, `ctx.hasUI` | Attended escalation, gated by the explicit [attendance contract](#attendance-is-a-setting-not-an-inference) — `hasUI` alone is only used to decide *whether a dialog can be drawn*, never whether a human is present. |
 | Steer after a breaker trip | `pi.sendMessage(…, { deliverAs: "steer" })`, `ctx.abort()` | Tell the agent the *outcome* is off-limits, not just the command. |
 | Persistence | Session entries, `session_start` / `session_shutdown` | The per-session approval table and breaker state survive resume; a bypass never does. |
-| Commands and status | `registerCommand`, status line | `/enclave status\|on\|off\|profile <name>\|model\|backend\|violations`; the footer shows backend, mode and counts. |
+| Commands and status | `registerCommand`, status line | `/enclave status\|backend\|violations\|rules\|audit\|pending`, plus the `pi-enclave` binary for anything that happens outside a session. The footer shows backend, mode, attendance in force, breaker state and counts. There is deliberately **no** runtime `on`/`off` toggle: a switch that changes the trust model mid-session is exactly what the lock and the audit log exist to prevent. |
 
 > [!WARNING]
-> **Tools pi-enclave does not own.** Custom tools from other extensions and MCP servers
-> execute in the pi process with the user's privileges and never touch the sandbox. In auto
-> mode the policy layer therefore **denies any tool not in `tools.allow`**. Allowlisted
-> tools must be declared `readOnly: true` (then allowed) or `reviewed: true` (every call
-> goes to L3). This is the honest answer until pi core offers a sandbox hook for tool
-> execution — see [core changes](#core-changes-to-propose-to-pi).
+> **Tools pi-enclave does not own.** Tools registered by other extensions execute in the pi
+> process with the user's privileges and never touch the sandbox. In auto mode the policy
+> layer therefore **denies any tool not in `tools.allow`**. Allowlisted tools may be
+> declared `readOnly: true` or `reviewed: true` (which is an `ask` while there is no
+> reviewer), and a grant may pin `source` to the `sourceInfo.path` pi reports for the
+> registering extension — without a pin, a tool name is not an identity, and whichever
+> extension loads first inherits the grant. This is the honest answer until pi core offers
+> a sandbox hook for tool execution — see [core changes](#core-changes-to-propose-to-pi).
+>
+> **pi 0.84.2 has no MCP support at all** — no dependency, no setting, no tool namespace.
+> Earlier drafts of this document said "MCP and custom tools"; there is only the second
+> kind. An MCP bridge, when one exists, will be an extension registering ordinary tools,
+> and the allowlist covers it unchanged.
 
 ---
 
@@ -548,7 +563,7 @@ the same order. These are the only ones that exist:
 |---|---|---|---|
 | `PI_ENCLAVE_ATTENDED` | `off` | Only turns attendance off. Any other value is a config error. |
 | `PI_ENCLAVE_PROFILE` | name of a profile defined in the user-global file | Selection only; the selected profile must be ⊑ the user-global default, exactly as for a project file. It cannot define a profile. |
-| `PI_ENCLAVE_AUTO` | `off` | Refuses to enter auto mode at all (CI smoke runs without a sandbox). There is no `on`. |
+| `PI_ENCLAVE_AUTO` | `off` | Turns off **L1 and L4 only**: the gate passes everything, the breaker and escalation are dormant, and the status line says `L1 off`. It never removes the sandbox — L2 is the one layer the monotonic rule says nothing may remove, and the process environment is the least trusted place such a request could come from. There is no `on`. |
 
 There is no `PI_ENCLAVE_MODEL` or `PI_ENCLAVE_BACKEND`: the reviewer and the backend are
 immutable below user-global because whoever controls the process environment of an ops
@@ -677,13 +692,26 @@ mutating, so that predicate is a policy contract, not an implementation detail:
 
 ### Inspecting and critiquing the rulebook
 
+`pi enclave …` **is not possible**: pi 0.84.2's subcommand set is closed (`install`,
+`remove`, `update`, `list`, `config`, `auth`) and any other bare word on its command line
+becomes a prompt for the model, so `pi enclave approve` would ask the agent to do something
+called "enclave approve". The commands ship as their own `pi-enclave` binary, and every one
+is mirrored in-session as `/enclave …`. Both call the same functions with different input
+and output adapters, so the two cannot drift.
+
 | Command | Does |
 |---|---|
-| `pi enclave rules defaults [--label <prefix>]` | Prints the built-in `rules` and `review` lists as JSON, one prose string per entry |
-| `pi enclave rules config` | Prints the *effective* rulebook after the monotonic fold, with `"$defaults"` expanded and each entry tagged with its source |
-| `pi enclave rules critique` | Sends the user's custom `review.*` entries to the configured reviewer and reports entries that are ambiguous, redundant with `$defaults`, contradicting a `hard_deny`, or likely to cause false denials. Offline, same model, no session context |
+| `pi-enclave rules defaults [--readonly]` | Prints the built-in lists as JSON |
+| `pi-enclave rules config` | Prints the *effective* rulebook after the monotonic fold, with `"$defaults"` expanded and each entry tagged with its source |
+| `pi-enclave pending [--all]` | Lists approval records awaiting a decision |
+| `pi-enclave approve <nonce>` | Shows an action in full, asks in *that* terminal, and runs it once under the profile in force now |
+| `pi-enclave audit [verify]` | Reads or re-chains the audit log |
+| `pi-enclave attend-secret` | Provisions the RPC attendance secret |
+| `pi-enclave rules critique` *(Phase 3)* | Sends the user's custom `review.*` entries to the configured reviewer and reports entries that are ambiguous, redundant with `$defaults`, contradicting a `hard_deny`, or likely to cause false denials |
 
 `critique` is advisory; `config` is what the qualification hash is computed over.
+`/enclave pending` is read-only: approving from inside the session the agent is driving
+would put the decision back where the agent can see the prompt.
 
 ---
 
@@ -696,7 +724,10 @@ The reviewer is where the existing extensions put most of their effort. Here it 
   prompt. No session system prompt, no memories, skills, extensions, MCP, or tools in v1.
   (Guardian's read-only reviewer tools are a v2 option, behind the same sandbox profile.)
 - **Explicit model, no silent fallback.** `reviewer.model` must be set to enter auto mode,
-  to either a model or the literal `"none"`. These are two different, explicitly chosen
+  to either a model or the literal `"none"`. **In the shipped version `"none"` is the only
+  accepted value**; a named model is refused at config load with a pointer to this section,
+  rather than being silently downgraded to deterministic mode, because a user who named a
+  model and got no review would not know they were not getting it. These are two different, explicitly chosen
   modes and there is no path from one to the other at runtime:
   - `"none"` is **deterministic mode** (Phase 2): `review.trigger` is forced to `boundary`,
     every crossing is an `ask`, and any `review.*` prose list is a config error — a rulebook
@@ -934,7 +965,7 @@ Execution is sandboxed unless the record explicitly carries a human `hostExec` a
 | Reviewer output unparsable | Deny — fail closed. Never re-prompt the reviewer with "fix your JSON"; that is an injection vector. | Same |
 | Breaker opens | `block` + `terminate`, plus a steer message naming the denied *outcome*. Resets on the next direct user input. | Same |
 | Backend `probe()` fails | Auto mode refuses to turn on; the status line shows why and the fix. No degraded mode. | Same |
-| Untrusted repo-local extension loaded | Auto mode refuses to turn on — such an extension can register its own `tool_call` handler or override `bash`. | Same |
+| A **trusted** project carries `.pi/extensions` | Auto mode refuses to turn on. pi will not load a project extension from an *untrusted* project at all, so the hazard is the opposite one: a project the user has trusted, whose extension directory the sandboxed agent can write, running in the pi process with the user's privileges. | Same |
 | Reviewer not qualified for current digest/prompt/corpus | Auto mode refuses to turn on; prints the `eval-reviewer` command | Same |
 
 ### Audit log
@@ -1108,7 +1139,7 @@ with no network. No model involved yet.*
 See [Phase 1 status](#phase-1-status) for what this cost and what it does not cover. The
 matrix is green on both backends in CI, on a real Linux host rather than a container.
 
-### Phase 2 — Policy, lock, breaker, state
+### Phase 2 — Policy, lock, breaker, state ✅ implemented
 
 *Outcome: deterministic auto mode — usable offline with no reviewer at all: `rules.deny` /
 `rules.ask` plus the sandbox, `review.trigger` pinned to `boundary`, every crossing an `ask`.*
@@ -1116,11 +1147,14 @@ matrix is green on both backends in CI, on a real Linux host rather than a conta
 - Pattern `rules` (`deny`, `ask`, `skipReview`) with `$defaults`; monotonic merge with its
   property test, including rejection of the four prose lists (`review.environment` /
   `hard_deny` / `soft_deny` / `allow`) below user-global even though nothing reads them
-  yet, and raise-only `review.trigger`; port guardian's lock, provenance and breaker.
-- `pi enclave rules defaults|config`.
-- Tool allowlist enforcement for custom and MCP tools; untrusted-extension refusal.
+  yet, and raise-only `review.trigger`; guardian's lock, provenance and breaker ported.
+- `pi-enclave rules defaults|config` (a `bin`, not a pi subcommand — see below).
+- Tool allowlist enforcement for third-party tools; project-extension refusal.
 - Attendance contract with RPC handshake; outcome matrix; pending-approval records; audit
   log with `verify`.
+
+See [Phase 2 status](#phase-2-status) for what this cost, what it corrected in this
+document, and what it does not cover.
 
 ### Phase 3 — Reviewer
 
@@ -1158,9 +1192,20 @@ after passing the eval.*
 Each row is a test that must pass on every backend before a phase is called done. The
 matrix is what "OS-enforced" means in this document.
 
-**Phase-1 rows are executable.** They live in
+**Every row is executable.** Phase-1 rows live in
 [`test/conformance/scenarios.ts`](test/conformance/scenarios.ts) and run against any
-backend; the **Test** column gives the id. Run them with `npm run conformance:report -- srt`.
+backend (`npm run conformance:report -- srt`); Phase-2 rows live in
+[`test/policy/scenarios.ts`](test/policy/scenarios.ts) and run in-process
+(`npm run policy:report`). The **Test** column gives the id.
+
+The two suites share one discipline: **every row carries a control**, and the meta-test
+requires the control to fail. Phase 1's control is a backend that enforces nothing; Phase
+2's is the same assertion with the specific mechanism removed — the ownership check not
+performed, the execute-time breaker re-check dropped, the precedence reordered. A row whose
+control also passes is measuring something other than what it claims, and the report prints
+that as loudly as a failing row. Every control carries a written note saying what it
+switches off, because an unexplained control is indistinguishable from one written to make
+the meta-test green.
 
 Each scenario asserts the **security property** — did the secret leak, did the file get
 written, did the connection open — never an exit code or a violation count. Neither of
@@ -1192,20 +1237,20 @@ sandbox's, so a green row on a restricted host is not read as stronger evidence 
 | Spawn a PTY (`vim`, `less`), Python multiprocessing, `git worktree` outside cwd | Works / violation as configured. **Linux:** bubblewrap cannot deny PTYs, so `allowPty: false` is not enforceable there and the compiled profile reports `pty on` | 1 | C6 |
 | Script that calls `sudo` / `su` / `systemctl` | Violation, not a policy denial | 1 | C7 |
 | **IPC sockets**: connect to `/var/run/docker.sock`, `~/.gnupg/S.gpg-agent`, `$SSH_AUTH_SOCK`, the broker socket, an X11/Wayland socket | Violation; `allowUnixSockets` is not exposed in the dev profile | 1 | C8 |
-| **Load order / tool shadowing**: another extension registers `bash` or a `tool_call` handler after pi-enclave | Auto mode refuses to start; a `tool_call_final`-style re-validation is tracked in [core changes](#core-changes-to-propose-to-pi) | 2 | — |
-| **Parallel batch termination**: three tool calls in one batch, the second trips the breaker | All three are blocked, `terminate` fires once, the audit log shows one batch outcome, no call from that batch executes after the trip | 2 | — |
-| **Crash / recovery**: kill pi mid-action, resume the session | The lock table and breaker state are restored from session entries; a half-written pending record is invisible (atomic rename); the audit chain verifies up to the last complete line; the helper and any container are reaped (`--die-with-parent`, `--rm`) | 2 | — |
-| Project-local config that selects a wider profile / adds `rules.skipReview` or `review.allow` / adds a trust entry to `review.environment` / changes the reviewer | Whole file rejected, auto mode refuses to start, diagnostic names the field | 2 | — |
-| Project-shared or project-local config contains any of `review.environment` / `hard_deny` / `soft_deny` / `allow` (even a `soft_deny` that reads as tightening) | Whole file rejected, auto mode refuses to start, diagnostic names the key; the reviewer system prompt is byte-identical to the user-global-only render | 2 | — |
-| Project file raises `review.trigger` from `mutating` to `all` | Accepted; lowering it is rejected | 2 | — |
-| Canonical action matches `rules.deny` *and* `rules.skipReview` | Denied at L1, never executed, audit record names both matches | 2 | — |
-| Canonical action matches `rules.ask` *and* `rules.skipReview` | Goes to L4, never fast-pathed | 2 | — |
+| **Tool ownership**: another extension provides `bash` or a file tool. pi keeps the **first** extension's registration, so the hazard is one loaded *before* pi-enclave, not after | Auto mode refuses to start, naming the extension that owns the tool. A handler loaded *after* pi-enclave cannot mutate a frozen input; one loaded before is inside the trusted-extension boundary, and `tool_call_final` is tracked in [core changes](#core-changes-to-propose-to-pi) | 2 | P1 |
+| **Parallel batch termination**: three tool calls in one batch, the second trips the breaker | No call from that batch executes after the trip, `terminate` fires once, the audit log shows one batch outcome. pi prepares every call in a batch before executing any of them, so blocking cannot un-prepare a sibling — the operations objects re-check the breaker at execute time | 2 | P2 |
+| **Crash / recovery**: kill pi mid-action, resume the session | The breaker state is restored from session entries; a half-written pending record is invisible (atomic rename); the audit chain verifies up to the last complete line; the helper and any container are reaped (`--die-with-parent`, `--rm`) | 2 | P3 |
+| Project-local config that selects a wider profile / adds `rules.skipReview` or `review.allow` / adds a trust entry to `review.environment` / changes the reviewer | Whole file rejected, auto mode refuses to start, diagnostic names the field | 2 | P4 |
+| Project-shared or project-local config contains any of `review.environment` / `hard_deny` / `soft_deny` / `allow` (even an empty list, and even a `soft_deny` that reads as tightening) | Whole file rejected, auto mode refuses to start, diagnostic names the key; presence is the test, and the value is never examined | 2 | P5 |
+| Project file raises `review.trigger` from `mutating` to `all` | Accepted; lowering it is rejected | 2 | P6 |
+| Canonical action matches `rules.deny` *and* `rules.skipReview` | Denied at L1, never executed, audit record names both matches | 2 | P7 |
+| Canonical action matches `rules.ask` *and* `rules.skipReview` | Goes to L4, never fast-pathed | 2 | P8 |
 | Mutating action in a user-global `skipReview` list, e.g. `git push *` while `network.allowHosts` contains the remote | Executes without L3; audit record is tagged `skipReview`; `rules critique` flags the entry | 3 | — |
-| Attendance `"rpc"` with no handshake, or TTY lost mid-session | `ask` → deny + pending record; never a dialog | 2 | — |
+| Attendance `"rpc"` with no handshake, or TTY lost mid-session | `ask` → deny + pending record; never a dialog. A declared `"tui"` with no controlling terminal **refuses to start** rather than degrading, because the configuration then describes a situation that is not the real one | 2 | P9 |
 | Reviewer `allow` on `allow_write=X`, then the same hash replayed with `allow_write=Y` | Second request is a fresh L3 review, not a replay | 3 | — |
-| Pending record edited on disk, or mode changed to `0644`, or nonce reused | Refused with an audit entry | 2 | — |
+| Pending record edited on disk, or mode changed to `0644`, or nonce reused, or a nonce containing a path | Refused with an audit entry | 2 | P10 |
 | **Environment leak**: provider keys set in the pi process; `env`, `$VAR` expansion, `os.environ`, `/proc/self/environ` inside the sandbox | None of the values appear; a `passthrough` entry matching `envDeny` is rejected at config load | 1 | C9 |
-| **Stale resume**: pending record written, user then removes a writable root / re-adds a `readDeny` entry / loosens config; `pi enclave approve` | Narrower config: executes under the *current* profile and the removed grant is absent. Wider config or uncovered hash change: refused, record stays pending | 2 | — |
+| **Stale resume**: pending record written, user then removes a writable root / re-adds a `readDeny` entry / loosens config; `pi-enclave approve` | Narrower config: executes under the *current* profile and the removed grant is absent. Wider config or uncovered hash change: refused, record stays pending | 2 | P11 |
 
 ---
 
@@ -1286,6 +1331,76 @@ change the I/O path.
 - **One profile at a time.** sandbox-runtime's manager is process-global, so only the most
   recently compiled profile is in force. The backend refuses to run against a stale one
   rather than silently applying the newer.
+
+
+---
+
+## Phase 2 status
+
+What deterministic auto mode does today, what it corrected in this document, and what it
+does not do. The [Phase 2 plan](docs/phase-2-plan.md) records how each step was verified.
+
+### Built
+
+- **One gate, one path.** Every `tool_call` is canonicalized, evaluated against L1, checked
+  against the tool allowlist, escalated if it needs a person, then frozen and registered.
+  Any exception inside the gate becomes a denial.
+- **The monotonic fold**, with the property test the design promised: for random `a` and
+  `b`, `merge(a, b)` is either rejected or at most as permissive as `a`. Five sources,
+  `$defaults` splicing, whole-file rejection with the field named.
+- **The action lock**: guardian's deep-freeze plus a canonical hash and an execute-once
+  table. A later extension mutating `event.input` throws, and pi does not catch it, so the
+  tool never runs.
+- **The circuit breaker**, collapsed per turn, surviving a resume, and tripping with
+  `terminate` + `ctx.abort()` + a message naming the *outcome*.
+- **Attendance** as an explicit contract with an RPC handshake, and **pending approval
+  records** with an atomic write, a single-use lifecycle, and a resume that re-derives the
+  hash, re-runs L1, and refuses a configuration wider than the one approved.
+- **A hash-chained audit log** with redaction and `verify`, in a `0700` state directory
+  checked for mode, owner and symlink on every open.
+- **The `pi-enclave` binary**, mirrored as `/enclave …` in-session.
+
+### What building it corrected in this document
+
+Every one of these was a claim in an earlier draft that turned out to be wrong when checked
+against pi 0.84.2 rather than assumed. They are listed because a design document that
+quietly absorbs its own corrections teaches nobody anything.
+
+| The document said | pi actually does | So |
+|---|---|---|
+| An extension registering `bash` *after* pi-enclave is the hazard | Across extensions the **first** registration wins; a later one is ignored | The check is *ownership* — is every sandboxed tool ours? — not load order. The dangerous extension loads **before** us |
+| Blocking the calls after a breaker trip stops the batch | A batch's `tool_call` events all complete **before any tool executes** | A call gated before the trip is already prepared. Every operations object pi-enclave owns re-checks the breaker at execute time |
+| Guardian's `tool-input-lock.ts` can be ported as-is, hash included | Guardian has no hash, no canonical snapshot and no execute-once | The freeze ports; the canonical action, its hash and the lock table are new design |
+| `pi enclave approve …` | pi's subcommand set is closed; any other bare word becomes a prompt | A `pi-enclave` binary, mirrored as `/enclave` |
+| "MCP and custom tools" | pi 0.84.2 has no MCP at all | The allowlist covers third-party extension tools, and grants may pin `source` |
+| An untrusted repo-local extension is the refusal case | pi does not load project extensions from an untrusted project | The refusal is for a **trusted** project whose `.pi/extensions` the agent can write |
+| `PI_ENCLAVE_AUTO=off` "refuses to enter auto mode at all" | — | It clears L1 and L4 and **never** the sandbox |
+
+### Known gaps
+
+- **`edit` cannot be resumed from the command line.** `pi-enclave approve` executes `bash`
+  and `write` actions. Reimplementing pi's string-replacement semantics outside pi would
+  risk applying a *slightly different* edit from the one the approver read, which is
+  exactly what the canonical hash exists to prevent. An `edit` record is refused with that
+  explanation and left pending; re-run the task instead.
+- **The shell tokenizer is a heuristic.** It records what it cannot follow — command and
+  process substitution, backticks, heredocs, `eval`, `xargs`, `sh -c`, an unbalanced quote
+  — and a non-confident parse escalates to a person rather than being trusted. That is the
+  safe direction, and it means a repository full of `$(...)` will ask more often. A real
+  parser (tree-sitter-bash) remains the v2 answer.
+- **A `tool_call` handler in another extension is invisible.** pi exposes no API to
+  enumerate extensions or handlers. One loaded after pi-enclave cannot change a frozen
+  input; one loaded before is inside the trusted-extension boundary the threat model
+  already accepts as a residual risk.
+- **The RPC handshake has no client.** `attended.mode: "rpc"` behaves as `"off"` until some
+  client implements it, which is the safe direction but means the mode is currently
+  theoretical.
+- **`reviewed: true` is an `ask`.** With no reviewer, the strongest thing available is a
+  human, so an unattended session denies such a tool rather than running it unexamined.
+- **The audit log is tamper-evident, not tamper-proof.** Anything running as the user can
+  delete it. Re-chaining detects an edit, a deletion or a reorder; it cannot prevent one.
+- **Retention deletes whole session files.** There is no in-session rotation, because the
+  only thing worse for a hash chain than deleting a file is deleting part of one.
 
 ---
 

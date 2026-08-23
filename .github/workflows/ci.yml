@@ -69,6 +69,7 @@ jobs:
         run: npm run probe
 
       - run: npm run test:unit
+      - run: npm run test:policy
       - run: npm run test:conformance
 
       # The suite's pass/fail is the gate; this records *which* boundary each
@@ -76,6 +77,13 @@ jobs:
       # host rather than on a green check. C12 in particular: on Linux the
       # detail line is the difference between "capabilities dropped" and the
       # weakened nested mode.
+      # The Phase-2 rows and, more importantly, their controls. A control that
+      # passes means the row proves nothing, and the report says so in the job
+      # summary rather than leaving it to a green check.
+      - name: Policy matrix report
+        run: |
+          npm run policy:report >> "$GITHUB_STEP_SUMMARY"
+
       - name: Conformance report
         run: |
           {
