@@ -20,7 +20,8 @@
 		"test:unit": "vitest --run test/unit",
 		"test:conformance": "vitest --run --passWithNoTests test/conformance",
 		"probe": "tsx scripts/probe.ts",
-		"conformance:report": "tsx scripts/conformance-report.ts"
+		"conformance:report": "tsx scripts/conformance-report.ts",
+		"bench:fs": "tsx scripts/fs-bench.ts"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": ">=0.84.2 <0.85.0"

@@ -21,13 +21,19 @@
  *    settle rather than read once. They are evidence, not the verdict, so a
  *    missed line degrades reporting and never enforcement.
  */
-import { spawn } from "node:child_process";
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
+import { buildChildEnv } from "../env/child-env.ts";
+import { HelperFsClient } from "../fs/client.ts";
 import type { BackendName } from "../probe.ts";
-import type { CompiledProfile, Profile, RunRequest, RunResult, SandboxBackend, Violation } from "./types.ts";
+import type { CompiledProfile, FsClient, Profile, RunRequest, RunResult, SandboxBackend, Violation } from "./types.ts";
 import { dedupeViolations, parseViolations } from "./violations.ts";
+
+/** The helper script, resolved relative to this module so it moves with the package. */
+const HELPER_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "fs", "helper.mjs");
 
 /**
  * Paths sandbox-runtime makes writable by default that pi-enclave does not
@@ -128,6 +134,13 @@ export class SrtBackend implements SandboxBackend {
 	private initialized = false;
 	/** Incremented on every compile; the newest is the one the manager holds. */
 	private generation = 0;
+	private fsClient: HelperFsClient | undefined;
+	/** Which generation `fsClient` was started for. A helper outlives only its own profile. */
+	private fsGeneration = 0;
+	/** Prepared during compile, because HelperSpawner must be synchronous. */
+	private helperArgv: string[] | undefined;
+	/** Set by the extension so helper denials reach the same audit trail as shell ones. */
+	onFsViolation: ((violation: Violation) => void) | undefined;
 
 	constructor(options: SrtBackendOptions = {}) {
 		this.name = options.name ?? (process.platform === "darwin" ? "seatbelt" : "bwrap");
@@ -153,6 +166,19 @@ export class SrtBackend implements SandboxBackend {
 		const { argv } = await SandboxManager.wrapWithSandboxArgv(":", undefined, undefined, undefined, process.cwd(), {
 			commandId: "enclave-describe",
 		});
+		// Prepared here because the helper spawner must be synchronous, and because
+		// a helper wrapped by a stale configuration would be exactly the hazard
+		// assertCurrent exists to prevent.
+		const helper = await SandboxManager.wrapWithSandboxArgv(
+			`exec ${process.execPath} ${HELPER_PATH}`,
+			undefined,
+			undefined,
+			undefined,
+			profile.writableRoots[0] ?? process.cwd(),
+			{ commandId: "enclave-fs-helper", commandText: "pi-enclave-fs" },
+		);
+		this.helperArgv = helper.argv;
+
 		return new SrtCompiledProfile(this.name, profile, ++this.generation, argv.join(" "));
 	}
 
@@ -283,15 +309,74 @@ export class SrtBackend implements SandboxBackend {
 		return dedupeViolations(parseViolations(lines, this.name));
 	}
 
-	fs(_compiled: CompiledProfile): never {
-		// Step 6. Until the helper exists, the file tools stay on pi's own
-		// implementations and the status line says the guarantee is narrowed to
-		// shell execution -- claiming otherwise would be the one lie this project
-		// cannot afford.
-		throw new Error("pi-enclave: the sandboxed filesystem helper is not implemented yet (step 6)");
+	/**
+	 * The sandboxed filesystem helper for this profile, started on first use and
+	 * reused thereafter.
+	 *
+	 * One helper per backend, not per call: it costs about 40 ms to start and
+	 * well under a tenth of a millisecond per operation, so per-call spawning
+	 * would add a hundredfold overhead to every read for no security benefit --
+	 * the profile is identical either way.
+	 */
+	fs(compiled: CompiledProfile): FsClient {
+		this.assertCurrent(compiled);
+
+		// A helper is bound to the profile it was started under -- the kernel
+		// applied that profile at exec and nothing can change it afterwards. When
+		// the profile is recompiled, the running helper is still enforcing the old
+		// one: it would refuse writes to the new workspace and, far worse, permit
+		// reads the new profile denies. Retire it.
+		//
+		// The conformance suite found this by leaking a secret through a symlink,
+		// because a cached helper was still enforcing an earlier scenario's
+		// read-deny list.
+		if (this.fsClient && this.fsGeneration !== this.generation) {
+			const stale = this.fsClient;
+			this.fsClient = undefined;
+			void stale.dispose();
+		}
+
+		if (!this.fsClient) {
+			this.fsGeneration = this.generation;
+			this.fsClient = new HelperFsClient({
+				compiled,
+				spawnHelper: () => this.spawnHelper(compiled),
+				...(this.onFsViolation ? { onViolation: this.onFsViolation } : {}),
+			});
+		}
+		return this.fsClient;
+	}
+
+	/**
+	 * Start the helper inside the sandbox.
+	 *
+	 * `exec` replaces the shell with node, so the helper is the process the
+	 * profile applies to rather than a child of one -- otherwise the shell would
+	 * linger as an unsandboxed parent holding the pipes.
+	 */
+	private spawnHelper(compiled: CompiledProfile): ChildProcessWithoutNullStreams {
+		// The argv is prepared during compile(): the spawner contract is
+		// synchronous, and wrapping here would also race the configuration that
+		// assertCurrent exists to pin down.
+		const argv = this.helperArgv;
+		if (!argv) throw new Error("pi-enclave: the helper argv was not prepared; compile() must run first");
+
+		const [bin, ...args] = argv;
+		if (!bin) throw new Error("pi-enclave: sandbox-runtime returned an empty argv for the helper");
+
+		return spawn(bin, args, {
+			cwd: compiled.profile.writableRoots[0] ?? process.cwd(),
+			// The same allowlist the shell gets. The helper reads files on the
+			// agent's behalf, so a credential in its environment is exactly as
+			// disclosable as one in bash's.
+			env: buildChildEnv(process.env, { readDeny: compiled.profile.readDeny }),
+			stdio: ["pipe", "pipe", "pipe"],
+		}) as ChildProcessWithoutNullStreams;
 	}
 
 	async dispose(): Promise<void> {
+		await this.fsClient?.dispose();
+		this.fsClient = undefined;
 		if (!this.initialized) return;
 		await SandboxManager.reset();
 		this.initialized = false;

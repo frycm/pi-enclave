@@ -17,6 +17,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { CompiledProfile, SandboxBackend, ViolationKind } from "../../src/backend/types.ts";
+import { SandboxDenied } from "../../src/backend/types.ts";
 import { buildChildEnv } from "../../src/env/child-env.ts";
 import { type Fixture, OUTSIDE_FILE_CONTENT, SECRET_ENV, SECRET_FILE_CONTENT } from "./fixture.ts";
 
@@ -303,6 +304,132 @@ for p in ['${fixture.socketPath}', '/var/run/docker.sock']:
 		},
 	},
 ];
+
+// ---------------------------------------------------------------------------
+// Filesystem-helper scenarios (surface: "fs")
+//
+// These go through backend.fs() rather than the shell, which is the path the
+// read/edit/write/find/ls/grep tools take. The distinction matters: pi's own
+// implementations perform these operations in the pi process, where a path
+// check is a check-then-open race rather than a kernel decision.
+// ---------------------------------------------------------------------------
+
+SCENARIOS.push(
+	{
+		id: "F1",
+		title: "helper: read a read-denied path",
+		surface: "fs",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ backend, compiled, fixture }) {
+			const key = join(fixture.deniedHome, ".ssh", "id_ed25519");
+			try {
+				const content = await backend.fs(compiled).readFile(key);
+				const leakedBytes = content.toString("utf8").includes(SECRET_FILE_CONTENT);
+				return {
+					ok: !leakedBytes,
+					detail: leakedBytes ? "SECRET LEAKED through the helper" : "read returned no secret",
+				};
+			} catch (error) {
+				// A denial is the expected outcome. It must be reported AS a denial:
+				// on Linux the raw errno is ENOENT, and surfacing that unclassified
+				// would tell the agent the credential store does not exist.
+				const denied = error instanceof SandboxDenied;
+				return {
+					ok: true,
+					detail: denied
+						? `denied and classified as ${(error as SandboxDenied).violation.kind}`
+						: `denied, but NOT classified: ${String(error).slice(0, 90)}`,
+				};
+			}
+		},
+	},
+	{
+		id: "F2",
+		title: "helper: write outside a writable root",
+		surface: "fs",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ backend, compiled, fixture }) {
+			const target = join(fixture.outside, "helper-pwned.txt");
+			try {
+				await backend.fs(compiled).writeFile(target, "pwned");
+			} catch {
+				// Expected.
+			}
+			let created = true;
+			try {
+				readFileSync(target);
+			} catch {
+				created = false;
+			}
+			return { ok: !created, detail: created ? `WROTE ${target}` : "write denied" };
+		},
+	},
+	{
+		id: "F3",
+		title: "helper: symlink race resolves to the denied target",
+		surface: "fs",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ backend, compiled, fixture }) {
+			// The path named is inside a writable root. Only the resolved path is
+			// denied, so a check performed in the pi process would permit this.
+			const via = join(fixture.workspace, "link-to-denied", "id_ed25519");
+			try {
+				const content = await backend.fs(compiled).readFile(via);
+				const leakedBytes = content.toString("utf8").includes(SECRET_FILE_CONTENT);
+				return { ok: !leakedBytes, detail: leakedBytes ? "SECRET LEAKED via symlink" : "no secret returned" };
+			} catch {
+				return { ok: true, detail: "denied on the resolved path" };
+			}
+		},
+	},
+	{
+		id: "F4",
+		title: "helper: a genuinely missing file is not reported as a denial",
+		surface: "fs",
+		expectation: "allowed",
+		falsifiableByNoop: false,
+		falsifiabilityNote:
+			"This asserts the classifier does not over-report, which no backend swap can falsify; " +
+			"its control is the ENOENT case in errno.test.ts.",
+		async run({ backend, compiled, fixture }) {
+			// The mirror of F1. On Linux both cases are ENOENT, so a classifier that
+			// called every ENOENT a denial would turn each typo into a security
+			// event and teach the agent to ignore them.
+			try {
+				await backend.fs(compiled).readFile(join(fixture.workspace, "definitely-not-here.txt"));
+				return { ok: false, detail: "reading a missing file unexpectedly succeeded" };
+			} catch (error) {
+				const misreported = error instanceof SandboxDenied;
+				return {
+					ok: !misreported,
+					detail: misreported ? "MISREPORTED a missing file as a sandbox denial" : "reported as an ordinary error",
+				};
+			}
+		},
+	},
+	{
+		id: "F5",
+		title: "helper: ordinary reads, writes and listings work",
+		surface: "fs",
+		expectation: "allowed",
+		falsifiableByNoop: false,
+		falsifiabilityNote: "An allowed row is meant to pass with or without a sandbox.",
+		async run({ backend, compiled, fixture }) {
+			const fs = backend.fs(compiled);
+			const created = join(fixture.workspace, "helper-made.txt");
+			await fs.writeFile(created, "written by the helper");
+			const back = (await fs.readFile(created)).toString("utf8");
+			const entries = await fs.readdir(fixture.workspace);
+			const stats = await fs.stat(fixture.workspace);
+			const ok =
+				back === "written by the helper" && entries.includes("helper-made.txt") && stats.isDirectory() === true;
+			return { ok, detail: ok ? "helper round-trips normal operations" : "helper broke ordinary work" };
+		},
+	},
+);
 
 SCENARIOS.push({
 	id: "C12",

@@ -1,0 +1,144 @@
+/**
+ * pi-enclave-fs: the sandboxed filesystem helper.
+ *
+ * Runs INSIDE the sandbox under the same compiled profile as `bash`, and
+ * performs every file operation the pi tools need. The point is that the
+ * `open`, `readdir` and `spawn` calls happen on this side of the boundary, so
+ * the kernel decides -- rather than the pi process resolving a path, checking it
+ * against a policy, and then opening it, which is a privileged process doing a
+ * check with a race window between the check and the syscall.
+ *
+ * Plain JavaScript on purpose. This is spawned as its own `node` process inside
+ * the sandbox, with no TypeScript loader available and no dependency on how pi
+ * loaded the extension.
+ *
+ * It reports raw errnos and never a verdict: only the pi process holds the
+ * compiled profile, and on Linux an ENOENT is a denied read or a missing file
+ * depending on it.
+ */
+import { spawn } from "node:child_process";
+import { accessSync, constants, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+
+const HEADER_BYTES = 4;
+const MAX_FRAME_BYTES = 64 * 1024 * 1024;
+const PROTOCOL_VERSION = 1;
+
+function writeFrame(message) {
+	const payload = Buffer.from(JSON.stringify(message), "utf8");
+	const header = Buffer.allocUnsafe(HEADER_BYTES);
+	header.writeUInt32BE(payload.length, 0);
+	process.stdout.write(Buffer.concat([header, payload]));
+}
+
+/** Run a search tool and collect its output. Spawned here so it runs under the profile. */
+function runTool(bin, args) {
+	return new Promise((resolve) => {
+		const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+		let stdout = "";
+		let stderr = "";
+		child.stdout.on("data", (d) => {
+			stdout += d;
+		});
+		child.stderr.on("data", (d) => {
+			stderr += d;
+		});
+		child.on("error", (error) =>
+			resolve({ stdout: "", stderr: String(error.message), exitCode: null, code: error.code }),
+		);
+		child.on("close", (exitCode) => resolve({ stdout, stderr, exitCode }));
+	});
+}
+
+async function handle(request) {
+	switch (request.op) {
+		case "ping":
+			return "pong";
+		case "readFile":
+			// Base64 so arbitrary bytes survive a JSON frame.
+			return readFileSync(request.path).toString("base64");
+		case "writeFile":
+			writeFileSync(request.path, request.content, "utf8");
+			return null;
+		case "mkdir":
+			mkdirSync(request.path, { recursive: true });
+			return null;
+		case "access":
+			accessSync(request.path, request.mode === "write" ? constants.R_OK | constants.W_OK : constants.R_OK);
+			return null;
+		case "stat": {
+			const stats = statSync(request.path);
+			return { isDirectory: stats.isDirectory(), size: stats.size, mtimeMs: stats.mtimeMs };
+		}
+		case "readdir":
+			return readdirSync(request.path);
+		case "exists":
+			try {
+				accessSync(request.path, constants.F_OK);
+				return true;
+			} catch {
+				return false;
+			}
+		case "glob": {
+			const args = ["--glob", "--color=never", "--hidden", "--no-require-git"];
+			for (const pattern of request.ignore ?? []) args.push("--exclude", pattern);
+			args.push("--max-results", String(request.limit ?? 1000), request.pattern, request.cwd);
+			const result = await runTool("fd", args);
+			if (result.code === "ENOENT") throw Object.assign(new Error("fd is not available"), { code: "ENOENT" });
+			return result.stdout.split("\n").filter(Boolean);
+		}
+		case "grep": {
+			const result = await runTool("rg", request.args);
+			if (result.code === "ENOENT") throw Object.assign(new Error("rg is not available"), { code: "ENOENT" });
+			return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
+		}
+		default:
+			throw Object.assign(new Error(`unknown operation: ${request.op}`), { code: "EINVAL" });
+	}
+}
+
+let buffer = Buffer.alloc(0);
+
+process.stdin.on("data", (chunk) => {
+	buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
+
+	while (buffer.length >= HEADER_BYTES) {
+		const length = buffer.readUInt32BE(0);
+		if (length > MAX_FRAME_BYTES) {
+			process.stderr.write(`pi-enclave-fs: oversized frame (${length} bytes)\n`);
+			process.exit(1);
+		}
+		if (buffer.length < HEADER_BYTES + length) break;
+
+		const payload = buffer.subarray(HEADER_BYTES, HEADER_BYTES + length);
+		buffer = buffer.subarray(HEADER_BYTES + length);
+
+		let request;
+		try {
+			request = JSON.parse(payload.toString("utf8"));
+		} catch (error) {
+			process.stderr.write(`pi-enclave-fs: unparseable frame: ${error.message}\n`);
+			continue;
+		}
+
+		// Requests are served concurrently and answered by id, so one slow search
+		// does not stall every read behind it.
+		void handle(request).then(
+			(result) => writeFrame({ id: request.id, ok: true, result }),
+			(error) =>
+				writeFrame({
+					id: request.id,
+					ok: false,
+					code: error?.code,
+					syscall: error?.syscall,
+					message: String(error?.message ?? error),
+				}),
+		);
+	}
+});
+
+// Exiting when stdin closes is what makes the helper die with its parent even
+// where the backend cannot address it by pid -- on Linux it is PID 1 inside a
+// nested namespace and invisible to the host.
+process.stdin.on("end", () => process.exit(0));
+
+writeFrame({ ready: true, pid: process.pid, protocol: PROTOCOL_VERSION });

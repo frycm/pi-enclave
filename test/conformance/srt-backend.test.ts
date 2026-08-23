@@ -44,7 +44,7 @@ describe.skipIf(!supported)("conformance: sandbox-runtime backend", () => {
 	beforeAll(async () => {
 		restoreSecrets = plantSecrets();
 		backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
-		rows = await runConformance(backend, createFixture);
+		rows = await runConformance(backend, createFixture, { includeFs: true });
 	}, 300_000);
 
 	afterAll(async () => {
@@ -52,19 +52,37 @@ describe.skipIf(!supported)("conformance: sandbox-runtime backend", () => {
 		restoreSecrets?.();
 	});
 
+	/**
+	 * C12 asserts the sandboxed process holds no capabilities, which is exactly
+	 * what weaker nested mode gives up. In that mode it must fail: making it pass
+	 * would hide the weakening, and leaving the suite red would train everyone to
+	 * ignore a failing security run. So both directions are asserted.
+	 */
+	const CAPABILITY_ROW = "C12";
+
 	it("passes every row", () => {
-		const failed = rows.filter((row) => !row.ok);
+		const expectedFailures = weakerNested ? [CAPABILITY_ROW] : [];
+		const failed = rows.filter((row) => !row.ok && !expectedFailures.includes(row.id));
 		expect(failed, `\n${formatRows(rows)}`).toEqual([]);
 	});
 
-	it("runs every non-fs scenario", () => {
-		expect(rows.map((r) => r.id)).toEqual(SCENARIOS.filter((s) => s.surface !== "fs").map((s) => s.id));
+	it.skipIf(!weakerNested)("reports the capability row as failing in weaker nested mode", () => {
+		// The weakening must be visible in the run, not only in the docs.
+		const row = rows.find((r) => r.id === CAPABILITY_ROW);
+		expect(row?.ok, "weaker nested mode kept capabilities but C12 passed; the row has stopped detecting it").toBe(
+			false,
+		);
+		expect(row?.detail).toMatch(/HOLDS CAPABILITIES/);
+	});
+
+	it("runs every scenario, including the filesystem helper", () => {
+		expect(rows.map((r) => r.id)).toEqual(SCENARIOS.map((s) => s.id));
 	});
 
 	// Individual rows, so a failure names the boundary that broke rather than
 	// reporting "conformance failed".
-	for (const scenario of SCENARIOS.filter((s) => s.surface !== "fs")) {
-		it(`${scenario.id}: ${scenario.title}`, () => {
+	for (const scenario of SCENARIOS) {
+		it.skipIf(weakerNested && scenario.id === CAPABILITY_ROW)(`${scenario.id}: ${scenario.title}`, () => {
 			const row = rows.find((r) => r.id === scenario.id);
 			expect(row, `${scenario.id} did not run`).toBeDefined();
 			expect(row?.ok, row?.error ?? row?.detail).toBe(true);
