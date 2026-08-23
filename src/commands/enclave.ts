@@ -65,10 +65,14 @@ export function renderStatus(state: EnclaveState): string {
 			"            Only use this where something else provides isolation.",
 		);
 	}
+	// The compiled profile is the one in force: the backend may widen the
+	// requested one by what it cannot avoid (sandbox-runtime's temp directory),
+	// and the status must describe that, not the request.
+	const profile = state.compiled?.profile ?? state.profile;
 	lines.push(
-		`profile:    ${state.profile.mode}, network ${state.profile.network}, pty ${state.profile.allowPty ? "on" : "off"}`,
-		`writable:   ${state.profile.writableRoots.join(", ") || "(nothing)"}`,
-		`read-deny:  ${state.profile.readDeny.length} path(s)`,
+		`profile:    ${profile.mode}, network ${profile.network}, pty ${profile.allowPty ? "on" : "off"}`,
+		`writable:   ${profile.writableRoots.join(", ") || "(nothing)"}`,
+		`read-deny:  ${profile.readDeny.length} path(s)`,
 		`violations: ${state.violations.length} this session`,
 		`coverage:   ${COVERAGE_NOTE}`,
 	);

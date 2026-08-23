@@ -11,7 +11,7 @@
  * the sysctl remediation rather than letting every row fail obscurely.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { SrtBackend, toSrtConfig, UNADVERTISED_WRITE_PATHS } from "../../src/backend/srt.ts";
+import { effectiveProfile, partitionSrtDefaults, SrtBackend, srtTmpDir, toSrtConfig } from "../../src/backend/srt.ts";
 import { formatProbeReport } from "../../src/probe.ts";
 import { probeHost } from "../../src/probe-host.ts";
 import { createFixture, plantSecrets } from "./fixture.ts";
@@ -91,20 +91,40 @@ describe.skipIf(!supported)("conformance: sandbox-runtime backend", () => {
 });
 
 describe.skipIf(!supported)("sandbox-runtime profile translation", () => {
-	it("denies the write paths sandbox-runtime grants but pi-enclave does not advertise", () => {
-		// getDefaultWritePaths() unions ~/.npm/_logs and ~/.claude/debug into every
-		// profile. A sandbox that can write those is wider than the status line
-		// claims, and ~/.claude/debug sits beside configuration that steers another
-		// agent.
-		const config = toSrtConfig({
-			mode: "workspace-write",
-			writableRoots: ["/tmp/ws"],
-			readDeny: [],
-			network: "off",
-			allowPty: true,
-		});
-		expect(config.filesystem.denyWrite).toEqual(UNADVERTISED_WRITE_PATHS);
-		expect(config.filesystem.allowWrite).toEqual(["/tmp/ws"]);
+	const requested = {
+		mode: "workspace-write" as const,
+		writableRoots: ["/tmp/ws"],
+		readDeny: [],
+		network: "off" as const,
+		allowPty: true,
+	};
+
+	it("represents every non-device sandbox-runtime default explicitly", () => {
+		// getDefaultWritePaths() unions paths into every profile -- ~/.npm/_logs,
+		// ~/.claude/debug, and the /tmp/claude the child's TMPDIR is pointed at. A
+		// sandbox that can write something the status line does not mention is
+		// wider than advertised, so each default must be either an advertised root
+		// or an explicit deny. Computed from SRT's list, not a hand-kept copy, so a
+		// new default in a future SRT lands in the denied set rather than nowhere.
+		const profile = effectiveProfile(requested);
+		const config = toSrtConfig(profile);
+		const { advertised, devices, denied } = partitionSrtDefaults(profile.writableRoots);
+		for (const path of devices) expect(path).toMatch(/^\/dev\//);
+		expect(config.filesystem.denyWrite).toEqual(denied);
+		expect(denied.length + advertised.length + devices.length).toBeGreaterThan(devices.length);
+		expect(denied.some((p) => p.endsWith("/.claude/debug"))).toBe(true);
+		expect(denied.some((p) => p.endsWith("/.npm/_logs"))).toBe(true);
+	});
+
+	it("advertises the temp directory the child is actually given", () => {
+		// SRT injects TMPDIR=/tmp/claude and makes it writable regardless of the
+		// profile. Denying it would leave the child with an unwritable TMPDIR;
+		// omitting it would describe a narrower boundary than the real one.
+		const profile = effectiveProfile(requested);
+		expect(profile.writableRoots).toContain(srtTmpDir());
+		const { denied } = partitionSrtDefaults(profile.writableRoots);
+		expect(denied.filter((p) => p.endsWith("/tmp/claude"))).toEqual([]);
+		expect(toSrtConfig(profile).filesystem.allowWrite).toEqual(["/tmp/ws", srtTmpDir()]);
 	});
 
 	it("allowlists no host when the profile is offline", () => {

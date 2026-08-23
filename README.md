@@ -295,7 +295,11 @@ const CHILD_ENV_BASE = [
   `KUBECONFIG`, `DOCKER_HOST`, `PI_*`. The list is the default `envDeny` in `$defaults` and
   can be extended, never shortened, below user-global.
 - `HOME` and `TMPDIR` are rewritten to the sandbox's view (`$TMPDIR` is a writable root; the
-  real home is not), and `PATH` is filtered to entries under read-allowed roots.
+  real home is not), and `PATH` is filtered to entries under read-allowed roots. Under
+  sandbox-runtime the child's `TMPDIR` is `/tmp/claude` (or `CLAUDE_CODE_TMPDIR`), which SRT
+  makes writable in every profile; pi-enclave advertises it as a writable root rather than
+  describe a narrower sandbox than the one in force, and denies every other SRT default
+  that is not a device node.
 - **Provider credentials stay in the pi parent.** The reviewer call, the session model and
   the egress proxy's credential masking all run in pi's process; nothing inside the sandbox
   needs a credential to do the task, and if a task genuinely does (a deploy key for a

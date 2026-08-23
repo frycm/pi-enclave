@@ -22,10 +22,10 @@
  *    missed line degrades reporting and never enforcement.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { homedir } from "node:os";
+import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
+import { getDefaultWritePaths, SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { buildChildEnv } from "../env/child-env.ts";
 import { HelperFsClient } from "../fs/client.ts";
 import type { BackendName } from "../probe.ts";
@@ -50,16 +50,64 @@ function resolveSearchTools(): Record<string, string> {
 const HELPER_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "fs", "helper.mjs");
 
 /**
- * Paths sandbox-runtime makes writable by default that pi-enclave does not
- * advertise, and therefore denies.
+ * The temporary directory sandbox-runtime gives every child.
  *
- * `getDefaultWritePaths()` unions `~/.npm/_logs` and `~/.claude/debug` into
- * every profile. A sandbox that can write those is wider than the one the status
- * line describes, and `~/.claude/debug` in particular sits next to configuration
- * that steers another agent. The device entries in that list (`/dev/null`,
- * `/dev/stdout`, ...) are genuinely required and stay.
+ * SRT injects `TMPDIR=<this>` into the child's argv prefix and makes the path
+ * writable in every profile, so temp-file writers land somewhere the sandbox
+ * allows. It is therefore part of the boundary whether pi-enclave mentions it
+ * or not; the honest move is to advertise it as a writable root rather than
+ * leave the status line describing a narrower sandbox than the one in force.
+ * Mirrors SRT's own resolution, including its two environment overrides.
  */
-export const UNADVERTISED_WRITE_PATHS = [join(homedir(), ".npm", "_logs"), join(homedir(), ".claude", "debug")];
+export function srtTmpDir(): string {
+	return process.env.CLAUDE_CODE_TMPDIR || process.env.CLAUDE_TMPDIR || "/tmp/claude";
+}
+
+/** Collapse macOS's `/private/tmp` and `/tmp` spellings so they compare equal. */
+function samePath(a: string, b: string): boolean {
+	const strip = (p: string) => p.replace(/^\/private(?=\/)/, "");
+	return strip(a) === strip(b);
+}
+
+/**
+ * Every path sandbox-runtime makes writable by default, partitioned against
+ * the profile: advertised roots are left alone, the device entries (`/dev/null`,
+ * `/dev/stdout`, ...) are genuinely required and stay, and everything else is
+ * denied.
+ *
+ * This is computed from `getDefaultWritePaths()` rather than from a hand-kept
+ * list, so a future SRT default cannot silently widen the sandbox: it is either
+ * in the profile or it is denied. `~/.npm/_logs` and `~/.claude/debug` fall in
+ * the denied set -- the latter sits next to configuration that steers another
+ * agent.
+ */
+export function partitionSrtDefaults(writableRoots: readonly string[]): {
+	advertised: string[];
+	devices: string[];
+	denied: string[];
+} {
+	const advertised: string[] = [];
+	const devices: string[] = [];
+	const denied: string[] = [];
+	for (const path of getDefaultWritePaths()) {
+		if (path.startsWith("/dev/")) devices.push(path);
+		else if (writableRoots.some((root) => samePath(root, path))) advertised.push(path);
+		else denied.push(path);
+	}
+	return { advertised, devices, denied };
+}
+
+/**
+ * The profile as it is actually in force under sandbox-runtime: the caller's
+ * roots plus the SRT temp directory the child is pointed at.
+ */
+export function effectiveProfile(profile: Profile): Profile {
+	const tmp = srtTmpDir();
+	const roots = profile.writableRoots.some((root) => samePath(root, tmp))
+		? profile.writableRoots
+		: [...profile.writableRoots, tmp];
+	return { ...profile, writableRoots: roots };
+}
 
 /** How long to keep draining violations after a command exits. */
 const VIOLATION_SETTLE_MAX_MS = 750;
@@ -81,8 +129,14 @@ interface SrtConfig {
 	enableWeakerNestedSandbox?: boolean;
 }
 
-/** Translate a pi-enclave profile into sandbox-runtime's configuration shape. */
+/**
+ * Translate a pi-enclave profile into sandbox-runtime's configuration shape.
+ *
+ * Expects the {@link effectiveProfile}; the SRT defaults it does not advertise
+ * are denied explicitly.
+ */
 export function toSrtConfig(profile: Profile, weakerNested = false): SrtConfig {
+	const { denied } = partitionSrtDefaults(profile.writableRoots);
 	return {
 		...(weakerNested ? { enableWeakerNestedSandbox: true } : {}),
 		// "off" means no host is allowlisted. SRT still runs an egress proxy the
@@ -92,7 +146,7 @@ export function toSrtConfig(profile: Profile, weakerNested = false): SrtConfig {
 		filesystem: {
 			denyRead: [...profile.readDeny],
 			allowWrite: [...profile.writableRoots],
-			denyWrite: [...UNADVERTISED_WRITE_PATHS],
+			denyWrite: denied,
 		},
 		allowPty: profile.allowPty,
 	};
@@ -161,8 +215,20 @@ export class SrtBackend implements SandboxBackend {
 		this.weakened = options.weakerNestedSandbox ?? false;
 	}
 
-	async compile(profile: Profile): Promise<CompiledProfile> {
+	async compile(requested: Profile): Promise<CompiledProfile> {
+		const profile = effectiveProfile(requested);
 		const config = toSrtConfig(profile, this.weakened);
+
+		// SRT points the child's TMPDIR here but never creates it. On macOS a
+		// child can mkdir it itself (the profile allows the path); on Linux bwrap
+		// skips an absent bind, leaving TMPDIR pointing nowhere and `mktemp`
+		// failing. Creating it makes both platforms behave the same.
+		try {
+			mkdirSync(srtTmpDir(), { recursive: true, mode: 0o700 });
+		} catch {
+			// A temp directory that cannot be created is the child's problem to
+			// report, not a reason to refuse to compile.
+		}
 
 		// The manager is global to the process, so initialise once and update
 		// thereafter. Re-initialising would tear down the proxy and log monitor
