@@ -279,13 +279,24 @@ for p in ['${fixture.socketPath}', '/var/run/docker.sock']:
 		expectation: "allowed",
 		falsifiableByNoop: false,
 		falsifiabilityNote: "An allowed row is meant to pass with or without a sandbox.",
-		async run({ sh }) {
+		async run({ sh, compiled }) {
+			// The PTY half has to allocate one. Piping `git log` into `head` never
+			// does, and both backends deny PTYs by default, so a profile that lost
+			// allowPty in translation would have left this row green.
 			const r = await sh(
 				`git init -q . && git -c user.email=a@b -c user.name=a commit -q --allow-empty -m x && ` +
-					`git log --oneline | head -1 && echo GIT-OK`,
+					`git log --oneline | head -1 && echo GIT-OK; ` +
+					`python3 -c "import pty,os; m,s=pty.openpty(); os.close(s); os.close(m); print('PTY-OK')" 2>&1 || echo PTY-DENIED`,
 			);
-			const ok = r.output.includes("GIT-OK");
-			return { ok, detail: ok ? "git works in the workspace" : `git broken: ${r.output.slice(0, 200)}` };
+			const git = r.output.includes("GIT-OK");
+			const pty = r.output.includes("PTY-OK");
+			const ok = git && pty === compiled.profile.allowPty;
+			return {
+				ok,
+				detail: ok
+					? `git works; pty ${pty ? "allocated" : "denied"} as the profile says`
+					: `git ${git ? "ok" : "BROKEN"}; pty ${pty ? "allocated" : "denied"} but profile allowPty=${compiled.profile.allowPty}: ${r.output.slice(0, 160)}`,
+			};
 		},
 	},
 	{

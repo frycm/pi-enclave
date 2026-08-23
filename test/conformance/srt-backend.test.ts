@@ -139,6 +139,34 @@ describe.skipIf(!supported)("sandbox-runtime profile translation", () => {
 	});
 });
 
+describe.skipIf(!supported)("pty policy", () => {
+	it("denies PTY allocation when the profile says so", async () => {
+		// The inverse of C6. Both backends deny PTYs by default and allowPty is the
+		// one profile field that widens them, so the translation must carry it in
+		// both directions -- a profile that always allowed PTYs would pass C6 too.
+		const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
+		const fixture = createFixture();
+		try {
+			const compiled = await backend.compile({ ...fixture.profile, allowPty: false });
+			let output = "";
+			await backend.run(compiled, {
+				command: `python3 -c "import pty,os; m,s=pty.openpty(); print('PTY-OK')" 2>&1 || echo PTY-DENIED`,
+				cwd: fixture.workspace,
+				env: { PATH: process.env.PATH ?? "" },
+				commandId: "pty-off-1",
+				onData: (chunk) => {
+					output += chunk.toString("utf8");
+				},
+			});
+			expect(output, "a PTY was allocated under allowPty: false").not.toContain("PTY-OK");
+			expect(output).toContain("PTY-DENIED");
+		} finally {
+			await backend.dispose();
+			fixture.cleanup();
+		}
+	}, 60_000);
+});
+
 describe.skipIf(!supported)("stale profile guard", () => {
 	it("refuses to run against a profile the manager no longer holds", async () => {
 		// sandbox-runtime is process-global: wrapWithSandboxArgv reads the
