@@ -14,11 +14,24 @@
  *   rather than by the kernel, so the noop backend still receives a sanitised
  *   environment. It gets its own control below.
  *
+ * Two more are falsifiable only on a host that can run their control, which is
+ * decided at the assertion rather than declared in `scenarios.ts`: **C5** needs
+ * a host with egress, and **C12** needs a host whose own processes hold
+ * capabilities. Both are recorded with the host's measured value so a green row
+ * says which of the two it was.
+ *
  * When the real backends land in steps 4-5 they run the same scenarios and must
  * pass every row. This file is what makes that meaningful.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createFixture, hostHasNetwork, plantSecrets, SECRET_ENV } from "./fixture.ts";
+import {
+	createFixture,
+	hostCapEff,
+	hostHasNetwork,
+	hostHoldsCapabilities,
+	plantSecrets,
+	SECRET_ENV,
+} from "./fixture.ts";
 import { NoopBackend } from "./noop-backend.ts";
 import { type ConformanceRow, formatRows, runConformance } from "./runner.ts";
 import { SCENARIOS } from "./scenarios.ts";
@@ -47,12 +60,20 @@ describe("conformance suite falsifiability", () => {
 		// which would report the suite as unfalsifiable when the host simply
 		// cannot run that control.
 		const networkControlAvailable = hostHasNetwork();
+		// C12 has the same shape: it can only be falsified where an unsandboxed
+		// process holds capabilities to begin with. Under an ordinary unprivileged
+		// user -- a GitHub runner -- CapEff is already zero, so the noop backend
+		// passes the row without any sandbox being involved. That is a fact about
+		// the host, not a suite that stopped testing anything, and the row still
+		// separates secure bwrap from the weaker nested mode there.
+		const capabilityControlAvailable = hostHoldsCapabilities();
 		const wronglyPassing = rows.filter(
 			(row) =>
 				row.expectation === "denied" &&
 				row.falsifiableByNoop &&
 				row.ok &&
-				!(row.id === "C5" && !networkControlAvailable),
+				!(row.id === "C5" && !networkControlAvailable) &&
+				!(row.id === "C12" && !capabilityControlAvailable),
 		);
 		expect(
 			wronglyPassing,
@@ -86,6 +107,31 @@ describe("conformance suite falsifiability", () => {
 		for (const scenario of SCENARIOS) {
 			if (scenario.falsifiableByNoop) continue;
 			expect(scenario.falsifiabilityNote, `${scenario.id} is exempt without a note`).toBeTruthy();
+		}
+	});
+
+	it("records which environment-dependent controls this host could run", () => {
+		// An exemption that leaves no trace is how a suite quietly stops proving
+		// things. Print what was skipped and why, so a green run on an
+		// unprivileged host is not read as stronger evidence than it is.
+		const capEff = hostCapEff();
+		const notes = [
+			`C5 network control: ${hostHasNetwork() ? "ran" : "skipped -- host has no egress"}`,
+			`C12 capability control: ${
+				hostHoldsCapabilities()
+					? `ran -- host CapEff=${capEff}`
+					: capEff === null
+						? "skipped -- no capability model on this platform"
+						: `skipped -- host holds no capabilities (CapEff=${capEff})`
+			}`,
+		];
+		console.log(`falsifiability controls on this host:\n  ${notes.join("\n  ")}`);
+
+		// The row itself must carry the baseline, not just this log line: the
+		// conformance report is what a reviewer reads, and "no capabilities" means
+		// two different things depending on what the host started with.
+		if (process.platform === "linux") {
+			expect(rows.find((row) => row.id === "C12")?.detail).toContain("host CapEff=");
 		}
 	});
 

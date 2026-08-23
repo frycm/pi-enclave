@@ -19,7 +19,7 @@ import { join } from "node:path";
 import type { CompiledProfile, SandboxBackend, ViolationKind } from "../../src/backend/types.ts";
 import { SandboxDenied } from "../../src/backend/types.ts";
 import { buildChildEnv } from "../../src/env/child-env.ts";
-import { type Fixture, OUTSIDE_FILE_CONTENT, SECRET_ENV, SECRET_FILE_CONTENT } from "./fixture.ts";
+import { type Fixture, hostCapEff, OUTSIDE_FILE_CONTENT, SECRET_ENV, SECRET_FILE_CONTENT } from "./fixture.ts";
 
 export interface ScenarioContext {
 	backend: SandboxBackend;
@@ -442,7 +442,13 @@ SCENARIOS.push({
 	falsifiableByNoop: process.platform === "linux",
 	falsifiabilityNote:
 		"Capabilities are a Linux concept; on other platforms this row reports 'not applicable' " +
-		"for every backend, so the noop control cannot distinguish them.",
+		"for every backend, so the noop control cannot distinguish them. On Linux the control " +
+		"needs one more thing the platform check cannot see: a host whose own processes hold " +
+		"capabilities. Under an ordinary unprivileged user -- a GitHub runner -- CapEff is " +
+		"already zero unsandboxed, so the noop backend passes for a reason unrelated to the " +
+		"sandbox. hostHoldsCapabilities() decides that at the control, as hostHasNetwork() does " +
+		"for C5. The row still discriminates there: it separates secure bwrap from the weaker " +
+		"nested mode, which puts the process in a capability-bearing namespace.",
 	async run({ sh }) {
 		// Linux only: this is what sandbox-runtime's weaker nested mode gives up.
 		// In secure mode bwrap runs `--cap-drop ALL`, so CapEff is empty; in weaker
@@ -460,11 +466,18 @@ SCENARIOS.push({
 			return { ok: true, detail: "no capability model on this platform (Linux-only row)" };
 		}
 		const elevated = /[1-9a-fA-F]/.test(value);
+		// Report the host's own mask beside the sandbox's. Without it, a green row
+		// on an unprivileged host reads as "the sandbox dropped capabilities" when
+		// what it shows is that the sandbox did not hand any out -- which is the
+		// weaker nested mode's actual failure, but a weaker claim than the phrase
+		// implies.
+		const ambient = hostCapEff();
+		const baseline = ambient === null ? "host has no capability model" : `host CapEff=${ambient}`;
 		return {
 			ok: !elevated,
 			detail: elevated
-				? `HOLDS CAPABILITIES CapEff=${value} -- bwrap did not drop them (weaker nested mode?)`
-				: `no capabilities (CapEff=${value})`,
+				? `HOLDS CAPABILITIES CapEff=${value} -- bwrap did not drop them (weaker nested mode?); ${baseline}`
+				: `no capabilities (CapEff=${value}; ${baseline})`,
 		};
 	},
 });

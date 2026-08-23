@@ -9,7 +9,7 @@
  * if nothing stopped it.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -130,6 +130,34 @@ export function hostHasNetwork(): boolean {
 		{ encoding: "utf8", timeout: 15_000 },
 	);
 	return probe.stdout?.includes("OK") ?? false;
+}
+
+/**
+ * What capabilities does an *unsandboxed* process hold on this host?
+ *
+ * Returns the hex `CapEff` mask, or `null` where the platform has no capability
+ * model. C12's falsifiability control assumes an unsandboxed process has
+ * capabilities to lose. That is true in a privileged container and as root; it
+ * is false for an ordinary unprivileged Linux user -- a GitHub runner, a
+ * developer laptop -- where `CapEff` is already zero and the noop backend passes
+ * the row for a reason that has nothing to do with the sandbox.
+ *
+ * Same shape as {@link hostHasNetwork}: check the control's assumption instead
+ * of reporting "the suite is unfalsifiable" when the host cannot run it.
+ */
+export function hostCapEff(): string | null {
+	try {
+		const match = /CapEff:\s*([0-9a-fA-F]+)/.exec(readFileSync("/proc/self/status", "utf8"));
+		return match?.[1] ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/** True when this host's own processes hold capabilities, so C12 has something to prove. */
+export function hostHoldsCapabilities(): boolean {
+	const value = hostCapEff();
+	return value !== null && /[1-9a-fA-F]/.test(value);
 }
 
 /** Set the secret variables in this process, returning a restore function. */
