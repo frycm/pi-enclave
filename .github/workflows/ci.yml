@@ -63,3 +63,20 @@ jobs:
 
       - run: npm run test:unit
       - run: npm run test:conformance
+
+      # The suite's pass/fail is the gate; this records *which* boundary each
+      # row observed, so the matrix sign-off rests on a per-row line from a real
+      # host rather than on a green check. C12 in particular: on Linux the
+      # detail line is the difference between "capabilities dropped" and the
+      # weakened nested mode.
+      - name: Conformance report
+        run: |
+          {
+            echo "### Conformance rows -- ${{ matrix.os }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          npm run --silent conformance:report srt 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          status=${PIPESTATUS[0]}
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

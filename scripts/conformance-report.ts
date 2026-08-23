@@ -20,15 +20,18 @@ const backend: SandboxBackend = which === "srt" ? new SrtBackend({ weakerNestedS
 
 const restore = plantSecrets();
 const started = Date.now();
-const rows = await runConformance(backend, createFixture);
+// The fs rows need the helper, which only a real backend can run.
+const rows = await runConformance(backend, createFixture, { includeFs: which === "srt" });
 const elapsed = Date.now() - started;
 restore();
 await backend.dispose();
 
 const width = Math.max(...rows.map((r) => r.title.length));
-console.log(
-	`backend: ${which === "srt" ? `${backend.name} (sandbox-runtime)` : "noop (enforces nothing)"}  [${elapsed}ms]\n`,
-);
+const heading =
+	which === "srt"
+		? `${backend.name} (sandbox-runtime)${weaker ? " -- WEAKER NESTED MODE: capabilities are not dropped" : ""}`
+		: "noop (enforces nothing)";
+console.log(`backend: ${heading}  [${elapsed}ms]\n`);
 for (const row of rows) {
 	const verdict = row.ok ? "PASS" : "FAIL";
 	const expected =
