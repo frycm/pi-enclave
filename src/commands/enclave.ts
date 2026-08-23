@@ -18,6 +18,7 @@ import { renderConfig, renderDefaults } from "../config/render.ts";
 import type { LoadedSource } from "../config/sources.ts";
 import { renderSources } from "../config/sources.ts";
 import type { EffectiveProfile, Provenance } from "../config/types.ts";
+import { describeRecord, listPending } from "../escalate/pending.ts";
 import { formatProbeReport, type ProbeReport } from "../probe.ts";
 import { formatVerifyResult, verifyLog } from "../state/audit.ts";
 
@@ -43,6 +44,9 @@ export interface EnclaveState {
 	breaker?: { open: boolean; consecutive: number; limit: number };
 	/** What attendance is actually in force, and what was configured. */
 	attendance?: string;
+	/** Where pending approval records live, and the session they belong to. */
+	pendingRoot?: string;
+	sessionId?: string;
 	auditPath?: string;
 	/** True once an audit write has failed. Shown without being asked for. */
 	auditDegraded?: boolean;
@@ -165,7 +169,7 @@ export interface CommandOutput {
 	level: CommandLevel;
 }
 
-const USAGE = "usage: /enclave [status|backend|violations|rules defaults|rules config|audit [verify]]";
+const USAGE = "usage: /enclave [status|backend|violations|rules defaults|rules config|audit [verify]|pending]";
 
 /**
  * `rules defaults` and `rules config`.
@@ -202,6 +206,26 @@ function renderAudit(state: EnclaveState, argv: readonly string[]): CommandOutpu
 	return { text: `audit log: ${state.auditPath}\nRun "/enclave audit verify" to re-chain it.`, level: "info" };
 }
 
+/**
+ * `pending`.
+ *
+ * Read-only, deliberately. Approving is `pi-enclave approve <nonce>` in a
+ * terminal, not a slash command: the point of a pending record is that a person
+ * looks at it outside the session the agent is driving, and offering to approve
+ * one from inside that session would put the decision back where the agent can
+ * see the prompt.
+ */
+function renderPending(state: EnclaveState): CommandOutput {
+	if (!state.pendingRoot || !state.sessionId) return { text: "no state directory is open", level: "warning" };
+	const records = listPending(state.pendingRoot, state.sessionId).filter((entry) => entry.state === "pending");
+	if (records.length === 0) return { text: "nothing is waiting for approval", level: "info" };
+	const body = records.map((entry) => describeRecord(entry.record)).join("\n\n");
+	return {
+		text: `${records.length} action(s) waiting for approval:\n\n${body}\n\nApprove one in a terminal with: pi-enclave approve <nonce>`,
+		level: "warning",
+	};
+}
+
 export function handleEnclaveCommand(state: EnclaveState, args: string): CommandOutput {
 	const sub = args.trim().split(/\s+/)[0] || "status";
 
@@ -216,6 +240,8 @@ export function handleEnclaveCommand(state: EnclaveState, args: string): Command
 			return renderRules(state, args.trim().split(/\s+/).slice(1));
 		case "audit":
 			return renderAudit(state, args.trim().split(/\s+/).slice(1));
+		case "pending":
+			return renderPending(state);
 		default:
 			return { text: `unknown subcommand "${sub}"\n${USAGE}`, level: "warning" };
 	}

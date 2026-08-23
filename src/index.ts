@@ -41,6 +41,7 @@ import {
 } from "./escalate/attendance.ts";
 import { createConfirmEscalator } from "./escalate/confirm.ts";
 import { describeHandshakeFailure, runHandshake } from "./escalate/handshake.ts";
+import { writePending } from "./escalate/pending.ts";
 import { BREAKER_ENTRY_TYPE, CircuitBreaker, isBreakerState, steerMessage } from "./gate/breaker.ts";
 import { decide, type GateDecision } from "./gate/gate.ts";
 import { ActionLock } from "./gate/lock.ts";
@@ -126,6 +127,35 @@ export default function (pi: ExtensionAPI): void {
 		ui: () => uiContext,
 		attendance: () => attendance,
 		confirmTimeoutMs: () => effective?.attended.confirmTimeoutMs ?? 300_000,
+		onUnattended: (action, reason) => {
+			// A record is written whenever an escalation did not get a yes --
+			// unattended, declined or timed out. The turn is over either way, and
+			// the difference between "nobody was asked" and "someone said not now"
+			// is a decision the person may want to revisit with more context.
+			if (!effective || !sessionId) return;
+			try {
+				const { path, record } = writePending({
+					stateRoot: stateDirs().state,
+					sessionId,
+					...(sessionFile !== undefined ? { sessionFile } : {}),
+					action,
+					profile: effective,
+					configHash: configHash(effective),
+					reason,
+				});
+				audit?.append("pending", { event: "written", nonce: record.nonce, hash: action.hash, path });
+				process.stderr.write(
+					`pi-enclave: an action needs approval. Run:\n  pi-enclave approve ${record.nonce}\n${path}\n`,
+				);
+			} catch (error) {
+				// A record that cannot be written must not be silent: without it the
+				// user has no way to resume, and the only thing worse than that is
+				// their not knowing.
+				const message = `pi-enclave: could not write the approval record: ${(error as Error).message}`;
+				audit?.append("pending", { event: "write-failed", hash: action.hash, error: (error as Error).message });
+				process.stderr.write(`${message}\n`);
+			}
+		},
 		onEscalation: (event) => {
 			audit?.append("attendance", {
 				event: "escalation",
@@ -145,6 +175,8 @@ export default function (pi: ExtensionAPI): void {
 	let uiContext: { confirm: ConfirmFn } | undefined;
 	/** The pi mode this session is running in, captured once at session start. */
 	let piMode: "tui" | "rpc" | "json" | "print" = "print";
+	let sessionId: string | undefined;
+	let sessionFile: string | undefined;
 
 	/**
 	 * When the lock is not the right thing to complain about.
@@ -184,6 +216,8 @@ export default function (pi: ExtensionAPI): void {
 		...(sources ? { sources } : {}),
 		...(audit ? { auditPath: audit.path, auditDegraded: audit.degraded } : {}),
 		attendance: describeAttendance(attendance),
+		pendingRoot: stateDirs().state,
+		...(sessionId !== undefined ? { sessionId } : {}),
 		breaker: { open: breaker.open, consecutive: breaker.state.consecutive, limit: effective?.breaker.consecutive ?? 3 },
 		// A configuration refusal and an ownership refusal are both "auto mode
 		// will not start"; the status line shows whichever came first.
@@ -510,6 +544,8 @@ export default function (pi: ExtensionAPI): void {
 		// Attendance. Resolved after the configuration because it is configured,
 		// and before the breaker because a fatal mismatch stops the session.
 		piMode = ctx.mode as "tui" | "rpc" | "json" | "print";
+		sessionId = ctx.sessionManager.getSessionId();
+		sessionFile = ctx.sessionManager.getSessionFile();
 		const attendanceEnv = {
 			mode: piMode,
 			hasUI: ctx.hasUI,

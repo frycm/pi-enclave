@@ -65,9 +65,24 @@ async function compare(label: string, iterations: number, sandboxed: () => Promi
 	);
 }
 
-await compare("read 4 KB", 200, () => fs.readFile(small), () => readFileSync(small));
-await compare("read 1 MB", 50, () => fs.readFile(large), () => readFileSync(large));
-await compare("stat", 200, () => fs.stat(workspace), () => statSync(workspace));
+await compare(
+	"read 4 KB",
+	200,
+	() => fs.readFile(small),
+	() => readFileSync(small),
+);
+await compare(
+	"read 1 MB",
+	50,
+	() => fs.readFile(large),
+	() => readFileSync(large),
+);
+await compare(
+	"stat",
+	200,
+	() => fs.stat(workspace),
+	() => statSync(workspace),
+);
 
 // A realistic search: the whole source tree. Skipped rather than fatal when rg
 // is absent -- a benchmark that cannot run one case should still report the
