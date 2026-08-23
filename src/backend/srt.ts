@@ -22,7 +22,7 @@
  *    missed line degrades reporting and never enforcement.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getDefaultWritePaths, SandboxManager } from "@anthropic-ai/sandbox-runtime";
@@ -51,9 +51,60 @@ export function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-/** Which deny roots exist right now, as one comparable string. */
+/**
+ * Each deny entry plus, for a symlink, the path it currently resolves to.
+ *
+ * Seatbelt matches its `subpath` rules against the canonical path the kernel
+ * sees, and sandbox-runtime writes a symlinked deny entry as the link's own
+ * path -- so on macOS a `readDeny` entry that is a symlink denied nothing at
+ * all. (F13 found this: the secret was readable before the link was ever
+ * retargeted.) Denying the target as well closes that; it only ever widens the
+ * deny list, never narrows it. On Linux sandbox-runtime resolves the target
+ * itself and the extra entry is redundant. Recomputed on every translation, so
+ * a retargeted link is re-denied at its new target by the re-wrap.
+ */
+function withResolvedTargets(readDeny: readonly string[]): string[] {
+	const out = [...readDeny];
+	for (const path of readDeny) {
+		try {
+			if (!lstatSync(path).isSymbolicLink()) continue;
+			const target = realpathSync(path);
+			if (!out.includes(target)) out.push(target);
+		} catch {
+			// Absent or dangling: nothing to resolve.
+		}
+	}
+	return out;
+}
+
+/**
+ * What the deny roots resolve to right now, as one comparable string.
+ *
+ * Existence alone is not enough: sandbox-runtime masks the *target* of a deny
+ * entry that is a symlink, so a link retargeted from one existing directory to
+ * another keeps the old mask while reads follow the new target. The snapshot
+ * therefore carries the canonical path and, for a link, the link's own
+ * identity (inode and mtime), so a retarget or a replacement changes it.
+ */
 function denySnapshot(profile: Profile): string {
-	return profile.readDeny.map((path) => (existsSync(path) ? `1${path}` : `0${path}`)).join("\n");
+	return profile.readDeny
+		.map((path) => {
+			let link = "";
+			try {
+				const own = lstatSync(path);
+				if (own.isSymbolicLink()) link = `@${own.ino}:${own.mtimeMs}`;
+			} catch {
+				return `0${path}`;
+			}
+			let target = path;
+			try {
+				target = realpathSync(path);
+			} catch {
+				// A dangling link: the identity above still changes on retarget.
+			}
+			return `1${path}>${target}${link}`;
+		})
+		.join("\n");
 }
 
 /** The helper script, resolved relative to this module so it moves with the package. */
@@ -73,8 +124,14 @@ export function srtTmpDir(): string {
 	return process.env.CLAUDE_CODE_TMPDIR || process.env.CLAUDE_TMPDIR || "/tmp/claude";
 }
 
-/** Collapse macOS's `/private/tmp` and `/tmp` spellings so they compare equal. */
-function samePath(a: string, b: string): boolean {
+/**
+ * Compare two paths, treating `/private/tmp` and `/tmp` as the same place on
+ * macOS -- where they are aliases -- and as two places everywhere else. On
+ * Linux `/private/tmp/claude` is a distinct directory that SRT would make
+ * writable if it existed, so it must not be folded into the advertised root.
+ */
+function samePath(a: string, b: string, platform: NodeJS.Platform = process.platform): boolean {
+	if (platform !== "darwin") return a === b;
 	const strip = (p: string) => p.replace(/^\/private(?=\/)/, "");
 	return strip(a) === strip(b);
 }
@@ -91,7 +148,10 @@ function samePath(a: string, b: string): boolean {
  * the denied set -- the latter sits next to configuration that steers another
  * agent.
  */
-export function partitionSrtDefaults(writableRoots: readonly string[]): {
+export function partitionSrtDefaults(
+	writableRoots: readonly string[],
+	platform: NodeJS.Platform = process.platform,
+): {
 	advertised: string[];
 	devices: string[];
 	denied: string[];
@@ -101,7 +161,7 @@ export function partitionSrtDefaults(writableRoots: readonly string[]): {
 	const denied: string[] = [];
 	for (const path of getDefaultWritePaths()) {
 		if (path.startsWith("/dev/")) devices.push(path);
-		else if (writableRoots.some((root) => samePath(root, path))) advertised.push(path);
+		else if (writableRoots.some((root) => samePath(root, path, platform))) advertised.push(path);
 		else denied.push(path);
 	}
 	return { advertised, devices, denied };
@@ -113,7 +173,7 @@ export function partitionSrtDefaults(writableRoots: readonly string[]): {
  */
 export function effectiveProfile(profile: Profile, platform: NodeJS.Platform = process.platform): Profile {
 	const tmp = srtTmpDir();
-	const roots = profile.writableRoots.some((root) => samePath(root, tmp))
+	const roots = profile.writableRoots.some((root) => samePath(root, tmp, platform))
 		? profile.writableRoots
 		: [...profile.writableRoots, tmp];
 	// sandbox-runtime's allowPty is macOS-only: bubblewrap never restricts
@@ -150,8 +210,12 @@ interface SrtConfig {
  * Expects the {@link effectiveProfile}; the SRT defaults it does not advertise
  * are denied explicitly.
  */
-export function toSrtConfig(profile: Profile, weakerNested = false): SrtConfig {
-	const { denied } = partitionSrtDefaults(profile.writableRoots);
+export function toSrtConfig(
+	profile: Profile,
+	weakerNested = false,
+	platform: NodeJS.Platform = process.platform,
+): SrtConfig {
+	const { denied } = partitionSrtDefaults(profile.writableRoots, platform);
 	return {
 		...(weakerNested ? { enableWeakerNestedSandbox: true } : {}),
 		// "off" means no host is allowlisted. SRT still runs an egress proxy the
@@ -159,7 +223,7 @@ export function toSrtConfig(profile: Profile, weakerNested = false): SrtConfig {
 		// by the kernel.
 		network: { allowedDomains: [], deniedDomains: [] },
 		filesystem: {
-			denyRead: [...profile.readDeny],
+			denyRead: withResolvedTargets(profile.readDeny),
 			allowWrite: [...profile.writableRoots],
 			denyWrite: denied,
 		},
@@ -297,18 +361,27 @@ export class SrtBackend implements SandboxBackend {
 	}
 
 	/**
-	 * Re-wrap and retire the helper if a deny root has appeared or vanished
-	 * since it was wrapped. Called before every helper operation; the cost is
-	 * one stat per deny root, microseconds against a round trip.
+	 * Re-apply the configuration and re-wrap the helper if a deny root has
+	 * appeared, vanished or been retargeted since the last wrap. Called before
+	 * every helper operation and every shell command; the cost is an lstat and
+	 * a realpath per deny root, microseconds against a round trip.
 	 */
 	private async refreshHelperIfStale(compiled: CompiledProfile): Promise<void> {
 		if (denySnapshot(compiled.profile) === this.helperDenySnapshot) return;
+		// Re-apply the configuration before re-wrapping: the manager resolves
+		// deny targets when it takes the configuration, not per wrap, so a wrap
+		// alone would mask the same stale target again.
+		SandboxManager.updateConfig(toSrtConfig(compiled.profile, this.weakened) as never);
 		await this.wrapHelper(compiled.profile);
 		this.fsClient?.retire();
 	}
 
 	async run(compiled: CompiledProfile, request: RunRequest): Promise<RunResult> {
 		this.assertCurrent(compiled);
+		// Shell commands are wrapped per call, but the manager resolves deny
+		// targets when it takes the configuration, so a retargeted deny link
+		// needs the configuration re-applied here too.
+		await this.refreshHelperIfStale(compiled);
 
 		const { argv } = await SandboxManager.wrapWithSandboxArgv(
 			request.command,

@@ -174,7 +174,7 @@ describe("createDevProfile", () => {
 	});
 
 	it("allows PTYs by default", () => {
-		// Both backends deny them, which breaks vim, less and git without a pager
+		// Both backends deny them, which breaks vim, less and git without a pager (Seatbelt; bwrap cannot deny PTYs at all)
 		// override. An agent fighting the sandbox looks for workarounds.
 		expect(createDevProfile({ cwd: "/work" }).allowPty).toBe(true);
 	});

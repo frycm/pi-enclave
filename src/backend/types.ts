@@ -38,8 +38,10 @@ export interface Profile {
 	 */
 	network: "off";
 	/**
-	 * PTY allocation. Denied by default on both backends, which breaks `vim`,
-	 * `less`, and anything that wants a terminal -- so the dev profile enables it.
+	 * PTY allocation. Seatbelt denies it unless asked, which breaks `vim`,
+	 * `less`, and anything that wants a terminal -- so the dev profile enables
+	 * it. bubblewrap never restricts PTYs: on Linux `false` is not enforceable,
+	 * and the compiled profile reports `true` there whatever was requested.
 	 */
 	allowPty: boolean;
 }

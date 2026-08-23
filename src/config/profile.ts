@@ -53,10 +53,11 @@ export interface DevProfileOptions {
 	home?: string;
 	tmp?: string;
 	/**
-	 * PTY allocation. On by default: both backends deny PTYs, which breaks `vim`,
-	 * `less` and `git log` without a pager override, and an agent that has to
-	 * fight the sandbox to run ordinary commands will be steered toward
-	 * workarounds rather than away from the boundary.
+	 * PTY allocation. On by default: Seatbelt denies PTYs unless asked, which
+	 * breaks `vim`, `less` and `git log` without a pager override, and an agent
+	 * that has to fight the sandbox to run ordinary commands will be steered
+	 * toward workarounds rather than away from the boundary. On Linux the field
+	 * is informational only -- bubblewrap cannot deny PTYs.
 	 */
 	allowPty?: boolean;
 }

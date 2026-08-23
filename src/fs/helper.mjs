@@ -44,7 +44,12 @@ const PROTOCOL_VERSION = 2;
  * caller can act on rather than a crash nobody can.
  */
 const MAX_READ_BYTES = 32 * 1024 * 1024;
-/** The most search output a single grep or glob may accumulate before the tool is stopped. */
+/**
+ * The most output -- stdout and stderr together -- a single grep or glob may
+ * accumulate before the tool is stopped. One budget for both: a walk over a
+ * tree of unreadable paths emits one diagnostic per path on stderr, which is
+ * the same unbounded growth as matches on stdout.
+ */
 const MAX_SEARCH_OUTPUT_BYTES = 16 * 1024 * 1024;
 
 function writeFrame(message) {
@@ -99,7 +104,7 @@ function runTool(requestId, bin, args, stopAfterLines) {
 		child.stdout.on("data", (d) => {
 			if (stopped) return;
 			stdout += d;
-			if (stdout.length > MAX_SEARCH_OUTPUT_BYTES) {
+			if (stdout.length + stderr.length > MAX_SEARCH_OUTPUT_BYTES) {
 				stop("cap");
 				return;
 			}
@@ -115,7 +120,9 @@ function runTool(requestId, bin, args, stopAfterLines) {
 			}
 		});
 		child.stderr.on("data", (d) => {
+			if (stopped) return;
 			stderr += d;
+			if (stdout.length + stderr.length > MAX_SEARCH_OUTPUT_BYTES) stop("cap");
 		});
 		child.on("error", (error) => {
 			running.delete(requestId);
@@ -295,8 +302,12 @@ function resolveForReport(path) {
 	return path;
 }
 
-/** Operations whose success on bwrap may be the masking tmpfs talking, not the real directory. */
-const MASKABLE = new Set(["exists", "readdir", "stat", "glob", "grep"]);
+/**
+ * Operations whose success on bwrap may be the mask talking, not the real
+ * file: a denied directory is an empty tmpfs, a denied *file* is a read-only
+ * bind of /dev/null, so reads come back empty and access checks pass.
+ */
+const MASKABLE = new Set(["exists", "readdir", "stat", "glob", "grep", "readFile", "head", "access"]);
 
 let buffer = Buffer.alloc(0);
 

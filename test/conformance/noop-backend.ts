@@ -102,8 +102,15 @@ export class NoopBackend implements SandboxBackend {
 			// catch.
 			glob: async (pattern, cwd, options) => {
 				const args = ["--glob", "--color=never", "--hidden", "--max-results", String(options.limit)];
-				if (pattern.includes("/")) args.push("--full-path");
-				args.push("--", pattern, cwd);
+				// The same normalisation as pi's tool and the helper: the control
+				// must be as capable as the real thing, or an allowed row fails here
+				// for a reason unrelated to the sandbox.
+				let effective = pattern;
+				if (pattern.includes("/")) {
+					args.push("--full-path");
+					if (!pattern.startsWith("/") && !pattern.startsWith("**/") && pattern !== "**") effective = `**/${pattern}`;
+				}
+				args.push("--", effective, cwd);
 				const { stdout } = await run("fd", args);
 				return stdout.split("\n").filter(Boolean);
 			},

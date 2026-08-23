@@ -11,7 +11,7 @@
  * not spawned per operation.
  */
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { classifyErrno, kindForOp } from "../backend/errno.ts";
+import { classifyErrno } from "../backend/errno.ts";
 import { isUnderAny } from "../backend/paths.ts";
 import type { CompiledProfile, FsClient, Violation } from "../backend/types.ts";
 import { SandboxDenied } from "../backend/types.ts";
@@ -304,11 +304,14 @@ export class HelperFsClient implements FsClient {
 	 */
 	private refuseMaskedSuccess(request: FsCall, resolvedPath: string | undefined): void {
 		if (this.options.compiled.backend !== "bwrap") return;
+		// A write-access check passing under a deny root is not a masked read --
+		// the deny list governs reads, and writes are decided by the roots.
+		if (request.op === "access" && request.mode === "write") return;
 		const path = resolvedPath ?? ("path" in request ? request.path : "cwd" in request ? request.cwd : undefined);
 		if (!path || !isUnderAny(path, this.options.compiled.profile.readDeny)) return;
 		const violation: Violation = {
 			source: "errno",
-			kind: kindForOp(request.op),
+			kind: "read",
 			op: request.op,
 			path,
 			backend: "bwrap",

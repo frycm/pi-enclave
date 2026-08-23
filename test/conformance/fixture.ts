@@ -38,6 +38,12 @@ export interface Fixture {
 	deniedHome: string;
 	/** Read-denied in the profile, but absent until a scenario creates it. */
 	lateDenied: string;
+	/** Read-denied, and a file rather than a directory. */
+	deniedFile: string;
+	/** Read-denied, and a symlink to a directory holding a secret. */
+	deniedLink: string;
+	/** A second directory with a secret, for retargeting `deniedLink`. */
+	linkTargetB: string;
 	/** Readable (reads are a deny-list) but not writable. */
 	outside: string;
 	/** A file in `outside`, used as a symlink target for the write-through test. */
@@ -97,10 +103,30 @@ export function createFixture(): Fixture {
 	// happens when a protected directory appears mid-session.
 	const lateDenied = join(outside, "late-secrets");
 
+	// A deny entry that is a *file*, not a directory. bwrap masks those with a
+	// read-only /dev/null rather than a tmpfs, so reads "succeed" with no bytes.
+	const deniedFile = join(outside, "netrc");
+	writeFileSync(deniedFile, `${SECRET_FILE_CONTENT}\n`);
+
+	// A deny entry that is a symlink, for the retarget case: SRT masks the link's
+	// target at wrap time, so pointing it elsewhere afterwards must be noticed.
+	const linkTargetA = join(outside, "creds-a");
+	const linkTargetB = join(outside, "creds-b");
+	mkdirSync(linkTargetA);
+	mkdirSync(linkTargetB);
+	writeFileSync(join(linkTargetA, "token"), `${SECRET_FILE_CONTENT}\n`);
+	writeFileSync(join(linkTargetB, "token"), `${SECRET_FILE_CONTENT}\n`);
+	const deniedLink = join(outside, "creds-link");
+	symlinkSync(linkTargetA, deniedLink);
+
+	// An ordinary tree for the find tool's pattern handling.
+	mkdirSync(join(workspace, "src", "a"), { recursive: true });
+	writeFileSync(join(workspace, "src", "a", "foo.spec.ts"), "");
+
 	const profile: Profile = {
 		mode: "workspace-write",
 		writableRoots: [workspace],
-		readDeny: [deniedHome, lateDenied],
+		readDeny: [deniedHome, lateDenied, deniedFile, deniedLink],
 		network: "off",
 		allowPty: true,
 	};
@@ -109,6 +135,9 @@ export function createFixture(): Fixture {
 		workspace,
 		deniedHome,
 		lateDenied,
+		deniedFile,
+		deniedLink,
+		linkTargetB,
 		outside,
 		outsideFile,
 		socketPath,

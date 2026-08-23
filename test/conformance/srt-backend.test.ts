@@ -116,6 +116,21 @@ describe.skipIf(!supported)("sandbox-runtime profile translation", () => {
 		expect(denied.some((p) => p.endsWith("/.npm/_logs"))).toBe(true);
 	});
 
+	it("treats /private/tmp/claude as an alias only on macOS", () => {
+		// On macOS /private/tmp is /tmp, so both SRT defaults are the advertised
+		// root. On Linux /private/tmp/claude is a separate directory SRT would
+		// make writable if it existed; folding it into the alias would leave it
+		// writable and unadvertised.
+		const mac = partitionSrtDefaults(["/tmp/claude"], "darwin");
+		expect(mac.advertised.sort()).toEqual(["/private/tmp/claude", "/tmp/claude"]);
+		const linux = partitionSrtDefaults(["/tmp/claude"], "linux");
+		expect(linux.advertised).toEqual(["/tmp/claude"]);
+		expect(linux.denied).toContain("/private/tmp/claude");
+		expect(toSrtConfig(effectiveProfile(requested, "linux"), false, "linux").filesystem.denyWrite).toContain(
+			"/private/tmp/claude",
+		);
+	});
+
 	it("advertises the temp directory the child is actually given", () => {
 		// SRT injects TMPDIR=/tmp/claude and makes it writable regardless of the
 		// profile. Denying it would leave the child with an unwritable TMPDIR;

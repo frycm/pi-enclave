@@ -14,7 +14,7 @@
  * every `denied` scenario reports `ok: false` against a backend that does not
  * sandbox at all.
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { CompiledProfile, SandboxBackend, ViolationKind } from "../../src/backend/types.ts";
 import { SandboxDenied } from "../../src/backend/types.ts";
@@ -486,9 +486,11 @@ SCENARIOS.push(
 			}
 			const text = outcome.content[0].text;
 			if (text.includes(SECRET_FILE_CONTENT)) return { ok: false, detail: "SECRET LEAKED through the grep tool" };
-			// Either a classified denial or nothing found is acceptable; on bwrap the
-			// directory is a tmpfs and rg finds nothing, on seatbelt rg is refused.
-			return { ok: true, detail: `grep returned no secret: ${text.split("\n")[0]?.slice(0, 60)}` };
+			// "No matches found" is not a denial. On bwrap the directory is an empty
+			// tmpfs and rg would honestly find nothing; the tool must still report
+			// the search as denied, or the agent learns the directory is empty.
+			const denied = outcome.isError === true && text.startsWith("sandbox denied");
+			return { ok: denied, detail: denied ? text.slice(0, 80) : `NOT CLASSIFIED as a denial: ${text.slice(0, 60)}` };
 		},
 	},
 	{
@@ -507,9 +509,13 @@ SCENARIOS.push(
 				throw error;
 			}
 			const leaked = found.some((entry) => entry.includes("id_ed25519") || entry.includes("credentials"));
+			// An empty list is what the bwrap tmpfs would honestly produce; the
+			// operation must throw SandboxDenied, never return.
 			return {
-				ok: !leaked,
-				detail: leaked ? `LISTED the denied directory: ${found.slice(0, 3).join(", ")}` : "nothing listed",
+				ok: false,
+				detail: leaked
+					? `LISTED the denied directory: ${found.slice(0, 3).join(", ")}`
+					: "NOT CLASSIFIED: returned an empty list instead of a denial",
 			};
 		},
 	},
@@ -577,6 +583,87 @@ SCENARIOS.push({
 		}
 	},
 });
+
+SCENARIOS.push(
+	{
+		id: "F11",
+		title: "find tool: a path-containing pattern matches inside the workspace",
+		surface: "fs",
+		expectation: "allowed",
+		falsifiableByNoop: false,
+		falsifiabilityNote: "An allowed row is meant to pass with or without a sandbox.",
+		async run({ backend, compiled, fixture }) {
+			// fd --glob matches basenames unless --full-path is set, and then a
+			// relative pattern needs a **/ prefix. The pattern pi's description
+			// advertises must work through the helper; the denied-directory row
+			// cannot show that because its pattern already starts with **/.
+			const found = await backend.fs(compiled).glob("src/**/*.spec.ts", fixture.workspace, { ignore: [], limit: 100 });
+			const ok = found.some((entry) => entry.endsWith(join("src", "a", "foo.spec.ts")));
+			return { ok, detail: ok ? "src/**/*.spec.ts matched" : `no match: ${JSON.stringify(found.slice(0, 3))}` };
+		},
+	},
+	{
+		id: "F12",
+		title: "helper: a read-denied file is denied, not returned empty",
+		surface: "fs",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ backend, compiled, fixture }) {
+			// Several default deny entries are files (auth.json, .netrc, .npmrc).
+			// bwrap masks a denied file with a read-only /dev/null, so readFile,
+			// head and a read access check all succeed with nothing in them.
+			const fs = backend.fs(compiled);
+			const attempts: Array<[string, () => Promise<unknown>]> = [
+				["readFile", () => fs.readFile(fixture.deniedFile)],
+				["head", () => fs.head(fixture.deniedFile, 64)],
+				["access", () => fs.access(fixture.deniedFile, "read")],
+			];
+			for (const [name, attempt] of attempts) {
+				try {
+					const result = await attempt();
+					if (Buffer.isBuffer(result) && result.toString("utf8").includes(SECRET_FILE_CONTENT)) {
+						return { ok: false, detail: `SECRET LEAKED through ${name}` };
+					}
+					return { ok: false, detail: `${name} NOT CLASSIFIED: succeeded (masked as empty?)` };
+				} catch (error) {
+					if (!(error instanceof SandboxDenied))
+						return { ok: false, detail: `${name} NOT CLASSIFIED: ${String(error).slice(0, 60)}` };
+				}
+			}
+			return { ok: true, detail: "readFile, head and access all classified as denied" };
+		},
+	},
+	{
+		id: "F13",
+		title: "helper: a deny symlink retargeted after startup is still denied",
+		surface: "fs",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ backend, compiled, fixture }) {
+			// SRT masks the link's target at wrap time. Retargeting the link to
+			// another existing directory keeps the old mask while reads follow the
+			// new target -- unless the backend notices the link changed.
+			const fs = backend.fs(compiled);
+			await fs.readFile(join(fixture.workspace, "ok.txt"));
+			rmSync(fixture.deniedLink);
+			symlinkSync(fixture.linkTargetB, fixture.deniedLink);
+			try {
+				const content = await fs.readFile(join(fixture.deniedLink, "token"));
+				const leaked = content.toString("utf8").includes(SECRET_FILE_CONTENT);
+				return {
+					ok: false,
+					detail: leaked ? "SECRET LEAKED through a retargeted deny link" : "NOT CLASSIFIED: read succeeded",
+				};
+			} catch (error) {
+				const denied = error instanceof SandboxDenied;
+				return {
+					ok: denied,
+					detail: denied ? "denied after the link was retargeted" : `NOT CLASSIFIED: ${String(error).slice(0, 80)}`,
+				};
+			}
+		},
+	},
+);
 
 SCENARIOS.push({
 	id: "F9",
