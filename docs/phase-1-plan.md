@@ -236,19 +236,40 @@ annotation reaches the agent. That run also exposed a benign `SystemConfiguratio
 mach-lookup cluttering the line that mattered, now filtered **by name** rather than ignoring
 `mach-lookup` as a class, since other mach services are genuinely powerful.
 
-### Step 5 — Verify the backend on Linux
+### Step 5 — Verify the backend on Linux ✅ done (with one gap that needs CI)
 
-*Was "write the bwrap backend". Step 4 made it one implementation, so this is now a
-verification step.*
+**Every conformance row passes on Linux/bwrap.** Run with
+`PI_ENCLAVE_WEAKER_NESTED=1 npm run conformance:report -- srt` in a privileged container.
 
-- Run the conformance suite on `ubuntu-latest` in CI, with the userns sysctl applied.
-- Confirm the Linux-specific rows: `/proc/self/environ` (C9), `--die-with-parent` reaping,
-  and the seccomp-dependent rows (C8 sockets, C7 `sudo`) that step 0 could only observe in
-  `enableWeakerNestedSandbox` mode.
-- Confirm the bwrap violation parser against real observer output, and settle `allowPty`
-  on bwrap — untested in step 0 because the probe used macOS `script(1)` syntax.
+**What this verifies and what it cannot.** No container mode on this host gives
+capability-bearing nested user namespaces — `--privileged`, `--userns=host` and
+`--cap-add=SYS_ADMIN` all fail — so the run uses SRT's `enableWeakerNestedSandbox`. That
+mode changes only bwrap's flags and **still runs `apply-seccomp`**, so the filesystem,
+network, socket, environment and seccomp-dependent rows are all genuinely exercised. What
+it cannot verify is the capability drop itself. That needs a real Linux host: **the CI run
+is the remaining gap.**
 
-**Verified by:** the same suite green on both runners.
+**Three findings, each from a control rather than from inspection:**
+
+- **`probe()` was checking the wrong thing.** The sysctl was a proxy for the real question
+  and gives a false pass exactly where phase 4 will live: inside a container the sysctl is
+  *absent* and plain `bwrap` *succeeds*, yet the nested namespace `apply-seccomp` needs
+  cannot be created. Both heuristics said "ready" while every command would have failed.
+  `probe()` now runs the real chain and reports the actual error.
+- **C8 was testing nothing on a host without Docker.** It connected to `/var/run/docker.sock`
+  and a fixture path with no listener, so `connect()` failed with `ENOENT` and the row passed
+  against a backend that enforces nothing. The Linux noop control reported it immediately.
+  The fixture now runs a real listener.
+- **The weakening is now a test, not a footnote.** New row **C12** asserts the sandboxed
+  process holds no capabilities — precisely what weaker mode gives up, leaving
+  `CapEff=000001ffffffffff` and the ability to create mount namespaces. Three escape attempts
+  from that position failed, which is not proof none exists. C12 correctly **fails** in the
+  container run, so a weakened run reports the difference instead of looking identical to a
+  real one.
+
+`weakerNestedSandbox` is an explicit opt-in, **never inferred** — a sandbox that silently
+downgraded itself when the host looked awkward would keep saying "enforced" while the
+boundary thinned. It surfaces in `/enclave status` and on the report's first line.
 
 ### Step 6 — `pi-enclave-fs` helper
 
