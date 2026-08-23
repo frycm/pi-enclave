@@ -1101,8 +1101,8 @@ with no network. No model involved yet.*
 - Violation reporting in tool output; `/enclave status|backend|violations`.
 - The [platform matrix](#platform-matrix) below, green on both backends.
 
-See [Phase 1 status](#phase-1-status) for what this cost, what it does not cover, and the
-one thing still to verify on a real Linux host.
+See [Phase 1 status](#phase-1-status) for what this cost and what it does not cover. The
+matrix is green on both backends in CI, on a real Linux host rather than a container.
 
 ### Phase 2 — Policy, lock, breaker, state
 
