@@ -139,6 +139,8 @@ export interface SandboxBackend {
  */
 export interface FsClient {
 	readFile(path: string): Promise<Buffer>;
+	/** The first `bytes` of a file, for type sniffing without a full read. */
+	head(path: string, bytes: number): Promise<Buffer>;
 	writeFile(path: string, content: string): Promise<void>;
 	mkdir(path: string): Promise<void>;
 	access(path: string, mode: "read" | "write"): Promise<void>;

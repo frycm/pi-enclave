@@ -35,6 +35,7 @@ export const MAX_FRAME_BYTES = 64 * 1024 * 1024;
  */
 export type FsCall =
 	| { op: "readFile"; path: string }
+	| { op: "head"; path: string; bytes: number }
 	| { op: "writeFile"; path: string; content: string }
 	| { op: "mkdir"; path: string }
 	| { op: "access"; path: string; mode: "read" | "write" }

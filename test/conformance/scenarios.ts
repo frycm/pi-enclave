@@ -14,11 +14,12 @@
  * every `denied` scenario reports `ok: false` against a backend that does not
  * sandbox at all.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { CompiledProfile, SandboxBackend, ViolationKind } from "../../src/backend/types.ts";
 import { SandboxDenied } from "../../src/backend/types.ts";
 import { buildChildEnv } from "../../src/env/child-env.ts";
+import { createReadOperations } from "../../src/tools/file-ops.ts";
 import { type GrepOutcome, runSandboxedGrep } from "../../src/tools/grep.ts";
 import { type Fixture, hostCapEff, OUTSIDE_FILE_CONTENT, SECRET_ENV, SECRET_FILE_CONTENT } from "./fixture.ts";
 
@@ -535,6 +536,27 @@ SCENARIOS.push(
 );
 
 SCENARIOS.push({
+	id: "F9",
+	title: "read tool: an image read through the helper is still detected as one",
+	surface: "fs",
+	expectation: "allowed",
+	falsifiableByNoop: false,
+	falsifiabilityNote: "An allowed row is meant to pass with or without a sandbox.",
+	async run({ backend, compiled, fixture }) {
+		// pi decodes the bytes as text when the operations object has no
+		// detector. The detector here reads the head through the helper, so the
+		// open stays on the sandbox side.
+		const ops = createReadOperations(() => backend.fs(compiled));
+		const png = join(fixture.workspace, "pixel.png");
+		writeFileSync(png, PNG_1X1);
+		const mime = await ops.detectImageMimeType(png);
+		const text = await ops.detectImageMimeType(join(fixture.workspace, "ok.txt"));
+		const ok = mime === "image/png" && text === null;
+		return { ok, detail: ok ? "png detected, text not" : `png -> ${mime}, text -> ${text}` };
+	},
+});
+
+SCENARIOS.push({
 	id: "C12",
 	title: "the sandboxed process holds no elevated capabilities",
 	surface: "bash",
@@ -584,5 +606,11 @@ SCENARIOS.push({
 		};
 	},
 });
+
+/** A valid 1x1 PNG, for the image-detection row. */
+const PNG_1X1 = Buffer.from(
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+	"base64",
+);
 
 export const DENIAL_SCENARIOS = SCENARIOS.filter((s) => s.expectation === "denied");

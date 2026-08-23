@@ -38,10 +38,13 @@ function findPiRoot(): string {
 }
 
 const GREP_ARTIFACT = join(findPiRoot(), "dist", "core", "tools", "grep.js");
+/** Loaded by file URL in src/tools/image-mime.ts because `exports` hides it. */
+const MIME_ARTIFACT = join(findPiRoot(), "dist", "utils", "mime.js");
 
-/** The pi build this hash was taken from. Bump both together, never one. */
+/** The pi build these hashes were taken from. Bump all together, never one. */
 const PINNED_PI_VERSION = "0.84.2";
 const PINNED_GREP_SHA256 = "c5289cbb5ea2a0f784387f80c91a10667104d651eb9af15903a87585044e75ed";
+const PINNED_MIME_SHA256 = "e865d8bb69bc7462da3769a9add3f417f6f55ee3f8803cca4603123f8fbed438";
 
 /** Duplicated in src/tools/grep.ts because pi does not export it. */
 const DUPLICATED_DEFAULT_LIMIT = 100;
@@ -66,6 +69,16 @@ describe("upstream grep drift", () => {
 			Number(match?.[1]),
 			"pi changed grep's default match limit; src/tools/grep.ts duplicates it and must follow",
 		).toBe(DUPLICATED_DEFAULT_LIMIT);
+	});
+
+	it("still ships the image detector where the sandboxed read loads it from", () => {
+		const digest = createHash("sha256").update(readFileSync(MIME_ARTIFACT)).digest("hex");
+		expect(
+			digest,
+			"pi's dist/utils/mime.js changed. src/tools/image-mime.ts imports detectSupportedImageMimeType " +
+				"from it by path; check the export and the sniff size, then update PINNED_MIME_SHA256.",
+		).toBe(PINNED_MIME_SHA256);
+		expect(/IMAGE_TYPE_SNIFF_BYTES = 4100/.test(readFileSync(MIME_ARTIFACT, "utf8"))).toBe(true);
 	});
 
 	it("has not changed since the sandboxed execute was written against it", () => {

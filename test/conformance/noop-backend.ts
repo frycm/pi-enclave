@@ -80,6 +80,7 @@ export class NoopBackend implements SandboxBackend {
 	fs(_compiled: CompiledProfile): FsClient {
 		return {
 			readFile: (path) => fs.readFile(path),
+			head: async (path, bytes) => (await fs.readFile(path)).subarray(0, bytes),
 			writeFile: (path, content) => fs.writeFile(path, content, "utf8"),
 			mkdir: async (path) => {
 				await fs.mkdir(path, { recursive: true });

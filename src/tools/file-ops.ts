@@ -13,6 +13,7 @@
  */
 import type { FsClient } from "../backend/types.ts";
 import { SandboxDenied } from "../backend/types.ts";
+import { detectImageMimeType, IMAGE_SNIFF_BYTES } from "./image-mime.ts";
 
 /**
  * Resolves the helper for the profile currently in force.
@@ -53,10 +54,12 @@ export function createReadOperations(fs: FsClientRef) {
 	return {
 		readFile: (path: string) => guard(() => fs().readFile(path)),
 		access: (path: string) => guard(() => fs().access(path, "read")),
-		// Image detection reads the file's magic bytes, which the helper has
-		// already returned; leaving it undefined lets pi fall back to its own
-		// detection on the buffer rather than opening the file a second time
-		// outside the sandbox.
+		// pi does not fall back to sniffing the buffer when this is absent: it
+		// decodes the bytes as text. So the magic bytes are fetched through the
+		// helper -- the open stays inside the sandbox -- and judged by pi's own
+		// detector on this side.
+		detectImageMimeType: (path: string) =>
+			guard(async () => detectImageMimeType(await fs().head(path, IMAGE_SNIFF_BYTES))),
 	};
 }
 

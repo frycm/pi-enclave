@@ -304,6 +304,10 @@ export class HelperFsClient implements FsClient {
 		return Buffer.from((await this.call({ op: "readFile", path })) as string, "base64");
 	}
 
+	async head(path: string, bytes: number): Promise<Buffer> {
+		return Buffer.from((await this.call({ op: "head", path, bytes })) as string, "base64");
+	}
+
 	async writeFile(path: string, content: string): Promise<void> {
 		await this.call({ op: "writeFile", path, content });
 	}

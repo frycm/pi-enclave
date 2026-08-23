@@ -24,7 +24,7 @@ import { isUnderAny } from "./paths.ts";
 import type { BackendName, Profile, Violation, ViolationKind } from "./types.ts";
 
 /** Operations the helper performs, grouped by the kind of access they need. */
-export const READ_OPS = ["readFile", "access:read", "stat", "readdir", "exists", "glob", "grep"] as const;
+export const READ_OPS = ["readFile", "head", "access:read", "stat", "readdir", "exists", "glob", "grep"] as const;
 export const WRITE_OPS = ["writeFile", "mkdir", "access:write", "unlink"] as const;
 
 export type FsOp = (typeof READ_OPS)[number] | (typeof WRITE_OPS)[number];

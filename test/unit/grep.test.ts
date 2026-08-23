@@ -21,6 +21,7 @@ function fakeFs(files: Record<string, string>, stdout: string, options: { grepTh
 			if (content === undefined) throw Object.assign(new Error("missing"), { code: "ENOENT" });
 			return Buffer.from(content, "utf8");
 		},
+		head: async (path, bytes) => Buffer.from(files[path] ?? "", "utf8").subarray(0, bytes),
 		writeFile: async () => {},
 		mkdir: async () => {},
 		access: async () => {},

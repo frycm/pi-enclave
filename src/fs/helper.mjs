@@ -19,12 +19,15 @@
 import { spawn } from "node:child_process";
 import {
 	accessSync,
+	closeSync,
 	constants,
 	lstatSync,
 	mkdirSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	readlinkSync,
+	readSync,
 	realpathSync,
 	statSync,
 	writeFileSync,
@@ -140,6 +143,19 @@ async function handle(request) {
 			}
 			// Base64 so arbitrary bytes survive a JSON frame.
 			return readFileSync(request.path).toString("base64");
+		}
+		case "head": {
+			// A bounded read from the start of the file, for image sniffing: the
+			// whole point is not to pay for a full read (and not to exceed the
+			// frame) just to learn a file is a PNG.
+			const fd = openSync(request.path, "r");
+			try {
+				const buffer = Buffer.alloc(Math.min(request.bytes, MAX_READ_BYTES));
+				const read = readSync(fd, buffer, 0, buffer.length, 0);
+				return buffer.subarray(0, read).toString("base64");
+			} finally {
+				closeSync(fd);
+			}
 		}
 		case "writeFile":
 			writeFileSync(request.path, request.content, "utf8");
