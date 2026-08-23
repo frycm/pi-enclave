@@ -5,7 +5,7 @@
  * rather than assumed: routing every file operation through another process is
  * the design's main performance cost, and "probably fine" is not a number.
  */
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SrtBackend } from "../src/backend/srt.ts";
@@ -43,5 +43,42 @@ await bench("read 1 MB", 50, () => fs.readFile(large));
 await bench("stat", 200, () => fs.stat(workspace));
 await bench("readdir", 200, () => fs.readdir(workspace));
 await bench("write 4 KB", 200, () => fs.writeFile(join(workspace, "out.txt"), "z".repeat(4096)));
+
+// The comparison that matters: what routing through the sandbox costs versus
+// doing the same operation directly in this process, which is what pi's own
+// tools do. A ratio is more useful than an absolute number, since it is the
+// part a faster machine will not improve away.
+console.log("\n  vs. direct (unsandboxed) in this process:");
+
+async function compare(label: string, iterations: number, sandboxed: () => Promise<unknown>, direct: () => unknown) {
+	await sandboxed();
+	direct();
+	const t0 = process.hrtime.bigint();
+	for (let i = 0; i < iterations; i++) await sandboxed();
+	const sandboxMs = Number(process.hrtime.bigint() - t0) / 1e6 / iterations;
+	const t1 = process.hrtime.bigint();
+	for (let i = 0; i < iterations; i++) direct();
+	const directMs = Number(process.hrtime.bigint() - t1) / 1e6 / iterations;
+	const overhead = directMs > 0 ? `${(sandboxMs / directMs).toFixed(1)}x` : "n/a";
+	console.log(
+		`  ${label.padEnd(28)} ${sandboxMs.toFixed(3)} ms vs ${directMs.toFixed(3)} ms direct  (${overhead}, +${(sandboxMs - directMs).toFixed(3)} ms)`,
+	);
+}
+
+await compare("read 4 KB", 200, () => fs.readFile(small), () => readFileSync(small));
+await compare("read 1 MB", 50, () => fs.readFile(large), () => readFileSync(large));
+await compare("stat", 200, () => fs.stat(workspace), () => statSync(workspace));
+
+// A realistic search: the whole source tree. Skipped rather than fatal when rg
+// is absent -- a benchmark that cannot run one case should still report the
+// others, and `probe()` already warns about the missing tool.
+const repo = process.env.PI_ENCLAVE_REPO ?? process.cwd();
+const rgArgs = ["--json", "--line-number", "--color=never", "--hidden", "--", "export", repo];
+try {
+	console.log("");
+	await bench("grep over the repo", 10, () => fs.grep(rgArgs));
+} catch (error) {
+	console.log(`  grep over the repo           skipped: ${(error as Error).message}`);
+}
 
 await backend.dispose();
