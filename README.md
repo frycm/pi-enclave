@@ -1118,6 +1118,10 @@ matrix is green on both backends in CI, on a real Linux host rather than a conta
 - Attendance contract with RPC handshake; outcome matrix; pending-approval records; audit
   log with `verify`.
 
+The [Phase 2 plan](docs/phase-2-plan.md) has the step breakdown, the pi integration facts it
+rests on, and the two corrections this document needs once they stop being harmless: pi has
+no MCP, and the baseline cannot register the `pi enclave …` subcommands used above.
+
 ### Phase 3 — Reviewer
 
 *Outcome: mutations and boundary crossings get a model opinion, and small local models are admitted only
