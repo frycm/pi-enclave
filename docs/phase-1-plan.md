@@ -271,32 +271,43 @@ is the remaining gap.**
 downgraded itself when the host looked awkward would keep saying "enforced" while the
 boundary thinned. It surfaces in `/enclave status` and on the report's first line.
 
-### Step 6 — `pi-enclave-fs` helper
+### Step 6 — `pi-enclave-fs` helper ✅ done
 
-A small Node script (shipped in the package, started by `backend.run` once per compiled
-profile, long-lived) speaking length-prefixed JSON over stdio:
+Delivered: [`fs/protocol.ts`](../src/fs/protocol.ts),
+[`fs/helper.mjs`](../src/fs/helper.mjs), [`fs/client.ts`](../src/fs/client.ts), the
+`backend.fs()` wiring, five conformance rows (F1–F5), 9 protocol unit tests, and
+`npm run bench:fs`.
 
-```
-→ { id, op: "readFile" | "access" | "writeFile" | "mkdir" | "stat" | "readdir"
-         | "exists" | "glob" | "grep", ...args }
-← { id, ok: true, result } | { id, ok: false, violation: Violation } | { id, ok: false, error }
-```
+**Length-prefixed framing, not newline-delimited.** File contents and search results
+contain newlines; a framing its own payload can confuse desynchronises mid-session and
+returns one file's bytes in answer to another file's request. Binary travels base64 inside
+one uniform frame type — the extra third on reads buys away a second frame kind whose
+failure mode is exactly what the framing exists to prevent.
 
-- `glob` shells out to `fd`, `grep` to `rg --json`, both **from inside the helper** so the
-  binaries run under the profile.
-- `FsClient` in the pi process: request/response multiplexing, per-call timeout, restart
-  on helper crash (with the crash logged as an audit-worthy event for Phase 2).
-- Helper denials go through `classifyErrno` (step 2) and are reported as
-  `Violation{source:"errno"}`, never retried in-process. **No log parsing on this path** —
-  the errno is exact and synchronous.
-- Measured in step 0: **40 ms startup / 0.02 ms per round-trip on macOS, 28 ms / 0.08 ms on
-  Linux** over 200 calls, with enforcement (including the symlink case) intact inside the
-  helper on both.
-- On Linux the helper is **PID 2 in a nested PID namespace**, so it cannot be addressed by
-  host PID — lifecycle and restart go through the `spawn` handle, never `kill(pid)`.
+**The helper reports errnos, never verdicts.** Only the pi process holds the compiled
+profile, and on Linux an `ENOENT` is a denied read or a missing file depending on it.
+Classifying in the helper would put that decision on the wrong side of the boundary. F1 and
+F4 assert both directions: a denial must be *classified* as one, and a genuine typo must not.
 
-**Verified by:** protocol unit tests with a fake helper; the `read`/`grep`/`find` variants
-of C2 now pass on both backends.
+**The suite caught a real secret leak.** `backend.fs()` cached one client per backend while
+`compile()` can replace the profile, so a helper started under an earlier profile kept
+enforcing it — refusing writes to the new workspace and, worse, permitting reads the new
+profile denied. F3 leaked a key through a symlink. A helper is bound to the profile the
+kernel applied at `exec` and cannot be updated, so it is now retired when the generation
+changes.
+
+**Measured** (exit criterion 5):
+
+| | macOS / seatbelt | Linux / bwrap |
+|---|---|---|
+| helper startup (once per profile) | 55 ms | 25 ms |
+| read 4 KB | 0.067 ms | 0.136 ms |
+| read 1 MB | 1.78 ms | 7.17 ms |
+| stat | 0.039 ms | 0.093 ms |
+| write 4 KB | 0.073 ms | 0.156 ms |
+
+Per-call overhead is far below a spawn, which is why the helper is long-lived rather than
+started per operation.
 
 ### Step 7 — File tool overrides
 
