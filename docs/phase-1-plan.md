@@ -416,7 +416,7 @@ in force.
 
 ## Phase 1: done
 
-Steps 0–9 are complete. 189 tests, green on macOS and on Linux in CI; `tsc` and biome
+Steps 0–9 are complete. 192 tests, green on macOS and on Linux in CI; `tsc` and biome
 clean. [PR #3](https://github.com/frycm/pi-enclave/pull/3) carried the first run on a real
 Linux host, which closed the last outstanding item and corrected one claim about it.
 
@@ -499,7 +499,7 @@ pi-enclave/
 | ~~bwrap diverges from Seatbelt on a matrix row~~ | **Partly realised in step 0**: every row passes on both, but the *mechanism* diverges (errno, violation presence). Contained by `classifyErrno` and per-backend noise lists, both tested by the shared suite |
 | Linux `ENOENT` misclassified — a genuinely missing file reported as a violation, or a denied read reported as absent | `classifyErrno` consults the compiled profile; the conformance suite asserts the classification, not just that the call failed. Both directions get a test |
 | bwrap unavailable in the target environment (nested userns, Ubuntu 24.04 sysctl, containers) | `probe()` fails closed with the exact remediation; CI sets the sysctl; Phase 4's Docker backend must record which mode it passed the suite in |
-| The copied `grep.ts` drifts from upstream | Stored upstream hash checked in the baseline-bump script |
+| The copied `grep.ts` drifts from upstream | `test/unit/upstream-drift.test.ts` pins pi's version, its grep artifact's hash and the one constant duplicated from it; a bump that touches grep fails with what to re-read |
 | `examples/extensions/sandbox` semantics change in a later 0.84.x patch | The baseline is a bounded range; CI installs the exact pi version under test |
 
 ## Explicitly out of Phase 1

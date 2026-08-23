@@ -22,7 +22,8 @@ import { SandboxDenied } from "../backend/types.ts";
 
 /**
  * Mirrors pi's private `DEFAULT_LIMIT` (grep.ts:44). Duplicated because it is
- * not exported; the drift check in the baseline-bump script covers it.
+ * not exported; `test/unit/upstream-drift.test.ts` fails when pi's value or its
+ * grep artifact changes, so the copy cannot drift silently.
  */
 const DEFAULT_LIMIT = 100;
 
