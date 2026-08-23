@@ -8,6 +8,7 @@
  */
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { Profile } from "../backend/types.ts";
 
 /**
@@ -19,8 +20,14 @@ import type { Profile } from "../backend/types.ts";
  * an agent has no business reading, including pi's own, so a task cannot
  * exfiltrate the key that is running it.
  */
-export function defaultReadDeny(home = homedir()): string[] {
+export function defaultReadDeny(home = homedir(), agentDir = getAgentDir()): string[] {
 	return [
+		// pi's *live* credential storage. pi resolves its agent directory from
+		// PI_CODING_AGENT_DIR, so the default path below is only where auth.json
+		// usually is; this entry is where it actually is. The child never sees the
+		// variable, but the file is on disk regardless, and an agent that can read
+		// it can spend the account running it.
+		join(agentDir, "auth.json"),
 		join(home, ".ssh"),
 		join(home, ".aws"),
 		join(home, ".gnupg"),
@@ -29,8 +36,8 @@ export function defaultReadDeny(home = homedir()): string[] {
 		join(home, ".config", "gh"),
 		join(home, ".netrc"),
 		join(home, ".npmrc"),
-		// pi's own credential storage. An agent that can read this can spend the
-		// account running it.
+		// The default agent directory, kept even when the live one is elsewhere:
+		// a stale auth.json at the default path is still a credential.
 		join(home, ".pi", "agent", "auth.json"),
 		join(home, ".pi", "auth.json"),
 		// Sibling agents' stored credentials, for the same reason.

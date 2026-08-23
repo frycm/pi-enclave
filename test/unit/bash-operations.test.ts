@@ -184,6 +184,27 @@ describe("createDevProfile", () => {
 		expect(defaultReadDeny("/home/u")).toContain("/home/u/.pi/agent/auth.json");
 	});
 
+	it("denies the live credential store wherever pi actually keeps it", () => {
+		// pi resolves its agent directory from PI_CODING_AGENT_DIR. With that set,
+		// the default path is empty and the real auth.json is elsewhere; denying
+		// only the default would leave the live key readable through read, bash
+		// or grep while the env allowlist hides the variable that points at it.
+		const deny = defaultReadDeny("/home/u", "/srv/pi-agent");
+		expect(deny).toContain("/srv/pi-agent/auth.json");
+		expect(deny).toContain("/home/u/.pi/agent/auth.json");
+	});
+
+	it("follows PI_CODING_AGENT_DIR by default", () => {
+		const previous = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = "/srv/elsewhere";
+		try {
+			expect(defaultReadDeny("/home/u")).toContain("/srv/elsewhere/auth.json");
+		} finally {
+			if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previous;
+		}
+	});
+
 	it("denies the usual credential locations", () => {
 		const deny = defaultReadDeny("/home/u");
 		for (const suffix of [".ssh", ".aws", ".gnupg", ".kube", ".docker", ".netrc", ".npmrc"]) {
