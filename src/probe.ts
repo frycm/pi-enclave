@@ -75,8 +75,12 @@ export interface ProbeEnv {
 // Version comparison
 //
 // A dependency-free comparator for the `x.y.z[-prerelease]` versions we care
-// about. Prereleases sort before their release, so `0.85.0-rc.1` is correctly
-// outside a `< 0.85.0` bound.
+// about. Semver orders a prerelease before its release, which puts
+// `0.85.0-rc.1` *inside* a `< 0.85.0` bound -- the opposite of what the bound
+// means here. The upper bound exists because an unseen minor may change hook
+// semantics, and an 0.85 release candidate contains exactly those unseen
+// changes. So the range check compares the exclusive upper bound on the core
+// version alone, ignoring prerelease ordering in that direction.
 // ---------------------------------------------------------------------------
 
 interface ParsedVersion {
@@ -107,13 +111,20 @@ export function compareVersions(a: ParsedVersion, b: ParsedVersion): number {
 	return a.prerelease < b.prerelease ? -1 : 1;
 }
 
-/** True when `min <= raw < max`. Unparseable versions are never in range. */
+/**
+ * True when `min <= raw < max`. Unparseable versions are never in range.
+ *
+ * The upper bound is applied to the core version only: every build of `max`,
+ * prerelease or not, is outside the range.
+ */
 export function isVersionInRange(raw: string, min: string, max: string): boolean {
 	const version = parseVersion(raw);
 	const lower = parseVersion(min);
 	const upper = parseVersion(max);
 	if (!version || !lower || !upper) return false;
-	return compareVersions(version, lower) >= 0 && compareVersions(version, upper) < 0;
+	const belowUpper =
+		compareVersions({ core: version.core, prerelease: null }, { core: upper.core, prerelease: null }) < 0;
+	return compareVersions(version, lower) >= 0 && belowUpper;
 }
 
 /** True when `raw >= min`. */

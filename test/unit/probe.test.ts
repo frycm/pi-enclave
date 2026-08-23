@@ -69,10 +69,16 @@ describe("range checks", () => {
 		expect(isVersionInRange("0.85.0", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
 	});
 
-	it("treats a prerelease of the upper bound as inside the range", () => {
-		// 0.85.0-rc.1 < 0.85.0, so it is in range by semver. Recorded deliberately:
-		// if we ever want prereleases excluded, this is the test to change.
-		expect(isVersionInRange("0.85.0-rc.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
+	it("refuses a prerelease of the next minor", () => {
+		// Semver puts 0.85.0-rc.1 below 0.85.0, but the bound exists because an
+		// unseen minor may change hook semantics, and an rc is exactly that.
+		expect(isVersionInRange("0.85.0-rc.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
+		expect(isVersionInRange("0.85.0-0", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
+	});
+
+	it("still admits a prerelease inside the range", () => {
+		// Prereleases of a patch we already support carry no unseen minor.
+		expect(isVersionInRange("0.84.3-rc.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
 	});
 
 	it("never admits an unparseable version", () => {
