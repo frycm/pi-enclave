@@ -300,6 +300,27 @@ per-backend with no shared grammar. This reinforces the step-0 decision that the
 operation's own error is the primary signal and violations are supporting evidence — on
 Linux that is not a preference, it is the only thing that works for reads.
 
+**Corollary, found while building the classifier in step 2: on Linux a read denial
+through `bash` is invisible to pi-enclave.** There is no violation event, and the shell
+reports the tmpfs overlay's `ENOENT` as an ordinary missing file:
+
+```
+### C2 read denied ssh key
+  exit: 1  violations: 0
+  out: cat: /tmp/enclave-home-YfDTzO/.ssh/id_ed25519: No such file or directory
+```
+
+pi-enclave sees an exit code and some stderr text, and cannot tell that apart from a
+typo'd filename. **Enforcement is intact** -- the agent did not get the key -- but the
+*reporting* is degraded: the agent is told the file does not exist rather than that it was
+denied, and the audit log records nothing.
+
+This does not affect the file tools, which go through the helper and get a real errno that
+`classifyErrno` resolves against the profile. It affects `bash` alone, on Linux alone, for
+reads alone. Steps 4-5 should state it rather than imply every denial reaches the model,
+and a post-hoc annotation (scanning a failed command's output for paths under `readDeny`)
+is possible later if it proves to matter.
+
 Noise differs too: Linux emitted 30 `/dev/shm/sem.*` violations for the `multiprocessing`
 test (which *succeeded* — `mp ok: [2, 4, 6]`, unlike macOS where it failed on
 `__pycache__`). Each backend needs its own default ignore list.

@@ -81,7 +81,10 @@ Results that change the steps below:
   a portable concept, and `ENOENT` cannot be mapped blindly because a missing file and a
   denied file are indistinguishable by errno.
 - **On Linux, denied reads emit no violation event at all.** The violation stream cannot be
-  a denial detector there.
+  a denial detector there -- and through `bash` specifically, a read denial is *entirely*
+  invisible: no event, and an `ENOENT` the shell reports as a missing file. Enforcement
+  holds; only reporting degrades. The file tools are unaffected because the helper sees the
+  real errno.
 - **bwrap needs capability-bearing user namespaces**, which `ubuntu-latest` (24.04) blocks
   by default — step 1's CI needs a sysctl, and `probe()` must detect it.
 
