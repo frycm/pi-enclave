@@ -1,0 +1,138 @@
+/**
+ * The meta-test: proof that the conformance suite can fail.
+ *
+ * A security suite that cannot distinguish "enforced" from "not enforced" is
+ * worse than no suite, because it reports green either way. This runs every
+ * scenario against a backend that deliberately enforces nothing and requires
+ * each falsifiable denial row to report a failure.
+ *
+ * Two denial rows are honestly *not* falsifiable this way, and are marked as
+ * such in `scenarios.ts` rather than quietly counted as proof:
+ *
+ * - **C7 (sudo/su)** holds unsandboxed too, because the test user is not root.
+ * - **C9 (environment)** is enforced by `buildChildEnv` inside the pi process
+ *   rather than by the kernel, so the noop backend still receives a sanitised
+ *   environment. It gets its own control below.
+ *
+ * When the real backends land in steps 4-5 they run the same scenarios and must
+ * pass every row. This file is what makes that meaningful.
+ */
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createFixture, hostHasNetwork, plantSecrets, SECRET_ENV } from "./fixture.ts";
+import { NoopBackend } from "./noop-backend.ts";
+import { type ConformanceRow, formatRows, runConformance } from "./runner.ts";
+import { SCENARIOS } from "./scenarios.ts";
+
+describe("conformance suite falsifiability", () => {
+	let restoreSecrets: () => void;
+	let rows: ConformanceRow[];
+
+	beforeAll(async () => {
+		restoreSecrets = plantSecrets();
+		rows = await runConformance(new NoopBackend(), createFixture);
+	}, 180_000);
+
+	afterAll(() => {
+		restoreSecrets?.();
+	});
+
+	it("runs every non-fs scenario", () => {
+		const expected = SCENARIOS.filter((s) => s.surface !== "fs").map((s) => s.id);
+		expect(rows.map((r) => r.id)).toEqual(expected);
+	});
+
+	it("every falsifiable denial scenario FAILS without a sandbox", () => {
+		// C5 can only be falsified where an unsandboxed process would actually
+		// reach the internet. On an isolated runner it fails for the wrong reason,
+		// which would report the suite as unfalsifiable when the host simply
+		// cannot run that control.
+		const networkControlAvailable = hostHasNetwork();
+		const wronglyPassing = rows.filter(
+			(row) =>
+				row.expectation === "denied" &&
+				row.falsifiableByNoop &&
+				row.ok &&
+				!(row.id === "C5" && !networkControlAvailable),
+		);
+		expect(
+			wronglyPassing,
+			"These passed against a backend that enforces nothing, so they are not testing the " +
+				`sandbox:\n${formatRows(wronglyPassing)}`,
+		).toEqual([]);
+	});
+
+	it("at least one scenario covers each denial category", () => {
+		// Guards against a row silently dropping out: nothing fails when a test
+		// stops running, so the absence has to be asserted explicitly.
+		const ran = new Set(rows.filter((r) => r.expectation === "denied" && r.falsifiableByNoop).map((r) => r.id));
+		for (const id of ["C1", "C2", "C2b", "C3", "C4", "C5", "C8"]) {
+			expect(ran.has(id), `${id} is not in the falsifiable denial set`).toBe(true);
+		}
+	});
+
+	it("the allowed scenarios pass, so a failure there means broken tooling not a weak sandbox", () => {
+		const brokenBaseline = rows.filter((row) => row.expectation === "allowed" && !row.ok);
+		expect(
+			brokenBaseline,
+			"These check ordinary work still functions and should pass even unsandboxed. A failure " +
+				"here means the test environment is missing something (git, python3, curl), not that " +
+				`the sandbox is wrong:\n${formatRows(brokenBaseline)}`,
+		).toEqual([]);
+	});
+
+	it("every non-falsifiable row explains why", () => {
+		// The escape hatch must stay expensive to use: an unexplained exemption is
+		// indistinguishable from a scenario someone silenced to get a green run.
+		for (const scenario of SCENARIOS) {
+			if (scenario.falsifiableByNoop) continue;
+			expect(scenario.falsifiabilityNote, `${scenario.id} is exempt without a note`).toBeTruthy();
+		}
+	});
+
+	it("reports a usable detail for every row", () => {
+		for (const row of rows) {
+			expect(row.detail.length, row.id).toBeGreaterThan(0);
+		}
+	});
+});
+
+describe("C9 control: the environment scenario fails when credentials are not stripped", () => {
+	let restoreSecrets: () => void;
+
+	beforeAll(() => {
+		restoreSecrets = plantSecrets();
+	});
+	afterAll(() => restoreSecrets?.());
+
+	it("detects a leak when the raw parent environment is passed through", async () => {
+		// C9 cannot be falsified by removing the sandbox, because the boundary it
+		// tests is buildChildEnv rather than the kernel. So falsify the thing it
+		// actually tests: hand the child `process.env` -- which is precisely what
+		// pi's own sandbox example does, and what SRT returns -- and require the
+		// scenario to catch it.
+		const rows = await runConformance(new NoopBackend(), createFixture, {
+			only: ["C9"],
+			envOverride: () => process.env as Record<string, string>,
+		});
+
+		expect(rows).toHaveLength(1);
+		expect(
+			rows[0]?.ok,
+			"C9 passed even with the parent environment passed straight through, so it is not " +
+				"detecting credential leaks at all",
+		).toBe(false);
+		expect(rows[0]?.detail).toContain("LEAKED");
+	}, 60_000);
+
+	it("passes once buildChildEnv is in the path", async () => {
+		const rows = await runConformance(new NoopBackend(), createFixture, { only: ["C9"] });
+		expect(rows[0]?.ok, rows[0]?.detail).toBe(true);
+	}, 60_000);
+
+	it("plants credentials the scenario could actually find", () => {
+		// If the fixture stopped setting these, C9 would pass vacuously.
+		for (const [name, value] of Object.entries(SECRET_ENV)) {
+			expect(process.env[name], name).toBe(value);
+		}
+	});
+});

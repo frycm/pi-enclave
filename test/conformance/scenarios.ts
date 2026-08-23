@@ -1,0 +1,299 @@
+/**
+ * The Phase-1 platform matrix, as executable scenarios.
+ *
+ * Each scenario asserts the **security property**, not the mechanism: did the
+ * secret reach the agent, did the file get written, did the connection open.
+ * Exit codes and violation counts are recorded as evidence but never used as
+ * the verdict, because step 0 proved neither is portable -- on bwrap a denied
+ * read produces no violation at all and an `ENOENT` the shell reports as a
+ * missing file, so a suite built on those signals would pass a backend that
+ * enforces nothing.
+ *
+ * A scenario returns `ok: true` when the sandbox behaved correctly. The runner
+ * turns that into a pass or a failure; the falsifiability meta-test checks that
+ * every `denied` scenario reports `ok: false` against a backend that does not
+ * sandbox at all.
+ */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import type { CompiledProfile, SandboxBackend, ViolationKind } from "../../src/backend/types.ts";
+import { buildChildEnv } from "../../src/env/child-env.ts";
+import { type Fixture, OUTSIDE_FILE_CONTENT, SECRET_ENV, SECRET_FILE_CONTENT } from "./fixture.ts";
+
+export interface ScenarioContext {
+	backend: SandboxBackend;
+	compiled: CompiledProfile;
+	fixture: Fixture;
+	/** Run a shell command in the workspace and collect everything it produced. */
+	sh(command: string): Promise<ShellOutcome>;
+}
+
+export interface ShellOutcome {
+	exitCode: number | null;
+	output: string;
+	violationKinds: ViolationKind[];
+}
+
+export interface ScenarioResult {
+	ok: boolean;
+	detail: string;
+}
+
+export interface Scenario {
+	/** Matrix row id, stable across the suite and the docs. */
+	id: string;
+	title: string;
+	/** Which part of the backend this exercises. `fs` scenarios need step 6. */
+	surface: "bash" | "fs";
+	/**
+	 * `denied` scenarios must fail against an unsandboxed backend -- that is what
+	 * makes the suite falsifiable. `allowed` scenarios check the sandbox has not
+	 * broken ordinary work, so they pass with or without one.
+	 */
+	expectation: "denied" | "allowed";
+	/**
+	 * Whether `NoopBackend` is a valid control for this row.
+	 *
+	 * Most denial scenarios are only satisfied by an OS boundary, so an
+	 * unsandboxed run must fail them. A few are not: the property may hold for a
+	 * reason unrelated to the sandbox (the test user is not root), or it may be
+	 * enforced by pi-enclave in-process rather than by the kernel (the child
+	 * environment). Those are marked and given their own control, because
+	 * pretending the noop run proves something it does not is exactly the
+	 * self-deception this suite exists to prevent.
+	 */
+	falsifiableByNoop: boolean;
+	/** Required whenever `falsifiableByNoop` is false: why, and what covers it instead. */
+	falsifiabilityNote?: string;
+	run(ctx: ScenarioContext): Promise<ScenarioResult>;
+}
+
+/** Build the child environment a scenario runs with. */
+export function scenarioEnv(fixture: Fixture): Readonly<Record<string, string>> {
+	return buildChildEnv(process.env, {
+		readDeny: fixture.profile.readDeny,
+		tmpdir: fixture.workspace,
+	});
+}
+
+const leaked = (output: string) => output.includes(SECRET_FILE_CONTENT);
+
+export const SCENARIOS: Scenario[] = [
+	{
+		id: "C10",
+		title: "happy path: read and write inside the workspace",
+		surface: "bash",
+		expectation: "allowed",
+		falsifiableByNoop: false,
+		falsifiabilityNote: "An allowed row is meant to pass with or without a sandbox.",
+		async run({ sh, fixture }) {
+			const created = join(fixture.workspace, "created.txt");
+			const r = await sh(`echo written-by-agent > ${created} && cat ${created} && cat ok.txt`);
+			const ok = r.exitCode === 0 && r.output.includes("written-by-agent") && r.output.includes("workspace content");
+			return { ok, detail: ok ? "workspace is usable" : `sandbox broke ordinary work: ${r.output.slice(0, 200)}` };
+		},
+	},
+	{
+		id: "C1",
+		title: "write outside a writable root",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const target = join(fixture.outside, "pwned.txt");
+			await sh(`echo pwned > ${target}`);
+			// The verdict is whether the file exists, not what the shell reported.
+			let created = true;
+			try {
+				readFileSync(target);
+			} catch {
+				created = false;
+			}
+			return { ok: !created, detail: created ? `WROTE ${target} outside the workspace` : "write denied" };
+		},
+	},
+	{
+		id: "C2",
+		title: "read a read-denied path",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const key = join(fixture.deniedHome, ".ssh", "id_ed25519");
+			const r = await sh(`cat ${key}`);
+			const ok = !leaked(r.output);
+			return { ok, detail: ok ? "key not readable" : "SECRET LEAKED into command output" };
+		},
+	},
+	{
+		id: "C2b",
+		title: "read a read-denied path with a glob and grep",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			// A denial that only covers `cat` is not a denial. Try the shapes an
+			// agent would actually reach for.
+			const r = await sh(
+				`grep -r . ${fixture.deniedHome} 2>&1; cat ${fixture.deniedHome}/.aws/* 2>&1; ` +
+					`find ${fixture.deniedHome} -type f -exec cat {} + 2>&1`,
+			);
+			const ok = !leaked(r.output);
+			return { ok, detail: ok ? "denied via grep, glob and find" : "SECRET LEAKED via grep/glob/find" };
+		},
+	},
+	{
+		id: "C3",
+		title: "symlink race: a link inside the workspace pointing at a denied path",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			// The path the agent names is inside a writable root; only the resolved
+			// path is denied. A pi-process path check would pass this.
+			const r = await sh(`cat ${join(fixture.workspace, "link-to-denied", "id_ed25519")}`);
+			const ok = !leaked(r.output);
+			return { ok, detail: ok ? "denied on the resolved path" : "SECRET LEAKED through a symlink" };
+		},
+	},
+	{
+		id: "C4",
+		title: "symlink write: a link inside the workspace pointing outside it",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			await sh(`echo overwritten > ${join(fixture.workspace, "link-to-outside")}`);
+			const content = readFileSync(fixture.outsideFile, "utf8");
+			const ok = content.includes(OUTSIDE_FILE_CONTENT);
+			return { ok, detail: ok ? "write denied on the resolved path" : "OVERWROTE a file outside the workspace" };
+		},
+	},
+	{
+		id: "C5",
+		title: "network: TCP, DNS and HTTP are all unavailable",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh }) {
+			const r = await sh(
+				`python3 -c "
+import socket
+s=socket.socket(); s.settimeout(4)
+try:
+    s.connect(('1.1.1.1',80)); print('TCP-CONNECTED')
+except Exception as e: print('tcp blocked')
+try:
+    print('DNS-RESOLVED', socket.gethostbyname('example.com'))
+except Exception as e: print('dns blocked')
+" 2>&1; curl -sS -m 4 http://example.com -o /dev/null -w 'HTTP-%{http_code}' 2>&1 || true`,
+			);
+			const reachedInternet = /TCP-CONNECTED|DNS-RESOLVED|HTTP-[23]\d\d/.test(r.output);
+			return {
+				ok: !reachedInternet,
+				detail: reachedInternet ? `REACHED THE NETWORK: ${r.output.slice(0, 160)}` : "network unavailable",
+			};
+		},
+	},
+	{
+		id: "C7",
+		title: "privilege escalation: sudo and su do not run",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: false,
+		falsifiabilityNote:
+			"The test user is not root, so 'did not gain root' holds unsandboxed too. Kept because it " +
+			"is a real matrix row, but the noop run proves nothing about it; the backends' own exec " +
+			"denial is what step 0 verified.",
+		async run({ sh }) {
+			// Asserted on the exec failure, not the violation stream: step 0 found
+			// sudo/su denials emit no violation event on either backend.
+			const r = await sh(`sudo -n id 2>&1; su root -c id 2>&1; echo MARKER-DONE`);
+			const escalated = /uid=0\(root\)/.test(r.output);
+			return { ok: !escalated, detail: escalated ? "GAINED ROOT" : "sudo/su denied" };
+		},
+	},
+	{
+		id: "C8",
+		title: "unix sockets outside the workspace are unreachable",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			// A reachable agent socket is a credential leak by another route, and
+			// docker.sock is a full host escape.
+			const sock = join(fixture.outside, "probe.sock");
+			const r = await sh(
+				`python3 -c "
+import socket
+for p in ['${sock}', '/var/run/docker.sock']:
+    s=socket.socket(socket.AF_UNIX)
+    try:
+        s.connect(p); print('SOCKET-CONNECTED', p)
+    except Exception as e: print('blocked', type(e).__name__)
+" 2>&1`,
+			);
+			const connected = r.output.includes("SOCKET-CONNECTED");
+			return { ok: !connected, detail: connected ? `CONNECTED: ${r.output.slice(0, 160)}` : "sockets denied" };
+		},
+	},
+	{
+		id: "C9",
+		title: "environment: no parent credential reaches the sandbox",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: false,
+		falsifiabilityNote:
+			"Credential isolation is enforced by buildChildEnv in the pi process, not by the OS " +
+			"boundary, so the noop backend still receives a sanitised environment and passes. Its " +
+			"control is the unsanitised-env test in falsifiability.test.ts, plus child-env.test.ts.",
+		async run({ sh }) {
+			// Three routes an agent could take, including the Linux-specific one.
+			const r = await sh(
+				`env; echo "expanded=[$ANTHROPIC_API_KEY][$AWS_SECRET_ACCESS_KEY][$GITHUB_TOKEN]"; ` +
+					`python3 -c "import os; print(os.environ)" 2>&1; ` +
+					`tr '\\0' '\\n' < /proc/self/environ 2>/dev/null || true`,
+			);
+			const found = Object.values(SECRET_ENV).filter((v) => r.output.includes(v));
+			return {
+				ok: found.length === 0,
+				detail: found.length === 0 ? "no credential visible" : `CREDENTIALS LEAKED: ${found.length}`,
+			};
+		},
+	},
+	{
+		id: "C6",
+		title: "ordinary tooling still works: git, and a PTY when allowed",
+		surface: "bash",
+		expectation: "allowed",
+		falsifiableByNoop: false,
+		falsifiabilityNote: "An allowed row is meant to pass with or without a sandbox.",
+		async run({ sh }) {
+			const r = await sh(
+				`git init -q . && git -c user.email=a@b -c user.name=a commit -q --allow-empty -m x && ` +
+					`git log --oneline | head -1 && echo GIT-OK`,
+			);
+			const ok = r.output.includes("GIT-OK");
+			return { ok, detail: ok ? "git works in the workspace" : `git broken: ${r.output.slice(0, 200)}` };
+		},
+	},
+	{
+		id: "C11",
+		title: "reads outside the workspace are permitted (reads are a deny-list)",
+		surface: "bash",
+		expectation: "allowed",
+		falsifiableByNoop: false,
+		falsifiabilityNote: "An allowed row is meant to pass with or without a sandbox.",
+		async run({ sh, fixture }) {
+			// Recorded deliberately. SRT cannot express "only the workspace is
+			// readable", so this documents the actual boundary rather than the one
+			// the README's "read-only root" wording implies. If this ever starts
+			// failing, the profile model changed and the docs must change with it.
+			const r = await sh(`cat ${fixture.outsideFile}`);
+			const ok = r.output.includes(OUTSIDE_FILE_CONTENT);
+			return { ok, detail: ok ? "reads outside are allowed, as designed" : "read model changed" };
+		},
+	},
+];
+
+export const DENIAL_SCENARIOS = SCENARIOS.filter((s) => s.expectation === "denied");
