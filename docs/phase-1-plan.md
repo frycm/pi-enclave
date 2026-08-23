@@ -48,10 +48,9 @@ verified.
 
 Full write-up: [step-0-srt-findings.md](step-0-srt-findings.md).
 
-**Verdict: SRT is sufficient for Phase 1 on macOS**; pin **`0.0.73`** (not the `0.0.26`
-pi's example bundles) and use `wrapWithSandboxArgv`. Every filesystem, network and socket
-matrix row is kernel-enforced. Linux/bwrap is untested — no Linux host was available —
-and moves into step 1's CI.
+**Verdict: SRT is sufficient for Phase 1 on both backends**; pin **`0.0.73`** (not the
+`0.0.26` pi's example bundles) and use `wrapWithSandboxArgv`. Every filesystem, network and
+socket matrix row is kernel-enforced on macOS/Seatbelt and on Linux/bwrap.
 
 Results that change the steps below:
 
@@ -73,6 +72,14 @@ Results that change the steps below:
   `__pycache__` violations from one Python call. A `violations.length > 0` check is wrong.
 - **PTYs are denied by default** (`allowPty`), and `sudo`/`su` are denied with *no*
   violation event.
+- **The backends deny with different errnos** — `EPERM` on macOS, but `EROFS` (writes),
+  `ENOENT` (reads, via tmpfs overlay) and `ENETUNREACH` (network) on Linux. A denial is not
+  a portable concept, and `ENOENT` cannot be mapped blindly because a missing file and a
+  denied file are indistinguishable by errno.
+- **On Linux, denied reads emit no violation event at all.** The violation stream cannot be
+  a denial detector there.
+- **bwrap needs capability-bearing user namespaces**, which `ubuntu-latest` (24.04) blocks
+  by default — step 1's CI needs a sysctl, and `probe()` must detect it.
 
 Two README claims need correcting (detail in the findings doc): `network.mode: "off"` is
 not kernel-absolute — SRT always starts a reachable localhost proxy that denies HTTP in
@@ -87,7 +94,13 @@ userspace — and reads are a **deny-list**, not the allow-list "read-only root"
 - `probe()`: reads the installed pi version, refuses outside the range; checks backend
   prerequisites per platform; returns a structured report used by `/enclave status`.
 - CI: GitHub Actions matrix `macos-latest` + `ubuntu-latest` (with `bubblewrap socat
-  ripgrep fd-find` installed). The conformance suite from step 3 runs here.
+  ripgrep fd-find` installed). The conformance suite from step 3 runs here. **The Linux job
+  must run `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` before the
+  suite** — `ubuntu-latest` is 24.04, which ships that restriction on and strips
+  capabilities from the user namespaces both bwrap and `apply-seccomp` need. Without it the
+  backend fails closed with a confusing error.
+- `probe()` additionally checks that sysctl on Linux and reports the remediation verbatim,
+  so a user hitting it gets the one-line fix instead of a bwrap stack trace.
 
 **Verified by:** `probe()` unit tests with a mocked pi version; CI green on both runners
 with an empty test suite.
@@ -121,11 +134,20 @@ type Violation = { kind: "read" | "write" | "network" | "exec" | "socket";
   `process.env` plus additions — 54 keys including `SSH_AUTH_SOCK`). Both are documented
   in the code. Add `PYTHONDONTWRITEBYTECODE=1` to `CHILD_ENV_BASE`, and note SRT rewrites
   `TMPDIR` to `/tmp/claude` — pi-enclave adopts or overrides it, never assumes the host's.
-- **Violation parsing** is per-backend and per-source, with a default noise list
-  (`sysctl-read`, `__pycache__` writes) applied before anything reaches the status line or
-  the Phase-2 circuit breaker. Kernel-log violations are async: the backend needs a defined
-  settle policy before it calls a command's violation list complete — the spike used an
-  800 ms sleep, which is not acceptable in shipped code.
+- **Violation parsing** is per-backend and per-source, with a per-backend default noise
+  list (macOS: `sysctl-read`, `__pycache__`; Linux: `/dev/shm/sem.*`) applied before
+  anything reaches the status line or the Phase-2 circuit breaker. Kernel-log violations
+  are async: the backend needs a defined settle policy before it calls a command's
+  violation list complete — the spike used an 800 ms sleep, which is not shippable.
+- **`classifyErrno(errno, op, path, profile)`** — the denial errno differs per backend
+  (`EPERM` macOS; `EROFS` / `ENOENT` / `ENETUNREACH` Linux), so the mapping is a per-backend
+  table, not a check. `ENOENT` on Linux is **ambiguous** — a read-denied path and a missing
+  path are indistinguishable — so classification consults the compiled profile's deny list.
+  Getting this wrong means either silently missing every Linux write denial, or reporting
+  every genuine `ENOENT` as a security violation.
+- **The primary denial signal is the operation's own error, never the violation stream.**
+  On Linux a denied read produces no violation event, so this is a correctness requirement
+  rather than a preference. Violations are supporting evidence for the audit log.
 
 **Verified by:** property test that no name matching `envDeny` ever survives
 `buildChildEnv` regardless of `passthrough`; snapshot tests of the constructed env.
@@ -210,11 +232,14 @@ profile, long-lived) speaking length-prefixed JSON over stdio:
   binaries run under the profile.
 - `FsClient` in the pi process: request/response multiplexing, per-call timeout, restart
   on helper crash (with the crash logged as an audit-worthy event for Phase 2).
-- Helper denials are recognised by `EACCES`/`EPERM` from the kernel and reported as
+- Helper denials go through `classifyErrno` (step 2) and are reported as
   `Violation{source:"errno"}`, never retried in-process. **No log parsing on this path** —
   the errno is exact and synchronous.
-- Measured in step 0: **40 ms startup, 0.02 ms per round-trip** over 200 calls, with
-  enforcement (including the symlink case) intact inside the helper.
+- Measured in step 0: **40 ms startup / 0.02 ms per round-trip on macOS, 28 ms / 0.08 ms on
+  Linux** over 200 calls, with enforcement (including the symlink case) intact inside the
+  helper on both.
+- On Linux the helper is **PID 2 in a nested PID namespace**, so it cannot be addressed by
+  host PID — lifecycle and restart go through the `spawn` handle, never `kill(pid)`.
 
 **Verified by:** protocol unit tests with a fake helper; the `read`/`grep`/`find` variants
 of C2 now pass on both backends.
@@ -289,7 +314,9 @@ pi-enclave/
 | ~~Kernel denial indistinguishable from ordinary failure~~ | **Retired by step 0** — errno for the helper, correlated log lines for bash. The residual risk is *noise*, not detection |
 | Violation noise makes the breaker and status line useless | Default ignore list from step 0 (`sysctl-read`, `__pycache__`); exit code plus the operation's own error stay the primary signal, violations are evidence |
 | Kernel-log violations are async — a command's list may be incomplete when read | Define a settle policy in step 4 and test it; the spike's 800 ms sleep is not shippable |
-| bwrap diverges from Seatbelt on a matrix row | The conformance suite is backend-agnostic and runs on both in CI from step 1; divergence surfaces as a red row, not a surprise |
+| ~~bwrap diverges from Seatbelt on a matrix row~~ | **Partly realised in step 0**: every row passes on both, but the *mechanism* diverges (errno, violation presence). Contained by `classifyErrno` and per-backend noise lists, both tested by the shared suite |
+| Linux `ENOENT` misclassified — a genuinely missing file reported as a violation, or a denied read reported as absent | `classifyErrno` consults the compiled profile; the conformance suite asserts the classification, not just that the call failed. Both directions get a test |
+| bwrap unavailable in the target environment (nested userns, Ubuntu 24.04 sysctl, containers) | `probe()` fails closed with the exact remediation; CI sets the sysctl; Phase 4's Docker backend must record which mode it passed the suite in |
 | The copied `grep.ts` drifts from upstream | Stored upstream hash checked in the baseline-bump script |
 | `examples/extensions/sandbox` semantics change in a later 0.84.x patch | The baseline is a bounded range; CI installs the exact pi version under test |
 
