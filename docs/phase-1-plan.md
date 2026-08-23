@@ -74,7 +74,8 @@ Results that change the steps below:
   macOS command and 62 spurious `__pycache__` violations from one Python call; 30
   `/dev/shm/sem.*` violations from the same test on Linux, which *succeeded*. A
   `violations.length > 0` check is wrong.
-- **PTYs are denied by default** (`allowPty`), and `sudo`/`su` are denied with *no*
+- **PTYs are denied by default on macOS** (`allowPty`; bubblewrap never restricts them,
+  which the PR-3 review's PTY test surfaced), and `sudo`/`su` are denied with *no*
   violation event.
 - **The backends deny with different errnos** — `EPERM` on macOS, but `EROFS` (writes),
   `ENOENT` (reads, via tmpfs overlay) and `ENETUNREACH` (network) on Linux. A denial is not

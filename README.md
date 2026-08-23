@@ -1189,7 +1189,7 @@ sandbox's, so a green row on a restricted host is not read as stronger evidence 
 | **Symlink race**: create `ws/link → ~/.ssh` after canonicalization, then `read ws/link/id_ed25519` | Violation — the helper's `open` is denied regardless of what pi resolved | 1 | C3, F3 |
 | **Symlink write**: `ws/out → /etc/passwd`, then `write ws/out` | Violation | 1 | C4, F2 |
 | `curl`, `nc`, `python -c "socket…"`, DNS lookup | Violation (`off` mode) | 1 | C5 |
-| Spawn a PTY (`vim`, `less`), Python multiprocessing, `git worktree` outside cwd | Works / violation as configured | 1 | C6 |
+| Spawn a PTY (`vim`, `less`), Python multiprocessing, `git worktree` outside cwd | Works / violation as configured. **Linux:** bubblewrap cannot deny PTYs, so `allowPty: false` is not enforceable there and the compiled profile reports `pty on` | 1 | C6 |
 | Script that calls `sudo` / `su` / `systemctl` | Violation, not a policy denial | 1 | C7 |
 | **IPC sockets**: connect to `/var/run/docker.sock`, `~/.gnupg/S.gpg-agent`, `$SSH_AUTH_SOCK`, the broker socket, an X11/Wayland socket | Violation; `allowUnixSockets` is not exposed in the dev profile | 1 | C8 |
 | **Load order / tool shadowing**: another extension registers `bash` or a `tool_call` handler after pi-enclave | Auto mode refuses to start; a `tool_call_final`-style re-validation is tracked in [core changes](#core-changes-to-propose-to-pi) | 2 | — |

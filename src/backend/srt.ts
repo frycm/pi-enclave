@@ -111,12 +111,17 @@ export function partitionSrtDefaults(writableRoots: readonly string[]): {
  * The profile as it is actually in force under sandbox-runtime: the caller's
  * roots plus the SRT temp directory the child is pointed at.
  */
-export function effectiveProfile(profile: Profile): Profile {
+export function effectiveProfile(profile: Profile, platform: NodeJS.Platform = process.platform): Profile {
 	const tmp = srtTmpDir();
 	const roots = profile.writableRoots.some((root) => samePath(root, tmp))
 		? profile.writableRoots
 		: [...profile.writableRoots, tmp];
-	return { ...profile, writableRoots: roots };
+	// sandbox-runtime's allowPty is macOS-only: bubblewrap never restricts
+	// pseudo-terminals. The compiled profile says what is in force, so on Linux
+	// it says PTYs are allowed whatever was asked -- a status line reading "pty
+	// off" there would be describing a restriction that does not exist.
+	const allowPty = platform === "linux" ? true : profile.allowPty;
+	return { ...profile, writableRoots: roots, allowPty };
 }
 
 /** How long to keep draining violations after a command exits. */

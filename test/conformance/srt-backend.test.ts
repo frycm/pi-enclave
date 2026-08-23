@@ -140,17 +140,21 @@ describe.skipIf(!supported)("sandbox-runtime profile translation", () => {
 });
 
 describe.skipIf(!supported)("pty policy", () => {
-	it("denies PTY allocation when the profile says so", async () => {
-		// The inverse of C6. Both backends deny PTYs by default and allowPty is the
-		// one profile field that widens them, so the translation must carry it in
-		// both directions -- a profile that always allowed PTYs would pass C6 too.
+	it("carries allowPty: false through to the kernel where the backend can", async () => {
+		// The inverse of C6. Seatbelt denies PTYs unless the profile allows them,
+		// so the translation must carry the field in both directions -- a profile
+		// that always allowed PTYs would pass C6 too. bubblewrap never restricts
+		// PTYs (sandbox-runtime documents allowPty as macOS-only), and the compiled
+		// profile must say so rather than claim a restriction that is not there.
 		const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
 		const fixture = createFixture();
 		try {
 			const compiled = await backend.compile({ ...fixture.profile, allowPty: false });
 			let output = "";
+			// The marker is assembled at runtime so a traceback that quotes the
+			// source line cannot contain it.
 			await backend.run(compiled, {
-				command: `python3 -c "import pty,os; m,s=pty.openpty(); print('PTY-OK')" 2>&1 || echo PTY-DENIED`,
+				command: `python3 -c "import pty,os; m,s=pty.openpty(); print('PTY-'+'OK')" 2>&1 || echo PTY-DENIED`,
 				cwd: fixture.workspace,
 				env: { PATH: process.env.PATH ?? "" },
 				commandId: "pty-off-1",
@@ -158,8 +162,17 @@ describe.skipIf(!supported)("pty policy", () => {
 					output += chunk.toString("utf8");
 				},
 			});
-			expect(output, "a PTY was allocated under allowPty: false").not.toContain("PTY-OK");
-			expect(output).toContain("PTY-DENIED");
+			if (process.platform === "linux") {
+				expect(
+					compiled.profile.allowPty,
+					"bwrap cannot deny PTYs; the compiled profile must say they are allowed",
+				).toBe(true);
+				expect(output).toContain("PTY-OK");
+			} else {
+				expect(compiled.profile.allowPty).toBe(false);
+				expect(output, "a PTY was allocated under allowPty: false").not.toContain("PTY-OK");
+				expect(output).toContain("PTY-DENIED");
+			}
 		} finally {
 			await backend.dispose();
 			fixture.cleanup();
