@@ -39,6 +39,12 @@ export const NOISE_PATTERNS: Record<BackendName, RegExp[]> = {
 		// Font and preference lookups from anything linking AppKit.
 		/\buser-preference-read\b/,
 		/mach-lookup com\.apple\.(FontObjectsServer|fonts)\b/,
+		// Every network client queries this before connecting; it is a read-only
+		// system-configuration lookup and appears alongside the real network
+		// denial, where it adds noise to the one line that matters. Named
+		// explicitly rather than ignoring mach-lookup as a class, since other
+		// mach services are genuinely powerful.
+		/mach-lookup com\.apple\.SystemConfiguration\.configd\b/,
 	],
 	bwrap: [
 		// POSIX semaphores for multiprocessing; the call succeeds via a fallback.

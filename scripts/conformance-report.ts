@@ -5,25 +5,47 @@
  * every falsifiable denial row must read FAIL. Steps 4-5 point this at the real
  * backends, where every row must read PASS.
  */
+import { SrtBackend } from "../src/backend/srt.ts";
+import type { SandboxBackend } from "../src/backend/types.ts";
 import { createFixture, plantSecrets } from "../test/conformance/fixture.ts";
 import { NoopBackend } from "../test/conformance/noop-backend.ts";
 import { runConformance } from "../test/conformance/runner.ts";
 
+const which = process.argv[2] ?? "noop";
+const backend: SandboxBackend = which === "srt" ? new SrtBackend() : new NoopBackend();
+
 const restore = plantSecrets();
-const rows = await runConformance(new NoopBackend(), createFixture);
+const started = Date.now();
+const rows = await runConformance(backend, createFixture);
+const elapsed = Date.now() - started;
 restore();
+await backend.dispose();
 
 const width = Math.max(...rows.map((r) => r.title.length));
-console.log(`backend: noop (enforces nothing)\n`);
+console.log(
+	`backend: ${which === "srt" ? `${backend.name} (sandbox-runtime)` : "noop (enforces nothing)"}  [${elapsed}ms]\n`,
+);
 for (const row of rows) {
 	const verdict = row.ok ? "PASS" : "FAIL";
-	const expected = row.expectation === "denied" ? (row.falsifiableByNoop ? "must FAIL" : "exempt") : "must PASS";
+	const expected =
+		which === "srt"
+			? "must PASS"
+			: row.expectation === "denied"
+				? row.falsifiableByNoop
+					? "must FAIL"
+					: "exempt"
+				: "must PASS";
 	console.log(`  ${verdict}  ${row.id.padEnd(4)} ${row.title.padEnd(width)}  [${expected}]`);
 	console.log(`        ${row.detail}`);
 }
 
-const wrong = rows.filter((r) =>
-	r.expectation === "denied" && r.falsifiableByNoop ? r.ok : r.expectation === "allowed" ? !r.ok : false,
-);
-console.log(`\n${wrong.length === 0 ? "control holds" : `CONTROL BROKEN: ${wrong.map((r) => r.id).join(", ")}`}`);
+// A real backend must pass every row. The noop control must fail every
+// falsifiable denial row and pass the rest.
+const wrong =
+	which === "srt"
+		? rows.filter((r) => !r.ok)
+		: rows.filter((r) =>
+				r.expectation === "denied" && r.falsifiableByNoop ? r.ok : r.expectation === "allowed" ? !r.ok : false,
+			);
+console.log(`\n${wrong.length === 0 ? "OK" : `WRONG: ${wrong.map((r) => r.id).join(", ")}`}`);
 process.exit(wrong.length === 0 ? 0 : 1);

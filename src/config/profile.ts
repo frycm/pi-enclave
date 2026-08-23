@@ -1,0 +1,66 @@
+/**
+ * The Phase-1 dev profile.
+ *
+ * One mode, `workspace-write`, with no configuration surface yet -- the config
+ * loader, the monotonic merge and the project/user precedence rules are phase 2.
+ * Building it here keeps the defaults in one place and makes them testable
+ * before any of that exists.
+ */
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Profile } from "../backend/types.ts";
+
+/**
+ * Paths denied for reading by default.
+ *
+ * Reads are a deny-list on both backends -- there is no way to say "only the
+ * workspace is readable" -- so this list is the whole of the read boundary, and
+ * anything absent from it is readable by the agent. It covers credential stores
+ * an agent has no business reading, including pi's own, so a task cannot
+ * exfiltrate the key that is running it.
+ */
+export function defaultReadDeny(home = homedir()): string[] {
+	return [
+		join(home, ".ssh"),
+		join(home, ".aws"),
+		join(home, ".gnupg"),
+		join(home, ".kube"),
+		join(home, ".docker"),
+		join(home, ".config", "gh"),
+		join(home, ".netrc"),
+		join(home, ".npmrc"),
+		// pi's own credential storage. An agent that can read this can spend the
+		// account running it.
+		join(home, ".pi", "agent", "auth.json"),
+		join(home, ".pi", "auth.json"),
+		// Sibling agents' stored credentials, for the same reason.
+		join(home, ".claude", ".credentials.json"),
+		join(home, ".config", "claude"),
+	];
+}
+
+export interface DevProfileOptions {
+	/** The workspace root. Normally pi's cwd. */
+	cwd: string;
+	/** Overrides for testing. */
+	home?: string;
+	tmp?: string;
+	/**
+	 * PTY allocation. On by default: both backends deny PTYs, which breaks `vim`,
+	 * `less` and `git log` without a pager override, and an agent that has to
+	 * fight the sandbox to run ordinary commands will be steered toward
+	 * workarounds rather than away from the boundary.
+	 */
+	allowPty?: boolean;
+}
+
+export function createDevProfile(options: DevProfileOptions): Profile {
+	const { cwd, home = homedir(), tmp = tmpdir(), allowPty = true } = options;
+	return {
+		mode: "workspace-write",
+		writableRoots: [cwd, tmp],
+		readDeny: defaultReadDeny(home),
+		network: "off",
+		allowPty,
+	};
+}
