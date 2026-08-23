@@ -127,52 +127,37 @@ Linux userns sysctl. The CI Linux job applies
   resolve the absolute path outside the sandbox and pass it in**. Until then the check is
   advisory (`warn`, not `fail`).
 
-### Step 2 — `SandboxBackend` interface, `Violation`, `ChildEnv`
+### Step 2 — `SandboxBackend` interface, `Violation`, `ChildEnv` ✅ done
 
-Pure TypeScript, no OS calls, fully unit-tested.
+Pure TypeScript, no OS calls. 67 new tests (95 total), with the three critical behaviours
+mutation-checked to prove the tests can fail.
 
-```ts
-interface SandboxBackend {
-  name: "seatbelt" | "bwrap";
-  probe(): Promise<ProbeReport>;
-  compile(profile: Profile): Promise<CompiledProfile>;        // done once per session
-  run(compiled: CompiledProfile, req: RunRequest): Promise<RunResult>;  // bash + helper start
-  fs(compiled: CompiledProfile): FsClient;                     // step 6
-}
+| Module | What it settles |
+|---|---|
+| [`backend/types.ts`](../src/backend/types.ts) | `SandboxBackend`, `Profile`, `CompiledProfile`, `Violation`, `FsClient`, `SandboxDenied`. `Profile` records the asymmetry SRT imposes: writes are an allow-list, reads a deny-list |
+| [`backend/paths.ts`](../src/backend/paths.ts) | Whole-segment containment, so `/opt/secretsbin` is not inside `/opt/secrets` |
+| [`backend/errno.ts`](../src/backend/errno.ts) | `classifyErrno` — the per-backend denial table, and the `ENOENT` disambiguation |
+| [`backend/violations.ts`](../src/backend/violations.ts) | Per-backend line parsing and noise lists, built from lines captured verbatim in step 0 |
+| [`env/child-env.ts`](../src/env/child-env.ts) | `buildChildEnv`, `validatePassthrough`, the credential deny list applied last |
 
-type RunResult = { exitCode: number | null; violations: Violation[] };
-type Violation = { kind: "read" | "write" | "network" | "exec" | "socket";
-                   source: "errno" | "kernel-log" | "proxy";   // ← from step 0
-                   path?: string; host?: string; op: string; backend: string };
-```
+**Decisions worth carrying forward:**
 
-- `Profile` for Phase 1 is `workspace-write` only: writable roots = `cwd` + `$TMPDIR`,
-  read-deny = `$defaults.readDeny` (`~/.ssh`, `~/.aws`, `~/.pi/**/auth*`, …),
-  `network: "off"`, no unix sockets.
-- `buildChildEnv(processEnv, config)` implements the README's `CHILD_ENV_BASE`,
-  `passthrough`, credential deny pattern (applied last), `HOME`/`TMPDIR` rewrite and
-  `PATH` filtering. Two things the backend **ignores**: the `env` option pi passes to
-  `BashOperations.exec`, and the `env` SRT returns from `wrapWithSandboxArgv` (it is
-  `process.env` plus additions — 54 keys including `SSH_AUTH_SOCK`). Both are documented
-  in the code. Add `PYTHONDONTWRITEBYTECODE=1` to `CHILD_ENV_BASE`, and note SRT rewrites
-  `TMPDIR` to `/tmp/claude` — pi-enclave adopts or overrides it, never assumes the host's.
-- **Violation parsing** is per-backend and per-source, with a per-backend default noise
-  list (macOS: `sysctl-read`, `__pycache__`; Linux: `/dev/shm/sem.*`) applied before
-  anything reaches the status line or the Phase-2 circuit breaker. Kernel-log violations
-  are async: the backend needs a defined settle policy before it calls a command's
-  violation list complete — the spike used an 800 ms sleep, which is not shippable.
-- **`classifyErrno(errno, op, path, profile)`** — the denial errno differs per backend
-  (`EPERM` macOS; `EROFS` / `ENOENT` / `ENETUNREACH` Linux), so the mapping is a per-backend
-  table, not a check. `ENOENT` on Linux is **ambiguous** — a read-denied path and a missing
-  path are indistinguishable — so classification consults the compiled profile's deny list.
-  Getting this wrong means either silently missing every Linux write denial, or reporting
-  every genuine `ENOENT` as a security violation.
-- **The primary denial signal is the operation's own error, never the violation stream.**
-  On Linux a denied read produces no violation event, so this is a correctness requirement
-  rather than a preference. Violations are supporting evidence for the audit log.
+- **An unparseable violation line never becomes a `Violation`.** A fabricated denial is
+  worse than a missed log line, which is still in the raw audit either way.
+- **`formatViolations` is backend-neutral.** An agent that learns one platform's vocabulary
+  would not recognise the other's, so the rendering names the kind and target, never the
+  mechanism. Asserted in tests.
+- **`EROFS` counts as a denial unconditionally.** A user whose workspace sits on a genuinely
+  read-only mount gets a violation rather than a plain error — a legible failure, not a
+  dangerous one.
+- **`validatePassthrough` refuses loudly** rather than dropping silently: someone who listed
+  `FOO_TOKEN` believes it is reaching the sandbox. `buildChildEnv` also strips it, so the
+  validation is the diagnostic and not the enforcement.
 
-**Verified by:** property test that no name matching `envDeny` ever survives
-`buildChildEnv` regardless of `passthrough`; snapshot tests of the constructed env.
+**Mutation checks** (each reverted after): dropping `EROFS` from the denial set failed 4
+tests including cross-backend parity; moving the credential deny list off the end failed
+the property test and two others; degrading path containment to a string prefix failed 3
+tests across two modules.
 
 ### Step 3 — Backend-conformance suite
 
