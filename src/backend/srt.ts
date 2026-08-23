@@ -58,11 +58,13 @@ interface SrtConfig {
 	network: { allowedDomains: string[]; deniedDomains: string[] };
 	filesystem: SrtFilesystemConfig;
 	allowPty?: boolean;
+	enableWeakerNestedSandbox?: boolean;
 }
 
 /** Translate a pi-enclave profile into sandbox-runtime's configuration shape. */
-export function toSrtConfig(profile: Profile): SrtConfig {
+export function toSrtConfig(profile: Profile, weakerNested = false): SrtConfig {
 	return {
+		...(weakerNested ? { enableWeakerNestedSandbox: true } : {}),
 		// "off" means no host is allowlisted. SRT still runs an egress proxy the
 		// child can reach; it denies every request. Raw sockets and DNS are denied
 		// by the kernel.
@@ -101,20 +103,39 @@ class SrtCompiledProfile implements CompiledProfile {
 export interface SrtBackendOptions {
 	/** Overrides the platform-derived name. Tests use this; production does not. */
 	name?: BackendName;
+	/**
+	 * Opt in to sandbox-runtime's weaker nested mode.
+	 *
+	 * Needed only where the host cannot give bubblewrap and the seccomp helper
+	 * capability-bearing user namespaces -- in practice, inside an unprivileged
+	 * or nested container. sandbox-runtime's own security notes call this mode
+	 * "considerably weaker" and say it should be used only where additional
+	 * isolation is otherwise enforced.
+	 *
+	 * It is off by default and never inferred. A sandbox that silently downgraded
+	 * itself when the host looked awkward would be exactly the failure mode this
+	 * project exists to avoid: the status line would keep saying "enforced" while
+	 * the boundary quietly thinned. Callers that turn it on must say so where the
+	 * user can see it -- {@link SrtBackend.weakened} exists for that.
+	 */
+	weakerNestedSandbox?: boolean;
 }
 
 export class SrtBackend implements SandboxBackend {
 	readonly name: BackendName;
+	/** True when running in sandbox-runtime's weaker nested mode. Surface this to the user. */
+	readonly weakened: boolean;
 	private initialized = false;
 	/** Incremented on every compile; the newest is the one the manager holds. */
 	private generation = 0;
 
 	constructor(options: SrtBackendOptions = {}) {
 		this.name = options.name ?? (process.platform === "darwin" ? "seatbelt" : "bwrap");
+		this.weakened = options.weakerNestedSandbox ?? false;
 	}
 
 	async compile(profile: Profile): Promise<CompiledProfile> {
-		const config = toSrtConfig(profile);
+		const config = toSrtConfig(profile, this.weakened);
 
 		// The manager is global to the process, so initialise once and update
 		// thereafter. Re-initialising would tear down the proxy and log monitor

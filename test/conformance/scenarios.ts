@@ -221,16 +221,24 @@ except Exception as e: print('dns blocked')
 		falsifiableByNoop: true,
 		async run({ sh, fixture }) {
 			// A reachable agent socket is a credential leak by another route, and
-			// docker.sock is a full host escape.
-			const sock = join(fixture.outside, "probe.sock");
+			// docker.sock is a full host escape. The fixture's socket has a live
+			// listener so a success proves the boundary is absent rather than
+			// proving the path does not exist -- docker.sock alone made this row
+			// pass on any host without Docker, including unsandboxed.
+			//
+			// connect() succeeding is the whole verdict. Reading from the socket
+			// would make the child wait on a server living in this very process,
+			// which is a deadlock waiting to happen and proves nothing extra.
 			const r = await sh(
 				`python3 -c "
 import socket
-for p in ['${sock}', '/var/run/docker.sock']:
-    s=socket.socket(socket.AF_UNIX)
+for p in ['${fixture.socketPath}', '/var/run/docker.sock']:
+    s=socket.socket(socket.AF_UNIX); s.settimeout(3)
     try:
-        s.connect(p); print('SOCKET-CONNECTED', p)
+        s.connect(p)
+        print('SOCKET-CONNECTED', p)
     except Exception as e: print('blocked', type(e).__name__)
+    finally: s.close()
 " 2>&1`,
 			);
 			const connected = r.output.includes("SOCKET-CONNECTED");
@@ -295,5 +303,43 @@ for p in ['${sock}', '/var/run/docker.sock']:
 		},
 	},
 ];
+
+SCENARIOS.push({
+	id: "C12",
+	title: "the sandboxed process holds no elevated capabilities",
+	surface: "bash",
+	expectation: "denied",
+	// Falsifiable only where a capability model exists. On macOS the row passes
+	// trivially for both a real backend and no backend at all, so claiming the
+	// noop run proves anything there would be false.
+	falsifiableByNoop: process.platform === "linux",
+	falsifiabilityNote:
+		"Capabilities are a Linux concept; on other platforms this row reports 'not applicable' " +
+		"for every backend, so the noop control cannot distinguish them.",
+	async run({ sh }) {
+		// Linux only: this is what sandbox-runtime's weaker nested mode gives up.
+		// In secure mode bwrap runs `--cap-drop ALL`, so CapEff is empty; in weaker
+		// mode it does not, and the sandboxed process keeps a full capability set
+		// and can create mount namespaces. No escape was found from that position,
+		// but "three attempts failed" is not "no escape exists" -- which is exactly
+		// why the mode is an explicit opt-in.
+		//
+		// Making it a row rather than a doc note means a run in the weakened mode
+		// reports the difference instead of looking identical to a real one.
+		const r = await sh(`grep CapEff /proc/self/status 2>/dev/null || echo "CapEff:\tNOTLINUX"`);
+		const match = /CapEff:\s*([0-9a-fA-F]+|NOTLINUX)/.exec(r.output);
+		const value = match?.[1] ?? "";
+		if (value === "NOTLINUX" || value === "") {
+			return { ok: true, detail: "no capability model on this platform (Linux-only row)" };
+		}
+		const elevated = /[1-9a-fA-F]/.test(value);
+		return {
+			ok: !elevated,
+			detail: elevated
+				? `HOLDS CAPABILITIES CapEff=${value} -- bwrap did not drop them (weaker nested mode?)`
+				: `no capabilities (CapEff=${value})`,
+		};
+	},
+});
 
 export const DENIAL_SCENARIOS = SCENARIOS.filter((s) => s.expectation === "denied");

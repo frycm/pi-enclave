@@ -10,6 +10,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Profile } from "../../src/backend/types.ts";
@@ -27,6 +28,9 @@ export const SECRET_FILE_CONTENT = "PRIVATE-KEY-CONFORMANCE-LEAK";
 /** Written outside the workspace. Scenarios check it is still intact afterwards. */
 export const OUTSIDE_FILE_CONTENT = "OUTSIDE-ORIGINAL-CONTENT";
 
+/** Sent by the probe socket. Seeing it means the sandbox did not stop the connection. */
+export const SOCKET_GREETING = "SOCKET-REACHED-CONFORMANCE";
+
 export interface Fixture {
 	/** Writable root and the command working directory. */
 	workspace: string;
@@ -36,6 +40,15 @@ export interface Fixture {
 	outside: string;
 	/** A file in `outside`, used as a symlink target for the write-through test. */
 	outsideFile: string;
+	/**
+	 * A unix socket outside the workspace with something genuinely listening.
+	 *
+	 * It has to be real. Pointing the socket scenario at a path with no listener
+	 * makes it pass everywhere -- including against a backend that enforces
+	 * nothing, because connect() fails with ENOENT rather than a denial. The
+	 * falsifiability control caught exactly that on a host without docker.sock.
+	 */
+	socketPath: string;
 	profile: Profile;
 	cleanup(): void;
 }
@@ -52,6 +65,21 @@ export function createFixture(): Fixture {
 
 	const outsideFile = join(outside, "target.txt");
 	writeFileSync(outsideFile, `${OUTSIDE_FILE_CONTENT}\n`);
+
+	// A live listener, so a successful connect() proves the boundary is absent
+	// rather than proving the socket does not exist.
+	const socketPath = join(outside, "probe.sock");
+	const server: Server = createServer((connection) => {
+		// The scenario connects and closes immediately -- a successful connect is
+		// the whole verdict -- so this write usually lands on a closed socket. A
+		// fixture that crashed the run on EPIPE would turn a passing security
+		// test into an unexplained process exit.
+		connection.on("error", () => {});
+		connection.end(`${SOCKET_GREETING}\n`);
+	});
+	server.on("error", () => {});
+	server.listen(socketPath);
+	server.unref();
 
 	writeFileSync(join(workspace, "ok.txt"), "workspace content\n");
 
@@ -75,8 +103,10 @@ export function createFixture(): Fixture {
 		deniedHome,
 		outside,
 		outsideFile,
+		socketPath,
 		profile,
 		cleanup() {
+			server.close();
 			for (const dir of [workspace, deniedHome, outside]) {
 				rmSync(dir, { recursive: true, force: true });
 			}

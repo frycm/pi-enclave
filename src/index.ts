@@ -79,7 +79,7 @@ export default function (pi: ExtensionAPI): void {
 				const lines = [
 					formatProbeReport(report),
 					"",
-					`backend:    ${backend.name}${compiled ? "" : " (not started)"}`,
+					`backend:    ${backend.name}${compiled ? "" : " (not started)"}${backend.weakened ? " [WEAKENED nested mode]" : ""}`,
 					`profile:    ${profile.mode}, network ${profile.network}`,
 					`writable:   ${profile.writableRoots.join(", ")}`,
 					`violations: ${violations.length} this session`,

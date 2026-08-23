@@ -12,7 +12,11 @@ import { NoopBackend } from "../test/conformance/noop-backend.ts";
 import { runConformance } from "../test/conformance/runner.ts";
 
 const which = process.argv[2] ?? "noop";
-const backend: SandboxBackend = which === "srt" ? new SrtBackend() : new NoopBackend();
+// PI_ENCLAVE_WEAKER_NESTED exists for running this suite inside a container,
+// where capability-bearing user namespaces are unavailable. It weakens the
+// boundary, so the report says so on its first line.
+const weaker = process.env.PI_ENCLAVE_WEAKER_NESTED === "1";
+const backend: SandboxBackend = which === "srt" ? new SrtBackend({ weakerNestedSandbox: weaker }) : new NoopBackend();
 
 const restore = plantSecrets();
 const started = Date.now();

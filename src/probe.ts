@@ -56,6 +56,19 @@ export interface ProbeEnv {
 	which: (bin: string) => string | null;
 	/** Read a file as text; null when it does not exist or cannot be read. */
 	readText: (path: string) => string | null;
+	/**
+	 * Linux only: can this host actually give bubblewrap and the seccomp layer
+	 * the capability-bearing namespaces they need?
+	 *
+	 * Functional rather than inferred. The sysctl below is one cause of failure
+	 * but not the only one -- inside a container the sysctl is absent and plain
+	 * `bwrap` succeeds, yet the nested user namespace `apply-seccomp` needs
+	 * cannot be created. Both heuristics pass there while the sandbox does not
+	 * work at all, which is the worst possible outcome for a startup gate.
+	 *
+	 * Returns null when the check could not be run (no bwrap, not Linux).
+	 */
+	canNestNamespaces?: () => { ok: boolean; detail: string } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +302,39 @@ function checkLinuxUserns(env: ProbeEnv): ProbeCheck | null {
 	};
 }
 
+/**
+ * The functional namespace check.
+ *
+ * Runs the same chain sandbox-runtime does -- bubblewrap creating a
+ * capability-dropped user namespace, then the seccomp helper creating a nested
+ * one inside it. Anything that breaks that chain breaks every command, so it is
+ * worth one subprocess at startup to say so in a sentence rather than let the
+ * first tool call fail with a uid_map error.
+ */
+function checkNamespaceNesting(env: ProbeEnv): ProbeCheck | null {
+	const result = env.canNestNamespaces?.();
+	if (!result) return null;
+
+	if (result.ok) {
+		return {
+			id: "linux-namespace-nesting",
+			title: "Namespace nesting",
+			status: "ok",
+			detail: result.detail,
+		};
+	}
+	return {
+		id: "linux-namespace-nesting",
+		title: "Namespace nesting",
+		status: "fail",
+		detail: result.detail,
+		remediation:
+			"bubblewrap and the seccomp layer both need capability-bearing user namespaces. " +
+			"Inside a container this usually means the container itself is nested or unprivileged; " +
+			"run pi-enclave on the host, or use a privileged container.",
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -302,6 +348,13 @@ export function probe(env: ProbeEnv): ProbeReport {
 		if (env.platform === "linux") {
 			const userns = checkLinuxUserns(env);
 			if (userns) checks.push(userns);
+			// Only worth running when the sysctl has not already explained the
+			// failure, and only when the binaries it needs are present.
+			const alreadyFailed = checks.some((check) => check.status === "fail");
+			if (!alreadyFailed) {
+				const nesting = checkNamespaceNesting(env);
+				if (nesting) checks.push(nesting);
+			}
 		}
 	}
 

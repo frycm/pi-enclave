@@ -19,9 +19,22 @@ import { type ConformanceRow, formatRows, runConformance } from "./runner.ts";
 import { SCENARIOS } from "./scenarios.ts";
 
 const report = probeHost("0.84.2");
+
+/**
+ * Inside a container, capability-bearing user namespaces are unavailable and
+ * sandbox-runtime's weaker nested mode is the only way to run at all. It is an
+ * explicit opt-in, never inferred: see SrtBackendOptions.weakerNestedSandbox.
+ */
+const weakerNested = process.env.PI_ENCLAVE_WEAKER_NESTED === "1";
+
 // A host that cannot support the sandbox produces N identical failures with no
-// common explanation. Skip with the probe's own diagnosis instead.
-const supported = report.ok && (process.platform === "darwin" || process.platform === "linux");
+// common explanation. Skip with the probe's own diagnosis instead -- except when
+// the only failing check is namespace nesting and weaker mode was requested,
+// which is precisely the case that mode exists for.
+const blocking = report.checks.filter(
+	(check) => check.status === "fail" && !(weakerNested && check.id === "linux-namespace-nesting"),
+);
+const supported = blocking.length === 0 && (process.platform === "darwin" || process.platform === "linux");
 
 describe.skipIf(!supported)("conformance: sandbox-runtime backend", () => {
 	let backend: SrtBackend;
@@ -30,7 +43,7 @@ describe.skipIf(!supported)("conformance: sandbox-runtime backend", () => {
 
 	beforeAll(async () => {
 		restoreSecrets = plantSecrets();
-		backend = new SrtBackend();
+		backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
 		rows = await runConformance(backend, createFixture);
 	}, 300_000);
 
@@ -94,7 +107,7 @@ describe.skipIf(!supported)("stale profile guard", () => {
 		// manager's current configuration and ignores whatever CompiledProfile the
 		// caller passed. Without this guard, holding on to an older profile would
 		// silently execute under the newer -- possibly wider -- one.
-		const backend = new SrtBackend();
+		const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
 		const fixture = createFixture();
 		try {
 			const first = await backend.compile(fixture.profile);
@@ -111,7 +124,7 @@ describe.skipIf(!supported)("stale profile guard", () => {
 	}, 60_000);
 
 	it("rejects a profile compiled by something else entirely", async () => {
-		const backend = new SrtBackend();
+		const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
 		try {
 			await expect(
 				backend.run(
