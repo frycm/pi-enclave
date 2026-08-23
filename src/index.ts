@@ -63,13 +63,40 @@ import {
 import { runSandboxedGrep } from "./tools/grep.ts";
 
 /**
- * The path pi reports for tools this file registers.
+ * A fallback spelling of this module's path.
  *
- * pi records the extension's own module path in `sourceInfo`, so the ownership
- * check compares against this rather than a name -- a name is something another
- * extension can also claim.
+ * Only a fallback: pi stores an extension's `sourceInfo.path` as the path it
+ * was *configured* with (a package spec, a relative `-e` argument, a symlink),
+ * which is not in general the resolved module URL. Comparing owned tools to
+ * this resolved path made the ownership check refuse to start on every normal
+ * install and matched only when the extension was loaded by its exact absolute
+ * path. `resolveOwnPath` learns pi's actual spelling at runtime; this is used
+ * only when that cannot be determined unambiguously.
  */
 const OWN_SOURCE_PATH = fileURLToPath(import.meta.url);
+
+/**
+ * pi's own spelling of this extension's `sourceInfo.path`, learned from a
+ * command we registered.
+ *
+ * Every tool and command a single extension registers shares one `sourceInfo`,
+ * so the `enclave` command's path is the path our tools should have. Reading it
+ * back from `getCommands()` sidesteps the configured-vs-resolved mismatch
+ * entirely. If the name is ambiguous -- another extension squatting `enclave`,
+ * which pi would suffix -- there is more than one candidate path and we return
+ * undefined, leaving the caller to fall back.
+ */
+function resolveOwnPath(pi: ExtensionAPI): string | undefined {
+	const commands = pi.getCommands?.() ?? [];
+	const paths = new Set<string>();
+	for (const command of commands) {
+		if (command.name === "enclave" || command.name.startsWith("enclave:")) {
+			const path = command.sourceInfo?.path;
+			if (path) paths.add(path);
+		}
+	}
+	return paths.size === 1 ? [...paths][0] : undefined;
+}
 
 /** The text of a user message, whatever content shape pi used for it. */
 function messageText(message: { content?: unknown }): string {
@@ -114,7 +141,10 @@ export default function (pi: ExtensionAPI): void {
 	 * executing any of them: a call gated before something went wrong is already
 	 * prepared when it does, and blocking cannot un-prepare it.
 	 */
-	const breaker = new CircuitBreaker({ consecutive: 3, window: [10, 50] });
+	// Built with the defaults until the fold runs; session_start rebuilds it
+	// from the configured thresholds. A `let` so that rebuild is visible to the
+	// closures below, which read `breaker` at call time rather than capturing it.
+	let breaker = new CircuitBreaker({ consecutive: 3, window: [10, 50] });
 	const directInput = new ProvenanceTracker();
 	const lock = new ActionLock({ breakerOpen: () => breaker.open });
 
@@ -285,6 +315,28 @@ export default function (pi: ExtensionAPI): void {
 		guard: guardCommand,
 	});
 
+	/**
+	 * Operations for the `!`/`!!` shortcut.
+	 *
+	 * `user_bash` is delivered on its own event and never goes through the
+	 * `tool_call` gate, so no lock entry is ever registered for it -- and pi
+	 * prepends a shell prefix before calling `exec`, so the command string would
+	 * not match a registered key anyway. Using the gated `operations` here threw
+	 * a LockViolation on every `!command`. The shortcut is direct human input, so
+	 * it runs sandboxed (L2) with a breaker check but no lock lookup; the breaker
+	 * still stops it once a turn has been shut down.
+	 */
+	const userBashOperations = createEnclaveBashOperations({
+		backend,
+		getCompiled: requireCompiled,
+		onViolations: recordViolations,
+		guard: () => {
+			if (effective?.auto && breaker.open) {
+				throw new Error("pi-enclave: the denial circuit breaker is open; this turn is over.");
+			}
+		},
+	});
+
 	const fsClient = () => backend.fs(requireCompiled());
 
 	// Registered unconditionally. pi's registry starts with every built-in tool
@@ -297,12 +349,14 @@ export default function (pi: ExtensionAPI): void {
 		const base = createBashTool(cwd, { operations });
 		pi.registerTool({ ...base, label: "bash (sandboxed)", promptGuidelines: BASH_PROMPT_GUIDELINES });
 
-		// `!` and `!!` reach the same operations object rather than a parallel
-		// path, so there is no shortcut that bypasses the sandbox by construction.
+		// `!` and `!!` run through the sandbox by construction, but not through the
+		// policy gate: they arrive on their own event with no `tool_call`, so they
+		// get `userBashOperations` (sandboxed, breaker-checked, no lock lookup)
+		// rather than the gated `operations`, which would refuse them as unlocked.
 		// With no sandbox the shortcut is answered outright rather than left to a
 		// throwing exec, so the user sees the diagnosis and not a stack trace.
 		pi.on("user_bash", () => {
-			if (report.ok) return { operations };
+			if (report.ok) return { operations: userBashOperations };
 			return {
 				result: {
 					output: `pi-enclave: refusing to run unsandboxed.\n${formatProbeReport(report)}\n`,
@@ -372,7 +426,13 @@ export default function (pi: ExtensionAPI): void {
 				toolSource: (tool) => pi.getAllTools?.().find((entry) => entry.name === tool)?.sourceInfo?.path,
 				breakerOpen: () => breaker.open,
 				onDecision: (result) => {
-					if (effective?.auto) breaker.record(currentTurn, result.adverse);
+					// A breaker-open decision is not evidence: the breaker already
+					// opened, and feeding this turn back in as a (non-adverse) outcome
+					// would reset the consecutive counter at turn_end and quietly close
+					// the breaker again -- handing the agent fresh attempts at exactly
+					// the outcome the breaker exists to stop. Only real gate decisions
+					// count.
+					if (effective?.auto && result.outcome !== "breaker-open") breaker.record(currentTurn, result.adverse);
 					if (!result.action) {
 						audit?.append("decision", {
 							outcome: result.outcome,
@@ -488,7 +548,7 @@ export default function (pi: ExtensionAPI): void {
 		// only actionable once we know auto mode was going to start at all.
 		const problems = checkOwnership({
 			tools: pi.getAllTools?.() ?? [],
-			ownPath: OWN_SOURCE_PATH,
+			ownPath: resolveOwnPath(pi) ?? OWN_SOURCE_PATH,
 			cwd,
 			projectTrusted: ctx.isProjectTrusted(),
 		});
@@ -593,6 +653,14 @@ export default function (pi: ExtensionAPI): void {
 		// tripped it.
 		directInput.reset();
 		lock.reset();
+		// Rebuilt from the configured thresholds now that the fold has run, then
+		// restored from the session's persisted state. Building it here rather
+		// than at load is what makes `breaker.consecutive` / `window` actually
+		// take effect and keeps the status line's reported limit honest.
+		breaker = new CircuitBreaker({
+			consecutive: loaded.profile.breaker.consecutive,
+			window: [...loaded.profile.breaker.window],
+		});
 		for (const entry of ctx.sessionManager.getEntries()) {
 			if (entry.type !== "custom" || entry.customType !== BREAKER_ENTRY_TYPE) continue;
 			if (isBreakerState(entry.data)) breaker.restore(entry.data);
@@ -604,8 +672,13 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		// Flush, then dispose, then flush once more: tearing the backend down can
+		// deliver a last `onFsViolation` (a denial during teardown), which queues
+		// an audit append that the first flush has already passed. The second
+		// flush is what keeps that final record from being lost on exit.
 		await audit?.flush();
 		await backend.dispose();
+		await audit?.flush();
 	});
 
 	pi.registerCommand("enclave", {

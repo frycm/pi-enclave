@@ -80,7 +80,13 @@ export interface LockOptions {
 }
 
 export class ActionLock {
-	private readonly byKey = new Map<string, LockEntry>();
+	// A key maps to *every* entry registered under it, not one: two identical
+	// calls in a batch (same command, same path) canonicalize to the same keys,
+	// and a single-value map let the second registration overwrite the first, so
+	// one call could execute under the other's entry -- including one carrying an
+	// `approved` flag from a resumed record. beginExecution picks the first entry
+	// still available.
+	private readonly byKey = new Map<string, LockEntry[]>();
 	private readonly byToolCall = new Map<string, LockEntry>();
 	private readonly options: LockOptions;
 
@@ -91,13 +97,17 @@ export class ActionLock {
 	/** Record an action as permitted to execute. */
 	register(action: CanonicalAction, toolCallId: string, approved = false): LockEntry {
 		const entry: LockEntry = { action, toolCallId, state: "locked", executions: 0, ...(approved ? { approved } : {}) };
-		for (const key of executionKeys(action)) this.byKey.set(key, entry);
+		for (const key of executionKeys(action)) {
+			const list = this.byKey.get(key);
+			if (list) list.push(entry);
+			else this.byKey.set(key, [entry]);
+		}
 		this.byToolCall.set(toolCallId, entry);
 		return entry;
 	}
 
 	get(key: string): LockEntry | undefined {
-		return this.byKey.get(key);
+		return this.byKey.get(key)?.[0];
 	}
 
 	/**
@@ -109,14 +119,17 @@ export class ActionLock {
 	 * a boolean would have to be checked, and an unchecked boolean is a hole.
 	 */
 	beginExecution(key: string): LockEntry {
-		const entry = this.byKey.get(key);
-		if (!entry) {
+		const list = this.byKey.get(key);
+		if (!list || list.length === 0) {
 			throw new LockViolation(
 				"not-locked",
 				"pi-enclave: this call did not pass the policy gate, so it will not run. This is a bug in pi-enclave or another extension reached the tool directly.",
 			);
 		}
-		if (entry.state === "consumed") {
+		// The first entry not yet finished. Two identical calls each find their
+		// own; a lone entry already consumed reports it rather than re-running.
+		const entry = list.find((candidate) => candidate.state !== "consumed");
+		if (!entry) {
 			throw new LockViolation(
 				"already-consumed",
 				"pi-enclave: this action has already run once and will not be repeated.",
@@ -154,10 +167,14 @@ export class ActionLock {
 	 * than ours. Every spelling is registered and every spelling is tried.
 	 */
 	beginPathExecution(tool: string, path: string): LockEntry {
-		const candidates = [path, normalizePath(path), canonical(path)];
-		for (const candidate of candidates) {
+		// The cheap spellings first; `canonical` (a realpath walk) is computed
+		// only if they miss, since the registered `raw`/`typed` keys almost always
+		// match one of the first two.
+		for (const candidate of [path, normalizePath(path)]) {
 			if (this.byKey.has(`${tool}:${candidate}`)) return this.beginExecution(`${tool}:${candidate}`);
 		}
+		const resolved = canonical(path);
+		if (this.byKey.has(`${tool}:${resolved}`)) return this.beginExecution(`${tool}:${resolved}`);
 		// Report against the path as given: that is the one the caller can see.
 		return this.beginExecution(`${tool}:${path}`);
 	}

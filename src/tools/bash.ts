@@ -80,9 +80,15 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 		async exec(command, cwd, execOptions) {
 			options.guard?.(command);
 			const compiled = getCompiled();
+			// The compiled profile's env settings are the configured ones and win;
+			// the static options remain only as a fallback for callers (tests, the
+			// benchmark) that build operations without a folded config. Passing
+			// them here rather than at construction is what lets the live session
+			// honour `sandbox.env.passthrough` / `envDeny`, which an earlier version
+			// silently dropped.
 			const env = buildChildEnv(process.env, {
-				...(passthrough ? { passthrough } : {}),
-				...(envDeny ? { envDeny } : {}),
+				passthrough: compiled.profile.envPassthrough ?? passthrough ?? [],
+				envDeny: compiled.profile.envDeny ?? envDeny ?? [],
 				readDeny: compiled.profile.readDeny,
 			});
 

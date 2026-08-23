@@ -297,6 +297,23 @@ describe("the lock", () => {
 			expect(() => lock.beginExecution("bash:ls")).toThrow(/already run once/);
 		});
 
+		// Two identical commands in one batch canonicalize to the same key; a
+		// single-value table let the second registration orphan the first, so one
+		// call could run under the other's entry. Each must find its own.
+		it("keeps a separate entry for each of two identical calls", () => {
+			const lock = new ActionLock();
+			lock.register(action, "c1");
+			lock.register(action, "c2");
+			const first = lock.beginExecution("bash:ls");
+			lock.consume("c1");
+			const second = lock.beginExecution("bash:ls");
+			expect(first.toolCallId).toBe("c1");
+			expect(second.toolCallId).toBe("c2");
+			lock.consume("c2");
+			// Both spent now; a third finds nothing available.
+			expect(() => lock.beginExecution("bash:ls")).toThrow(/already run once/);
+		});
+
 		// The window pi's prepare-all-then-execute batching opens: this call was
 		// gated before the breaker tripped and is already prepared.
 		it("refuses when the breaker opened after the call was locked", () => {

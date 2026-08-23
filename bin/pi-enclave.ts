@@ -70,12 +70,17 @@ async function main(argv: string[]): Promise<number> {
 /**
  * The configuration as a session would see it.
  *
- * `projectTrusted: false` on purpose. This process is not a pi session and has
- * no trust answer to consult, and assuming trust would let a repository's
- * config file influence a command the user runs *about* that repository.
+ * `projectTrusted: true` on purpose. A session that wrote a pending record
+ * folded the project files in, so its `profileSnapshot` already reflects any
+ * narrowing they add; dropping them here made the CLI's profile strictly *wider*
+ * than the snapshot, and `checkResume`'s narrower-or-equal test then refused
+ * every approval from any repo that configures policy. It is safe to apply them
+ * because the monotonic fold lets a project file only tighten, never widen — so
+ * reading them can only make the resume profile the same or narrower, never a
+ * grant nobody approved.
  */
 function currentConfig(cwd: string) {
-	const loaded = loadConfig({ cwd, projectTrusted: false });
+	const loaded = loadConfig({ cwd, projectTrusted: true });
 	if (!loaded.ok) {
 		process.stderr.write(`${loaded.message}\n`);
 		return undefined;

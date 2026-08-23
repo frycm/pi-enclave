@@ -105,4 +105,43 @@ describe("parseShell", () => {
 	it("ignores empty segments from trailing separators", () => {
 		expect(names("ls ; ")).toEqual(["ls"]);
 	});
+
+	// A redirect glued to the preceding word was kept as one token, so the target
+	// was never seen as a write and protectedPaths never fired.
+	describe("glued redirects", () => {
+		it("splits an operator joined to a word", () => {
+			const parsed = parseShell("cat payload>>.git/hooks/pre-commit");
+			expect(parsed.commands[0]?.name).toBe("cat");
+			expect(parsed.commands[0]?.redirects).toEqual([{ op: ">>", target: ".git/hooks/pre-commit", writes: true }]);
+		});
+
+		it("keeps an fd prefix on the operator", () => {
+			expect(parseShell("cmd 2>err").commands[0]?.redirects).toEqual([{ op: "2>", target: "err", writes: true }]);
+			expect(parseShell("cmd 2>>err").commands[0]?.redirects[0]?.op).toBe("2>>");
+		});
+
+		it("does not split process substitution as a glued redirect", () => {
+			// The `<(` guard keeps the new word-splitting from firing; process
+			// substitution is non-confident anyway, which is what actually matters.
+			expect(parseShell("diff <(a) <(b)").confident).toBe(false);
+		});
+	});
+
+	// A command wrapper hides the real command from a rule anchored on it, so it
+	// is marked non-confident and the gate escalates rather than guess.
+	describe("wrappers", () => {
+		it.each([
+			["env rm -rf /", "env"],
+			["nohup sudo sh", "nohup"],
+			["timeout 30 rm -rf .", "timeout"],
+			["/usr/bin/env curl x", "path-qualified env"],
+			["bash -lc 'git push'", "clustered -lc"],
+		])("%s is not confident (%s)", (command) => {
+			expect(parseShell(command).confident).toBe(false);
+		});
+
+		it("bare env with no command stays confident", () => {
+			expect(parseShell("env").confident).toBe(true);
+		});
+	});
 });

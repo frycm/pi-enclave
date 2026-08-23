@@ -147,11 +147,15 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 		};
 	}
 
+	// Resolved once: in the wiring this is a fresh `getAllTools()` allocation and
+	// a linear scan, and it ran twice per gated call for the `!== undefined` test
+	// and then the value.
+	const toolSource = deps.toolSource?.(action.tool);
 	const disposition = checkTool({
 		tool: action.tool,
 		tools: profile.tools,
 		owned: deps.owned,
-		...(deps.toolSource?.(action.tool) !== undefined ? { source: deps.toolSource(action.tool) as string } : {}),
+		...(toolSource !== undefined ? { source: toolSource } : {}),
 	});
 	if (!disposition.allowed) {
 		return {

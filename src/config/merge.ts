@@ -14,9 +14,14 @@
  * already inside a root it had. Writing them as one generic "subset" rule was
  * the first version and it was wrong in both directions.
  *
- * **The built-in → user-global step is not checked.** The user's own file is
- * the most trusted source there is; it defines the ceiling that everything
- * after it is measured against. The fold checks the three steps below it.
+ * **Each step is checked against the profile it received, not a fixed ceiling.**
+ * The user's own file is the most trusted source and is not itself measured
+ * against anything. Every source below it must be at most as permissive as the
+ * profile produced by the source immediately above it -- which is what the
+ * "the one it received" wording means, and is strictly stronger than checking
+ * against the user-global result alone: it also stops a less-trusted source
+ * (project-shared) from undoing a more-trusted one's (project-local) narrowing.
+ * Transitivity still guarantees everything ends up ⊑ the user-global profile.
  *
  * **Nothing is clamped.** A violation rejects the whole file and names the
  * field. A clamped value is one the user believes they set.
@@ -425,8 +430,6 @@ export function fold(documents: readonly ConfigDocument[], options: DefaultProfi
 	let current = builtin;
 	/** Profiles the user-global file defined, available for later selection. */
 	let defined: Record<string, ProfilePatch> = {};
-	/** The ceiling every less-trusted source is measured against. */
-	let ceiling = builtin;
 	let seenUserGlobal = false;
 
 	for (const document of documents) {
@@ -436,6 +439,16 @@ export function fold(documents: readonly ConfigDocument[], options: DefaultProfi
 			if (document.path !== undefined) error.path = document.path;
 			errors.push(error);
 		};
+
+		// The profile this source was handed, before any of its own mutations.
+		// The order is checked against *this*, not only against the user-global
+		// ceiling: the promise is "at most as permissive as the one it received",
+		// and checking against the ceiling alone let a less-trusted source undo a
+		// more-trusted one's narrowing (project-shared reverting project-local, or
+		// a project re-selecting a profile to revert PI_ENCLAVE_ATTENDED=off) as
+		// long as the result stayed under the ceiling. Checking against `received`
+		// is strictly stronger and still implies `⊑ ceiling` by transitivity.
+		const received = current;
 
 		if (document.auto === false) current = { ...current, auto: false };
 
@@ -476,13 +489,12 @@ export function fold(documents: readonly ConfigDocument[], options: DefaultProfi
 		}
 
 		if (source === "user_global") {
-			// The user's own file *is* the ceiling. Checking it against the
-			// built-in defaults would mean a user could never widen anything,
-			// which is the opposite of what the configuration table says.
+			// The user's own file is the most trusted source: it sets the ceiling
+			// and is not itself measured against anything. Checking it against the
+			// built-in defaults would mean a user could never widen anything.
 			seenUserGlobal = true;
-			ceiling = current;
 		} else if (seenUserGlobal || source !== "builtin") {
-			for (const violation of narrowerOrEqual(current, ceiling)) {
+			for (const violation of narrowerOrEqual(current, received)) {
 				fail(violation.field, violation.message);
 			}
 		}

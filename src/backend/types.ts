@@ -44,6 +44,21 @@ export interface Profile {
 	 * and the compiled profile reports `true` there whatever was requested.
 	 */
 	allowPty: boolean;
+	/**
+	 * Host environment names copied into the child, by exact name, on top of the
+	 * base set. Configured through `sandbox.env.passthrough`.
+	 *
+	 * This lives on the backend profile because the child environment is built
+	 * inside `run` and `fs` -- the only place the values are needed -- so the
+	 * backend has to carry them. Optional so a Phase-1 profile built without a
+	 * config loader still compiles; absent means "none".
+	 */
+	envPassthrough?: readonly string[];
+	/**
+	 * Extra credential-name patterns stripped from the child, on top of the
+	 * built-in list. Configured through `sandbox.env.envDeny`.
+	 */
+	envDeny?: readonly string[];
 }
 
 /**

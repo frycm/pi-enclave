@@ -77,14 +77,26 @@ export function globToRegExp(pattern: string): RegExp {
 		if (char === "[") {
 			const close = pattern.indexOf("]", i + 1);
 			if (close > i) {
-				out += pattern.slice(i, close + 1);
+				// A POSIX glob negates a class with a leading `!` (`[!c]`); a regex
+				// uses `^`. Copied verbatim, `[!c]` matched a literal `!` or `c`
+				// instead of negating, so a `protectedPaths` pattern like
+				// `infra/[!c]*` silently failed to escalate.
+				let cls = pattern.slice(i, close + 1);
+				if (cls.startsWith("[!")) cls = `[^${cls.slice(2)}`;
+				out += cls;
 				i = close;
 				continue;
 			}
 		}
 		out += char.replace(/[.+^${}()|[\]\\]/g, "\\$&");
 	}
-	return new RegExp(`^${out}$`);
+	// Case-insensitive to match the `deny`/`ask` wildcard matcher, and because
+	// on a case-insensitive filesystem (macOS, Windows) `dockerfile` and
+	// `Dockerfile` are the same file -- a case-sensitive protected-path glob let
+	// a case-variant spelling slip past the escalation. Over-matching a distinct
+	// file on a case-sensitive filesystem only costs an extra ask, the direction
+	// this layer already errs in.
+	return new RegExp(`^${out}$`, "i");
 }
 
 const globCache = new Map<string, RegExp>();

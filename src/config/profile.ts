@@ -21,6 +21,8 @@ export function toBackendProfile(effective: EffectiveProfile): Profile {
 		readDeny: [...effective.sandbox.readDeny],
 		network: effective.sandbox.network.mode,
 		allowPty: effective.sandbox.allowPty,
+		envPassthrough: [...effective.sandbox.env.passthrough],
+		envDeny: [...effective.sandbox.env.envDeny],
 	};
 }
 

@@ -50,6 +50,37 @@ describe("canonicalize", () => {
 		it("finds a path inside a --flag=value argument", () => {
 			expect(bash("tool --output=/work/out").paths.map((path) => path.typed)).toContain("/work/out");
 		});
+
+		// A redirect glued to a word must still be seen as a write, or a protected
+		// path can be appended to with no escalation.
+		it("records a glued redirect target as a write", () => {
+			const target = bash("cat p>>.git/hooks/pre-commit").paths.find((path) => path.typed.endsWith("pre-commit"));
+			expect(target?.writes).toBe(true);
+		});
+
+		// A bare filename operand of a writer command is a possible protected
+		// target; `tee authorized_keys` writes the same file as `tee ./authorized_keys`.
+		it("records a bare filename operand of a writer command", () => {
+			expect(bash("tee authorized_keys").paths.map((path) => path.relative)).toContain("authorized_keys");
+		});
+
+		it("does not turn a non-writer command's bare word into a path", () => {
+			// A commit message word is not a file target.
+			expect(bash("git commit -m message").paths).toHaveLength(0);
+		});
+	});
+
+	// ls/find default their path to the working directory; recording it keeps the
+	// lock key in step so the bare call is not refused at execute time.
+	describe("ls/find default path", () => {
+		it("records the working directory when path is omitted", () => {
+			expect(file("ls", {}).paths.map((path) => path.typed)).toEqual(["/work"]);
+			expect(file("find", { pattern: "*.ts" }).paths.map((path) => path.typed)).toEqual(["/work"]);
+		});
+
+		it("uses the explicit path when given", () => {
+			expect(file("ls", { path: "src" }).paths[0]?.typed).toBe("/work/src");
+		});
 	});
 
 	describe("capabilities", () => {
@@ -134,6 +165,20 @@ describe("globs", () => {
 		["**/Dockerfile", "deploy/Dockerfile", true],
 	])("%s against %s", (pattern, path, expected) => {
 		expect(globToRegExp(pattern).test(path)).toBe(expected);
+	});
+
+	// `[!c]` is a POSIX negation; copied verbatim it matched a literal `!`.
+	it("negates a [!…] character class", () => {
+		const regex = globToRegExp("infra/[!c]*");
+		expect(regex.test("infra/main")).toBe(true);
+		expect(regex.test("infra/config")).toBe(false);
+	});
+
+	// Case-insensitive so a case-variant spelling of a protected file on a
+	// case-insensitive filesystem still matches.
+	it("matches case-insensitively", () => {
+		expect(globToRegExp("**/Dockerfile").test("deploy/dockerfile")).toBe(true);
+		expect(globToRegExp("**/.git/config").test("repo/.git/CONFIG")).toBe(true);
 	});
 });
 

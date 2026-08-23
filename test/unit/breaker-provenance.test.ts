@@ -124,6 +124,28 @@ describe("the circuit breaker", () => {
 	it("names the outcome rather than the command", () => {
 		expect(steerMessage()).toContain("Do not pursue this outcome by other means");
 	});
+
+	// The gate must not feed its own breaker-open decisions back in: recording a
+	// turn of nothing-but-breaker-open as a (non-adverse) success would reset the
+	// consecutive count and close the breaker again with no human input. This
+	// mirrors what index.ts does -- skip recording when outcome is breaker-open.
+	it("stays open across a turn that only produced breaker-open decisions", () => {
+		const breaker = new CircuitBreaker({ consecutive: 3, window: [10, 50] });
+		for (let turn = 0; turn < 3; turn++) {
+			breaker.record(turn, true);
+			breaker.finishTurn(turn);
+		}
+		expect(breaker.open).toBe(true);
+
+		// Next turn: the gate short-circuits every call as breaker-open and, per
+		// index.ts, records nothing for those. So the turn has no recorded outcome.
+		breaker.finishTurn(3);
+		expect(breaker.open).toBe(true);
+
+		// Only a direct user message clears it.
+		breaker.reset();
+		expect(breaker.open).toBe(false);
+	});
 });
 
 describe("provenance", () => {

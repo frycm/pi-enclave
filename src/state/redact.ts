@@ -24,7 +24,7 @@
  *   the pattern list does not recognize.
  */
 import { createHash } from "node:crypto";
-import { isUnderAny } from "../backend/paths.ts";
+import { canonical, isUnder } from "../backend/paths.ts";
 
 /** Keys whose values are file contents rather than arguments. */
 const BODY_KEYS = new Set([
@@ -88,20 +88,40 @@ export interface RedactOptions {
  * secrets are replaced.
  */
 export function redact(value: unknown, options: RedactOptions = {}, key?: string): unknown {
-	if (typeof value === "string") {
-		if (key !== undefined && BODY_KEYS.has(key)) {
-			// The length is kept because it is the one thing about a file body
-			// that is useful in an audit record and cannot leak anything.
-			return `${redactedMarker(value)} (${value.length} chars)`;
+	// The denied roots are resolved once here, not per token: `canonical` does a
+	// `realpathSync` walk, and doing it for every root for every path-shaped
+	// token of every record put a synchronous filesystem probe on the tool-call
+	// path (~15 default roots, several nonexistent). Resolving them once and
+	// comparing against both spellings keeps the same symlink-awareness with no
+	// per-token realpath.
+	const denyRoots = resolveDenyRoots(options.readDeny);
+	const walk = (input: unknown, k?: string): unknown => {
+		if (typeof input === "string") {
+			if (k !== undefined && BODY_KEYS.has(k)) {
+				// The length is kept because it is the one thing about a file body
+				// that is useful in an audit record and cannot leak anything.
+				return `${redactedMarker(input)} (${input.length} chars)`;
+			}
+			return redactString(redactDenyPaths(input, denyRoots));
 		}
-		const withPaths = redactDenyPaths(value, options.readDeny);
-		return redactString(withPaths);
+		if (Array.isArray(input)) return input.map((entry) => walk(entry, k));
+		if (input && typeof input === "object") {
+			return Object.fromEntries(Object.entries(input).map(([kk, v]) => [kk, walk(v, kk)]));
+		}
+		return input;
+	};
+	return walk(value, key);
+}
+
+/** Raw roots plus their canonical spellings, de-duplicated, resolved once. */
+function resolveDenyRoots(readDeny?: readonly string[]): string[] {
+	if (!readDeny || readDeny.length === 0) return [];
+	const roots = new Set<string>();
+	for (const root of readDeny) {
+		roots.add(root);
+		roots.add(canonical(root));
 	}
-	if (Array.isArray(value)) return value.map((entry) => redact(entry, options, key));
-	if (value && typeof value === "object") {
-		return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redact(v, options, k)]));
-	}
-	return value;
+	return [...roots];
 }
 
 /**
@@ -111,14 +131,17 @@ export function redact(value: unknown, options: RedactOptions = {}, key?: string
  * into a partially-masked string that is neither readable nor safe, and
  * containment is the same whole-segment comparison the sandbox uses.
  */
-function redactDenyPaths(value: string, readDeny?: readonly string[]): string {
-	if (!readDeny || readDeny.length === 0) return value;
+function redactDenyPaths(value: string, denyRoots: readonly string[]): string {
+	if (denyRoots.length === 0) return value;
 	return value
 		.split(/(\s+)/)
 		.map((token) => {
 			const bare = token.replace(/^["'`]|["'`,;:]$/g, "");
 			if (bare.length < 2 || !bare.startsWith("/")) return token;
-			return isUnderAny(bare, readDeny) ? token.replace(bare, redactedMarker(bare)) : token;
+			// `denyRoots` already contains each root's canonical spelling, so a
+			// plain containment check keeps the symlink-awareness `isUnderAny`
+			// gave without re-resolving anything here.
+			return denyRoots.some((root) => isUnder(bare, root)) ? token.replace(bare, redactedMarker(bare)) : token;
 		})
 		.join("");
 }

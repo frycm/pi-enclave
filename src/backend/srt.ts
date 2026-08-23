@@ -569,7 +569,15 @@ export class SrtBackend implements SandboxBackend {
 			// helper has no network and cannot fetch a missing tool, so the lookup
 			// has to happen on this side while it still can.
 			env: {
-				...buildChildEnv(process.env, { readDeny: compiled.profile.readDeny }),
+				...buildChildEnv(process.env, {
+					readDeny: compiled.profile.readDeny,
+					// The helper reads files on the agent's behalf, so it must honour
+					// the same configured passthrough/envDeny the shell does; without
+					// these a user's custom envDeny protected bash but not the file
+					// helper, which reads through /proc/self/environ just as readily.
+					...(compiled.profile.envPassthrough ? { passthrough: compiled.profile.envPassthrough } : {}),
+					...(compiled.profile.envDeny ? { envDeny: compiled.profile.envDeny } : {}),
+				}),
 				...resolveSearchTools(),
 			},
 			stdio: ["pipe", "pipe", "pipe"],

@@ -291,6 +291,67 @@ describe("fold", () => {
 		expect(result.profile.sandbox).toEqual(base().sandbox);
 	});
 
+	// Each source is measured against the profile it received, not just the
+	// user-global ceiling, so a less-trusted source cannot undo a more-trusted
+	// one's narrowing even while staying under the ceiling.
+	describe("no source undoes a more-trusted narrowing", () => {
+		it("a project cannot revert an env attendance narrowing", () => {
+			const userGlobal: ConfigDocument = {
+				source: "user_global",
+				profile: "dev",
+				profiles: { dev: { attended: { mode: "tui" } } },
+			};
+			const result = fold(
+				[
+					{ source: "builtin" },
+					userGlobal,
+					{ source: "env", patch: { attended: { mode: "off" } } },
+					// Re-selecting the profile would rebuild attended back to tui.
+					{ source: "project_local", profile: "dev", path: "/work/.pi/enclave.local.json" },
+				],
+				OPTIONS,
+			);
+			expect(result.ok).toBe(false);
+			if (result.ok) return;
+			expect(result.errors[0]?.field).toBe("attended.mode");
+		});
+
+		it("project-shared cannot undo a project-local tool tightening", () => {
+			const userGlobal: ConfigDocument = {
+				source: "user_global",
+				profile: "dev",
+				profiles: { dev: { tools: { allow: { deploy: {} } } } },
+			};
+			const result = fold(
+				[
+					{ source: "builtin" },
+					userGlobal,
+					{ source: "project_local", patch: { tools: { allow: { deploy: { reviewed: true } } } } },
+					// Re-widening the grant back to a plain allow, still ≤ ceiling.
+					{ source: "project_shared", patch: { tools: { allow: { deploy: {} } } } },
+				],
+				OPTIONS,
+			);
+			expect(result.ok).toBe(false);
+			if (result.ok) return;
+			expect(result.errors[0]?.field).toBe("tools.allow.deploy");
+		});
+
+		it("still accepts a genuine successive narrowing", () => {
+			const result = fold(
+				[
+					{ source: "builtin" },
+					doc("user_global", { rules: { deny: ["bash(a)"] } }),
+					doc("project_local", { rules: { deny: ["bash(b)"] } }),
+					doc("project_shared", { rules: { deny: ["bash(c)"] } }),
+				],
+				OPTIONS,
+			);
+			if (!result.ok) throw new Error(JSON.stringify(result.errors));
+			expect(result.profile.rules.deny).toEqual(expect.arrayContaining(["bash(a)", "bash(b)", "bash(c)"]));
+		});
+	});
+
 	it("refuses a writable root containing the state directory", () => {
 		const result = fold(
 			[{ source: "builtin" }, doc("user_global", { sandbox: { writableRoots: ["/home/u/.pi/agent"] } })],

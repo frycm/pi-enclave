@@ -218,6 +218,36 @@ describe("approving a record", () => {
 		expect(backend.writes).toEqual([{ path: "/work/notes.md", content: "hello" }]);
 	});
 
+	// A relative path must resolve against the *session's* cwd, not the CLI's, or
+	// the file lands somewhere other than what the approver read.
+	it("resolves a relative write against the record's cwd", async () => {
+		const backend = new RecordingBackend();
+		await approve({
+			record: record("write", { path: "notes.md", content: "hi" }),
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: io().make(true),
+			backend,
+		});
+		expect(backend.writes).toEqual([{ path: "/work/notes.md", content: "hi" }]);
+	});
+
+	// pi's write tool uses `file_path`; canonicalize accepts it, so approve must too.
+	it("accepts the file_path key", async () => {
+		const backend = new RecordingBackend();
+		const result = await approve({
+			record: record("write", { file_path: "/work/x", content: "y" }),
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: io().make(true),
+			backend,
+		});
+		expect(result.outcome).toBe("executed");
+		expect(backend.writes).toEqual([{ path: "/work/x", content: "y" }]);
+	});
+
 	// An approval that applied a slightly different edit from the one described
 	// would be exactly the failure the canonical hash exists to prevent.
 	it("refuses an edit rather than reimplementing pi's replacement semantics", async () => {

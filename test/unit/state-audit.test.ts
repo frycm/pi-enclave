@@ -203,6 +203,52 @@ describe("the audit log", () => {
 			const result = await corrupt((lines) => [...lines.slice(0, 1), ...lines.slice(2)]);
 			expect(formatVerifyResult("x", result)).toContain("not trustworthy");
 		});
+
+		// A crash leaves a torn final line; a resumed session must drop it before
+		// appending, or the next record fuses onto the partial bytes and verify
+		// reports a healthy crash+resume as tampering.
+		it("recovers cleanly after a torn final line on resume", async () => {
+			const first = log();
+			first.append("decision", { n: 1 });
+			await first.flush();
+			// Simulate a crash mid-write: append partial, newline-less bytes.
+			writeFileSync(first.path, `${readFileSync(first.path, "utf8")}{"seq":2,"partial`, { flag: "w" });
+
+			// Resume: a new AuditLog on the same file, then a normal append.
+			const second = log();
+			second.append("decision", { n: 2 });
+			await second.flush();
+
+			const result = verifyLog(second.path);
+			expect(result.ok).toBe(true);
+			expect(result.truncatedTail).toBeFalsy();
+			expect(result.records).toBe(2);
+		});
+	});
+
+	// A transient write failure must not advance the sequence: a skipped seq is
+	// a permanent "records missing" gap that reads as tampering ever after. The
+	// first append here fails (its directory does not exist yet); once the
+	// directory is created the next append must land as seq 1, not seq 2.
+	it("does not skip a sequence number when a write fails then recovers", async () => {
+		const dir = join(root, "late", "audit");
+		const audit = new AuditLog({ dir, sessionId: "s-fail", now: () => new Date("2026-08-23T12:00:00Z") });
+
+		audit.append("decision", { n: 1 });
+		await audit.flush();
+		expect(audit.degraded).toBe(true);
+
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		audit.append("decision", { n: 2 });
+		await audit.flush();
+
+		const lines = readFileSync(audit.path, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		expect(lines).toHaveLength(1);
+		expect(lines[0].seq).toBe(1);
+		expect(verifyLog(audit.path).ok).toBe(true);
 	});
 
 	it("keeps going when a write fails, and says it is degraded", async () => {

@@ -136,8 +136,11 @@ function matchList(
 	patterns: readonly string[],
 	action: CanonicalAction,
 	overflow: OverflowPolicy,
+	// Passed in rather than recomputed: the three rule lists share one action,
+	// and rebuilding the target set (re-joining every simple command) for each
+	// was wasted work on the hot path.
+	targets: readonly string[],
 ): RuleMatch[] {
-	const targets = matchTargets(action);
 	const matches: RuleMatch[] = [];
 	for (const raw of patterns) {
 		const pattern = parsePattern(raw);
@@ -193,12 +196,13 @@ export function evaluateRules(
 	rules: RulesInput,
 	options: { protectedMatcher?: (patterns: readonly string[]) => RuleMatch[] } = {},
 ): Evaluation {
+	const targets = matchTargets(action);
 	const matches: RuleMatch[] = [
-		...matchList("deny", rules.deny, action, "match"),
-		...matchList("ask", rules.ask, action, "match"),
+		...matchList("deny", rules.deny, action, "match", targets),
+		...matchList("ask", rules.ask, action, "match", targets),
 		// An oversized input must never be fast-pathed, so the allow-shaped list
 		// is the one that fails to *no* match.
-		...matchList("skipReview", rules.skipReview, action, "no-match"),
+		...matchList("skipReview", rules.skipReview, action, "no-match", targets),
 	];
 
 	if (options.protectedMatcher) {

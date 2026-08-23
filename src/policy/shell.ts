@@ -28,7 +28,8 @@ export type ShellMarker =
 	| "unbalanced-quote"
 	| "eval"
 	| "shell-c"
-	| "xargs";
+	| "xargs"
+	| "wrapper";
 
 export interface Redirect {
 	/** The operator as written: `>`, `>>`, `2>`, `&>`, `<`. */
@@ -76,17 +77,66 @@ const OPAQUE_COMMANDS: Record<string, ShellMarker> = {
 	ksh: "shell-c",
 };
 
+/**
+ * Commands that run *another* command given as their arguments.
+ *
+ * `env rm -rf /` and `bash(rm -rf *)` share no prefix, so a rule anchored on the
+ * inner command never fires and the parse otherwise looks ordinary. Rather than
+ * unwrap these -- which would mean parsing each wrapper's own options and
+ * getting a single one wrong is a bypass -- a wrapper with a real argument is
+ * marked non-confident, so the gate escalates it to a person. This over-asks for
+ * `timeout 30 npm test`, which is the safe direction the module already takes
+ * for everything it cannot read with confidence.
+ *
+ * The `-c` shells are handled by OPAQUE_COMMANDS; `sudo`/`su`/`doas` are denied
+ * outright by `rules.deny`, so they are not repeated here.
+ */
+const WRAPPER_COMMANDS = new Set([
+	"env",
+	"nohup",
+	"nice",
+	"ionice",
+	"chrt",
+	"timeout",
+	"stdbuf",
+	"setsid",
+	"command",
+	"exec",
+	"time",
+	"watch",
+	"nice",
+]);
+
+/** A path prefix such as `/usr/bin/env` still names `env`. */
+function baseName(command: string): string {
+	const slash = command.lastIndexOf("/");
+	return slash >= 0 ? command.slice(slash + 1) : command;
+}
+
 export function parseShell(command: string): ParsedShell {
 	const markers = new Set<ShellMarker>();
 	const segments = splitSegments(command, markers);
 	const commands = segments.map((segment) => parseSegment(segment, markers)).filter((cmd) => cmd.text !== "");
 
 	for (const cmd of commands) {
-		const marker = OPAQUE_COMMANDS[cmd.name];
-		if (!marker) continue;
-		// `sh script.sh` is ordinary; `sh -c '…'` hides a whole command line.
-		if (marker === "shell-c" && !cmd.args.includes("-c")) continue;
-		markers.add(marker);
+		// `/bin/bash -c` and `/usr/bin/env` name the same thing as `bash`/`env`.
+		const name = baseName(cmd.name);
+
+		const marker = OPAQUE_COMMANDS[name];
+		if (marker) {
+			// `sh script.sh` is ordinary; `sh -c '…'` (or `-lc`, `-xc`, …) hides a
+			// whole command line. Any clustered short flag containing `c` counts.
+			if (marker === "shell-c" && !cmd.args.some((arg) => /^-[a-z]*c[a-z]*$/i.test(arg))) continue;
+			markers.add(marker);
+			continue;
+		}
+
+		// A wrapper with a real (non-option) argument is running a command the
+		// rules were never matched against. Escalate rather than guess where the
+		// wrapper's own options end and the inner command begins.
+		if (WRAPPER_COMMANDS.has(name) && cmd.args.some((arg) => !arg.startsWith("-"))) {
+			markers.add("wrapper");
+		}
 	}
 
 	return { commands, confident: markers.size === 0, markers: [...markers] };
@@ -279,6 +329,26 @@ function splitWords(segment: string, markers: Set<ShellMarker>): string[] {
 		}
 		if (/\s/.test(char)) {
 			flush();
+			continue;
+		}
+		// A redirect operator glued to the preceding word: `payload>>.git/x` is
+		// arg `payload`, operator `>>`, target `.git/x` in a real shell, but the
+		// naive splitter kept it as one token so the target was never seen as a
+		// write. Split it out here, pulling any fd prefix (`2`, `&`) off the word.
+		// `<(`/`>(` are process substitution, already marked at the segment level;
+		// leave those alone so this does not invent a bogus redirect.
+		if ((char === ">" || char === "<") && segment[i + 1] !== "(") {
+			const fd = /(?:&|\d+)$/.exec(current);
+			if (fd) current = current.slice(0, current.length - fd[0].length);
+			if (current !== "") words.push(current);
+			current = "";
+			started = false;
+			let op = (fd?.[0] ?? "") + char;
+			if (char === ">" && segment[i + 1] === ">") {
+				op += ">";
+				i++;
+			}
+			words.push(op);
 			continue;
 		}
 		current += char;

@@ -128,8 +128,27 @@ export function canonicalize(options: CanonicalizeOptions): CanonicalAction {
 			// the README states for the read-only classifier and it applies here
 			// too: the cost of being wrong is an escalation, and the cost of the
 			// opposite is a silent write to a protected path.
+			const writes = !READ_ONLY_COMMANDS.has(command.name);
 			for (const arg of command.args) {
-				for (const candidate of pathCandidatesInToken(arg)) addPath(candidate, !READ_ONLY_COMMANDS.has(command.name));
+				const candidates = pathCandidatesInToken(arg);
+				if (candidates.length > 0) {
+					// Includes the `/path` of a `--flag=/path`, which is why every
+					// token is offered here before the bare-filename fallback below.
+					for (const candidate of candidates) addPath(candidate, writes);
+				} else if (
+					WRITER_COMMANDS.has(command.name) &&
+					arg !== "" &&
+					!arg.startsWith("-") &&
+					!/^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)
+				) {
+					// A bare filename in the working directory (no slash) is still a
+					// possible protected-path target: `tee authorized_keys` writes the
+					// same file as `tee ./authorized_keys`. Scoped to commands whose
+					// operands are files, so a commit message word or a subcommand is
+					// not resolved as a path; a matched name resolves to cwd/<name>
+					// and hits only the specific protected globs.
+					addPath(arg, true);
+				}
 			}
 		}
 	} else {
@@ -138,6 +157,13 @@ export function canonicalize(options: CanonicalizeOptions): CanonicalAction {
 			const value = input[key];
 			if (typeof value === "string") addPath(value, WRITING_TOOLS.has(tool));
 		}
+		// `ls` and `find` default their path to the working directory when it is
+		// omitted, and pi resolves that default itself. Recording it keeps the
+		// lock key in step with the operation the guard will actually run -- the
+		// bare `ls` / whole-workspace `find` are the most common calls, and
+		// without this they registered no path key and were refused at execute
+		// time as if they had bypassed the gate.
+		if ((tool === "ls" || tool === "find") && paths.length === 0) addPath(".", false);
 	}
 
 	const capability = readCapability(input);
@@ -157,6 +183,31 @@ export function canonicalize(options: CanonicalizeOptions): CanonicalAction {
 	action.hash = hashAction(action);
 	return action;
 }
+
+/**
+ * Commands whose bare (slash-free) operands are file targets.
+ *
+ * Only for these does a bare filename argument get recorded as a path, so an
+ * ordinary word (a commit message, a subcommand) is not resolved as one. The
+ * set is the common file-writing utilities; a slash-bearing path is caught for
+ * every command regardless, and redirect targets always are.
+ */
+const WRITER_COMMANDS = new Set([
+	"tee",
+	"cp",
+	"mv",
+	"dd",
+	"install",
+	"ln",
+	"touch",
+	"truncate",
+	"chmod",
+	"chown",
+	"rm",
+	"rmdir",
+	"mkdir",
+	"sed",
+]);
 
 /**
  * Commands whose path arguments are reads.

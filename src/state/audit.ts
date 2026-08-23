@@ -27,7 +27,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { appendFileSync, closeSync, createReadStream, existsSync, openSync, readFileSync } from "node:fs";
+import { appendFileSync, closeSync, createReadStream, existsSync, openSync, readFileSync, truncateSync } from "node:fs";
 import { join } from "node:path";
 import type { EffectiveProfile } from "../config/types.ts";
 import type { CanonicalAction } from "../policy/canonical.ts";
@@ -83,11 +83,32 @@ export class AuditLog {
 		// A resumed session appends to its own file, so the chain continues
 		// across a restart rather than starting again with a fresh genesis.
 		if (existsSync(this.path)) {
+			// Drop a torn final line (a crash mid-write) *before* appending, so the
+			// next record starts on a clean newline boundary. Without this the new
+			// record was concatenated onto the partial bytes as one line, which
+			// verifyLog then reported as a broken chain -- making an ordinary
+			// crash+resume indistinguishable from tampering.
+			this.truncateTornTail();
 			const tail = lastCompleteRecord(this.path);
 			if (tail) {
 				this.seq = tail.record.seq;
 				this.prevHash = hashLine(tail.line);
 			}
+		}
+	}
+
+	/** Truncate any bytes after the last newline: an unterminated final record. */
+	private truncateTornTail(): void {
+		try {
+			const raw = readFileSync(this.path);
+			if (raw.length === 0) return;
+			const lastNewline = raw.lastIndexOf(0x0a);
+			// `lastNewline + 1` keeps everything through the final newline and
+			// drops the rest; -1 (no newline at all) truncates to empty.
+			if (lastNewline !== raw.length - 1) truncateSync(this.path, lastNewline + 1);
+		} catch (error) {
+			this.failed = true;
+			this.options.onError?.(error as Error);
 		}
 	}
 
@@ -108,22 +129,30 @@ export class AuditLog {
 			unknown
 		>;
 		this.queue = this.queue.then(() => {
+			// seq and prevHash advance only after the write lands. Incrementing
+			// first meant a transient write failure (a full disk for one append)
+			// skipped a sequence number permanently, so every later record carried
+			// a gap that verifyLog reported as "records missing" forever after --
+			// a recoverable blip made indistinguishable from tampering.
+			const nextSeq = this.seq + 1;
+			const record: AuditRecord = {
+				seq: nextSeq,
+				ts: (this.options.now?.() ?? new Date()).toISOString(),
+				kind,
+				sessionId: this.options.sessionId,
+				prevHash: this.prevHash,
+				...body,
+			};
+			const line = JSON.stringify(record);
 			try {
-				const record: AuditRecord = {
-					seq: ++this.seq,
-					ts: (this.options.now?.() ?? new Date()).toISOString(),
-					kind,
-					sessionId: this.options.sessionId,
-					prevHash: this.prevHash,
-					...body,
-				};
-				const line = JSON.stringify(record);
 				appendFileSync(this.path, `${line}\n`, { mode: 0o600 });
-				this.prevHash = hashLine(line);
 			} catch (error) {
 				this.failed = true;
 				this.options.onError?.(error as Error);
+				return;
 			}
+			this.seq = nextSeq;
+			this.prevHash = hashLine(line);
 		});
 	}
 
@@ -206,7 +235,28 @@ export function configFields(
 
 /** A stable hash of the effective configuration, for the record and for resume. */
 export function configHash(profile: EffectiveProfile): string {
-	return `sha256:${createHash("sha256").update(JSON.stringify(profile)).digest("hex")}`;
+	// Keys are sorted so the hash depends on the configuration's content, not on
+	// the order the fold happened to build the object in. The action hash in
+	// canonical.ts was hardened this way for the same reason; this is stored in
+	// every pending record and re-derived at resume, so a key-order change
+	// between two versions must not read as a mismatch.
+	return `sha256:${createHash("sha256").update(stableStringify(profile)).digest("hex")}`;
+}
+
+/** JSON with object keys sorted recursively, so serialization is order-independent. */
+function stableStringify(value: unknown): string {
+	const sort = (input: unknown): unknown => {
+		if (Array.isArray(input)) return input.map(sort);
+		if (input && typeof input === "object") {
+			return Object.fromEntries(
+				Object.entries(input as Record<string, unknown>)
+					.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+					.map(([key, entry]) => [key, sort(entry)]),
+			);
+		}
+		return input;
+	};
+	return JSON.stringify(sort(value));
 }
 
 // ---------------------------------------------------------------------------

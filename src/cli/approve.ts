@@ -20,6 +20,7 @@
  * refused with that explanation and left pending, so the user re-runs the task
  * with the rule relaxed instead.
  */
+import { isAbsolute, resolve } from "node:path";
 import { SrtBackend } from "../backend/srt.ts";
 import type { SandboxBackend } from "../backend/types.ts";
 import { formatViolations } from "../backend/violations.ts";
@@ -122,11 +123,18 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 			return { outcome: "executed", exitCode: result.exitCode };
 		}
 
-		const path = record.action.input.path ?? record.action.input.filePath;
+		// All three keys canonicalize accepts, so a record hashed under `file_path`
+		// (which pi's write tool uses) is not a dead end at approve time.
+		const rawPath = record.action.input.path ?? record.action.input.filePath ?? record.action.input.file_path;
 		const content = record.action.input.content;
-		if (typeof path !== "string" || typeof content !== "string") {
+		if (typeof rawPath !== "string" || typeof content !== "string") {
 			return { outcome: "refused", reason: "the record's write action has no path and content" };
 		}
+		// Resolved against the *session's* cwd, not this CLI process's. The helper
+		// resolves a relative path against its own working directory, so a record
+		// of `notes.txt` from /project would otherwise be written wherever the
+		// approver happened to run the command -- the approver read "/project/notes.txt".
+		const path = isAbsolute(rawPath) ? rawPath : resolve(record.action.cwd, rawPath);
 		const fs = backend.fs(compiled);
 		await fs.writeFile(path, content);
 		io.out(`wrote ${path}`);
