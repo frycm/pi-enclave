@@ -51,15 +51,21 @@ export interface ClassifyInput {
 }
 
 /**
- * Errnos that always mean "the sandbox stopped this", on any backend.
+ * Errnos a sandbox refusal produces -- and that ordinary Unix permissions
+ * produce too.
  *
- * `EROFS` is here because pi-enclave never asks the helper to write to a
- * genuinely read-only filesystem in normal operation -- bwrap's `--ro-bind / /`
- * is what makes everything outside the writable roots read-only. A user who
- * points a workspace at a real read-only mount gets a violation instead of a
- * plain error; that is a legible failure, not a dangerous one.
+ * `EPERM` and `EACCES` are what a root-owned file, a `chmod 000` directory, or
+ * a macOS TCC-protected folder (`~/Documents` without Full Disk Access) return
+ * with no sandbox anywhere near them. `EROFS` is bwrap's `--ro-bind / /`, but
+ * also a genuinely read-only mount. So none of these is a verdict on its own;
+ * each is resolved against the profile, as `ENOENT` already is: a refused
+ * write is a denial only outside every writable root, a refused read only
+ * under a deny root. Anything else is the operating system's own "no", passed
+ * through as the ordinary error it is, so the agent is not told a permission
+ * problem is a policy boundary and the violation counter is not inflated by
+ * files the user could not read either.
  */
-const ALWAYS_DENIAL = new Set(["EPERM", "EACCES", "EROFS"]);
+const PERMISSION_ERRNOS = new Set(["EPERM", "EACCES", "EROFS"]);
 
 /** Errnos that mean the network was unreachable rather than forbidden. */
 const NETWORK_DENIAL = new Set(["ENETUNREACH", "EAFNOSUPPORT", "ENETDOWN"]);
@@ -84,12 +90,21 @@ export function classifyErrno(input: ClassifyInput): Violation | null {
 		raw: `${code}${error.syscall ? ` (${error.syscall})` : ""}`,
 	};
 
-	if (ALWAYS_DENIAL.has(code)) {
-		return { ...base, kind: kindForOp(op) };
-	}
-
 	if (NETWORK_DENIAL.has(code)) {
 		return { ...base, kind: "network" };
+	}
+
+	const kind = kindForOp(op);
+
+	if (PERMISSION_ERRNOS.has(code)) {
+		if (kind === "write") {
+			// Writes are an allow-list: a refusal inside a writable root is not the
+			// sandbox's doing.
+			return isUnderAny(path, profile.writableRoots) ? null : { ...base, kind };
+		}
+		// Reads are a deny-list: the sandbox refuses nothing outside readDeny, so
+		// a refusal there is the operating system's own.
+		return isUnderAny(path, profile.readDeny) ? { ...base, kind } : null;
 	}
 
 	// The ambiguous case. On bwrap a denied read region is a tmpfs mounted over
@@ -97,7 +112,7 @@ export function classifyErrno(input: ClassifyInput): Violation | null {
 	// errno is indistinguishable from a file that was never there. Resolve it
 	// against the profile rather than guessing.
 	if (code === "ENOENT" && isUnderAny(path, profile.readDeny)) {
-		return { ...base, kind: kindForOp(op) };
+		return { ...base, kind };
 	}
 
 	return null;

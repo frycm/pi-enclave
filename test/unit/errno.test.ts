@@ -52,15 +52,33 @@ describe("kindForOp", () => {
 	});
 });
 
-describe("classifyErrno: errnos that always mean denial", () => {
-	it("classifies EPERM as a denial (the macOS shape)", () => {
+describe("classifyErrno: permission errnos, resolved against the profile", () => {
+	it("classifies EPERM under a deny root as a read denial (the macOS shape)", () => {
 		const v = classify("EPERM", "readFile", "/home/u/.ssh/id_ed25519");
 		expect(v?.kind).toBe("read");
 		expect(v?.source).toBe("errno");
 	});
 
-	it("classifies EACCES as a denial", () => {
-		expect(classify("EACCES", "readFile", "/x")).not.toBeNull();
+	it("classifies EACCES under a deny root as a denial", () => {
+		expect(classify("EACCES", "readFile", "/home/u/.aws/credentials")).not.toBeNull();
+	});
+
+	it("passes through a permission error the sandbox did not cause", () => {
+		// Reads are a deny-list, so outside readDeny the sandbox refuses nothing:
+		// a root-owned file, a chmod 000 directory, or a macOS TCC-protected
+		// folder is the operating system's own "no". Calling it a policy boundary
+		// would mislead the agent and inflate the violation counter.
+		expect(classify("EACCES", "readFile", "/etc/shadow")).toBeNull();
+		expect(classify("EPERM", "readFile", "/Users/u/Documents/notes.txt")).toBeNull();
+		// Writes are an allow-list: inside a writable root a refusal is plain DAC.
+		expect(classify("EACCES", "writeFile", "/work/readonly-subdir/x")).toBeNull();
+		expect(classify("EROFS", "writeFile", "/work/x", "bwrap")).toBeNull();
+	});
+
+	it("classifies a refused write outside every writable root as a denial", () => {
+		expect(classify("EPERM", "writeFile", "/etc/hosts")?.kind).toBe("write");
+		expect(classify("EACCES", "mkdir", "/usr/local/x")?.kind).toBe("write");
+		expect(classify("EPERM", "access:write", "/etc")?.kind).toBe("write");
 	});
 
 	it("classifies EROFS as a WRITE denial (the Linux shape)", () => {
@@ -83,7 +101,7 @@ describe("classifyErrno: errnos that always mean denial", () => {
 	});
 
 	it("keeps the raw errno as audit evidence", () => {
-		expect(classify("EROFS", "writeFile", "/x", "bwrap")?.raw).toContain("EROFS");
+		expect(classify("EROFS", "writeFile", "/etc/x", "bwrap")?.raw).toContain("EROFS");
 	});
 });
 
