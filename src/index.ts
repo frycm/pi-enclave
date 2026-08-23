@@ -25,10 +25,22 @@ export default function (pi: ExtensionAPI): void {
 		},
 	});
 
+	if (!report.ok) {
+		// Refuse loudly, on stderr, at load time.
+		//
+		// `ctx.ui.notify` from a session_start handler is not enough on its own:
+		// it fires and returns cleanly in --print mode, but the message does not
+		// reach stdout there -- and unattended is exactly where a silent
+		// fail-closed is most dangerous. stderr is visible in every mode and does
+		// not depend on a UI being attached.
+		process.stderr.write(`${formatProbeReport(report)}\n`);
+	}
+
 	pi.on("session_start", (_event, ctx) => {
 		if (report.ok) return;
-		// Fail closed and say exactly why. Phase 2 turns this into a refusal to
-		// start auto mode; today there is nothing registered yet to disable.
+		// Interactive users get it in the TUI as well, where stderr is not visible.
+		// Phase 2 turns this into a refusal to start auto mode; today there is
+		// nothing registered yet to disable.
 		ctx.ui.notify(formatProbeReport(report), "error");
 	});
 }
