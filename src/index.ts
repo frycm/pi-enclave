@@ -13,6 +13,8 @@
  * needs either the policy layer (phase 2, which denies unlisted tools) or an
  * execution hook in pi core.
  */
+import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	createBashTool,
@@ -27,9 +29,13 @@ import {
 import { SrtBackend } from "./backend/srt.ts";
 import type { CompiledProfile, Violation } from "./backend/types.ts";
 import { type EnclaveState, handleEnclaveCommand, renderStatusLine } from "./commands/enclave.ts";
+import { OWNED_TOOLS } from "./config/defaults.ts";
 import { createDevProfile, toBackendProfile } from "./config/profile.ts";
 import { type LoadedSource, loadConfig } from "./config/sources.ts";
 import type { EffectiveProfile, Provenance } from "./config/types.ts";
+import { decide, type GateDecision } from "./gate/gate.ts";
+import { ActionLock } from "./gate/lock.ts";
+import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
 import { formatProbeReport } from "./probe.ts";
 import { probeHost } from "./probe-host.ts";
 import { BASH_PROMPT_GUIDELINES, createEnclaveBashOperations } from "./tools/bash.ts";
@@ -41,6 +47,15 @@ import {
 	createWriteOperations,
 } from "./tools/file-ops.ts";
 import { runSandboxedGrep } from "./tools/grep.ts";
+
+/**
+ * The path pi reports for tools this file registers.
+ *
+ * pi records the extension's own module path in `sourceInfo`, so the ownership
+ * check compares against this rather than a name -- a name is something another
+ * extension can also claim.
+ */
+const OWN_SOURCE_PATH = fileURLToPath(import.meta.url);
 
 export default function (pi: ExtensionAPI): void {
 	const report = probeHost(PI_VERSION ?? null);
@@ -56,9 +71,45 @@ export default function (pi: ExtensionAPI): void {
 	let provenance: Provenance | undefined;
 	let sources: readonly LoadedSource[] | undefined;
 	let configError: string | undefined;
+	let ownershipError: string | undefined;
 
 	let compiled: CompiledProfile | undefined;
 	const violations: Violation[] = [];
+
+	/**
+	 * The lock table, and the execute-time guards that read it.
+	 *
+	 * The guards are wired into every operations object below rather than only
+	 * into the gate, because pi prepares a whole batch of tool calls before
+	 * executing any of them: a call gated before something went wrong is already
+	 * prepared when it does, and blocking cannot un-prepare it.
+	 */
+	const lock = new ActionLock();
+
+	/**
+	 * When the lock is not the right thing to complain about.
+	 *
+	 * With a failed probe, a rejected configuration or a foreign tool, nothing
+	 * was gated because nothing *could* be, and the operation is about to be
+	 * refused anyway by `requireCompiled` with the diagnosis that tells the user
+	 * what to fix. Letting the lock speak first would replace an actionable
+	 * message with "this call did not pass the policy gate", which is true and
+	 * useless. A Phase-1 test caught exactly that.
+	 *
+	 * With `PI_ENCLAVE_AUTO=off` there is deliberately no gate, so there is
+	 * nothing for the table to know about.
+	 */
+	const lockNotApplicable = () =>
+		!report.ok || configError !== undefined || ownershipError !== undefined || effective?.auto === false;
+
+	const guardCommand = (command: string) => {
+		if (lockNotApplicable()) return;
+		lock.beginExecution(`bash:${command}`);
+	};
+	const guardPath = (tool: string, path: string) => {
+		if (lockNotApplicable()) return;
+		lock.beginPathExecution(tool, path);
+	};
 
 	/** A snapshot for rendering. Rebuilt per call so it never goes stale. */
 	const state = (): EnclaveState => ({
@@ -71,7 +122,13 @@ export default function (pi: ExtensionAPI): void {
 		...(effective ? { effective } : {}),
 		...(provenance ? { provenance } : {}),
 		...(sources ? { sources } : {}),
-		...(configError ? { configError } : {}),
+		// A configuration refusal and an ownership refusal are both "auto mode
+		// will not start"; the status line shows whichever came first.
+		...(configError !== undefined
+			? { configError }
+			: ownershipError !== undefined
+				? { configError: ownershipError }
+				: {}),
 	});
 
 	/** Set by session_start, so denials can refresh the footer as they happen. */
@@ -118,6 +175,7 @@ export default function (pi: ExtensionAPI): void {
 		backend,
 		getCompiled: requireCompiled,
 		onViolations: recordViolations,
+		guard: guardCommand,
 	});
 
 	const fsClient = () => backend.fs(requireCompiled());
@@ -152,11 +210,11 @@ export default function (pi: ExtensionAPI): void {
 		// Each closes over fsClient() rather than a captured client, so a
 		// recompiled profile retires the old helper without leaving a tool bound
 		// to it.
-		pi.registerTool(createReadTool(cwd, { operations: createReadOperations(fsClient) }));
-		pi.registerTool(createEditTool(cwd, { operations: createEditOperations(fsClient) }));
-		pi.registerTool(createWriteTool(cwd, { operations: createWriteOperations(fsClient) }));
-		pi.registerTool(createLsTool(cwd, { operations: createLsOperations(fsClient) }));
-		pi.registerTool(createFindTool(cwd, { operations: createFindOperations(fsClient) }));
+		pi.registerTool(createReadTool(cwd, { operations: createReadOperations(fsClient, guardPath) }));
+		pi.registerTool(createEditTool(cwd, { operations: createEditOperations(fsClient, guardPath) }));
+		pi.registerTool(createWriteTool(cwd, { operations: createWriteOperations(fsClient, guardPath) }));
+		pi.registerTool(createLsTool(cwd, { operations: createLsOperations(fsClient, guardPath) }));
+		pi.registerTool(createFindTool(cwd, { operations: createFindOperations(fsClient, guardPath) }));
 
 		// grep is the exception: its operations object cannot redirect the `rg`
 		// spawn, so pi's tool is kept whole and only `execute` is replaced.
@@ -171,6 +229,43 @@ export default function (pi: ExtensionAPI): void {
 				),
 		} as Parameters<typeof pi.registerTool>[0]);
 	}
+
+	/**
+	 * The one `tool_call` handler.
+	 *
+	 * Registered unconditionally and before anything else can be. Until the
+	 * configuration is loaded there is no profile to judge against, so the gate
+	 * refuses -- a tool call that arrives before `session_start` has not been
+	 * gated by anything, and permitting it would be the one case the whole layer
+	 * exists to prevent.
+	 */
+	pi.on("tool_call", async (event) => {
+		if (!report.ok) return { block: true, reason: formatProbeReport(report) };
+		if (configError) return { block: true, reason: configError };
+		if (ownershipError) return { block: true, reason: ownershipError };
+		if (!effective) return { block: true, reason: "pi-enclave: no policy is loaded yet, so nothing may run." };
+
+		const decision: GateDecision = await decide(
+			{ toolName: event.toolName, toolCallId: event.toolCallId, input: event.input as Record<string, unknown> },
+			{
+				profile: effective,
+				cwd,
+				home: homedir(),
+				lock,
+				owned: OWNED_TOOLS,
+				toolSource: (tool) => pi.getAllTools?.().find((entry) => entry.name === tool)?.sourceInfo?.path,
+			},
+		);
+		refreshStatusLine?.();
+		if (!decision.block) return {};
+		return { block: true, reason: decision.reason ?? "denied", ...(decision.terminate ? { terminate: true } : {}) };
+	});
+
+	// One call is finished, so its lock entry is spent. `edit` reads and then
+	// writes under one entry, which is why this is here and not in the guards.
+	pi.on("tool_result", (event) => {
+		lock.consume(event.toolCallId);
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (!report.ok) {
@@ -197,6 +292,23 @@ export default function (pi: ExtensionAPI): void {
 		effective = loaded.profile;
 		provenance = loaded.provenance;
 		profile = toBackendProfile(loaded.profile);
+
+		// Ownership is checked after the configuration, because the diagnosis is
+		// only actionable once we know auto mode was going to start at all.
+		const problems = checkOwnership({
+			tools: pi.getAllTools?.() ?? [],
+			ownPath: OWN_SOURCE_PATH,
+			cwd,
+			projectTrusted: ctx.isProjectTrusted(),
+		});
+		if (problems.length > 0) {
+			ownershipError = formatOwnershipProblems(problems);
+			process.stderr.write(`${ownershipError}\n`);
+			ctx.ui.notify(ownershipError, "error");
+			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
+			return;
+		}
+		ownershipError = undefined;
 
 		compiled = await backend.compile(profile);
 		refreshStatusLine = () => ctx.ui.setStatus?.("enclave", renderStatusLine(state()));

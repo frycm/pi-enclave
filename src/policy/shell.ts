@@ -149,7 +149,7 @@ function splitSegments(command: string, markers: Set<ShellMarker>): string[] {
 		if ((char === "<" || char === ">") && next === "(") {
 			markers.add("process-substitution");
 			depth++;
-			current += char + "(";
+			current += `${char}(`;
 			i++;
 			continue;
 		}

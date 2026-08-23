@@ -47,6 +47,15 @@ export interface EnclaveBashOptions {
 	envDeny?: readonly string[];
 	/** Called for every violation, for the phase-2 audit log and status line. */
 	onViolations?: (violations: Violation[]) => void;
+	/**
+	 * Asked again, here, whether this command may run.
+	 *
+	 * Not redundant with the gate. pi prepares every tool call in a batch before
+	 * executing any of them, so a command gated before the breaker tripped is
+	 * already prepared when it trips and blocking cannot un-prepare it. This is
+	 * the only place left to stop it. Throwing refuses the command.
+	 */
+	guard?: (command: string) => void;
 }
 
 /**
@@ -69,6 +78,7 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 
 	return {
 		async exec(command, cwd, execOptions) {
+			options.guard?.(command);
 			const compiled = getCompiled();
 			const env = buildChildEnv(process.env, {
 				...(passthrough ? { passthrough } : {}),

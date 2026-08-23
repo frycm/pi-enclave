@@ -27,6 +27,20 @@ import { detectImageMimeType, IMAGE_SNIFF_BYTES } from "./image-mime.ts";
 export type FsClientRef = () => FsClient;
 
 /**
+ * Asked again, here, whether this operation may run.
+ *
+ * See the note on the shell operations: pi prepares a whole batch before
+ * executing any of it, so the gate's decision can be overtaken by a breaker
+ * trip. Throwing refuses the operation. Absent in Phase 1's tests and in the
+ * benchmark, where there is no gate to have passed.
+ */
+export type ToolGuard = (tool: string, path: string) => void;
+
+function guarded(guard: ToolGuard | undefined, tool: string, path: string): void {
+	guard?.(tool, path);
+}
+
+/**
  * Translate a denial into a message the agent can act on.
  *
  * `SandboxDenied` carries a classified violation, which matters most on Linux:
@@ -42,7 +56,7 @@ function describe(error: unknown): never {
 	throw error;
 }
 
-const guard = async <T>(run: () => Promise<T>): Promise<T> => {
+const protect = async <T>(run: () => Promise<T>): Promise<T> => {
 	try {
 		return await run();
 	} catch (error) {
@@ -50,47 +64,75 @@ const guard = async <T>(run: () => Promise<T>): Promise<T> => {
 	}
 };
 
-export function createReadOperations(fs: FsClientRef) {
+export function createReadOperations(fs: FsClientRef, guard?: ToolGuard) {
 	return {
-		readFile: (path: string) => guard(() => fs().readFile(path)),
-		access: (path: string) => guard(() => fs().access(path, "read")),
+		readFile: (path: string) => {
+			guarded(guard, "read", path);
+			return protect(() => fs().readFile(path));
+		},
+		access: (path: string) => {
+			guarded(guard, "read", path);
+			return protect(() => fs().access(path, "read"));
+		},
 		// pi does not fall back to sniffing the buffer when this is absent: it
 		// decodes the bytes as text. So the magic bytes are fetched through the
 		// helper -- the open stays inside the sandbox -- and judged by pi's own
 		// detector on this side.
-		detectImageMimeType: (path: string) =>
-			guard(async () => detectImageMimeType(await fs().head(path, IMAGE_SNIFF_BYTES))),
+		detectImageMimeType: (path: string) => {
+			guarded(guard, "read", path);
+			return protect(async () => detectImageMimeType(await fs().head(path, IMAGE_SNIFF_BYTES)));
+		},
 	};
 }
 
-export function createEditOperations(fs: FsClientRef) {
+export function createEditOperations(fs: FsClientRef, guard?: ToolGuard) {
 	return {
-		readFile: (path: string) => guard(() => fs().readFile(path)),
-		writeFile: (path: string, content: string) => guard(() => fs().writeFile(path, content)),
-		access: (path: string) => guard(() => fs().access(path, "write")),
+		readFile: (path: string) => {
+			guarded(guard, "edit", path);
+			return protect(() => fs().readFile(path));
+		},
+		writeFile: (path: string, content: string) => {
+			guarded(guard, "edit", path);
+			return protect(() => fs().writeFile(path, content));
+		},
+		access: (path: string) => {
+			guarded(guard, "edit", path);
+			return protect(() => fs().access(path, "write"));
+		},
 	};
 }
 
-export function createWriteOperations(fs: FsClientRef) {
+export function createWriteOperations(fs: FsClientRef, guard?: ToolGuard) {
 	return {
-		writeFile: (path: string, content: string) => guard(() => fs().writeFile(path, content)),
-		mkdir: (path: string) => guard(() => fs().mkdir(path)),
+		writeFile: (path: string, content: string) => {
+			guarded(guard, "write", path);
+			return protect(() => fs().writeFile(path, content));
+		},
+		// `mkdir` is guarded against the *file* path the action named: pi creates
+		// the parent directory of a write target, so the directory itself never
+		// appears in the tool input and would never be in the table.
+		mkdir: (path: string) => protect(() => fs().mkdir(path)),
 	};
 }
 
-export function createLsOperations(fs: FsClientRef) {
+export function createLsOperations(fs: FsClientRef, guard?: ToolGuard) {
 	return {
-		exists: (path: string) => guard(() => fs().exists(path)),
-		stat: (path: string) => guard(() => fs().stat(path)),
-		readdir: (path: string) => guard(() => fs().readdir(path)),
+		exists: (path: string) => protect(() => fs().exists(path)),
+		stat: (path: string) => protect(() => fs().stat(path)),
+		readdir: (path: string) => {
+			guarded(guard, "ls", path);
+			return protect(() => fs().readdir(path));
+		},
 	};
 }
 
-export function createFindOperations(fs: FsClientRef) {
+export function createFindOperations(fs: FsClientRef, guard?: ToolGuard) {
 	return {
-		exists: (path: string) => guard(() => fs().exists(path)),
+		exists: (path: string) => protect(() => fs().exists(path)),
 		// Supplying glob is what stops pi spawning `fd` in its own process.
-		glob: (pattern: string, cwd: string, options: { ignore: string[]; limit: number }) =>
-			guard(() => fs().glob(pattern, cwd, options)),
+		glob: (pattern: string, cwd: string, options: { ignore: string[]; limit: number }) => {
+			guarded(guard, "find", cwd);
+			return protect(() => fs().glob(pattern, cwd, options));
+		},
 	};
 }

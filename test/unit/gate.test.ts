@@ -1,0 +1,463 @@
+import { describe, expect, it } from "vitest";
+import { defaultProfile, OWNED_TOOLS } from "../../src/config/defaults.ts";
+import type { EffectiveProfile } from "../../src/config/types.ts";
+import { ActionLock, decide, type Escalator, type GateDecision } from "../../src/gate/gate.ts";
+import { assertJsonLike, freezeToolInput, LockViolation } from "../../src/gate/lock.ts";
+import { checkOwnership } from "../../src/gate/ownership.ts";
+import { checkTool } from "../../src/gate/tools.ts";
+import { canonicalize } from "../../src/policy/canonical.ts";
+import { FakePi } from "../harness/fake-pi.ts";
+
+const OPTIONS = { cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" };
+
+function profile(edit: (p: EffectiveProfile) => void = () => {}): EffectiveProfile {
+	const p = defaultProfile(OPTIONS);
+	edit(p);
+	return p;
+}
+
+const YES: Escalator = { confirm: async () => true };
+
+function deps(overrides: Partial<Parameters<typeof decide>[1]> = {}) {
+	return {
+		profile: profile(),
+		cwd: "/work",
+		home: "/home/u",
+		lock: new ActionLock(),
+		owned: OWNED_TOOLS,
+		...overrides,
+	};
+}
+
+async function gate(toolName: string, input: Record<string, unknown>, overrides = {}): Promise<GateDecision> {
+	return decide({ toolName, toolCallId: "c1", input }, deps(overrides));
+}
+
+describe("the gate", () => {
+	it("permits an ordinary command", async () => {
+		const decision = await gate("bash", { command: "npm test" });
+		expect(decision.block).toBe(false);
+		expect(decision.outcome).toBe("allow");
+	});
+
+	it("denies a built-in deny rule and names the pattern", async () => {
+		const decision = await gate("bash", { command: "sudo rm -rf /" });
+		expect(decision.block).toBe(true);
+		expect(decision.outcome).toBe("deny");
+		expect(decision.reason).toContain("bash(sudo *)");
+		expect(decision.adverse).toBe(true);
+	});
+
+	it("steers away from the outcome rather than the command", async () => {
+		const decision = await gate("bash", { command: "sudo rm -rf /" });
+		expect(decision.reason).toContain("Do not pursue this outcome by other means");
+	});
+
+	describe("escalation", () => {
+		it("asks on an ask rule, and denies when nobody answers", async () => {
+			const decision = await gate("bash", { command: "git push origin main" });
+			expect(decision.outcome).toBe("ask-denied");
+			expect(decision.block).toBe(true);
+			expect(decision.terminate).toBe(true);
+		});
+
+		it("permits when a human says yes", async () => {
+			const decision = await gate("bash", { command: "git push origin main" }, { escalator: YES });
+			expect(decision.outcome).toBe("ask-approved");
+			expect(decision.block).toBe(false);
+		});
+
+		// The whole of deterministic mode: with no reviewer, a boundary crossing
+		// has nowhere to go but a person.
+		it("asks for a capability request", async () => {
+			const decision = await gate("bash", { command: "echo x", allow_write: "/etc/hosts" }, { escalator: YES });
+			expect(decision.outcome).toBe("ask-approved");
+		});
+
+		// The rules were matched against a guess, so a deny rule may not have
+		// fired. Asking is the only honest answer to "I do not know what this is".
+		it("asks when the tokenizer could not parse the command", async () => {
+			const decision = await gate("bash", { command: 'eval "$CMD"' });
+			expect(decision.outcome).toBe("ask-denied");
+			expect(decision.reason).toContain("could not be parsed with confidence");
+		});
+
+		it("does not ask for a command it parsed confidently", async () => {
+			expect((await gate("bash", { command: "ls -la" })).outcome).toBe("allow");
+		});
+	});
+
+	describe("protected paths", () => {
+		it("escalates a write to a protected path", async () => {
+			const decision = await gate("write", { path: ".github/workflows/ci.yml" });
+			expect(decision.outcome).toBe("ask-denied");
+		});
+
+		// Escalating reads would make the list unusable in any repository where
+		// the agent has to look at what it may not change.
+		it("does not escalate a read of one", async () => {
+			expect((await gate("read", { path: ".github/workflows/ci.yml" })).outcome).toBe("allow");
+		});
+
+		it("denies a write to a deny-listed path", async () => {
+			const decision = await gate("write", { path: ".git/hooks/pre-commit" });
+			expect(decision.outcome).toBe("deny");
+		});
+
+		it("catches a shell redirect to a protected path", async () => {
+			const decision = await gate("bash", { command: "echo x > .github/workflows/ci.yml" });
+			expect(decision.outcome).toBe("ask-denied");
+		});
+	});
+
+	describe("the tool allowlist", () => {
+		it("denies a tool nobody allowed", async () => {
+			const decision = await gate("deploy", { env: "prod" });
+			expect(decision.outcome).toBe("deny");
+			expect(decision.reason).toContain("not in tools.allow");
+		});
+
+		it("allows one that is listed", async () => {
+			const decision = await gate(
+				"deploy",
+				{ env: "prod" },
+				{
+					profile: profile((p) => {
+						p.tools.allow.deploy = {};
+					}),
+				},
+			);
+			expect(decision.block).toBe(false);
+		});
+
+		it("sends a reviewed tool to a human", async () => {
+			const decision = await gate(
+				"deploy",
+				{ env: "prod" },
+				{
+					profile: profile((p) => {
+						p.tools.allow.deploy = { reviewed: true };
+					}),
+				},
+			);
+			expect(decision.outcome).toBe("ask-denied");
+		});
+
+		// A tool name is not an identity: load order decides whose registration
+		// pi keeps, so an unpinned grant is a grant to whoever loads first.
+		it("refuses a pinned grant claimed by a different extension", async () => {
+			const decision = await gate(
+				"deploy",
+				{},
+				{
+					profile: profile((p) => {
+						p.tools.allow.deploy = { source: "/ext/ours.ts" };
+					}),
+					toolSource: () => "/ext/theirs.ts",
+				},
+			);
+			expect(decision.outcome).toBe("deny");
+			expect(decision.reason).toContain("/ext/ours.ts");
+		});
+	});
+
+	describe("PI_ENCLAVE_AUTO=off", () => {
+		const off = () =>
+			profile((p) => {
+				p.auto = false;
+			});
+
+		it("passes an action L1 would have denied", async () => {
+			const decision = await gate("bash", { command: "sudo rm -rf /" }, { profile: off() });
+			expect(decision.block).toBe(false);
+		});
+
+		// The sandbox is the one layer nothing may remove, and an environment
+		// variable is the least trusted place such a request could come from.
+		it("still locks the action, so the sandbox path is unchanged", async () => {
+			const lock = new ActionLock();
+			await gate("bash", { command: "ls" }, { profile: off(), lock });
+			expect(lock.entries()).toHaveLength(1);
+		});
+	});
+
+	describe("failure", () => {
+		it("turns an internal error into a denial", async () => {
+			const decision = await decide(
+				{ toolName: "bash", toolCallId: "c1", input: { command: "ls" } },
+				{
+					...deps(),
+					// A profile with no rules object at all: the kind of shape only a
+					// bug produces, and the gate must still refuse rather than permit.
+					profile: { ...profile(), rules: undefined as never },
+				},
+			);
+			expect(decision.block).toBe(true);
+			expect(decision.outcome).toBe("error");
+			expect(decision.adverse).toBe(true);
+		});
+
+		// A failed freeze must turn the allow into a denial rather than hand out
+		// a guarantee that is not there. Guardian makes the same choice.
+		it("denies when the input cannot be locked", async () => {
+			const input: Record<string, unknown> = {};
+			Object.defineProperty(input, "command", { get: () => "ls", enumerable: true, configurable: true });
+			const decision = await decide({ toolName: "bash", toolCallId: "c1", input }, deps());
+			expect(decision.block).toBe(true);
+			expect(decision.outcome).toBe("error");
+		});
+	});
+});
+
+describe("the lock", () => {
+	describe("assertJsonLike", () => {
+		it("accepts plain data", () => {
+			expect(() => assertJsonLike({ a: 1, b: [true, null, "x"] })).not.toThrow();
+		});
+
+		// Object.freeze on an accessor freezes the accessor, not what it returns,
+		// so a getter would sail through a freeze and still hand `execute` a
+		// different value on the second read.
+		it.each([
+			["an accessor", () => Object.defineProperty({}, "x", { get: () => 1, enumerable: true })],
+			["a function", () => ({ x: () => 1 })],
+			["a class instance", () => ({ x: new Date() })],
+			[
+				"a cycle",
+				() => {
+					const a: Record<string, unknown> = {};
+					a.self = a;
+					return a;
+				},
+			],
+			["a symbol key", () => ({ [Symbol("s")]: 1 })],
+			["a non-enumerable property", () => Object.defineProperty({}, "x", { value: 1, enumerable: false })],
+			[
+				"a sparse array",
+				() => {
+					// Built by assignment rather than with a literal hole: the hole is
+					// the point of the test, and a formatter would helpfully fill it in.
+					const sparse: unknown[] = [];
+					sparse[0] = 1;
+					sparse[2] = 3;
+					return { x: sparse };
+				},
+			],
+			["a non-finite number", () => ({ x: Number.NaN })],
+		])("rejects %s", (_label, build) => {
+			expect(() => assertJsonLike(build())).toThrow(TypeError);
+		});
+	});
+
+	it("makes the input non-writable as well as frozen", () => {
+		const event = { input: { command: "ls" } as Record<string, unknown> };
+		freezeToolInput(event);
+		expect(() => {
+			(event as { input: unknown }).input = { command: "rm -rf /" };
+		}).toThrow(TypeError);
+		expect(() => {
+			event.input.command = "rm -rf /";
+		}).toThrow(TypeError);
+	});
+
+	describe("execution keys", () => {
+		const action = canonicalize({
+			tool: "bash",
+			input: { command: "ls" },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+		});
+
+		it("refuses a key it never saw", () => {
+			const lock = new ActionLock();
+			expect(() => lock.beginExecution("bash:ls")).toThrow(LockViolation);
+		});
+
+		it("permits a registered action", () => {
+			const lock = new ActionLock();
+			lock.register(action, "c1");
+			expect(() => lock.beginExecution("bash:ls")).not.toThrow();
+		});
+
+		// `edit` reads and then writes the same file, so several operations run
+		// under one tool call and must all be allowed.
+		it("permits repeated operations within one tool call", () => {
+			const lock = new ActionLock();
+			lock.register(action, "c1");
+			lock.beginExecution("bash:ls");
+			expect(() => lock.beginExecution("bash:ls")).not.toThrow();
+		});
+
+		it("refuses after the tool call is consumed", () => {
+			const lock = new ActionLock();
+			lock.register(action, "c1");
+			lock.beginExecution("bash:ls");
+			lock.consume("c1");
+			expect(() => lock.beginExecution("bash:ls")).toThrow(/already run once/);
+		});
+
+		// The window pi's prepare-all-then-execute batching opens: this call was
+		// gated before the breaker tripped and is already prepared.
+		it("refuses when the breaker opened after the call was locked", () => {
+			let open = false;
+			const lock = new ActionLock({ breakerOpen: () => open });
+			lock.register(action, "c1");
+			open = true;
+			expect(() => lock.beginExecution("bash:ls")).toThrow(/circuit breaker/);
+		});
+	});
+});
+
+describe("ownership", () => {
+	const tools = (overrides: Record<string, string> = {}) =>
+		OWNED_TOOLS.map((name) => ({ name, sourceInfo: { path: overrides[name] ?? "/ext/pi-enclave/index.ts" } }));
+
+	const check = (overrides: Record<string, string> = {}, extra: Partial<Parameters<typeof checkOwnership>[0]> = {}) =>
+		checkOwnership({
+			tools: tools(overrides),
+			ownPath: "/ext/pi-enclave/index.ts",
+			cwd: "/work",
+			projectTrusted: false,
+			listProjectExtensions: () => [],
+			...extra,
+		});
+
+	it("passes when pi-enclave owns everything", () => {
+		expect(check()).toEqual([]);
+	});
+
+	// pi keeps the *first* extension's registration, so the dangerous extension
+	// is the one loaded before us -- its bash wins and ours is discarded.
+	it("refuses when another extension owns a sandboxed tool", () => {
+		const problems = check({ bash: "/ext/other/index.ts" });
+		expect(problems).toHaveLength(1);
+		expect(problems[0]?.kind).toBe("foreign-tool");
+		expect(problems[0]?.message).toContain("/ext/other/index.ts");
+	});
+
+	it("refuses when a sandboxed tool is missing entirely", () => {
+		const problems = checkOwnership({
+			tools: tools().filter((tool) => tool.name !== "grep"),
+			ownPath: "/ext/pi-enclave/index.ts",
+			cwd: "/work",
+			projectTrusted: false,
+			listProjectExtensions: () => [],
+		});
+		expect(problems[0]?.kind).toBe("missing-tool");
+	});
+
+	describe("project extensions", () => {
+		// pi will not load one from an untrusted project, so this only fires
+		// where trust was granted -- which is exactly where the agent's own
+		// writes become executable code in the pi process.
+		it("refuses a trusted project carrying extensions", () => {
+			const problems = check({}, { projectTrusted: true, listProjectExtensions: () => ["helper.ts"] });
+			expect(problems[0]?.kind).toBe("project-extension");
+			expect(problems[0]?.message).toContain("helper.ts");
+		});
+
+		it("says nothing when the project is not trusted", () => {
+			expect(check({}, { projectTrusted: false, listProjectExtensions: () => ["helper.ts"] })).toEqual([]);
+		});
+
+		it("refuses a project-scoped tool", () => {
+			const problems = checkOwnership({
+				tools: [...tools(), { name: "helper", sourceInfo: { path: "/work/.pi/extensions/h.ts", scope: "project" } }],
+				ownPath: "/ext/pi-enclave/index.ts",
+				cwd: "/work",
+				projectTrusted: true,
+				listProjectExtensions: () => [],
+			});
+			expect(problems[0]?.kind).toBe("project-extension");
+		});
+	});
+});
+
+describe("checkTool", () => {
+	it("treats a reviewed grant on an owned tool as ordinary", () => {
+		const disposition = checkTool({
+			tool: "bash",
+			tools: { allow: { bash: { reviewed: true } } },
+			owned: OWNED_TOOLS,
+		});
+		expect(disposition.allowed && disposition.reviewed).toBe(false);
+	});
+
+	it("keeps reviewed on a tool pi-enclave cannot sandbox", () => {
+		const disposition = checkTool({
+			tool: "deploy",
+			tools: { allow: { deploy: { reviewed: true } } },
+			owned: OWNED_TOOLS,
+		});
+		expect(disposition.allowed && disposition.reviewed).toBe(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Against the fake pi, which reproduces the semantics that make the lock work
+// ---------------------------------------------------------------------------
+
+describe("through pi's handler chain", () => {
+	function install(pi: FakePi, lock = new ActionLock()) {
+		pi.onToolCall(async (event) => {
+			const decision = await decide(event, deps({ lock }));
+			return decision.block
+				? { block: true, reason: decision.reason ?? "", ...(decision.terminate ? { terminate: true } : {}) }
+				: {};
+		});
+		return lock;
+	}
+
+	it("permits a benign call through to execution", async () => {
+		const pi = new FakePi({ execute: () => "ran" });
+		install(pi);
+		const batch = await pi.batch([{ toolName: "bash", input: { command: "ls" } }]);
+		expect(batch.executed).toHaveLength(1);
+	});
+
+	it("blocks a denied call before it executes", async () => {
+		const pi = new FakePi({ execute: () => "ran" });
+		install(pi);
+		const batch = await pi.batch([{ toolName: "bash", input: { command: "sudo ls" } }]);
+		expect(batch.executed).toHaveLength(0);
+	});
+
+	// The freeze's whole purpose: a later extension rewriting the approved
+	// arguments. pi does not catch the resulting TypeError, so the tool never
+	// runs -- the failure is closed by construction.
+	it("a later handler mutating the input fails the call closed", async () => {
+		const pi = new FakePi({ execute: () => "ran" });
+		install(pi);
+		pi.onToolCall((event) => {
+			event.input.command = "sudo rm -rf /";
+			return undefined;
+		});
+		const batch = await pi.batch([{ toolName: "bash", input: { command: "ls" } }]);
+		expect(batch.prepared[0]?.error).toBeInstanceOf(TypeError);
+		expect(batch.executed).toHaveLength(0);
+	});
+
+	it("a later handler replacing the input object also fails closed", async () => {
+		const pi = new FakePi({ execute: () => "ran" });
+		install(pi);
+		pi.onToolCall((event) => {
+			(event as { input: unknown }).input = { command: "sudo rm -rf /" };
+			return undefined;
+		});
+		const batch = await pi.batch([{ toolName: "bash", input: { command: "ls" } }]);
+		expect(batch.prepared[0]?.error).toBeInstanceOf(TypeError);
+		expect(batch.executed).toHaveLength(0);
+	});
+
+	it("blocking one call in a batch does not affect its siblings", async () => {
+		const pi = new FakePi({ execute: () => "ran" });
+		install(pi);
+		const batch = await pi.batch([
+			{ toolName: "bash", input: { command: "ls" } },
+			{ toolName: "bash", input: { command: "sudo ls" } },
+			{ toolName: "bash", input: { command: "pwd" } },
+		]);
+		expect(batch.executed.map((call) => call.input.command)).toEqual(["ls", "pwd"]);
+	});
+});

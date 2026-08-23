@@ -30,7 +30,9 @@ import { type ParsedShell, parseShell } from "./shell.ts";
 
 /** A path the action touches, in every spelling policy needs. */
 export interface ActionPath {
-	/** As the model wrote it, after `~`/`file://`/`@` normalization. */
+	/** Exactly as it appeared in the tool input, before any normalization. */
+	raw: string;
+	/** Absolute, after `~`/`file://`/`@` normalization. */
 	typed: string;
 	/** Symlinks followed as far as they exist. */
 	resolved: string;
@@ -111,7 +113,7 @@ export function canonicalize(options: CanonicalizeOptions): CanonicalAction {
 			return;
 		}
 		const relative = typed.startsWith(`${cwd}/`) ? typed.slice(cwd.length + 1) : undefined;
-		paths.push({ typed, resolved, writes, ...(relative !== undefined ? { relative } : {}) });
+		paths.push({ raw, typed, resolved, writes, ...(relative !== undefined ? { relative } : {}) });
 	};
 
 	let shell: ParsedShell | undefined;
