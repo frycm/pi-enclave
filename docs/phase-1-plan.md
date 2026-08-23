@@ -309,18 +309,45 @@ changes.
 Per-call overhead is far below a spawn, which is why the helper is long-lived rather than
 started per operation.
 
-### Step 7 — File tool overrides
+### Step 7 — File tool overrides ✅ done
 
-- `read`, `edit`, `write`, `find`, `ls`: `pi.registerTool(createXTool(cwd, { operations }))`
-  where each `*Operations` delegates to `FsClient`. `find` supplies `glob` so pi never
-  spawns `fd` (`find.ts:225`).
-- `grep`: copy `grep.ts` into `src/tools/grep.ts`, keep pi's argument handling, output
-  formatting and renderers, replace the `spawn(rgPath …)` block (`grep.ts:177-226`) with
-  `FsClient.grep`. Track the copied file's upstream hash so baseline bumps flag drift.
-- Remove the "L2 narrowed to shell execution" caveat from the status line once this lands.
+All six file tools now reach the filesystem through the helper.
+[`file-ops.ts`](../src/tools/file-ops.ts) backs `read`, `edit`, `write`, `ls` and `find`;
+[`grep.ts`](../src/tools/grep.ts) replaces the one pi will not let us redirect.
 
-**Verified by:** C2 `read`/`grep`/`find` variants green; pi's own tool tests ported for the
-re-implemented `grep` to catch formatting regressions.
+**`grep` keeps pi's tool and replaces only `execute`.** Its operations object abstracts the
+filesystem walk but the tool spawns `rg` itself, so without this a `grep` over a credential
+directory reads it with the user's full privileges whatever profile is in force. Copying
+pi's four hundred lines was the alternative; spreading the tool leaves far less to keep in
+step on a baseline bump and keeps the schema, renderers and description byte-identical to
+the built-in. Context lines go back through the helper too — fetching them in the pi process
+would reopen exactly the hole the module closes.
+
+**Operations take a getter, not a client.** Tools register before any profile is compiled,
+and a captured client would either fail at load or keep a tool bound to a retired helper
+still enforcing an older profile.
+
+**Three things only the real run found:**
+
+- **`rg` and `fd` are resolved in the pi process** and passed in as absolute paths. pi
+  downloads them into its own directory, so they are often absent from PATH — and the helper
+  has no network to fetch them. This closes the step-1 finding.
+- **`fd` 8.x rejects `--no-require-git`**, which pi passes. The helper uses a conservative
+  flag set every supported `fd` understands.
+- **That unknown flag made `fd` exit 2 with empty stdout, and the helper reported zero
+  results** — indistinguishable from "nothing matched", and enough to convince an agent a
+  file does not exist. Both search operations now treat exit > 1 as a failure; exit 1 stays
+  a real answer, since that is how `fd` and `rg` say "no matches".
+
+Verified on both platforms: reads, listings, globs and searches work; a read of `~/.ssh` is
+denied **and reported as a denial rather than a missing file**, which matters most on Linux
+where the raw errno is `ENOENT`.
+
+**Known limitation, unchanged from step 0:** a *denied grep* on Linux returns "No matches
+found" rather than a denial, because the deny-read tmpfs makes the directory look empty to
+`rg`. Nothing leaks; the report is just weaker than it should be.
+
+The status line no longer claims shell-only coverage.
 
 ### Step 8 — Commands, status, diagnostics
 
