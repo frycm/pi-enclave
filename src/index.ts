@@ -162,7 +162,17 @@ export default function (pi: ExtensionAPI): void {
 			// unattended, declined or timed out. The turn is over either way, and
 			// the difference between "nobody was asked" and "someone said not now"
 			// is a decision the person may want to revisit with more context.
-			if (!effective || !sessionId) return;
+			//
+			// The guard below should never trip -- both are set in session_start
+			// before the escalator can fire -- but if it ever did, a *silent* drop
+			// in exactly the unattended path the record exists to serve is the
+			// worst failure, so it is announced rather than swallowed.
+			if (!effective || !sessionId) {
+				const message = "pi-enclave: an action needed approval but no record could be written (no active session).";
+				audit?.append("pending", { event: "write-skipped", hash: action.hash, reason: "no session" });
+				process.stderr.write(`${message}\n`);
+				return;
+			}
 			try {
 				const { path, record } = writePending({
 					stateRoot: stateDirs().state,
