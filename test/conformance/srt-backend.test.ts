@@ -10,6 +10,9 @@
  * bubblewrap a capability-bearing user namespace, which `probe()` reports with
  * the sysctl remediation rather than letting every row fail obscurely.
  */
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { effectiveProfile, partitionSrtDefaults, SrtBackend, srtTmpDir, toSrtConfig } from "../../src/backend/srt.ts";
 import { formatProbeReport } from "../../src/probe.ts";
@@ -114,6 +117,25 @@ describe.skipIf(!supported)("sandbox-runtime profile translation", () => {
 		expect(denied.length + advertised.length + devices.length).toBeGreaterThan(devices.length);
 		expect(denied.some((p) => p.endsWith("/.claude/debug"))).toBe(true);
 		expect(denied.some((p) => p.endsWith("/.npm/_logs"))).toBe(true);
+	});
+
+	it("resolves a symlinked deny entry the way each backend needs", () => {
+		// Seatbelt matches canonical paths, so the link alone denies nothing;
+		// bwrap aborts at startup if asked to mask the link itself. macOS gets
+		// both spellings, Linux gets the target only.
+		const dir = mkdtempSync(join(tmpdir(), "enclave-denylink-"));
+		const target = join(dir, "real");
+		const link = join(dir, "link");
+		mkdirSync(target);
+		symlinkSync(target, link);
+		try {
+			const base = { ...requested, readDeny: [link] };
+			const canonical = realpathSync(target);
+			expect(toSrtConfig(base, false, "darwin").filesystem.denyRead).toEqual([link, canonical]);
+			expect(toSrtConfig(base, false, "linux").filesystem.denyRead).toEqual([canonical]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("treats /private/tmp/claude as an alias only on macOS", () => {

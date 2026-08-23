@@ -52,31 +52,31 @@ export function shellQuote(value: string): string {
 }
 
 /**
- * Each deny entry plus, for a symlink, the path it currently resolves to.
+ * Deny entries with symlinks resolved the way each backend needs.
  *
- * Seatbelt matches its `subpath` rules against the canonical path the kernel
- * sees, and sandbox-runtime writes a symlinked deny entry as the link's own
- * path -- so on macOS a `readDeny` entry that is a symlink denied nothing at
- * all. (F13 found this: the secret was readable before the link was ever
- * retargeted.) Denying the target as well closes that; it only ever widens the
- * deny list, never narrows it. On Linux sandbox-runtime resolves the target
- * itself and the extra entry is redundant. Recomputed on every translation, so
- * a retargeted link is re-denied at its new target by the re-wrap.
+ * Neither backend denies a symlinked entry as written. Seatbelt matches
+ * `subpath` rules on the canonical path the kernel sees, and sandbox-runtime
+ * writes the link's own path -- so on macOS a `readDeny` entry that is a
+ * symlink denied nothing at all (F13 found this: the secret was readable
+ * before the link was ever retargeted). bwrap, given the link, tries to mount
+ * a tmpfs on it and aborts at startup, taking the helper with it.
+ *
+ * So on macOS the target is denied *as well* (the rule only widens), and on
+ * Linux the target is denied *instead* -- the link resolves to it, and the
+ * mask lands on a real directory. Recomputed on every translation, so a
+ * retargeted link is re-denied at its new target by the re-wrap.
  */
 function withResolvedTargets(readDeny: readonly string[], platform: NodeJS.Platform = process.platform): string[] {
-	const out = [...readDeny];
-	// Linux only needs the link: sandbox-runtime canonicalises it and masks the
-	// target itself, and listing both makes bwrap try to mount a tmpfs on the
-	// link as well, which fails at startup.
-	if (platform !== "darwin") return out;
+	const out: string[] = [];
 	for (const path of readDeny) {
+		let target: string | undefined;
 		try {
-			if (!lstatSync(path).isSymbolicLink()) continue;
-			const target = realpathSync(path);
-			if (!out.includes(target)) out.push(target);
+			if (lstatSync(path).isSymbolicLink()) target = realpathSync(path);
 		} catch {
-			// Absent or dangling: nothing to resolve.
+			// Absent or dangling: nothing to resolve, keep the entry as written.
 		}
+		if (target === undefined || platform === "darwin") out.push(path);
+		if (target !== undefined && !out.includes(target)) out.push(target);
 	}
 	return out;
 }
