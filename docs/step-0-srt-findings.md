@@ -3,17 +3,21 @@
 **Question the spike had to answer:** can `@anthropic-ai/sandbox-runtime` deliver the
 Phase-1 platform-matrix guarantees, or must pi-enclave generate profiles itself?
 
-**Answer: SRT is sufficient for Phase 1 on macOS.** Every filesystem, network and socket
-row of the matrix is enforced by the kernel, and two design questions the plan left open
-(long-lived helper, per-invocation capability widening) both resolve in our favour. Three
-findings change the design; two change claims in the README.
+**Answer: SRT is sufficient for Phase 1 on both backends.** Every filesystem, network and
+socket row of the matrix is enforced by the kernel on macOS/Seatbelt *and* Linux/bwrap, and
+two design questions the plan left open (long-lived helper, per-invocation capability
+widening) both resolve in our favour on both.
+
+The Linux run added the most consequential finding of the spike: **the two backends deny
+with different errnos and report violations through different mechanisms**, so a denial is
+not a portable concept. Details in findings 9–11.
 
 | | |
 |---|---|
 | SRT version tested | **0.0.73** (pi's bundled example pins 0.0.26 — nine months of API behind) |
-| Platform tested | macOS 15 (`darwin` 25.6.0), Seatbelt backend |
-| Not tested | Linux / bwrap — no Linux host and no running container runtime available. Deferred to CI (step 1) |
-| Spike code | `scratchpad/srt-spike/` — throwaway, not committed |
+| macOS backend | macOS 15 (`darwin` 25.6.0), Seatbelt — full profile |
+| Linux backend | Podman VM, Fedora 40, kernel 6.11 aarch64, bwrap — in SRT's `enableWeakerNestedSandbox` mode (see [the container/userns problem](#the-containeruserns-problem--a-real-constraint-on-ci-and-on-phase-4)) |
+| Spike code | `scratchpad/srt-spike/`, `scratchpad/linux-spike/` — throwaway, not committed |
 
 ## Decisions
 
@@ -63,7 +67,7 @@ path or override it; it must not assume `$TMPDIR` is the host's.
 
 | Source | Shape | Reliability |
 |---|---|---|
-| **errno** (fs helper) | `EPERM` / `EACCES` from the syscall | Exact. Structured. The operation and path are known to the caller |
+| **errno** (fs helper) | `EPERM` / `EACCES` / `EROFS` / `ENETUNREACH` from the syscall — **the value differs per backend, see finding 9** | Exact. Structured. The operation and path are known to the caller |
 | **kernel log** (bash) | `bash(22824) deny(1) file-write-create /private/…` — a raw log line via `log stream`, correlated by a base64 `commandId` baked into the SBPL deny message | Good, but text. Async — needs a drain window before the violations for a command are complete |
 | **proxy** (network) | `deny network-outbound example.com:443 (host is not on the allow list)` | Good, but userspace, not kernel |
 
@@ -85,7 +89,10 @@ operation's own error as the primary signal.
 **Gap: `sudo` and `su` are denied with no violation event at all.** They fail with
 `Operation not permitted` and exit non-zero, but nothing reaches the store. The matrix row
 "script that calls `sudo` → violation, not a policy denial" therefore cannot be asserted
-on the violation stream alone; assert on the exec failure instead.
+on the violation stream alone; assert on the exec failure instead. Confirmed on Linux too.
+
+Findings 1–8 below were measured on macOS. Findings 9–13 cover Linux, where the *mechanism*
+of every denial differs — read them before writing any code that interprets a failure.
 
 ### 3. The long-lived sandboxed helper works, and is fast — step 6 is unblocked
 
@@ -103,7 +110,7 @@ enforcement inside the helper     read ws/ok.txt          OK
 ```
 
 Per-call overhead is negligible; the cost is the 40ms startup, once per session. The
-`FsClient` design in step 6 stands as written.
+`FsClient` design in step 6 stands as written. Confirmed on bwrap too — finding 11.
 
 ### 4. Symlink cases pass in Phase 1, not Phase 6 — the kernel resolves them
 
@@ -189,7 +196,12 @@ Separately, set `PYTHONDONTWRITEBYTECODE=1` in `CHILD_ENV_BASE`: without it ever
 invocation tries to write `__pycache__` into read-only install directories, producing
 dozens of spurious violations (62 in one `multiprocessing` call).
 
-## Matrix status after the spike (macOS/Seatbelt)
+## Matrix status after the spike
+
+Every row passes on both backends. The **mechanism** column is the point: identical
+policy, different denial surface.
+
+### macOS / Seatbelt
 
 | Row | Result |
 |---|---|
@@ -206,11 +218,172 @@ dozens of spurious violations (62 in one `multiprocessing` call).
 | C9 env leak | leaks with SRT's env; **clean with `ChildEnv`** |
 | C10 happy path | works |
 
+## Linux / bwrap findings
+
+Run in a privileged Podman container (Fedora 40, kernel 6.11, aarch64) with
+`enableWeakerNestedSandbox: true`. Every matrix row behaves correctly; the mechanisms
+differ from macOS throughout.
+
+What the compiled bwrap argv actually does — worth reading, because it is a stronger
+boundary than Seatbelt in three places:
+
+```
+bwrap --new-session --die-with-parent
+      --unshare-net --unshare-pid --unshare-user --cap-drop ALL
+      --ro-bind / /                       ← whole root read-only
+      --bind <workspace> <workspace>      ← writable roots bound back in
+      --tmpfs <denied-read-path>          ← deny-read is an EMPTY TMPFS OVERLAY
+      --dev /dev --proc /proc
+      -- bash -c 'socat TCP-LISTEN:3128 … UNIX-CONNECT:<sock> &
+                  …/vendor/seccomp/arm64/apply-seccomp <command>'
+```
+
+- `--unshare-net` — the network namespace is genuinely removed; the proxy is reached over
+  a bound unix socket bridged by `socat`. Stronger than macOS, where the proxy is a
+  reachable localhost TCP port.
+- `--die-with-parent` is already there, which answers the plan's helper-reaping question.
+- `apply-seccomp` creates a nested user+PID+mount namespace and becomes a non-dumpable
+  PID 1, so the sandboxed command cannot `ptrace` the unfiltered `socat` helpers. **If it
+  cannot create that namespace it aborts rather than running unfiltered** — fail-closed,
+  which is exactly what pi-enclave wants from a dependency.
+
+### 9. Linux and macOS deny with different errnos — the fs helper needs a table, not a check
+
+This is the finding with the widest blast radius. The same operation, denied on both
+platforms, surfaces differently:
+
+| Operation | macOS / Seatbelt | Linux / bwrap | Why |
+|---|---|---|---|
+| write outside a writable root | `EPERM` | **`EROFS`** | `--ro-bind / /` makes it read-only, not forbidden |
+| read a denied path | `EPERM` | **`ENOENT`** | deny-read is a **tmpfs overlay** — the file is not denied, it is *absent* |
+| raw TCP connect | `EPERM` | **`ENETUNREACH`** | `--unshare-net` removes the network, not the permission |
+| unix socket | `EPERM` at `connect()` | `EPERM` at `socket()` | seccomp blocks `AF_UNIX` socket *creation* |
+
+Confirmed through the helper on both platforms:
+
+```
+                                    macOS        Linux
+read ws/ok.txt                      OK           OK
+read <denied>/.ssh/id_ed25519       DENY EPERM   DENY ENOENT
+read ws/link-to-ssh/… (symlink)     DENY EPERM   DENY ENOENT
+write outside ws                    DENY EPERM   DENY EROFS
+write ws/from-helper.txt            OK           OK
+```
+
+**Consequences:**
+
+- `FsClient` must map `{EPERM, EACCES, EROFS, ENETUNREACH}` to `Violation`, per backend —
+  a single `EPERM` check silently misses every Linux write denial.
+- **`ENOENT` is ambiguous and cannot be mapped blindly.** A genuinely missing file and a
+  read-denied file are indistinguishable by errno on Linux. The helper must consult the
+  compiled profile's deny list to decide which it is, and the conformance suite must assert
+  the *classification*, not just that the call failed.
+- The message the model sees differs by platform (`No such file or directory` vs
+  `Operation not permitted`). The `promptGuidelines` re-declared on the `bash` tool should
+  describe the violation format in backend-neutral terms, or the agent will learn one
+  platform's vocabulary.
+
+### 10. On Linux, denied *reads* produce no violation event at all
+
+Because deny-read is a tmpfs overlay rather than a rule, C2 and C3 recorded **zero**
+violations on Linux while producing correct denials. Writes do emit events, in a format
+unrelated to macOS's:
+
+```
+Linux:  deny openat /tmp/enclave-home-YfDTzO/pwned.txt
+        deny network-outbound example.com:443 (host is not on the allow list)
+macOS:  bash(22824) deny(1) file-write-create /private/var/…/pwned.txt
+```
+
+So the violation stream is **not a reliable denial detector on Linux**, and the parser is
+per-backend with no shared grammar. This reinforces the step-0 decision that the
+operation's own error is the primary signal and violations are supporting evidence — on
+Linux that is not a preference, it is the only thing that works for reads.
+
+Noise differs too: Linux emitted 30 `/dev/shm/sem.*` violations for the `multiprocessing`
+test (which *succeeded* — `mp ok: [2, 4, 6]`, unlike macOS where it failed on
+`__pycache__`). Each backend needs its own default ignore list.
+
+### 11. The long-lived helper works on bwrap as well
+
+```
+helper ready pid=2 in 28ms       (macOS: 40ms)
+200 round-trips: 16ms            0.080ms/call   (macOS: 0.02ms/call)
+alive after 200 calls: true
+```
+
+Four times slower per call than macOS and still negligible. Note `pid=2`: the helper is
+PID 2 inside the nested PID namespace, so pi-enclave cannot address it by host PID —
+lifecycle management must go through the `spawn` handle, not `kill(pid)`.
+
+### 12. `ChildEnv` holds on Linux, including `/proc/self/environ`
+
+The Linux-specific leak vector the README calls out is closed:
+
+```
+env | grep -iE 'API_KEY|SECRET|GITHUB_TOKEN'                    → <<no secrets>>
+tr '\0' '\n' < /proc/self/environ | grep -iE '…'                → <<no secrets in /proc>>
+control: same run WITHOUT ChildEnv                              → 3 secrets leaked
+```
+
+The control case is the important half: it proves the test can fail and that SRT alone
+does not close this.
+
+### 13. `sudo`/`su` — no violation event on Linux either
+
+`su root -c true` → `su: cannot set groups: Operation not permitted`, zero violations.
+Same conclusion as macOS: assert on the exec failure, not the violation stream.
+
+Untested on Linux: the PTY row. `script(1)` takes different arguments on Linux than macOS
+and the probe was malformed; `allowPty` behaviour on bwrap is still unknown.
+
+## The container/userns problem — a real constraint on CI and on Phase 4
+
+The Linux run only produced data after enabling `enableWeakerNestedSandbox`, and that
+matters beyond this spike.
+
+**In a normal (non-privileged) container, the bwrap backend does not run at all:**
+
+```
+unprivileged container:  bwrap: Can't mount devpts on /newroot/dev/pts: Permission denied
+privileged container:    apply-seccomp: write /proc/self/uid_map: Operation not permitted
+```
+
+Reduced to its cause: `bwrap --unshare-user --cap-drop ALL` then `apply-seccomp` →
+`nested userns is capability-restricted; caller must provide CAP_SYS_ADMIN`. Both
+components need **capability-bearing** user namespaces, and a nested userns does not have
+them. `apply-seccomp` aborts rather than degrade, which is correct but total.
+
+Two consequences the plan has to absorb:
+
+1. **CI (step 1) will hit this.** SRT's README states that Ubuntu 24.04+ ships
+   `kernel.apparmor_restrict_unprivileged_userns=1`, which "allows `unshare(CLONE_NEWUSER)`
+   but strips capabilities from the resulting namespace" — the same failure. GitHub
+   Actions' `ubuntu-latest` **is** 24.04. The Linux CI job must run
+   `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` before the conformance
+   suite, and `probe()` should detect the sysctl and fail closed with that exact
+   remediation rather than producing a confusing bwrap error.
+2. **Phase 4's Docker backend claim needs qualifying.** The README says "Docker passes the
+   conformance suite". Inside a container, bwrap needs either a privileged container or
+   `enableWeakerNestedSandbox`, which SRT's own security notes call "considerably weaker …
+   should only be used in cases where additional isolation is otherwise enforced". For the
+   Docker backend that caveat is arguably satisfied — the container *is* the additional
+   isolation — but it must be a stated, tested decision, not an accident. The
+   conformance suite should record which mode a backend passed in.
+
+**Caveat on the Linux numbers above:** they were produced in weaker-nested mode, so the
+seccomp layer was not doing its normal job. Filesystem and network results come from
+bwrap's binds and namespaces and are unaffected, but the unix-socket and `sudo` rows
+depend on seccomp and must be re-confirmed on a real Linux host in CI.
+
 ## Open, carried into step 1
 
-- **Everything above is macOS-only.** bwrap must be validated in CI on `ubuntu-latest`;
-  `/proc/self/environ` (C9), `--die-with-parent` reaping, and the seccomp violation
-  monitor are the Linux-specific unknowns.
+- **Re-confirm the seccomp-dependent rows on a real Linux host.** The unix-socket and
+  `sudo`/`su` results came from weaker-nested mode; bwrap's binds and namespaces carried
+  the filesystem and network rows, but seccomp was not fully engaged.
+- **`allowPty` on bwrap is untested** — the probe used macOS `script(1)` syntax.
+- **`probe()` must detect `kernel.apparmor_restrict_unprivileged_userns`** and fail closed
+  with the sysctl remediation, rather than surfacing a raw bwrap error.
 - **Log-monitor cost** — `enableLogMonitor: true` spawns a `log stream` subprocess per
   session. Measure its idle CPU before enabling it by default.
 - **Violation drain window** — kernel-log violations are async. The spike used an 800ms
