@@ -44,29 +44,39 @@ Steps are ordered so the riskiest assumption — that SRT delivers the matrix gu
 is tested before anything is built on it. Each step names what it produces and how it is
 verified.
 
-### Step 0 — SRT capability spike
+### Step 0 — SRT capability spike ✅ done
 
-*Throwaway code. Output is a written decision, not a module.*
+Full write-up: [step-0-srt-findings.md](step-0-srt-findings.md).
 
-Pin a candidate SRT version (start with latest, `0.0.73`) and answer, by running real
-commands through `wrapWithSandbox` on macOS and Linux:
+**Verdict: SRT is sufficient for Phase 1 on macOS**; pin **`0.0.73`** (not the `0.0.26`
+pi's example bundles) and use `wrapWithSandboxArgv`. Every filesystem, network and socket
+matrix row is kernel-enforced. Linux/bwrap is untested — no Linux host was available —
+and moves into step 1's CI.
 
-- **Read deny:** does `filesystem.denyRead` stop `cat ~/.ssh/id_ed25519` at the kernel on
-  both platforms?
-- **Network off:** with `network.allowedDomains: []`, are `curl`, `nc`, raw `python socket`
-  and DNS all denied? Does SRT still start its proxy, and can the child reach it?
-- **Unix sockets:** are `/var/run/docker.sock`, `$SSH_AUTH_SOCK`, `~/.gnupg/S.gpg-agent`
-  unreachable by default, and is `allowUnixSockets` something we can refuse to expose?
-- **Violation detection:** how does SRT surface a kernel denial (macOS `sandbox-exec`
-  log / bwrap exit code) so it can be distinguished from an ordinary non-zero exit?
-- **Long-lived child:** can a process started under the profile stay alive across calls
-  (needed for the fs helper), or does SRT assume one-shot commands?
-- **Profile access:** can we get the compiled Seatbelt profile / bwrap argv out of SRT,
-  for `/enclave backend` diagnostics and for the conformance suite to assert on?
+Results that change the steps below:
 
-**Decision recorded:** exact SRT version to pin, and whether `wrapWithSandbox` is
-sufficient or the backend must call SRT's lower-level profile generation. If any of the
-first three answers is "no", the backend design changes here — before step 2.
+- **`ChildEnv` composes with SRT for free.** SRT injects its own variables as an
+  `env NAME=VALUE …` prefix *inside the argv*, so `spawn` can be handed a strict allowlist
+  env: SRT's proxy vars survive, and none of the parent's credentials leak. Verified with
+  `ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY` and `GITHUB_TOKEN` set in the parent.
+- **Violations arrive three ways** — errno (fs helper), kernel log line (bash), proxy
+  (network) — so `Violation` needs a `source` field, and `SandboxViolationEvent` is a raw
+  log line that must be parsed. **The fs helper needs no log parsing at all**: `EPERM` is
+  exact and synchronous.
+- **The long-lived helper works**: 40 ms startup, 0.02 ms per round-trip, enforcement
+  intact. Step 6's design stands; the per-call-spawn fallback is not needed.
+- **Symlink races are already denied on the resolved path**, so C3/C4 pass through plain
+  `bash` — they move from step 6 to steps 4/5.
+- **Per-invocation `customConfig`** widens one command without leaking into the next —
+  Phase 3's capability retry hatch is confirmed to work.
+- **Noise is real**: benign `sysctl-read` denials on nearly every command, 62 spurious
+  `__pycache__` violations from one Python call. A `violations.length > 0` check is wrong.
+- **PTYs are denied by default** (`allowPty`), and `sudo`/`su` are denied with *no*
+  violation event.
+
+Two README claims need correcting (detail in the findings doc): `network.mode: "off"` is
+not kernel-absolute — SRT always starts a reachable localhost proxy that denies HTTP in
+userspace — and reads are a **deny-list**, not the allow-list "read-only root" implies.
 
 ### Step 1 — Package scaffold
 
@@ -97,6 +107,7 @@ interface SandboxBackend {
 
 type RunResult = { exitCode: number | null; violations: Violation[] };
 type Violation = { kind: "read" | "write" | "network" | "exec" | "socket";
+                   source: "errno" | "kernel-log" | "proxy";   // ← from step 0
                    path?: string; host?: string; op: string; backend: string };
 ```
 
@@ -105,8 +116,16 @@ type Violation = { kind: "read" | "write" | "network" | "exec" | "socket";
   `network: "off"`, no unix sockets.
 - `buildChildEnv(processEnv, config)` implements the README's `CHILD_ENV_BASE`,
   `passthrough`, credential deny pattern (applied last), `HOME`/`TMPDIR` rewrite and
-  `PATH` filtering. Note `BashOperations.exec` receives an `env` option from pi; the
-  backend **ignores it** and uses `ChildEnv` — document this in the code.
+  `PATH` filtering. Two things the backend **ignores**: the `env` option pi passes to
+  `BashOperations.exec`, and the `env` SRT returns from `wrapWithSandboxArgv` (it is
+  `process.env` plus additions — 54 keys including `SSH_AUTH_SOCK`). Both are documented
+  in the code. Add `PYTHONDONTWRITEBYTECODE=1` to `CHILD_ENV_BASE`, and note SRT rewrites
+  `TMPDIR` to `/tmp/claude` — pi-enclave adopts or overrides it, never assumes the host's.
+- **Violation parsing** is per-backend and per-source, with a default noise list
+  (`sysctl-read`, `__pycache__` writes) applied before anything reaches the status line or
+  the Phase-2 circuit breaker. Kernel-log violations are async: the backend needs a defined
+  settle policy before it calls a command's violation list complete — the spike used an
+  800 ms sleep, which is not acceptable in shipped code.
 
 **Verified by:** property test that no name matching `envDeny` ever survives
 `buildChildEnv` regardless of `passthrough`; snapshot tests of the constructed env.
@@ -123,27 +142,42 @@ runs every Phase-1 matrix row through the backend under test. Each scenario asse
 |---|---|---|
 | C1 | Write outside writable root via `bash`, `write`, `edit` | `Violation{kind:"write"}` |
 | C2 | Read `~/.ssh/id_ed25519` via `bash`, `read`, `grep`, `find` | `Violation{kind:"read"}` |
-| C3 | Symlink race: canonicalize `ws/link`, then swap it to `~/.ssh`, then `read ws/link/id_ed25519` | violation — helper's `open` denied |
-| C4 | Symlink write: `ws/out → /etc/passwd`, `write ws/out` | violation |
+| C3 | Symlink race: canonicalize `ws/link`, then swap it to `~/.ssh`, then `read ws/link/id_ed25519` | violation naming the **resolved** path (passes from step 4) |
+| C4 | Symlink write: `ws/out → /etc/passwd`, `write ws/out` | violation naming the resolved path (passes from step 4) |
 | C5 | `curl`, `nc`, `python -c "socket…"`, DNS lookup | `Violation{kind:"network"}` |
-| C6 | `vim`/`less` PTY, Python multiprocessing, `git worktree` outside cwd | works / violation as configured |
-| C7 | Script calling `sudo`, `su`, `systemctl` | violation, not a policy denial |
+| C6 | `vim`/`less` PTY, Python multiprocessing, `git worktree` outside cwd | works / violation as configured — dev profile sets `allowPty: true` and `PYTHONDONTWRITEBYTECODE=1` |
+| C7 | Script calling `sudo`, `su`, `systemctl` | exec denied, not a policy denial — assert on the **exec failure**, not the violation stream (step 0: these produce no violation event) |
 | C8 | Connect to docker.sock, gpg-agent, `$SSH_AUTH_SOCK`, X11/Wayland socket | `Violation{kind:"socket"}` |
 | C9 | Environment leak: `env`, `sh -c 'echo $ANTHROPIC_API_KEY'`, `os.environ`, `/proc/self/environ` | none of the values present; `passthrough` entry matching `envDeny` rejected at config load |
 | C10 | Happy path: write inside cwd and `$TMPDIR`, read project files, run `git status` | works, zero violations |
 
-C3/C4 and the `read`/`grep`/`find` variants of C2 cannot pass until step 6; they are
-written now and marked `todo` so the suite documents the gap the status line reports.
+Only the `read`/`grep`/`find` variants of C2 wait for step 6; they are written now and
+marked `todo` so the suite documents the gap the status line reports. C3/C4 pass from
+step 4 — step 0 showed Seatbelt evaluates policy against the resolved path, so there is
+no check-then-open window to race.
+
+Every scenario also asserts the **noise filter**: a benign `sysctl-read` denial must not
+be reported as a violation.
 
 **Verified by:** the suite itself runs against a deliberately broken `NoopBackend` and
 fails every row — proving the tests can fail.
 
 ### Step 4 — `seatbelt` backend and the `bash` override
 
-- `SeatbeltBackend` wraps SRT per the step-0 decision; `run()` spawns through `ChildEnv`
-  only (never `process.env`), in its own process group, honours `signal` and `timeout`
-  the way pi's `createLocalBashOperations` does (`bash.ts:88`), and maps kernel denials
-  to `Violation[]`.
+- `SeatbeltBackend` calls `wrapWithSandboxArgv(cmd, undefined, customConfig, signal, cwd,
+  { commandId, commandText })` and spawns the returned `argv` with our `ChildEnv` — never
+  `process.env`, never SRT's returned env. Own process group; `signal` and `timeout`
+  handled the way pi's `createLocalBashOperations` does (`bash.ts:88`).
+- Violations come from `SandboxManager.getSandboxViolationStore().getViolationsForCommand(id)`,
+  correlated by the `commandId` SRT bakes into the SBPL deny message. Use the tool-use id,
+  not the command text (SRT compares only the first 100 characters, so long commands
+  sharing a prefix cross-attribute).
+- `SandboxManager` is a process-global singleton: `initialize()` once per session,
+  per-call divergence only via `customConfig`. The backend must not assume two live base
+  profiles.
+- Audit SRT's **default writable paths** (`/tmp/claude`, `~/.npm/_logs`, `~/.claude/debug`)
+  and drop the ones pi-enclave does not advertise — a sandbox that can write
+  `~/.claude/debug` is wider than the profile in the status line.
 - `createEnclaveBashOperations(backend, compiled)` returning `BashOperations`.
 - Extension entry: `pi.registerTool(createBashTool(cwd, { operations }))` with
   re-declared `promptSnippet` / `promptGuidelines` describing the violation format;
@@ -177,10 +211,13 @@ profile, long-lived) speaking length-prefixed JSON over stdio:
 - `FsClient` in the pi process: request/response multiplexing, per-call timeout, restart
   on helper crash (with the crash logged as an audit-worthy event for Phase 2).
 - Helper denials are recognised by `EACCES`/`EPERM` from the kernel and reported as
-  `Violation`, never retried in-process.
+  `Violation{source:"errno"}`, never retried in-process. **No log parsing on this path** —
+  the errno is exact and synchronous.
+- Measured in step 0: **40 ms startup, 0.02 ms per round-trip** over 200 calls, with
+  enforcement (including the symlink case) intact inside the helper.
 
-**Verified by:** protocol unit tests with a fake helper; C3 and C4 now pass on both
-backends.
+**Verified by:** protocol unit tests with a fake helper; the `read`/`grep`/`find` variants
+of C2 now pass on both backends.
 
 ### Step 7 — File tool overrides
 
@@ -247,9 +284,12 @@ pi-enclave/
 
 | Risk | Containment |
 |---|---|
-| SRT cannot express a Phase-1 guarantee (most likely: unix-socket deny or DNS in `off` mode) | Step 0 finds out first; fallback is generating the Seatbelt profile / bwrap argv ourselves for that one feature while still using SRT for the rest |
-| SRT `wrapWithSandbox` assumes one-shot commands; a long-lived helper is awkward | Step 0 checks; fallback is a per-call helper spawn (slower — measured in step 9) |
-| Kernel denial is not distinguishable from an ordinary failure | Seatbelt: read the sandbox log; bwrap: inspect `errno` from the helper, and for bash rely on stderr pattern + exit code with `Violation.confidence` flagged — decide in step 0 |
+| ~~SRT cannot express a Phase-1 guarantee~~ | **Retired by step 0** on macOS — every matrix row is enforced. Still open for bwrap until CI runs |
+| ~~SRT assumes one-shot commands~~ | **Retired by step 0** — the long-lived helper works at 0.02 ms/call |
+| ~~Kernel denial indistinguishable from ordinary failure~~ | **Retired by step 0** — errno for the helper, correlated log lines for bash. The residual risk is *noise*, not detection |
+| Violation noise makes the breaker and status line useless | Default ignore list from step 0 (`sysctl-read`, `__pycache__`); exit code plus the operation's own error stay the primary signal, violations are evidence |
+| Kernel-log violations are async — a command's list may be incomplete when read | Define a settle policy in step 4 and test it; the spike's 800 ms sleep is not shippable |
+| bwrap diverges from Seatbelt on a matrix row | The conformance suite is backend-agnostic and runs on both in CI from step 1; divergence surfaces as a red row, not a surprise |
 | The copied `grep.ts` drifts from upstream | Stored upstream hash checked in the baseline-bump script |
 | `examples/extensions/sandbox` semantics change in a later 0.84.x patch | The baseline is a bounded range; CI installs the exact pi version under test |
 
