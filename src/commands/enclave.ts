@@ -41,6 +41,8 @@ export interface EnclaveState {
 	configError?: string;
 	/** Breaker counters, for the footer. Absent before the gate is running. */
 	breaker?: { open: boolean; consecutive: number; limit: number };
+	/** What attendance is actually in force, and what was configured. */
+	attendance?: string;
 	auditPath?: string;
 	/** True once an audit write has failed. Shown without being asked for. */
 	auditDegraded?: boolean;
@@ -75,7 +77,9 @@ export function renderStatusLine(state: EnclaveState): string {
 	// and escalation are running" and "only the kernel is", and someone reading
 	// this line to decide whether to walk away needs to see it without asking.
 	if (state.effective && !state.effective.auto) parts.push("L1 off");
-	else if (state.effective) parts.push(`L4:${state.effective.attended.mode}`);
+	// The mode *in force*, not the one configured: a session that degraded to
+	// unattended must not keep displaying the mode it asked for.
+	else if (state.effective) parts.push(`L4:${(state.attendance ?? state.effective.attended.mode).split(" ")[0]}`);
 	// The breaker is shown only once it has something to say. A permanent
 	// "0/3" would be noise, and a silent trip would be the opposite.
 	// A log that has stopped recording is a weakened boundary, and the rule
@@ -119,7 +123,7 @@ export function renderStatus(state: EnclaveState): string {
 			`config:     profile "${state.effective.name}"${state.effective.auto ? "" : "   L1/L4 disabled by PI_ENCLAVE_AUTO=off"}`,
 			`rules:      ${state.effective.rules.deny.length} deny, ${state.effective.rules.ask.length} ask, ${state.effective.rules.skipReview.length} skipReview`,
 			`reviewer:   ${state.effective.reviewer.model} (deterministic mode: every crossing is an ask)`,
-			`attended:   ${state.effective.attended.mode}`,
+			`attended:   ${state.attendance ?? state.effective.attended.mode}`,
 			`breaker:    ${state.breaker?.open ? "OPEN -- the turn is stopped" : `${state.breaker?.consecutive ?? 0} of ${state.effective.breaker.consecutive} consecutive`}`,
 			`audit:      ${state.auditPath ?? "(not open)"}${state.auditDegraded ? "   WRITES ARE FAILING" : ""}`,
 		);

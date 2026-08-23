@@ -33,6 +33,14 @@ import { OWNED_TOOLS } from "./config/defaults.ts";
 import { createDevProfile, toBackendProfile } from "./config/profile.ts";
 import { type LoadedSource, loadConfig } from "./config/sources.ts";
 import type { EffectiveProfile, Provenance } from "./config/types.ts";
+import {
+	type AttendanceState,
+	describeAttendance,
+	recheckAttendance,
+	resolveAttendance,
+} from "./escalate/attendance.ts";
+import { createConfirmEscalator } from "./escalate/confirm.ts";
+import { describeHandshakeFailure, runHandshake } from "./escalate/handshake.ts";
 import { BREAKER_ENTRY_TYPE, CircuitBreaker, isBreakerState, steerMessage } from "./gate/breaker.ts";
 import { decide, type GateDecision } from "./gate/gate.ts";
 import { ActionLock } from "./gate/lock.ts";
@@ -41,7 +49,7 @@ import { PROVENANCE_ENTRY_TYPE, ProvenanceTracker } from "./gate/provenance.ts";
 import { formatProbeReport } from "./probe.ts";
 import { probeHost } from "./probe-host.ts";
 import { AuditLog, configFields, configHash, decisionFields } from "./state/audit.ts";
-import { ensureStateDirs, StateDirError } from "./state/dir.ts";
+import { ensureStateDirs, StateDirError, stateDirs } from "./state/dir.ts";
 import { applyRetention } from "./state/retention.ts";
 import { BASH_PROMPT_GUIDELINES, createEnclaveBashOperations } from "./tools/bash.ts";
 import {
@@ -71,6 +79,12 @@ function messageText(message: { content?: unknown }): string {
 		.map((part) => (part && typeof part === "object" && "text" in part ? String((part as { text: unknown }).text) : ""))
 		.join("");
 }
+
+type ConfirmFn = (
+	title: string,
+	message: string,
+	options?: { timeout?: number; signal?: AbortSignal },
+) => Promise<boolean>;
 
 export default function (pi: ExtensionAPI): void {
 	const report = probeHost(PI_VERSION ?? null);
@@ -102,9 +116,35 @@ export default function (pi: ExtensionAPI): void {
 	const breaker = new CircuitBreaker({ consecutive: 3, window: [10, 50] });
 	const directInput = new ProvenanceTracker();
 	const lock = new ActionLock({ breakerOpen: () => breaker.open });
+
+	/**
+	 * L4. Rebuilt from live state on every call rather than captured, because a
+	 * terminal can be lost and an RPC client can disconnect, and the answer to
+	 * "is anyone there?" must be the one that is true now.
+	 */
+	const escalator = createConfirmEscalator({
+		ui: () => uiContext,
+		attendance: () => attendance,
+		confirmTimeoutMs: () => effective?.attended.confirmTimeoutMs ?? 300_000,
+		onEscalation: (event) => {
+			audit?.append("attendance", {
+				event: "escalation",
+				outcome: event.outcome,
+				attended: event.attended,
+				hash: event.action.hash,
+				tool: event.action.tool,
+				reason: event.reason,
+			});
+		},
+	});
 	/** Set by turn_start; every decision is attributed to the turn it happened in. */
 	let currentTurn = 0;
 	let audit: AuditLog | undefined;
+	let attendance: AttendanceState = { configured: "off", effective: "off" };
+	/** Rebuilt per escalation from the live context, so a lost channel is seen. */
+	let uiContext: { confirm: ConfirmFn } | undefined;
+	/** The pi mode this session is running in, captured once at session start. */
+	let piMode: "tui" | "rpc" | "json" | "print" = "print";
 
 	/**
 	 * When the lock is not the right thing to complain about.
@@ -143,6 +183,7 @@ export default function (pi: ExtensionAPI): void {
 		...(provenance ? { provenance } : {}),
 		...(sources ? { sources } : {}),
 		...(audit ? { auditPath: audit.path, auditDegraded: audit.degraded } : {}),
+		attendance: describeAttendance(attendance),
 		breaker: { open: breaker.open, consecutive: breaker.state.consecutive, limit: effective?.breaker.consecutive ?? 3 },
 		// A configuration refusal and an ownership refusal are both "auto mode
 		// will not start"; the status line shows whichever came first.
@@ -277,6 +318,14 @@ export default function (pi: ExtensionAPI): void {
 		if (ownershipError) return { block: true, reason: ownershipError };
 		if (!effective) return { block: true, reason: "pi-enclave: no policy is loaded yet, so nothing may run." };
 
+		// A channel can be lost mid-session. Re-checked here rather than only at
+		// session start, and only ever narrowing.
+		attendance = recheckAttendance(attendance, {
+			mode: piMode,
+			hasUI: uiContext !== undefined,
+			hasTty: process.stdin.isTTY === true,
+		});
+
 		const decision: GateDecision = await decide(
 			{ toolName: event.toolName, toolCallId: event.toolCallId, input: event.input as Record<string, unknown> },
 			{
@@ -285,6 +334,7 @@ export default function (pi: ExtensionAPI): void {
 				home: homedir(),
 				lock,
 				owned: OWNED_TOOLS,
+				escalator,
 				toolSource: (tool) => pi.getAllTools?.().find((entry) => entry.name === tool)?.sourceInfo?.path,
 				breakerOpen: () => breaker.open,
 				onDecision: (result) => {
@@ -456,6 +506,50 @@ export default function (pi: ExtensionAPI): void {
 			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
 			return;
 		}
+
+		// Attendance. Resolved after the configuration because it is configured,
+		// and before the breaker because a fatal mismatch stops the session.
+		piMode = ctx.mode as "tui" | "rpc" | "json" | "print";
+		const attendanceEnv = {
+			mode: piMode,
+			hasUI: ctx.hasUI,
+			hasTty: process.stdin.isTTY === true,
+		};
+		if (loaded.profile.attended.mode === "rpc" && ctx.mode === "rpc") {
+			const handshake = await runHandshake({
+				ui: { input: (title, placeholder, options) => ctx.ui.input(title, placeholder, options) },
+				sessionId: ctx.sessionManager.getSessionId(),
+				secretPath: stateDirs().attendSecret,
+			});
+			if (handshake.verified) {
+				attendance = resolveAttendance("rpc", { ...attendanceEnv, handshakeVerified: true });
+			} else {
+				attendance = resolveAttendance("rpc", attendanceEnv);
+				attendance = { ...attendance, reason: describeHandshakeFailure(handshake.reason) };
+			}
+		} else {
+			attendance = resolveAttendance(loaded.profile.attended.mode, attendanceEnv);
+		}
+		audit?.append("attendance", {
+			event: "resolved",
+			configured: attendance.configured,
+			effective: attendance.effective,
+			reason: attendance.reason,
+		});
+
+		if (attendance.fatal) {
+			// The configuration describes a situation that is not the real one.
+			// Continuing as unattended would be safe and dishonest: the user would
+			// be waiting for a dialog that is never coming.
+			const message = `pi-enclave: refusing to start -- ${attendance.reason}.`;
+			configError = message;
+			process.stderr.write(`${message}\n`);
+			ctx.ui.notify(message, "error");
+			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
+			return;
+		}
+
+		uiContext = { confirm: (title, message, options) => ctx.ui.confirm(title, message, options) };
 
 		// The breaker survives a resume. Guardian deliberately drops its counters
 		// at session start; here they persist, because an unattended run that is
