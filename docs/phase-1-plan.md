@@ -198,38 +198,57 @@ reports "cannot run this control" rather than "the suite is not falsifiable".
 
 **Steps 4-5 point the same suite at the real backends, where every row must pass.**
 
-### Step 4 — `seatbelt` backend and the `bash` override
+### Step 4 — `seatbelt` backend and the `bash` override ✅ done
 
-- `SeatbeltBackend` calls `wrapWithSandboxArgv(cmd, undefined, customConfig, signal, cwd,
-  { commandId, commandText })` and spawns the returned `argv` with our `ChildEnv` — never
-  `process.env`, never SRT's returned env. Own process group; `signal` and `timeout`
-  handled the way pi's `createLocalBashOperations` does (`bash.ts:88`).
-- Violations come from `SandboxManager.getSandboxViolationStore().getViolationsForCommand(id)`,
-  correlated by the `commandId` SRT bakes into the SBPL deny message. Use the tool-use id,
-  not the command text (SRT compares only the first 100 characters, so long commands
-  sharing a prefix cross-attribute).
-- `SandboxManager` is a process-global singleton: `initialize()` once per session,
-  per-call divergence only via `customConfig`. The backend must not assume two live base
-  profiles.
-- Audit SRT's **default writable paths** (`/tmp/claude`, `~/.npm/_logs`, `~/.claude/debug`)
-  and drop the ones pi-enclave does not advertise — a sandbox that can write
-  `~/.claude/debug` is wider than the profile in the status line.
-- `createEnclaveBashOperations(backend, compiled)` returning `BashOperations`.
-- Extension entry: `pi.registerTool(createBashTool(cwd, { operations }))` with
-  re-declared `promptSnippet` / `promptGuidelines` describing the violation format;
-  `pi.on("user_bash", () => ({ operations }))`.
-- Violations are appended to tool output as a fenced `enclave-violation` block and to
-  `details`, so the model sees *why* a command failed.
+**Every conformance row passes against the real backend on macOS.** `npm run
+conformance:report -- srt` prints the table.
 
-**Verified by:** conformance rows C1 (`bash`), C2 (`bash`), C5–C10 green on macOS.
+**One backend serves both platforms.** SRT abstracts seatbelt and bwrap behind
+`wrapWithSandboxArgv`, and step 0 ran byte-identical code on each — so
+[`srt.ts`](../src/backend/srt.ts) is the whole implementation and **step 5 becomes "verify
+on Linux" rather than "write a second backend"**. The differences that do matter (errno,
+whether an event is emitted) already live in `errno.ts` and `violations.ts`, keyed by name.
 
-### Step 5 — `bwrap` backend
+Delivered: [`backend/srt.ts`](../src/backend/srt.ts),
+[`config/profile.ts`](../src/config/profile.ts), [`tools/bash.ts`](../src/tools/bash.ts),
+the `bash` override and `user_bash` routing in [`index.ts`](../src/index.ts),
+`/enclave status|backend|violations`.
 
-Same shape as step 4 on Linux. Expect platform-specific work on: `/proc/self/environ`
-(C9), `--die-with-parent` so the helper is reaped, and the network namespace for `off`
-mode (verify SRT does not rely on its proxy being reachable).
+**Decisions worth carrying forward:**
 
-**Verified by:** the same rows green on `ubuntu-latest` in CI.
+- **The violation settle policy** replaces the spike's flat 800 ms sleep: poll until the
+  count is stable for two reads, capped at 750 ms. Faster when there are none, more
+  complete during a burst. The bound is acceptable precisely because violations are
+  evidence, never the verdict.
+- **SRT's default write paths are denied.** `getDefaultWritePaths()` unions `~/.npm/_logs`
+  and `~/.claude/debug` into every profile; a sandbox that can write those is wider than the
+  status line claims, and `~/.claude/debug` sits beside configuration steering another agent.
+- **A stale `CompiledProfile` now fails closed.** A biome unused-parameter warning surfaced
+  a real hazard: `run()` ignored the profile it was handed, because `wrapWithSandboxArgv`
+  reads the manager's global state. Holding an older profile would have executed under a
+  newer, possibly wider one. Profiles carry a generation and mismatches throw.
+- **`/enclave status` states the coverage gap**: L2 covers shell execution only until
+  step 6. A status line that overstated the boundary is the one lie this project cannot afford.
+
+**Verified against real pi**, not only in tests — read inside the workspace works, the write
+outside is denied and the file never created, network refused, and the `sandbox denied:`
+annotation reaches the agent. That run also exposed a benign `SystemConfiguration.configd`
+mach-lookup cluttering the line that mattered, now filtered **by name** rather than ignoring
+`mach-lookup` as a class, since other mach services are genuinely powerful.
+
+### Step 5 — Verify the backend on Linux
+
+*Was "write the bwrap backend". Step 4 made it one implementation, so this is now a
+verification step.*
+
+- Run the conformance suite on `ubuntu-latest` in CI, with the userns sysctl applied.
+- Confirm the Linux-specific rows: `/proc/self/environ` (C9), `--die-with-parent` reaping,
+  and the seccomp-dependent rows (C8 sockets, C7 `sudo`) that step 0 could only observe in
+  `enableWeakerNestedSandbox` mode.
+- Confirm the bwrap violation parser against real observer output, and settle `allowPty`
+  on bwrap — untested in step 0 because the probe used macOS `script(1)` syntax.
+
+**Verified by:** the same suite green on both runners.
 
 ### Step 6 — `pi-enclave-fs` helper
 
