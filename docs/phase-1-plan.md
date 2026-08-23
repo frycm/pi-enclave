@@ -36,7 +36,8 @@ Phase 1 is done when all of the following hold on **both** backends (`seatbelt` 
 4. `/enclave status` and `/enclave backend` work; the status line shows backend and mode.
 5. Read latency through the helper is measured and recorded in the README.
 6. `probe()` fails closed outside the peer range and when the backend prerequisites
-   (`sandbox-exec`, `bwrap`, `socat`, `rg`, `fd`) are missing.
+   (`sandbox-exec`, `bwrap`, `socat`) are missing, and warns on `rg`/`fd` — pi fetches
+   those on demand, so absence from PATH is not a sandbox failure (step 1).
 
 ## Work breakdown
 
@@ -88,25 +89,40 @@ Two README claims need correcting (detail in the findings doc): `network.mode: "
 not kernel-absolute — SRT always starts a reachable localhost proxy that denies HTTP in
 userspace — and reads are a **deny-list**, not the allow-list "read-only root" implies.
 
-### Step 1 — Package scaffold
+### Step 1 — Package scaffold ✅ done
 
-- npm package `pi-enclave`, ESM, TypeScript, vitest; `pi.extensions` entry in
-  `package.json` so `pi -e ./pi-enclave` loads it.
-- `peerDependencies`: `@earendil-works/pi-coding-agent` `>=0.84.2 <0.85.0`;
-  `dependencies`: `@anthropic-ai/sandbox-runtime` pinned exactly (from step 0).
-- `probe()`: reads the installed pi version, refuses outside the range; checks backend
-  prerequisites per platform; returns a structured report used by `/enclave status`.
-- CI: GitHub Actions matrix `macos-latest` + `ubuntu-latest` (with `bubblewrap socat
-  ripgrep fd-find` installed). The conformance suite from step 3 runs here. **The Linux job
-  must run `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` before the
-  suite** — `ubuntu-latest` is 24.04, which ships that restriction on and strips
-  capabilities from the user namespaces both bwrap and `apply-seccomp` need. Without it the
-  backend fails closed with a confusing error.
-- `probe()` additionally checks that sysctl on Linux and reports the remediation verbatim,
-  so a user hitting it gets the one-line fix instead of a bwrap stack trace.
+Delivered: `package.json` (ESM, `pi.extensions` entry, pi peer range, SRT pinned to
+`0.0.73`), `tsconfig`, vitest, biome, [`src/probe.ts`](../src/probe.ts) +
+[`src/probe-host.ts`](../src/probe-host.ts), [`src/index.ts`](../src/index.ts),
+[`scripts/probe.ts`](../scripts/probe.ts), 28 unit tests, and
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
 
-**Verified by:** `probe()` unit tests with a mocked pi version; CI green on both runners
-with an empty test suite.
+`probe()` is pure with respect to an injected `ProbeEnv`, so the tests exercise the real
+decision logic on platforms the test host is not. It checks the pi range (failing on a
+newer pi too), Node against SRT's minimum, platform→backend, backend binaries, and the
+Linux userns sysctl. The CI Linux job applies
+`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` and symlinks Debian's
+`fdfind` to `fd`.
+
+**Verified beyond the unit tests:**
+
+- `tsc` clean against pi 0.84.2's published types — which corrected two guessed API shapes:
+  `registerCommand(name, options)` takes two arguments, and `ctx.ui.notify` is not optional.
+- The extension loads in real pi and a turn completes.
+- `probe()`'s Linux branch exercised in a container: healthy host, the apparmor
+  restriction, and missing `bwrap`/`socat` all produce the right verdict and remediation.
+
+**Two findings for later steps:**
+
+- **`session_start` + `ctx.ui.notify` is not a sufficient channel for a refusal.** Both
+  work in `--print` mode, but the message never reaches stdout — invisible in exactly the
+  unattended mode where a silent fail-closed is most dangerous. The refusal now goes to
+  **stderr at load time**, with the notify kept for interactive users. Phase 2's pending
+  approval records and breaker messages need the same treatment.
+- **`rg`/`fd` "not on PATH" does not mean "unavailable to pi"** — pi fetches them on demand
+  into its own directory. The helper cannot do that fetch (no network), so **step 7 must
+  resolve the absolute path outside the sandbox and pass it in**. Until then the check is
+  advisory (`warn`, not `fail`).
 
 ### Step 2 — `SandboxBackend` interface, `Violation`, `ChildEnv`
 
