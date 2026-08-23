@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: Typecheck and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx biome ci src test
+
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Linux sandbox prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap socat ripgrep fd-find
+          # fd ships as fdfind on Debian/Ubuntu; the helper looks for `fd`.
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      # ubuntu-latest is 24.04, which ships
+      # kernel.apparmor_restrict_unprivileged_userns=1. That permits
+      # unshare(CLONE_NEWUSER) but strips capabilities from the resulting
+      # namespace, and both bubblewrap and sandbox-runtime's apply-seccomp need
+      # capability-bearing user namespaces. Without this the backend fails
+      # closed at the first command with an obscure uid_map error.
+      # See docs/step-0-srt-findings.md.
+      - name: Allow capability-bearing user namespaces
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+
+      - run: npm ci
+
+      # Fail early and legibly if the host cannot support the sandbox at all,
+      # rather than letting the conformance suite report it as N red rows.
+      - name: Probe host
+        run: npm run probe
+
+      - run: npm run test:unit
+      - run: npm run test:conformance
