@@ -349,14 +349,32 @@ found" rather than a denial, because the deny-read tmpfs makes the directory loo
 
 The status line no longer claims shell-only coverage.
 
-### Step 8 — Commands, status, diagnostics
+### Step 8 — Commands, status, diagnostics ✅ done
 
-- `registerCommand("enclave")` with `status` (probe report, backend, mode, violation
-  counts) and `backend` (compiled profile dump — the Seatbelt SBPL / bwrap argv).
-- Status-line footer: `enclave: seatbelt · workspace-write · net off · 3 violations`.
-- `/enclave violations`: last N violations this session.
+[`commands/enclave.ts`](../src/commands/enclave.ts) renders `/enclave
+status|backend|violations` and the footer as pure functions over a state snapshot, so the
+surface a user reads is tested against constructed states rather than observed by eye.
 
-**Verified by:** snapshot test of the status output; manual check in the TUI.
+**The status line was lying, and the test caught it.** It derived "active" from whether the
+probe passed — so a *weakened* run, which legitimately fails the namespace-nesting check,
+displayed **NOT ACTIVE while visibly denying reads**. That is the worst configuration to be
+wrong in: it invites someone to assume nothing is enforced and act on it. "Active" now comes
+from whether a profile compiled. The probe is a startup gate; once a profile is in force,
+the compiled profile is the fact.
+
+**Filesystem-helper denials now reach the counter and footer.** Without that wiring the file
+tools would enforce silently, making step 7 invisible in the one place anyone looks.
+
+The rule the module follows: **anything that weakens the boundary appears without being
+asked for.** `WEAKENED` in the one-line summary and explained in the report; a profile that
+has not started; a probe that refused. `status` states what is *not* covered — MCP and
+third-party tools run in the pi process — because omitting it would imply total coverage.
+`backend` prints the compiled profile verbatim, since anyone checking the sandbox needs the
+artefact the kernel was given rather than our description of it.
+
+```
+enclave: bwrap · workspace-write · net off · WEAKENED · 1 denied
+```
 
 ### Step 9 — Matrix sign-off and measurement
 
