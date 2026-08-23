@@ -8,10 +8,21 @@ mutations and boundary crossings — never for the decisions that must be determ
 Designed to be trustworthy **offline, with open-weight models**.
 
 > [!IMPORTANT]
-> **Status: design proposal (v0.1). No implementation yet.**
-> This README is the design document. It is published first so the architecture can be
-> reviewed and argued with before any code exists. Nothing here is built; every section is
-> a commitment to be tested, not a description of working software.
+> **Status: Phase 1 (sandbox core) implemented. Phases 2–5 are still design.**
+>
+> **Built and tested:** the OS-enforced sandbox (L2). `bash`, `!`/`!!`, and all six file
+> tools run under Seatbelt on macOS and bubblewrap on Linux. The
+> [platform matrix](#platform-matrix) below runs as an executable conformance suite, with a
+> control proving each row fails when nothing is enforced. See the
+> [Phase 1 plan](docs/phase-1-plan.md) and the
+> [sandbox-runtime findings](docs/step-0-srt-findings.md).
+>
+> **Not built:** everything else. The policy layer (L1), the reviewer (L3), human escalation
+> (L4), the action lock, the circuit breaker, the audit log, the egress proxy, the Docker
+> backend, and the ops profile are all still design. Sections describing them are
+> commitments to be tested, not descriptions of working software.
+>
+> **Known gaps in what *is* built** are listed under [Phase 1 status](#phase-1-status).
 
 ### API baseline
 
@@ -56,6 +67,7 @@ to this section, not a silently different security model.
 - [Server-ops profile](#server-ops-profile)
 - [Prior art, reuse and credits](#prior-art-reuse-and-credits)
 - [Delivery plan](#delivery-plan)
+- [Phase 1 status](#phase-1-status)
 - [Core changes to propose to pi](#core-changes-to-propose-to-pi)
 - [Open questions and risks](#open-questions-and-risks)
 - [License](#license)
@@ -130,7 +142,7 @@ exposes everything required: built-in tool overrides with pluggable operations, 
 ## Threat model
 
 | Threat | Primary control | Backup |
-|---|---|---|
+|---|---|---|---|
 | Prompt injection via repo files, tool output, or fetched content steering the agent to run `curl … \| sh`, read `~/.ssh`, or push secrets | Sandbox: filesystem deny-read on secrets, no network except the proxy allowlist | Pattern `deny` rules; reviewer |
 | Injection aimed at the **reviewer** (text in arguments or messages telling it to allow) | Reviewer sees structured, provenance-labelled evidence only; only direct TUI/RPC input can carry authorization | A reviewer `allow` can only widen the sandbox by one declared capability for one action — it can never produce unsandboxed host execution, so the sandbox still bounds a wrong allow |
 | Agent tampers with pi-enclave's own state (approval records, config) from inside the sandbox | All extension state lives outside every writable root, mode `0600`, written atomically; project-local config is tighten-only | Session-bound nonces and expiry on approval records |
@@ -155,9 +167,9 @@ explicit bypass of the trigger is a `rules.skipReview` match. What stays invaria
 L2 always runs and that no layer below L4 can remove it.
 
 | Layer | Name | What it does |
-|---|---|---|
+|---|---|---|---|
 | **L1** | Deterministic rules | Pattern rules on tool and arguments with exactly two verbs: `deny` (never runs, nothing below can override) and `ask` (always a human decision, the reviewer cannot auto-approve it), plus protected paths. Never touches a model. Runs before everything else in under a millisecond. |
-| **L2** | **OS enforcement** | Every shell command **and every file/search operation** executes inside a Seatbelt / bwrap / Docker boundary: read-only root, explicit writable roots, secrets denied for reading, network only via the egress proxy. An L3 `allow` still lands here; so does a `skipReview` match. Sandbox denials are returned to the agent as a structured violation, which is the only way a request can *widen* the profile (via an L3-reviewed capability retry). |
+| **L2** | **OS enforcement** | Every shell command **and every file/search operation** executes inside a Seatbelt / bwrap / Docker boundary: explicit writable roots (everything else read-only), declared paths and secrets denied for reading, network only via the egress proxy. Note the asymmetry, which the backends impose and pi-enclave inherits: **writes are an allow-list, reads are a deny-list.** There is no way to say "the agent may only read the workspace"; anything absent from the read-deny list is readable. An L3 `allow` still lands here; so does a `skipReview` match. Sandbox denials are returned to the agent as a structured violation, which is the only way a request can *widen* the profile (via an L3-reviewed capability retry). |
 | **L3** | Isolated model reviewer | For every action L1 did not decide that is either selected by `review.trigger` (`mutating` by default; `all` selects read-only actions too; `boundary` selects none) or a request to widen the sandbox by one declared capability (`--allow-write <path>`, `--allow-host <host>`) for one action. Judges it against a **prose rulebook** (`review.environment` / `hard_deny` / `soft_deny` / `allow`) and the user's direct authorization. Fresh completion, own system prompt, structured evidence, strict JSON output with `allow` / `deny` / `ask`. **An L3 `allow` never leaves the sandbox** — it re-runs the locked action under a one-shot profile that is the base profile plus exactly the requested capability. |
 | **L4** | Human escalation | Attended: `ctx.ui.confirm` with the exact canonical action. Unattended: `ask` means deny, stop the turn, and write a resumable "needs approval" record outside the workspace. Unsandboxed host execution, if a profile permits it at all, is reachable **only** from this layer. |
 
@@ -283,7 +295,11 @@ const CHILD_ENV_BASE = [
   `KUBECONFIG`, `DOCKER_HOST`, `PI_*`. The list is the default `envDeny` in `$defaults` and
   can be extended, never shortened, below user-global.
 - `HOME` and `TMPDIR` are rewritten to the sandbox's view (`$TMPDIR` is a writable root; the
-  real home is not), and `PATH` is filtered to entries under read-allowed roots.
+  real home is not), and `PATH` is filtered to entries under read-allowed roots. Under
+  sandbox-runtime the child's `TMPDIR` is `/tmp/claude` (or `CLAUDE_CODE_TMPDIR`), which SRT
+  makes writable in every profile; pi-enclave advertises it as a writable root rather than
+  describe a narrower sandbox than the one in force, and denies every other SRT default
+  that is not a device node.
 - **Provider credentials stay in the pi parent.** The reviewer call, the session model and
   the egress proxy's credential masking all run in pi's process; nothing inside the sandbox
   needs a credential to do the task, and if a task genuinely does (a deploy key for a
@@ -415,7 +431,7 @@ complete tool coverage, monotonic policy, exact approval binding, auditability a
 evaluation on top of one.
 
 | Need | Pi API | How pi-enclave uses it |
-|---|---|---|
+|---|---|---|---|
 | Sandbox shell commands | `registerTool({ name: "bash", … })` built from `createBashTool({ operations, spawnHook })` | Override the built-in `bash`. The operations object delegates to `backend.run`. Renderers are inherited; `promptSnippet` and `promptGuidelines` are re-declared so the model learns about capability requests and the violation format. |
 | Sandbox file tools | `createReadTool` / `EditTool` / `WriteTool` / `FindTool` / `LsTool` with their `*Operations`; `grep` re-implemented | Same profile, enforced by the [sandboxed helper](#file-and-search-tools-are-os-enforced-too), not by in-process path checks. `grep` cannot be fully redirected through `GrepOperations` today (it spawns `rg` itself), so it is replaced outright. |
 | `!` and `!!` user commands | `on("user_bash")` | Routed through the same backend. Guardian lists this as an uncovered bypass; here it is covered by construction. |
@@ -443,7 +459,7 @@ between `permissions.deny` / `permissions.ask` and the classifier's `autoMode` r
 ([reference](https://code.claude.com/docs/en/auto-mode-config)), tailored to pi's layers:
 
 | | System 1 — `rules` (L1) | System 2 — `review` (L3) |
-|---|---|---|
+|---|---|---|---|
 | Form | Tool-and-argument **patterns** on the canonical action | **Prose**, read as natural-language rules |
 | Verbs | `deny`, `ask` — nothing else | `environment`, `hard_deny`, `soft_deny`, `allow` |
 | Evaluated | First, deterministically, before any model | Only for what L1 did not decide |
@@ -529,7 +545,7 @@ Environment variables sit between user-global and project-local in the fold, so 
 the same order. These are the only ones that exist:
 
 | Variable | Values | Monotonic direction |
-|---|---|---|
+|---|---|---|---|
 | `PI_ENCLAVE_ATTENDED` | `off` | Only turns attendance off. Any other value is a config error. |
 | `PI_ENCLAVE_PROFILE` | name of a profile defined in the user-global file | Selection only; the selected profile must be ⊑ the user-global default, exactly as for a project file. It cannot define a profile. |
 | `PI_ENCLAVE_AUTO` | `off` | Refuses to enter auto mode at all (CI smoke runs without a sandbox). There is no `on`. |
@@ -626,7 +642,7 @@ built-in entries at that position; omitting it takes full ownership of that list
 `review.trigger` decides which L1-undecided actions the reviewer sees:
 
 | Value | Reviewed | Use |
-|---|---|---|
+|---|---|---|---|
 | `"boundary"` | Only capability retries after a sandbox violation | Phase 2 deterministic mode — forced when `reviewer.model` is the explicit value `"none"`; every crossing is then an `ask` |
 | `"mutating"` (default) | Everything that is not a declared read-only tool or a read-only canonical shell command, plus capability retries | Normal dev work |
 | `"all"` | Every action | Auditing a new reviewer, high-sensitivity repos |
@@ -823,7 +839,7 @@ attended: {
 ```
 
 | `mode` | Meaning | Preconditions checked at session start and on every escalation |
-|---|---|---|
+|---|---|---|---|
 | `"tui"` | A person is at the terminal | `ctx.mode === "tui"` and the process has a controlling TTY; otherwise auto mode refuses to start |
 | `"rpc"` | A person is behind an RPC client that has opted in | The client must complete the **approval-channel handshake** below, built only from `ctx.ui.input` / `ctx.ui.confirm`. No handshake → treated as `"off"` for this session, and the status line says so. |
 | `"off"` | Nobody is there (CI, ops runner, print mode) | Every `ask` is a deny; no dialog is ever attempted |
@@ -910,7 +926,7 @@ Execution is sandboxed unless the record explicitly carries a human `hostExec` a
 ### Outcome matrix
 
 | Event | Attended (`tui`, or `rpc` with a completed handshake) | Unattended (`off`, failed handshake, or preconditions lost) |
-|---|---|---|
+|---|---|---|---|
 | Reviewer returns `ask` | `ctx.ui.confirm` showing the canonical action and reason, raced against `confirmTimeoutMs`; timeout = deny | Deny, `terminate`, write a [pending-approval record](#pending-approval-records) |
 | Reviewer returns `allow` on a capability request | Re-run the locked hash once under the extended profile, still sandboxed | Same |
 | Agent requests host execution | Only if `hostExec: "human"`: treated as `ask`, never sent to the reviewer | Deny; write a pending-approval record marked `requiresHuman` |
@@ -1034,7 +1050,7 @@ reference sandboxes are permissively licensed, and the intent is to reuse their 
 with attribution rather than reinvent them.
 
 | Component | Source | Notes |
-|---|---|---|
+|---|---|---|---|
 | Config layering, `$defaults`, tighten-only project rules, rule tiers, default rule lists | pi-automode — `config.ts`, `constants.ts`, `permissions.ts`, `hard-deny.ts` | Port the layering; collapse pattern tiers to `deny` / `ask`; move the tiered `hard_deny` / `soft_deny` / `allow` semantics into the prose `review` rulebook (after Claude Code's `autoMode` split); add `profiles`, `sandbox` and `tools` sections |
 | Two-stage classifier, transcript budgeting, strict key-order JSON parsing | pi-automode — `classifier.ts`, `transcript.ts` | Port; change evidence to structured JSON; add `ask` |
 | Input lock (`assertJsonLike` + recursive freeze + non-writable property) | pi-approval-guardian — `tool-input-lock.ts` | Port as-is; add the canonical hash |
@@ -1058,8 +1074,10 @@ header and attribution preserved, alongside a `NOTICE` file.
 v1 is deliberately small, and its contract is:
 
 - **Dev profile only.** `workspace-write` on macOS and Linux.
-- **Strict offline.** `network.mode: "off"` is the only mode; the egress proxy and
-  `allowHosts` are not in v1.
+- **Offline.** `network.mode: "off"` is the only mode; the egress proxy and `allowHosts`
+  are not in v1. "Off" means **no host is allowlisted**, not that no network stack exists:
+  raw sockets and DNS are denied by the kernel, while HTTP reaches a loopback proxy that
+  refuses every request. That last hop is a userspace boundary, not a kernel one.
 - **Sandboxing is delegated, not reimplemented.** v1 pins an exact version of
   [`@anthropic-ai/sandbox-runtime`](https://github.com/anthropic-experimental/sandbox-runtime)
   and wraps it as the `seatbelt` and `bwrap` backends, behind the `SandboxBackend` interface
@@ -1074,17 +1092,21 @@ v1 is deliberately small, and its contract is:
 Phases are ordered so each is independently useful and the riskiest part — the sandbox — is
 validated first.
 
-### Phase 1 — Sandbox core
+### Phase 1 — Sandbox core ✅ implemented
 
 *Outcome: every pi command and file operation on macOS and Linux runs in workspace-write
 with no network. No model involved yet.*
 
-- `SandboxBackend` interface; SRT-backed `seatbelt` and `bwrap` backends; `probe()`
-  diagnostics; backend-conformance suite.
+- `SandboxBackend` interface; SRT-backed backend covering `seatbelt` **and** `bwrap` from one
+  implementation; `probe()` diagnostics; backend-conformance suite with a falsifiability
+  control.
 - Sandboxed `pi-enclave-fs` helper; override `bash`, `read`, `edit`, `write`, `find`, `ls`;
-  re-implement `grep`; route `user_bash`.
-- Violation reporting in tool output; `/enclave status|backend`.
+  replace `grep`'s `execute`; route `user_bash`.
+- Violation reporting in tool output; `/enclave status|backend|violations`.
 - The [platform matrix](#platform-matrix) below, green on both backends.
+
+See [Phase 1 status](#phase-1-status) for what this cost and what it does not cover. The
+matrix is green on both backends in CI, on a real Linux host rather than a container.
 
 ### Phase 2 — Policy, lock, breaker, state
 
@@ -1136,30 +1158,134 @@ after passing the eval.*
 Each row is a test that must pass on every backend before a phase is called done. The
 matrix is what "OS-enforced" means in this document.
 
-| Scenario | Expected | Phase |
+**Phase-1 rows are executable.** They live in
+[`test/conformance/scenarios.ts`](test/conformance/scenarios.ts) and run against any
+backend; the **Test** column gives the id. Run them with `npm run conformance:report -- srt`.
+
+Each scenario asserts the **security property** — did the secret leak, did the file get
+written, did the connection open — never an exit code or a violation count. Neither of
+those is portable: on bwrap a denied read produces no violation at all and an `ENOENT` the
+shell reports as a missing file, so a suite built on them would pass a backend that enforces
+nothing.
+
+That claim is itself tested. `test/conformance/falsifiability.test.ts` runs every scenario
+against a backend that enforces nothing and requires each denial row to **fail**. Two rows
+cannot be falsified that way and say so in the code rather than being quietly counted as
+proof: **C7** (`sudo`) holds anyway because the test user is not root, and **C9** (environment)
+is enforced by `buildChildEnv` in the pi process rather than by the kernel — it gets its own
+control. The suite asserts that every exemption carries a written reason, because an
+unexplained one is indistinguishable from a scenario someone silenced to get a green run.
+
+Two further rows are falsifiable only where the host can run their control, which is decided
+at the assertion from a measurement rather than declared: **C5** needs a host with egress,
+and **C12** needs a host whose own processes hold capabilities. The run prints which of the
+two controls it could run, and each row records the host's measured value beside the
+sandbox's, so a green row on a restricted host is not read as stronger evidence than it is.
+
+| Scenario | Expected | Phase | Test |
+|---|---|---|---|
+| Write outside a writable root (`bash`, `write`, `edit`) | Sandbox violation from the kernel, not from a path check | 1 | C1 |
+| Read `~/.ssh/id_ed25519` (`bash`, `read`, `grep`, `find`) | Violation | 1 | C2, C2b, F1 |
+| **Symlink race**: create `ws/link → ~/.ssh` after canonicalization, then `read ws/link/id_ed25519` | Violation — the helper's `open` is denied regardless of what pi resolved | 1 | C3, F3 |
+| **Symlink write**: `ws/out → /etc/passwd`, then `write ws/out` | Violation | 1 | C4, F2 |
+| `curl`, `nc`, `python -c "socket…"`, DNS lookup | Violation (`off` mode) | 1 | C5 |
+| Spawn a PTY (`vim`, `less`), Python multiprocessing, `git worktree` outside cwd | Works / violation as configured. **Linux:** bubblewrap cannot deny PTYs, so `allowPty: false` is not enforceable there and the compiled profile reports `pty on` | 1 | C6 |
+| Script that calls `sudo` / `su` / `systemctl` | Violation, not a policy denial | 1 | C7 |
+| **IPC sockets**: connect to `/var/run/docker.sock`, `~/.gnupg/S.gpg-agent`, `$SSH_AUTH_SOCK`, the broker socket, an X11/Wayland socket | Violation; `allowUnixSockets` is not exposed in the dev profile | 1 | C8 |
+| **Load order / tool shadowing**: another extension registers `bash` or a `tool_call` handler after pi-enclave | Auto mode refuses to start; a `tool_call_final`-style re-validation is tracked in [core changes](#core-changes-to-propose-to-pi) | 2 | — |
+| **Parallel batch termination**: three tool calls in one batch, the second trips the breaker | All three are blocked, `terminate` fires once, the audit log shows one batch outcome, no call from that batch executes after the trip | 2 | — |
+| **Crash / recovery**: kill pi mid-action, resume the session | The lock table and breaker state are restored from session entries; a half-written pending record is invisible (atomic rename); the audit chain verifies up to the last complete line; the helper and any container are reaped (`--die-with-parent`, `--rm`) | 2 | — |
+| Project-local config that selects a wider profile / adds `rules.skipReview` or `review.allow` / adds a trust entry to `review.environment` / changes the reviewer | Whole file rejected, auto mode refuses to start, diagnostic names the field | 2 | — |
+| Project-shared or project-local config contains any of `review.environment` / `hard_deny` / `soft_deny` / `allow` (even a `soft_deny` that reads as tightening) | Whole file rejected, auto mode refuses to start, diagnostic names the key; the reviewer system prompt is byte-identical to the user-global-only render | 2 | — |
+| Project file raises `review.trigger` from `mutating` to `all` | Accepted; lowering it is rejected | 2 | — |
+| Canonical action matches `rules.deny` *and* `rules.skipReview` | Denied at L1, never executed, audit record names both matches | 2 | — |
+| Canonical action matches `rules.ask` *and* `rules.skipReview` | Goes to L4, never fast-pathed | 2 | — |
+| Mutating action in a user-global `skipReview` list, e.g. `git push *` while `network.allowHosts` contains the remote | Executes without L3; audit record is tagged `skipReview`; `rules critique` flags the entry | 3 | — |
+| Attendance `"rpc"` with no handshake, or TTY lost mid-session | `ask` → deny + pending record; never a dialog | 2 | — |
+| Reviewer `allow` on `allow_write=X`, then the same hash replayed with `allow_write=Y` | Second request is a fresh L3 review, not a replay | 3 | — |
+| Pending record edited on disk, or mode changed to `0644`, or nonce reused | Refused with an audit entry | 2 | — |
+| **Environment leak**: provider keys set in the pi process; `env`, `$VAR` expansion, `os.environ`, `/proc/self/environ` inside the sandbox | None of the values appear; a `passthrough` entry matching `envDeny` is rejected at config load | 1 | C9 |
+| **Stale resume**: pending record written, user then removes a writable root / re-adds a `readDeny` entry / loosens config; `pi enclave approve` | Narrower config: executes under the *current* profile and the removed grant is absent. Wider config or uncovered hash change: refused, record stays pending | 2 | — |
+
+---
+
+## Phase 1 status
+
+What the sandbox core does today, what it costs, and what it does not do. The
+[Phase 1 plan](docs/phase-1-plan.md) records how each step was verified; the
+[sandbox-runtime findings](docs/step-0-srt-findings.md) record what the two backends actually
+do, which differs from each other more than the design assumed.
+
+### Built
+
+- **Both backends**, from one implementation — sandbox-runtime abstracts Seatbelt and
+  bubblewrap behind the same API, so there is no second backend to keep in step.
+- **Every tool pi-enclave owns is OS-enforced**: `bash`, `!`/`!!`, and `read` / `edit` /
+  `write` / `find` / `ls` / `grep`. File operations go through a sandboxed helper, so the
+  `open` and `readdir` calls happen inside the boundary rather than in the pi process.
+- **`grep` keeps pi's tool and replaces only `execute`.** Its operations object cannot
+  redirect the `rg` spawn, so without this a search over a credential directory would read
+  it with the user's full privileges whatever profile was in force.
+- **`probe()` fails closed** on an unsupported pi (in *either* direction), a missing
+  backend binary, or a host that cannot give bubblewrap capability-bearing user namespaces.
+  That last check runs the real chain rather than inferring from a sysctl, because inside a
+  container the sysctl is absent and plain `bwrap` succeeds while the sandbox does not work
+  at all.
+- **`/enclave status | backend | violations`** and a footer that names the backend, the
+  mode, the denial count, and anything that weakens the boundary.
+
+### Cost
+
+Measured with `npm run bench:fs`. The comparison is against the same operation performed
+directly in the pi process — which is what pi's own tools do.
+
+| | macOS / Seatbelt | Linux / bwrap |
 |---|---|---|
-| Write outside a writable root (`bash`, `write`, `edit`) | Sandbox violation from the kernel, not from a path check | 1 |
-| Read `~/.ssh/id_ed25519` (`bash`, `read`, `grep`, `find`) | Violation | 1 |
-| **Symlink race**: create `ws/link → ~/.ssh` after canonicalization, then `read ws/link/id_ed25519` | Violation — the helper's `open` is denied regardless of what pi resolved | 1 |
-| **Symlink write**: `ws/out → /etc/passwd`, then `write ws/out` | Violation | 1 |
-| `curl`, `nc`, `python -c "socket…"`, DNS lookup | Violation (`off` mode) | 1 |
-| Spawn a PTY (`vim`, `less`), Python multiprocessing, `git worktree` outside cwd | Works / violation as configured | 1 |
-| Script that calls `sudo` / `su` / `systemctl` | Violation, not a policy denial | 1 |
-| **IPC sockets**: connect to `/var/run/docker.sock`, `~/.gnupg/S.gpg-agent`, `$SSH_AUTH_SOCK`, the broker socket, an X11/Wayland socket | Violation; `allowUnixSockets` is not exposed in the dev profile | 1 |
-| **Load order / tool shadowing**: another extension registers `bash` or a `tool_call` handler after pi-enclave | Auto mode refuses to start; a `tool_call_final`-style re-validation is tracked in [core changes](#core-changes-to-propose-to-pi) | 2 |
-| **Parallel batch termination**: three tool calls in one batch, the second trips the breaker | All three are blocked, `terminate` fires once, the audit log shows one batch outcome, no call from that batch executes after the trip | 2 |
-| **Crash / recovery**: kill pi mid-action, resume the session | The lock table and breaker state are restored from session entries; a half-written pending record is invisible (atomic rename); the audit chain verifies up to the last complete line; the helper and any container are reaped (`--die-with-parent`, `--rm`) | 2 |
-| Project-local config that selects a wider profile / adds `rules.skipReview` or `review.allow` / adds a trust entry to `review.environment` / changes the reviewer | Whole file rejected, auto mode refuses to start, diagnostic names the field | 2 |
-| Project-shared or project-local config contains any of `review.environment` / `hard_deny` / `soft_deny` / `allow` (even a `soft_deny` that reads as tightening) | Whole file rejected, auto mode refuses to start, diagnostic names the key; the reviewer system prompt is byte-identical to the user-global-only render | 2 |
-| Project file raises `review.trigger` from `mutating` to `all` | Accepted; lowering it is rejected | 2 |
-| Canonical action matches `rules.deny` *and* `rules.skipReview` | Denied at L1, never executed, audit record names both matches | 2 |
-| Canonical action matches `rules.ask` *and* `rules.skipReview` | Goes to L4, never fast-pathed | 2 |
-| Mutating action in a user-global `skipReview` list, e.g. `git push *` while `network.allowHosts` contains the remote | Executes without L3; audit record is tagged `skipReview`; `rules critique` flags the entry | 3 |
-| Attendance `"rpc"` with no handshake, or TTY lost mid-session | `ask` → deny + pending record; never a dialog | 2 |
-| Reviewer `allow` on `allow_write=X`, then the same hash replayed with `allow_write=Y` | Second request is a fresh L3 review, not a replay | 3 |
-| Pending record edited on disk, or mode changed to `0644`, or nonce reused | Refused with an audit entry | 2 |
-| **Environment leak**: provider keys set in the pi process; `env`, `$VAR` expansion, `os.environ`, `/proc/self/environ` inside the sandbox | None of the values appear; a `passthrough` entry matching `envDeny` is rejected at config load | 1 |
-| **Stale resume**: pending record written, user then removes a writable root / re-adds a `readDeny` entry / loosens config; `pi enclave approve` | Narrower config: executes under the *current* profile and the removed grant is absent. Wider config or uncovered hash change: refused, record stays pending | 2 |
+| profile compile (once per session) | 25 ms | 145 ms |
+| helper startup (once per profile) | 62 ms | 24 ms |
+| read 4 KB | 0.073 ms · **3.4x** direct | 0.146 ms · **20x** direct |
+| read 1 MB | 1.85 ms · **22x** direct | 6.78 ms · **48x** direct |
+| `stat` | 0.040 ms · 12x direct | 0.089 ms · 49x direct |
+| `grep` over the source tree | *(no `rg` on the test host)* | 4.3 ms |
+
+The multiples look alarming and the absolute numbers are what matter: a file read costs
+tens of microseconds more, and an agent doing real work waits on the model by four orders of
+magnitude more than on the sandbox. The 1 MB read is the honest worst case — base64 framing
+plus a process hop — and even that is under 7 ms.
+
+Linux figures were taken in `enableWeakerNestedSandbox` mode (see below), which does not
+change the I/O path.
+
+### Known gaps
+
+- **MCP and third-party tools are not sandboxed.** They execute in the pi process with the
+  user's privileges. Closing this needs either the policy layer's tool allowlist (phase 2)
+  or an execution hook in pi core.
+- **On Linux, a denied read through `bash` is invisible.** Deny-read is a tmpfs overlay, so
+  the shell reports `ENOENT` and no violation event is emitted. Enforcement holds — the
+  agent does not get the file — but pi-enclave cannot tell it apart from a typo. The file
+  tools are unaffected: the helper sees the real errno and classifies it against the profile.
+  A denied `grep` on Linux likewise returns "no matches" rather than a denial.
+- **`enableWeakerNestedSandbox` exists for containers**, where capability-bearing user
+  namespaces are unavailable. It skips `--cap-drop ALL`, leaving the sandboxed process with
+  a full capability set. It is an explicit opt-in, never inferred, and appears in the status
+  line. Conformance row **C12** asserts the capability drop, so a weakened run reports the
+  difference instead of looking identical to a real one.
+- **C12 is not falsifiable on an unprivileged host.** CI now runs on a real Linux host
+  (`ubuntu-latest`, `kernel.apparmor_restrict_unprivileged_userns=0`), where every row
+  including **C12** passes at full strength — `CapEff=0000000000000000`, no weakened mode.
+  But the runner's *own* processes already hold no capabilities, so the unsandboxed control
+  passes that row too. What C12 proves there is that the sandbox does not hand capabilities
+  out — which is exactly what separates it from `enableWeakerNestedSandbox` — not that it
+  dropped any from a privileged baseline. The row records both masks so the two readings
+  stay apart, and the suite reports which controls the host could run rather than counting
+  an unfalsifiable pass as proof.
+- **`rg` and `fd` must be on `PATH`.** pi fetches them into its own directory on demand, and
+  the helper has no network to do the same; pi-enclave resolves them before the sandbox
+  starts, but cannot find what pi downloaded. `probe()` warns when they are absent.
+- **One profile at a time.** sandbox-runtime's manager is process-global, so only the most
+  recently compiled profile is in force. The backend refuses to run against a stale one
+  rather than silently applying the newer.
 
 ---
 
