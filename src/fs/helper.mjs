@@ -30,6 +30,20 @@ function writeFrame(message) {
 	process.stdout.write(Buffer.concat([header, payload]));
 }
 
+/**
+ * Where to find the search tools.
+ *
+ * pi downloads `rg` and `fd` on demand into its own directory, so they are often
+ * absent from PATH -- and the helper cannot fetch them itself, because it has no
+ * network. The pi process therefore resolves them before the sandbox starts and
+ * passes the absolute paths in. Falling back to a bare name keeps the helper
+ * working when they are simply installed normally.
+ */
+const TOOL_PATHS = {
+	rg: process.env.PI_ENCLAVE_RG || "rg",
+	fd: process.env.PI_ENCLAVE_FD || "fd",
+};
+
 /** Run a search tool and collect its output. Spawned here so it runs under the profile. */
 function runTool(bin, args) {
 	return new Promise((resolve) => {
@@ -79,16 +93,38 @@ async function handle(request) {
 				return false;
 			}
 		case "glob": {
-			const args = ["--glob", "--color=never", "--hidden", "--no-require-git"];
+			// A deliberately conservative flag set. `--no-require-git`, which pi
+			// passes, does not exist in fd 8.x -- and an unknown flag makes fd exit
+			// 2 with an empty stdout, which is indistinguishable from "no files
+			// matched" unless the exit code is checked. Stick to flags every
+			// supported fd understands.
+			const args = ["--glob", "--color=never", "--hidden"];
 			for (const pattern of request.ignore ?? []) args.push("--exclude", pattern);
 			args.push("--max-results", String(request.limit ?? 1000), request.pattern, request.cwd);
-			const result = await runTool("fd", args);
-			if (result.code === "ENOENT") throw Object.assign(new Error("fd is not available"), { code: "ENOENT" });
+			const result = await runTool(TOOL_PATHS.fd, args);
+			if (result.code === "ENOENT")
+				throw Object.assign(new Error(`fd is not available (looked for ${TOOL_PATHS.fd})`), { code: "ENOENT" });
+			// fd exits 1 when nothing matched, which is a real answer. Anything
+			// higher is a failure, and reporting it as an empty result would tell
+			// the agent the files do not exist.
+			if (result.exitCode !== null && result.exitCode > 1) {
+				throw Object.assign(new Error(`fd failed (exit ${result.exitCode}): ${result.stderr.trim().slice(0, 200)}`), {
+					code: "EIO",
+				});
+			}
 			return result.stdout.split("\n").filter(Boolean);
 		}
 		case "grep": {
-			const result = await runTool("rg", request.args);
-			if (result.code === "ENOENT") throw Object.assign(new Error("rg is not available"), { code: "ENOENT" });
+			const result = await runTool(TOOL_PATHS.rg, request.args);
+			if (result.code === "ENOENT")
+				throw Object.assign(new Error(`rg is not available (looked for ${TOOL_PATHS.rg})`), { code: "ENOENT" });
+			// Same reasoning as glob: rg exits 1 for "no matches", and anything
+			// higher is a failure that must not be reported as an empty search.
+			if (result.exitCode !== null && result.exitCode > 1) {
+				throw Object.assign(new Error(`rg failed (exit ${result.exitCode}): ${result.stderr.trim().slice(0, 200)}`), {
+					code: "EIO",
+				});
+			}
 			return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
 		}
 		default:

@@ -29,8 +29,22 @@ import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { buildChildEnv } from "../env/child-env.ts";
 import { HelperFsClient } from "../fs/client.ts";
 import type { BackendName } from "../probe.ts";
+import { whichSync } from "../probe-host.ts";
 import type { CompiledProfile, FsClient, Profile, RunRequest, RunResult, SandboxBackend, Violation } from "./types.ts";
 import { dedupeViolations, parseViolations } from "./violations.ts";
+
+/**
+ * Absolute paths for the search tools, for the helper to use instead of a PATH
+ * lookup it may not be able to satisfy.
+ */
+function resolveSearchTools(): Record<string, string> {
+	const env: Record<string, string> = {};
+	const rg = whichSync("rg");
+	const fd = whichSync("fd");
+	if (rg) env.PI_ENCLAVE_RG = rg;
+	if (fd) env.PI_ENCLAVE_FD = fd;
+	return env;
+}
 
 /** The helper script, resolved relative to this module so it moves with the package. */
 const HELPER_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "fs", "helper.mjs");
@@ -366,10 +380,17 @@ export class SrtBackend implements SandboxBackend {
 
 		return spawn(bin, args, {
 			cwd: compiled.profile.writableRoots[0] ?? process.cwd(),
-			// The same allowlist the shell gets. The helper reads files on the
+			// The same allowlist the shell gets -- the helper reads files on the
 			// agent's behalf, so a credential in its environment is exactly as
-			// disclosable as one in bash's.
-			env: buildChildEnv(process.env, { readDeny: compiled.profile.readDeny }),
+			// disclosable as one in bash's -- plus the resolved search-tool paths.
+			//
+			// Resolving them here rather than inside the sandbox is the point: the
+			// helper has no network and cannot fetch a missing tool, so the lookup
+			// has to happen on this side while it still can.
+			env: {
+				...buildChildEnv(process.env, { readDeny: compiled.profile.readDeny }),
+				...resolveSearchTools(),
+			},
 			stdio: ["pipe", "pipe", "pipe"],
 		}) as ChildProcessWithoutNullStreams;
 	}

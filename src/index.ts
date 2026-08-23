@@ -10,16 +10,33 @@
  * the boundary would be the one lie this project cannot afford.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createBashTool, VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
+import {
+	createBashTool,
+	createEditTool,
+	createFindTool,
+	createGrepTool,
+	createLsTool,
+	createReadTool,
+	createWriteTool,
+	VERSION as PI_VERSION,
+} from "@earendil-works/pi-coding-agent";
 import { SrtBackend } from "./backend/srt.ts";
 import type { CompiledProfile, Violation } from "./backend/types.ts";
 import { createDevProfile } from "./config/profile.ts";
 import { formatProbeReport } from "./probe.ts";
 import { probeHost } from "./probe-host.ts";
 import { BASH_PROMPT_GUIDELINES, createEnclaveBashOperations } from "./tools/bash.ts";
+import {
+	createEditOperations,
+	createFindOperations,
+	createLsOperations,
+	createReadOperations,
+	createWriteOperations,
+} from "./tools/file-ops.ts";
+import { runSandboxedGrep } from "./tools/grep.ts";
 
-/** What the file tools currently are, stated plainly wherever status is shown. */
-const COVERAGE_NOTE = "L2 covers shell execution only; file tools are not sandboxed yet (step 6)";
+/** What the sandbox covers, stated plainly wherever status is shown. */
+const COVERAGE_NOTE = "shell and file tools are OS-enforced; MCP and third-party tools are not";
 
 export default function (pi: ExtensionAPI): void {
 	const report = probeHost(PI_VERSION ?? null);
@@ -49,6 +66,18 @@ export default function (pi: ExtensionAPI): void {
 		onViolations: recordViolations,
 	});
 
+	/**
+	 * The filesystem helper for the profile currently in force.
+	 *
+	 * Called per operation, never captured: tools are registered before any
+	 * profile is compiled, and `backend.fs()` retires the helper when the profile
+	 * changes.
+	 */
+	const fsClient = () => {
+		if (!compiled) throw new Error("pi-enclave: sandbox is not ready");
+		return backend.fs(compiled);
+	};
+
 	if (report.ok) {
 		const base = createBashTool(cwd, { operations });
 		pi.registerTool({ ...base, label: "bash (sandboxed)", promptGuidelines: BASH_PROMPT_GUIDELINES });
@@ -56,6 +85,26 @@ export default function (pi: ExtensionAPI): void {
 		// `!` and `!!` reach the same operations object rather than a parallel
 		// path, so there is no shortcut that bypasses the sandbox by construction.
 		pi.on("user_bash", () => ({ operations }));
+
+		// The five tools whose operations objects pi lets us replace outright.
+		// Each closes over fsClient() rather than a captured client, so a
+		// recompiled profile retires the old helper without leaving a tool bound
+		// to it.
+		pi.registerTool(createReadTool(cwd, { operations: createReadOperations(fsClient) }));
+		pi.registerTool(createEditTool(cwd, { operations: createEditOperations(fsClient) }));
+		pi.registerTool(createWriteTool(cwd, { operations: createWriteOperations(fsClient) }));
+		pi.registerTool(createLsTool(cwd, { operations: createLsOperations(fsClient) }));
+		pi.registerTool(createFindTool(cwd, { operations: createFindOperations(fsClient) }));
+
+		// grep is the exception: its operations object cannot redirect the `rg`
+		// spawn, so pi's tool is kept whole and only `execute` is replaced.
+		const grepBase = createGrepTool(cwd);
+		pi.registerTool({
+			...grepBase,
+			label: "grep (sandboxed)",
+			execute: async (_id: string, params: unknown) =>
+				runSandboxedGrep({ fs: fsClient(), cwd }, params as Parameters<typeof runSandboxedGrep>[1]),
+		} as Parameters<typeof pi.registerTool>[0]);
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
