@@ -159,37 +159,44 @@ tests including cross-backend parity; moving the credential deny list off the en
 the property test and two others; degrading path containment to a string prefix failed 3
 tests across two modules.
 
-### Step 3 — Backend-conformance suite
+### Step 3 — Backend-conformance suite ✅ done
 
-A backend-agnostic harness: `describeConformance(backendFactory)` that builds a temp
-workspace, plants a fake `$HOME` with `.ssh/id_ed25519`, `.aws/credentials`, sets
-`ANTHROPIC_API_KEY` / `AWS_SECRET_ACCESS_KEY` / `GITHUB_TOKEN` in the test process, and
-runs every Phase-1 matrix row through the backend under test. Each scenario asserts on
-`violations[]`, not on exit codes or stderr text.
+The matrix as executable scenarios, plus the control that keeps them honest.
+`npm run conformance:report` prints the table.
 
-| # | Scenario (README matrix, phase 1) | Assert |
-|---|---|---|
-| C1 | Write outside writable root via `bash`, `write`, `edit` | `Violation{kind:"write"}` |
-| C2 | Read `~/.ssh/id_ed25519` via `bash`, `read`, `grep`, `find` | `Violation{kind:"read"}` |
-| C3 | Symlink race: canonicalize `ws/link`, then swap it to `~/.ssh`, then `read ws/link/id_ed25519` | violation naming the **resolved** path (passes from step 4) |
-| C4 | Symlink write: `ws/out → /etc/passwd`, `write ws/out` | violation naming the resolved path (passes from step 4) |
-| C5 | `curl`, `nc`, `python -c "socket…"`, DNS lookup | `Violation{kind:"network"}` |
-| C6 | `vim`/`less` PTY, Python multiprocessing, `git worktree` outside cwd | works / violation as configured — dev profile sets `allowPty: true` and `PYTHONDONTWRITEBYTECODE=1` |
-| C7 | Script calling `sudo`, `su`, `systemctl` | exec denied, not a policy denial — assert on the **exec failure**, not the violation stream (step 0: these produce no violation event) |
-| C8 | Connect to docker.sock, gpg-agent, `$SSH_AUTH_SOCK`, X11/Wayland socket | `Violation{kind:"socket"}` |
-| C9 | Environment leak: `env`, `sh -c 'echo $ANTHROPIC_API_KEY'`, `os.environ`, `/proc/self/environ` | none of the values present; `passthrough` entry matching `envDeny` rejected at config load |
-| C10 | Happy path: write inside cwd and `$TMPDIR`, read project files, run `git status` | works, zero violations |
+| File | Role |
+|---|---|
+| [`fixture.ts`](../test/conformance/fixture.ts) | The world each scenario runs against; plants secrets and the symlink pair |
+| [`scenarios.ts`](../test/conformance/scenarios.ts) | C1–C11, each asserting a security property |
+| [`runner.ts`](../test/conformance/runner.ts) | Runs them against any backend, returning results rather than asserting |
+| [`noop-backend.ts`](../test/conformance/noop-backend.ts) | Enforces nothing. The falsifiability control |
+| [`falsifiability.test.ts`](../test/conformance/falsifiability.test.ts) | Requires every falsifiable denial row to fail unsandboxed |
 
-Only the `read`/`grep`/`find` variants of C2 wait for step 6; they are written now and
-marked `todo` so the suite documents the gap the status line reports. C3/C4 pass from
-step 4 — step 0 showed Seatbelt evaluates policy against the resolved path, so there is
-no check-then-open window to race.
+**Scenarios assert the security property, never the mechanism** — did the secret leak, did
+the file get written, did the connection open. Exit codes and violation counts are recorded
+as evidence but never used as the verdict, because step 0 proved neither is portable. Every
+denied target is a temp directory the test user genuinely could reach: a scenario aimed at
+`/etc/passwd` would "pass" unsandboxed purely because the tests do not run as root, which
+would make the suite unfalsifiable in exactly the way it exists to prevent.
 
-Every scenario also asserts the **noise filter**: a benign `sysctl-read` denial must not
-be reported as a violation.
+**The control caught three real defects on its first run:**
 
-**Verified by:** the suite itself runs against a deliberately broken `NoopBackend` and
-fails every row — proving the tests can fail.
+- Scenarios shared one fixture, so C4 correctly overwrote its target and silently broke C11,
+  which reads the same file. Each scenario now builds its own world.
+- **C7** (sudo/su) passed unsandboxed — it was measuring "the test user is not root".
+- **C9** (environment) passed unsandboxed — credential isolation is enforced by
+  `buildChildEnv` in the pi process, not by the kernel.
+
+C7 and C9 are marked `falsifiableByNoop: false` with a **required** note, and the meta-test
+asserts every exemption carries one: an unexplained exemption is indistinguishable from a
+scenario someone silenced to get a green run. C9 gets its own control — run it with the raw
+parent environment, which is what pi's example and SRT both hand over, and require it to
+catch the leak.
+
+The network row's control is guarded by a host-capability probe, so an isolated runner
+reports "cannot run this control" rather than "the suite is not falsifiable".
+
+**Steps 4-5 point the same suite at the real backends, where every row must pass.**
 
 ### Step 4 — `seatbelt` backend and the `bash` override
 
