@@ -22,7 +22,7 @@
  *    missed line degrades reporting and never enforcement.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getDefaultWritePaths, SandboxManager } from "@anthropic-ai/sandbox-runtime";
@@ -49,6 +49,11 @@ function resolveSearchTools(): Record<string, string> {
 /** Single-quote a string for a POSIX shell; the only safe quoting for arbitrary paths. */
 export function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Which deny roots exist right now, as one comparable string. */
+function denySnapshot(profile: Profile): string {
+	return profile.readDeny.map((path) => (existsSync(path) ? `1${path}` : `0${path}`)).join("\n");
 }
 
 /** The helper script, resolved relative to this module so it moves with the package. */
@@ -212,6 +217,7 @@ export class SrtBackend implements SandboxBackend {
 	private fsGeneration = 0;
 	/** Prepared during compile, because HelperSpawner must be synchronous. */
 	private helperArgv: string[] | undefined;
+	private helperDenySnapshot = "";
 	/** Set by the extension so helper denials reach the same audit trail as shell ones. */
 	onFsViolation: ((violation: Violation) => void) | undefined;
 
@@ -254,6 +260,22 @@ export class SrtBackend implements SandboxBackend {
 		// Prepared here because the helper spawner must be synchronous, and because
 		// a helper wrapped by a stale configuration would be exactly the hazard
 		// assertCurrent exists to prevent.
+		await this.wrapHelper(profile);
+
+		return new SrtCompiledProfile(this.name, profile, ++this.generation, argv.join(" "));
+	}
+
+	/**
+	 * Wrap the helper launch under the manager's current configuration, and
+	 * remember which deny roots existed when it was done.
+	 *
+	 * bwrap can only mask a directory that is there: sandbox-runtime stats each
+	 * `denyRead` entry at wrap time and skips the absent ones. A shell command is
+	 * wrapped per invocation, so it always sees the filesystem as it is. The
+	 * helper is wrapped once and lives for the session -- so a `~/.aws` created
+	 * after startup would be readable through it until this snapshot notices.
+	 */
+	private async wrapHelper(profile: Profile): Promise<void> {
 		// The command is a shell string that /bin/bash -c will parse, so both
 		// paths are quoted: a checkout under "Application Support" or a node
 		// under a directory with a space would otherwise split into arguments.
@@ -266,8 +288,18 @@ export class SrtBackend implements SandboxBackend {
 			{ commandId: "enclave-fs-helper", commandText: "pi-enclave-fs" },
 		);
 		this.helperArgv = helper.argv;
+		this.helperDenySnapshot = denySnapshot(profile);
+	}
 
-		return new SrtCompiledProfile(this.name, profile, ++this.generation, argv.join(" "));
+	/**
+	 * Re-wrap and retire the helper if a deny root has appeared or vanished
+	 * since it was wrapped. Called before every helper operation; the cost is
+	 * one stat per deny root, microseconds against a round trip.
+	 */
+	private async refreshHelperIfStale(compiled: CompiledProfile): Promise<void> {
+		if (denySnapshot(compiled.profile) === this.helperDenySnapshot) return;
+		await this.wrapHelper(compiled.profile);
+		this.fsClient?.retire();
 	}
 
 	async run(compiled: CompiledProfile, request: RunRequest): Promise<RunResult> {
@@ -429,6 +461,7 @@ export class SrtBackend implements SandboxBackend {
 			this.fsClient = new HelperFsClient({
 				compiled,
 				spawnHelper: () => this.spawnHelper(compiled),
+				beforeCall: () => this.refreshHelperIfStale(compiled),
 				...(this.onFsViolation ? { onViolation: this.onFsViolation } : {}),
 			});
 		}

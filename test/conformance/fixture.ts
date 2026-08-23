@@ -36,6 +36,8 @@ export interface Fixture {
 	workspace: string;
 	/** Read-denied: holds `.ssh/id_ed25519` and `.aws/credentials`. */
 	deniedHome: string;
+	/** Read-denied in the profile, but absent until a scenario creates it. */
+	lateDenied: string;
 	/** Readable (reads are a deny-list) but not writable. */
 	outside: string;
 	/** A file in `outside`, used as a symlink target for the write-through test. */
@@ -90,10 +92,15 @@ export function createFixture(): Fixture {
 	symlinkSync(join(deniedHome, ".ssh"), join(workspace, "link-to-denied"));
 	symlinkSync(outsideFile, join(workspace, "link-to-outside"));
 
+	// A deny root that does not exist when the profile is compiled. bwrap can
+	// only mask a directory that is there, so this is how the suite checks what
+	// happens when a protected directory appears mid-session.
+	const lateDenied = join(outside, "late-secrets");
+
 	const profile: Profile = {
 		mode: "workspace-write",
 		writableRoots: [workspace],
-		readDeny: [deniedHome],
+		readDeny: [deniedHome, lateDenied],
 		network: "off",
 		allowPty: true,
 	};
@@ -101,6 +108,7 @@ export function createFixture(): Fixture {
 	return {
 		workspace,
 		deniedHome,
+		lateDenied,
 		outside,
 		outsideFile,
 		socketPath,

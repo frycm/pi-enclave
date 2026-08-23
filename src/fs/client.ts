@@ -41,6 +41,13 @@ interface Pending {
 export interface FsClientOptions {
 	compiled: CompiledProfile;
 	spawnHelper: HelperSpawner;
+	/**
+	 * Runs before every call, before the helper is (re)started. The backend uses
+	 * it to notice that the profile it wrapped the helper under no longer
+	 * describes the filesystem -- a deny root that has since appeared -- and to
+	 * retire the helper so the next start wraps it afresh.
+	 */
+	beforeCall?: () => Promise<void>;
 	callTimeoutMs?: number;
 	/** Notified for every classified denial, for the audit log and status line. */
 	onViolation?: (violation: Violation) => void;
@@ -134,6 +141,8 @@ export class HelperFsClient implements FsClient {
 
 			child.on("close", (code) => {
 				clearTimeout(timer);
+				// A retired helper closing late must not clobber its successor.
+				if (this.child !== child) return;
 				this.child = undefined;
 				this.ready = undefined;
 				if (!this.disposed) {
@@ -184,8 +193,21 @@ export class HelperFsClient implements FsClient {
 		child.stdin.write(frame);
 	}
 
+	/**
+	 * Retire the running helper without disposing the client: the next call
+	 * starts a fresh one. Used when the wrap it was started under is stale.
+	 */
+	retire(): void {
+		const child = this.child;
+		this.child = undefined;
+		this.ready = undefined;
+		this.failAll(new Error("pi-enclave: the filesystem helper was restarted under an updated sandbox"));
+		child?.stdin.end();
+	}
+
 	private async call(request: FsCall, signal?: AbortSignal): Promise<unknown> {
 		if (this.disposed) throw new Error("pi-enclave: the filesystem helper was shut down");
+		await this.options.beforeCall?.();
 		await this.start();
 
 		const child = this.child;

@@ -14,7 +14,7 @@
  * every `denied` scenario reports `ok: false` against a backend that does not
  * sandbox at all.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { CompiledProfile, SandboxBackend, ViolationKind } from "../../src/backend/types.ts";
 import { SandboxDenied } from "../../src/backend/types.ts";
@@ -545,6 +545,38 @@ SCENARIOS.push(
 		},
 	},
 );
+
+SCENARIOS.push({
+	id: "F10",
+	title: "helper: a deny root created after startup is still denied",
+	surface: "fs",
+	expectation: "denied",
+	falsifiableByNoop: true,
+	async run({ backend, compiled, fixture }) {
+		// bwrap masks a denied directory with a tmpfs, and can only do so for a
+		// directory that exists when the helper is wrapped. The helper is wrapped
+		// once and lives for the session, so a ~/.aws that appears afterwards
+		// would be readable through it unless the backend notices. Shell commands
+		// are wrapped per call and never had this problem.
+		const fs = backend.fs(compiled);
+		// Get the helper running under the original wrap first.
+		await fs.readFile(join(fixture.workspace, "ok.txt"));
+		mkdirSync(fixture.lateDenied, { recursive: true });
+		const secret = join(fixture.lateDenied, "token");
+		writeFileSync(secret, `${SECRET_FILE_CONTENT}\n`);
+		try {
+			const content = await fs.readFile(secret);
+			const leaked = content.toString("utf8").includes(SECRET_FILE_CONTENT);
+			return { ok: !leaked, detail: leaked ? "SECRET LEAKED from a deny root created after startup" : "no secret" };
+		} catch (error) {
+			const denied = error instanceof SandboxDenied;
+			return {
+				ok: denied,
+				detail: denied ? "denied after the helper was re-wrapped" : `NOT CLASSIFIED: ${String(error).slice(0, 80)}`,
+			};
+		}
+	},
+});
 
 SCENARIOS.push({
 	id: "F9",
