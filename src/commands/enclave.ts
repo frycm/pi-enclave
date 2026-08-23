@@ -19,6 +19,7 @@ import type { LoadedSource } from "../config/sources.ts";
 import { renderSources } from "../config/sources.ts";
 import type { EffectiveProfile, Provenance } from "../config/types.ts";
 import { formatProbeReport, type ProbeReport } from "../probe.ts";
+import { formatVerifyResult, verifyLog } from "../state/audit.ts";
 
 export interface EnclaveState {
 	report: ProbeReport;
@@ -40,6 +41,9 @@ export interface EnclaveState {
 	configError?: string;
 	/** Breaker counters, for the footer. Absent before the gate is running. */
 	breaker?: { open: boolean; consecutive: number; limit: number };
+	auditPath?: string;
+	/** True once an audit write has failed. Shown without being asked for. */
+	auditDegraded?: boolean;
 }
 
 /** What the sandbox covers, and what it does not. Shown in `status`. */
@@ -74,6 +78,9 @@ export function renderStatusLine(state: EnclaveState): string {
 	else if (state.effective) parts.push(`L4:${state.effective.attended.mode}`);
 	// The breaker is shown only once it has something to say. A permanent
 	// "0/3" would be noise, and a silent trip would be the opposite.
+	// A log that has stopped recording is a weakened boundary, and the rule
+	// this module follows is that those appear without being asked for.
+	if (state.auditDegraded) parts.push("AUDIT FAILING");
 	if (state.breaker?.open) parts.push("BREAKER OPEN");
 	else if (state.breaker && state.breaker.consecutive > 0) {
 		parts.push(`breaker ${state.breaker.consecutive}/${state.breaker.limit}`);
@@ -114,6 +121,7 @@ export function renderStatus(state: EnclaveState): string {
 			`reviewer:   ${state.effective.reviewer.model} (deterministic mode: every crossing is an ask)`,
 			`attended:   ${state.effective.attended.mode}`,
 			`breaker:    ${state.breaker?.open ? "OPEN -- the turn is stopped" : `${state.breaker?.consecutive ?? 0} of ${state.effective.breaker.consecutive} consecutive`}`,
+			`audit:      ${state.auditPath ?? "(not open)"}${state.auditDegraded ? "   WRITES ARE FAILING" : ""}`,
 		);
 		if (state.sources) lines.push("sources:", renderSources(state.sources));
 	}
@@ -153,7 +161,7 @@ export interface CommandOutput {
 	level: CommandLevel;
 }
 
-const USAGE = "usage: /enclave [status|backend|violations|rules defaults|rules config]";
+const USAGE = "usage: /enclave [status|backend|violations|rules defaults|rules config|audit [verify]]";
 
 /**
  * `rules defaults` and `rules config`.
@@ -180,6 +188,16 @@ function renderRules(state: EnclaveState, argv: readonly string[]): CommandOutpu
 	}
 }
 
+/** `audit` and `audit verify`. */
+function renderAudit(state: EnclaveState, argv: readonly string[]): CommandOutput {
+	if (!state.auditPath) return { text: "the audit log is not open yet", level: "warning" };
+	if (argv[0] === "verify") {
+		const result = verifyLog(state.auditPath);
+		return { text: formatVerifyResult(state.auditPath, result), level: result.ok ? "info" : "error" };
+	}
+	return { text: `audit log: ${state.auditPath}\nRun "/enclave audit verify" to re-chain it.`, level: "info" };
+}
+
 export function handleEnclaveCommand(state: EnclaveState, args: string): CommandOutput {
 	const sub = args.trim().split(/\s+/)[0] || "status";
 
@@ -192,6 +210,8 @@ export function handleEnclaveCommand(state: EnclaveState, args: string): Command
 			return { text: renderViolations(state), level: "info" };
 		case "rules":
 			return renderRules(state, args.trim().split(/\s+/).slice(1));
+		case "audit":
+			return renderAudit(state, args.trim().split(/\s+/).slice(1));
 		default:
 			return { text: `unknown subcommand "${sub}"\n${USAGE}`, level: "warning" };
 	}

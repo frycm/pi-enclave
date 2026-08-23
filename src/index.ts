@@ -40,6 +40,9 @@ import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
 import { PROVENANCE_ENTRY_TYPE, ProvenanceTracker } from "./gate/provenance.ts";
 import { formatProbeReport } from "./probe.ts";
 import { probeHost } from "./probe-host.ts";
+import { AuditLog, configFields, configHash, decisionFields } from "./state/audit.ts";
+import { ensureStateDirs, StateDirError } from "./state/dir.ts";
+import { applyRetention } from "./state/retention.ts";
 import { BASH_PROMPT_GUIDELINES, createEnclaveBashOperations } from "./tools/bash.ts";
 import {
 	createEditOperations,
@@ -101,6 +104,7 @@ export default function (pi: ExtensionAPI): void {
 	const lock = new ActionLock({ breakerOpen: () => breaker.open });
 	/** Set by turn_start; every decision is attributed to the turn it happened in. */
 	let currentTurn = 0;
+	let audit: AuditLog | undefined;
 
 	/**
 	 * When the lock is not the right thing to complain about.
@@ -138,6 +142,7 @@ export default function (pi: ExtensionAPI): void {
 		...(effective ? { effective } : {}),
 		...(provenance ? { provenance } : {}),
 		...(sources ? { sources } : {}),
+		...(audit ? { auditPath: audit.path, auditDegraded: audit.degraded } : {}),
 		breaker: { open: breaker.open, consecutive: breaker.state.consecutive, limit: effective?.breaker.consecutive ?? 3 },
 		// A configuration refusal and an ownership refusal are both "auto mode
 		// will not start"; the status line shows whichever came first.
@@ -153,6 +158,16 @@ export default function (pi: ExtensionAPI): void {
 
 	const recordViolations = (found: Violation[]) => {
 		violations.push(...found);
+		for (const violation of found) {
+			audit?.append("violation", {
+				kind: violation.kind,
+				op: violation.op,
+				source: violation.source,
+				backend: violation.backend,
+				path: violation.path,
+				host: violation.host,
+			});
+		}
 		refreshStatusLine?.();
 	};
 
@@ -274,6 +289,26 @@ export default function (pi: ExtensionAPI): void {
 				breakerOpen: () => breaker.open,
 				onDecision: (result) => {
 					if (effective?.auto) breaker.record(currentTurn, result.adverse);
+					if (!result.action) {
+						audit?.append("decision", {
+							outcome: result.outcome,
+							tool: event.toolName,
+							turnIndex: currentTurn,
+							reason: result.reason,
+						});
+						return;
+					}
+					audit?.append(
+						"decision",
+						decisionFields({
+							action: result.action,
+							outcome: result.outcome,
+							matches: result.matches,
+							turnIndex: currentTurn,
+							attended: effective?.attended.mode ?? "off",
+							...(result.reason !== undefined ? { reason: result.reason } : {}),
+						}),
+					);
 				},
 			},
 		);
@@ -298,6 +333,7 @@ export default function (pi: ExtensionAPI): void {
 		ctx.abort();
 		pi.sendUserMessage(steerMessage(), { deliverAs: "followUp" });
 		pi.appendEntry(BREAKER_ENTRY_TYPE, breaker.state);
+		audit?.append("breaker", { event: "opened", turnIndex: event.turnIndex, state: breaker.state });
 		refreshStatusLine?.();
 	});
 
@@ -381,6 +417,46 @@ export default function (pi: ExtensionAPI): void {
 		}
 		ownershipError = undefined;
 
+		// The state directory is opened before anything is recorded, and a
+		// failure to secure it stops auto mode: pending approval records and the
+		// attendance secret live there, and a directory anyone can write is one
+		// where an approval can be forged.
+		try {
+			const dirs = ensureStateDirs();
+			applyRetention({
+				dir: dirs.audit,
+				retentionDays: loaded.profile.audit.retentionDays,
+				retentionMb: loaded.profile.audit.retentionMb,
+				keepSessionId: ctx.sessionManager.getSessionId(),
+			});
+			audit = new AuditLog({
+				dir: dirs.audit,
+				sessionId: ctx.sessionManager.getSessionId(),
+				readDeny: loaded.profile.sandbox.readDeny,
+				onError: (error) => process.stderr.write(`pi-enclave: audit write failed: ${error.message}\n`),
+			});
+			audit.touch();
+			audit.append("session_start", { pi: PI_VERSION ?? null, backend: backend.name, weakened: backend.weakened });
+			audit.append(
+				"config",
+				configFields(
+					loaded.profile,
+					configHash(loaded.profile),
+					loaded.sources.map((entry) => entry.path ?? entry.source),
+				),
+			);
+		} catch (error) {
+			const message =
+				error instanceof StateDirError
+					? error.message
+					: `pi-enclave: cannot prepare the state directory: ${(error as Error).message}`;
+			configError = message;
+			process.stderr.write(`${message}\n`);
+			ctx.ui.notify(message, "error");
+			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
+			return;
+		}
+
 		// The breaker survives a resume. Guardian deliberately drops its counters
 		// at session start; here they persist, because an unattended run that is
 		// resumed after tripping should not get three fresh attempts at whatever
@@ -398,6 +474,7 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		await audit?.flush();
 		await backend.dispose();
 	});
 
