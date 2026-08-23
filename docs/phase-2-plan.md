@@ -500,6 +500,38 @@ gap in the tests rather than a redundant check:
 | M17 | The audit write queue removed | Not falsifiable: `appendFileSync` plus a synchronous seq/hash block cannot interleave under JavaScript's threading model | The module comment now says the queue is what keeps the chain safe if the write ever becomes asynchronous, rather than implying a test covers it |
 | M32 | The `pending → approved` rename moved after execution | The tests only looked at the final state, so the crash-evidence property was untested | A test that observes the directory *during* execution |
 
+### The real-pi run
+
+Verified against pi 0.84.2 with a live model (`openai-codex/gpt-5`) in `--print` mode, in a
+scratch workspace, not only in tests:
+
+| What was exercised | Result |
+|---|---|
+| Extension load, config fold, state directory, audit log, attendance | `session_start` writes `session_start`, `config` and `attendance` records; the chain verifies |
+| A benign command (`cat notes.md`) | Allowed, executed in the sandbox, one `decision` record with `outcome: allow` |
+| An L1 denial (`sudo id`) | Blocked before execution; the agent is told it was denied by policy |
+| An unattended `ask` (`git push origin main`) | Denied, turn terminated, pending record written, and the exact `pi-enclave approve <nonce>` command printed to stderr |
+| `pi-enclave pending` | Shows the full action, the reason, the expiry and the hash |
+| `pi-enclave approve`, declined | Left pending |
+| `pi-enclave approve`, accepted | Ran the command through the sandbox (it failed on `src refspec main does not match any`, which is the proof it really executed), then moved the record to `consumed/` |
+| A second approve of the same nonce | Refused: the record is single-use |
+| `pi-enclave audit verify` | Detects an edited middle record (`prevHash` mismatch at the next seq) and a deleted one (seq gap); an untouched log verifies |
+| `PI_ENCLAVE_AUTO=off` | L1 did not fire — and `sudo id` was still refused by the **kernel** (`Operation not permitted`). The decision that this flag never removes the sandbox is now verified against a real one, not just asserted |
+
+**Two things only the real run found:**
+
+- **The state-directory refusal fires on a configuration people actually have.** Setting
+  `PI_CODING_AGENT_DIR` inside the workspace puts pi-enclave's state under a writable root,
+  and auto mode refused to start — correctly, since the agent could then forge its own
+  approval records and read the attendance secret. But the diagnostic explained the problem
+  without giving the fix, which is the difference between a fail-closed that helps and one
+  that just blocks. It now names both remedies.
+- **A pending record is written for an ephemeral session too**, and that is right. The
+  verified-facts table above notes that `getSessionFile()` is undefined for `--no-session`,
+  and an earlier reading of that was "an ephemeral session gets no pending records because
+  it cannot be resumed". Resuming the *pi session* is not what happens: `pi-enclave approve`
+  executes the action out of session entirely, so the record is just as useful there.
+
 ### Two defects the work found in itself
 
 - **The fold resolved a profile selection before registering the definitions from the same

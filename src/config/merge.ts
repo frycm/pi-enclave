@@ -498,7 +498,11 @@ export function fold(documents: readonly ConfigDocument[], options: DefaultProfi
 			errors.push({
 				source: "builtin",
 				field: "sandbox.writableRoots",
-				message: `"${root}" contains pi-enclave's state directory (${stateDir}); pending approval records and the attendance secret must never be writable by the agent`,
+				message:
+					`"${root}" contains pi-enclave's state directory (${stateDir}), so the sandboxed agent could write ` +
+					`its own approval records and read the attendance secret.\n` +
+					`    Fix it by moving pi's agent directory outside the workspace (unset PI_CODING_AGENT_DIR, or point ` +
+					`it somewhere the agent cannot write), or by narrowing sandbox.writableRoots so it does not contain that path.`,
 			});
 		}
 	}
