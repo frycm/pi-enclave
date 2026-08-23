@@ -236,7 +236,7 @@ annotation reaches the agent. That run also exposed a benign `SystemConfiguratio
 mach-lookup cluttering the line that mattered, now filtered **by name** rather than ignoring
 `mach-lookup` as a class, since other mach services are genuinely powerful.
 
-### Step 5 — Verify the backend on Linux ✅ done (with one gap that needs CI)
+### Step 5 — Verify the backend on Linux ✅ done (the CI gap it names is closed in step 9)
 
 **Every conformance row passes on Linux/bwrap.** Run with
 `PI_ENCLAVE_WEAKER_NESTED=1 npm run conformance:report -- srt` in a privileged container.
@@ -247,7 +247,8 @@ capability-bearing nested user namespaces — `--privileged`, `--userns=host` an
 mode changes only bwrap's flags and **still runs `apply-seccomp`**, so the filesystem,
 network, socket, environment and seccomp-dependent rows are all genuinely exercised. What
 it cannot verify is the capability drop itself. That needs a real Linux host: **the CI run
-is the remaining gap.**
+is the remaining gap** — closed in step 9, where the same rows pass on `ubuntu-latest` with
+no weakening at all.
 
 **Three findings, each from a control rather than from inspection:**
 
@@ -407,15 +408,17 @@ microseconds more, and an agent waits on the model by four orders of magnitude m
 the sandbox.
 
 **Gaps recorded rather than smoothed over:** MCP tools are unsandboxed, a denied read
-through `bash` is invisible on Linux, weaker nested mode leaves capabilities, CI has not run
-on a real Linux host, `rg`/`fd` must be on PATH, and only one profile can be in force.
+through `bash` is invisible on Linux, weaker nested mode leaves capabilities, C12 is not
+falsifiable on an unprivileged host, `rg`/`fd` must be on PATH, and only one profile can be
+in force.
 
 ---
 
-## Phase 1: done, with one thing outstanding
+## Phase 1: done
 
-Steps 0–9 are complete. 188 tests, green on macOS and in a privileged Linux container;
-`tsc` and biome clean.
+Steps 0–9 are complete. 189 tests, green on macOS and on Linux in CI; `tsc` and biome
+clean. [PR #3](https://github.com/frycm/pi-enclave/pull/3) carried the first run on a real
+Linux host, which closed the last outstanding item and corrected one claim about it.
 
 **Exit criteria:**
 
@@ -428,10 +431,31 @@ Steps 0–9 are complete. 188 tests, green on macOS and in a privileged Linux co
 | 5 | Helper latency measured and recorded | ✅ above and in the README |
 | 6 | `probe()` fails closed | ✅ — and now checks namespace nesting functionally |
 
-**Outstanding: the CI run on a real Linux host.** Everything was verified on macOS and in a
-privileged container, and the container cannot verify the capability drop (C12) because no
-container mode on this host gives capability-bearing nested user namespaces. That is the one
-claim in the matrix still resting on inference rather than a passing test.
+### The Linux CI run, and what it actually settled
+
+`ubuntu-latest` with `kernel.apparmor_restrict_unprivileged_userns=0` behaved exactly as the
+workaround assumed: `probe()` reports capability-bearing namespaces available and both
+bubblewrap and the seccomp helper create the namespaces they need. Every row passes on
+bwrap at full strength — the seccomp-dependent rows C7 and C8 among them, with no
+`PI_ENCLAVE_WEAKER_NESTED` anywhere in the workflow — and the test job now prints the
+per-row table into the job summary, so the sign-off rests on each row's own detail line
+rather than on a green check.
+
+**C12 passed, and the run also showed the row claimed more than it can prove there.** The
+first attempt failed the falsifiability meta-test: on the runner the *unsandboxed* control
+also reports `CapEff=0000000000000000`, because the runner user is unprivileged. The row
+had been declared falsifiable for all of Linux, which was only ever true of the privileged
+container everything had been verified in. So the control now checks its own assumption, as
+C5's network control already did, and the row carries the host's mask beside the sandbox's:
+
+| host | what a green C12 means |
+|---|---|
+| privileged container / root | capabilities were dropped — the noop control fails the row |
+| unprivileged (CI, a laptop) | the sandbox handed none out, which is what separates it from the weaker nested mode; the noop control cannot falsify it |
+
+The matrix claim — a sandboxed process holds no elevated capabilities — is now tested on a
+real Linux host instead of inferred. The narrower reading of *why* it holds there is stated
+rather than smoothed over, and is the remaining Phase-1 gap in the README.
 
 ## Package layout
 
@@ -467,7 +491,7 @@ pi-enclave/
 
 | Risk | Containment |
 |---|---|
-| ~~SRT cannot express a Phase-1 guarantee~~ | **Retired by step 0** on macOS — every matrix row is enforced. Still open for bwrap until CI runs |
+| ~~SRT cannot express a Phase-1 guarantee~~ | **Retired** — every matrix row is enforced on macOS (step 0) and on Linux/bwrap in CI at full strength (step 9) |
 | ~~SRT assumes one-shot commands~~ | **Retired by step 0** — the long-lived helper works at 0.02 ms/call |
 | ~~Kernel denial indistinguishable from ordinary failure~~ | **Retired by step 0** — errno for the helper, correlated log lines for bash. The residual risk is *noise*, not detection |
 | Violation noise makes the breaker and status line useless | Default ignore list from step 0 (`sysctl-read`, `__pycache__`); exit code plus the operation's own error stay the primary signal, violations are evidence |

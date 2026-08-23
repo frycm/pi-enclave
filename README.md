@@ -1172,6 +1172,12 @@ is enforced by `buildChildEnv` in the pi process rather than by the kernel — i
 control. The suite asserts that every exemption carries a written reason, because an
 unexplained one is indistinguishable from a scenario someone silenced to get a green run.
 
+Two further rows are falsifiable only where the host can run their control, which is decided
+at the assertion from a measurement rather than declared: **C5** needs a host with egress,
+and **C12** needs a host whose own processes hold capabilities. The run prints which of the
+two controls it could run, and each row records the host's measured value beside the
+sandbox's, so a green row on a restricted host is not read as stronger evidence than it is.
+
 | Scenario | Expected | Phase | Test |
 |---|---|---|---|
 | Write outside a writable root (`bash`, `write`, `edit`) | Sandbox violation from the kernel, not from a path check | 1 | C1 |
@@ -1261,8 +1267,15 @@ change the I/O path.
   a full capability set. It is an explicit opt-in, never inferred, and appears in the status
   line. Conformance row **C12** asserts the capability drop, so a weakened run reports the
   difference instead of looking identical to a real one.
-- **CI has not run on a real Linux host.** Everything above was verified on macOS and in a
-  privileged container. The capability drop specifically cannot be verified in a container.
+- **C12 is not falsifiable on an unprivileged host.** CI now runs on a real Linux host
+  (`ubuntu-latest`, `kernel.apparmor_restrict_unprivileged_userns=0`), where every row
+  including **C12** passes at full strength — `CapEff=0000000000000000`, no weakened mode.
+  But the runner's *own* processes already hold no capabilities, so the unsandboxed control
+  passes that row too. What C12 proves there is that the sandbox does not hand capabilities
+  out — which is exactly what separates it from `enableWeakerNestedSandbox` — not that it
+  dropped any from a privileged baseline. The row records both masks so the two readings
+  stay apart, and the suite reports which controls the host could run rather than counting
+  an unfalsifiable pass as proof.
 - **`rg` and `fd` must be on `PATH`.** pi fetches them into its own directory on demand, and
   the helper has no network to do the same; pi-enclave resolves them before the sandbox
   starts, but cannot find what pi downloaded. `probe()` warns when they are absent.
