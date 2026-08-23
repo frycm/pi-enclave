@@ -44,6 +44,12 @@ export interface Fixture {
 	deniedLink: string;
 	/** A second directory with a secret, for retargeting `deniedLink`. */
 	linkTargetB: string;
+	/** A symlink to a directory; the deny entry names a regular file beneath it. */
+	agentLink: string;
+	/** A second directory with its own `auth.json`, for retargeting `agentLink`. */
+	agentB: string;
+	/** `<agentLink>/auth.json`: a read-denied regular file under a symlinked parent. */
+	deniedUnderLink: string;
 	/** Readable (reads are a deny-list) but not writable. */
 	outside: string;
 	/** A file in `outside`, used as a symlink target for the write-through test. */
@@ -119,6 +125,19 @@ export function createFixture(): Fixture {
 	const deniedLink = join(outside, "creds-link");
 	symlinkSync(linkTargetA, deniedLink);
 
+	// A regular file under a symlinked parent -- the shape of
+	// PI_CODING_AGENT_DIR/auth.json when the agent directory is a link. The deny
+	// entry names the file through the link; only the parent is a symlink.
+	const agentA = join(outside, "agent-a");
+	const agentB = join(outside, "agent-b");
+	mkdirSync(agentA);
+	mkdirSync(agentB);
+	writeFileSync(join(agentA, "auth.json"), `${SECRET_FILE_CONTENT}\n`);
+	writeFileSync(join(agentB, "auth.json"), `${SECRET_FILE_CONTENT}\n`);
+	const agentLink = join(outside, "agent-link");
+	symlinkSync(agentA, agentLink);
+	const deniedUnderLink = join(agentLink, "auth.json");
+
 	// An ordinary tree for the find tool's pattern handling.
 	mkdirSync(join(workspace, "src", "a"), { recursive: true });
 	writeFileSync(join(workspace, "src", "a", "foo.spec.ts"), "");
@@ -126,7 +145,7 @@ export function createFixture(): Fixture {
 	const profile: Profile = {
 		mode: "workspace-write",
 		writableRoots: [workspace],
-		readDeny: [deniedHome, lateDenied, deniedFile, deniedLink],
+		readDeny: [deniedHome, lateDenied, deniedFile, deniedLink, deniedUnderLink],
 		network: "off",
 		allowPty: true,
 	};
@@ -138,6 +157,9 @@ export function createFixture(): Fixture {
 		deniedFile,
 		deniedLink,
 		linkTargetB,
+		agentLink,
+		agentB,
+		deniedUnderLink,
 		outside,
 		outsideFile,
 		socketPath,

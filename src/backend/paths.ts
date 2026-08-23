@@ -8,7 +8,7 @@
  * mis-comparison here degrades a message, it does not open a hole.
  */
 import { realpathSync } from "node:fs";
-import { resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 
 /** Resolve to an absolute path with no trailing separator (except for root itself). */
 export function normalizePath(path: string): string {
@@ -42,10 +42,23 @@ export function isUnderAny(path: string, roots: readonly string[]): boolean {
 	return roots.some((root) => isUnder(path, root) || isUnder(path, canonical(root)));
 }
 
-function canonical(path: string): string {
-	try {
-		return realpathSync(path);
-	} catch {
-		return path;
+/**
+ * The canonical spelling of a path, whether or not all of it exists: the
+ * deepest existing ancestor is resolved and the missing remainder re-joined.
+ * A path that cannot be resolved at all is returned as written.
+ */
+export function canonical(path: string): string {
+	let current = normalizePath(path);
+	let remainder = "";
+	for (;;) {
+		try {
+			const resolved = realpathSync(current);
+			return remainder ? join(resolved, remainder) : resolved;
+		} catch {
+			const parent = dirname(current);
+			if (parent === current) return normalizePath(path);
+			remainder = remainder ? join(basename(current), remainder) : basename(current);
+			current = parent;
+		}
 	}
 }

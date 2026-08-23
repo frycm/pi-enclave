@@ -666,6 +666,38 @@ SCENARIOS.push(
 );
 
 SCENARIOS.push({
+	id: "F14",
+	title: "helper: a denied file under a symlinked parent is denied, before and after a retarget",
+	surface: "fs",
+	expectation: "denied",
+	falsifiableByNoop: true,
+	async run({ backend, compiled, fixture }) {
+		// The credential-path shape: the deny entry is a regular file whose
+		// parent is a symlink. Seatbelt evaluates the canonical path, so a deny
+		// written with the link spelling covers nothing unless every component
+		// is resolved -- and a retargeted parent must be re-resolved.
+		const fs = backend.fs(compiled);
+		const attempt = async (label: string): Promise<ScenarioResult | undefined> => {
+			try {
+				const content = await fs.readFile(fixture.deniedUnderLink);
+				const leaked = content.toString("utf8").includes(SECRET_FILE_CONTENT);
+				return { ok: false, detail: leaked ? `SECRET LEAKED ${label}` : `NOT CLASSIFIED ${label}: read succeeded` };
+			} catch (error) {
+				if (error instanceof SandboxDenied) return undefined;
+				return { ok: false, detail: `NOT CLASSIFIED ${label}: ${String(error).slice(0, 80)}` };
+			}
+		};
+		const before = await attempt("through the symlinked parent");
+		if (before) return before;
+		rmSync(fixture.agentLink);
+		symlinkSync(fixture.agentB, fixture.agentLink);
+		const after = await attempt("after the parent was retargeted");
+		if (after) return after;
+		return { ok: true, detail: "denied through the link, and again after its retarget" };
+	},
+});
+
+SCENARIOS.push({
 	id: "F9",
 	title: "read tool: an image read through the helper is still detected as one",
 	surface: "fs",

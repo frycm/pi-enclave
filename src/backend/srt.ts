@@ -22,7 +22,7 @@
  *    missed line degrades reporting and never enforcement.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { lstatSync, mkdirSync, realpathSync } from "node:fs";
+import { lstatSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getDefaultWritePaths, SandboxManager } from "@anthropic-ai/sandbox-runtime";
@@ -30,6 +30,7 @@ import { buildChildEnv } from "../env/child-env.ts";
 import { HelperFsClient } from "../fs/client.ts";
 import type { BackendName } from "../probe.ts";
 import { whichSync } from "../probe-host.ts";
+import { canonical } from "./paths.ts";
 import type { CompiledProfile, FsClient, Profile, RunRequest, RunResult, SandboxBackend, Violation } from "./types.ts";
 import { dedupeViolations, parseViolations } from "./violations.ts";
 
@@ -52,31 +53,28 @@ export function shellQuote(value: string): string {
 }
 
 /**
- * Deny entries with symlinks resolved the way each backend needs.
+ * Deny entries in the spelling each backend needs.
  *
- * Neither backend denies a symlinked entry as written. Seatbelt matches
- * `subpath` rules on the canonical path the kernel sees, and sandbox-runtime
- * writes the link's own path -- so on macOS a `readDeny` entry that is a
- * symlink denied nothing at all (F13 found this: the secret was readable
- * before the link was ever retargeted). bwrap, given the link, tries to mount
- * a tmpfs on it and aborts at startup, taking the helper with it.
+ * Neither backend denies a path as written when a symlink sits anywhere in it.
+ * Seatbelt matches `subpath` rules on the canonical path the kernel sees, and
+ * sandbox-runtime keeps the link spelling -- so on macOS a `readDeny` entry
+ * that is a symlink, *or sits under one*, denied nothing (F13 found the first,
+ * F14 the second: `<agent-link>/auth.json` is exactly the credential path
+ * shape). bwrap, given a link, tries to mount a tmpfs on it and aborts at
+ * startup.
  *
- * So on macOS the target is denied *as well* (the rule only widens), and on
- * Linux the target is denied *instead* -- the link resolves to it, and the
- * mask lands on a real directory. Recomputed on every translation, so a
- * retargeted link is re-denied at its new target by the re-wrap.
+ * Every component is resolved, with the missing tail of an absent path
+ * re-joined onto its deepest existing ancestor. On macOS the canonical form is
+ * denied *as well* (the rule only widens); on Linux it is denied *instead*.
+ * Recomputed on every translation, so a retargeted link is re-denied at its
+ * new target by the re-wrap.
  */
 function withResolvedTargets(readDeny: readonly string[], platform: NodeJS.Platform = process.platform): string[] {
 	const out: string[] = [];
 	for (const path of readDeny) {
-		let target: string | undefined;
-		try {
-			if (lstatSync(path).isSymbolicLink()) target = realpathSync(path);
-		} catch {
-			// Absent or dangling: nothing to resolve, keep the entry as written.
-		}
-		if (target === undefined || platform === "darwin") out.push(path);
-		if (target !== undefined && !out.includes(target)) out.push(target);
+		const resolved = canonical(path);
+		if (resolved === path || platform === "darwin") out.push(path);
+		if (resolved !== path && !out.includes(resolved)) out.push(resolved);
 	}
 	return out;
 }
@@ -100,13 +98,7 @@ function denySnapshot(profile: Profile): string {
 			} catch {
 				return `0${path}`;
 			}
-			let target = path;
-			try {
-				target = realpathSync(path);
-			} catch {
-				// A dangling link: the identity above still changes on retarget.
-			}
-			return `1${path}>${target}${link}`;
+			return `1${path}>${canonical(path)}${link}`;
 		})
 		.join("\n");
 }
