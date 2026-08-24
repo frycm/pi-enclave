@@ -69,6 +69,31 @@ describe("createEnclaveBashOperations", () => {
 		expect(env.OPS_TEST_SECRET_TOKEN).toBeUndefined();
 	});
 
+	// The configured env settings travel on the compiled profile so the live
+	// shell honours them; an earlier version dropped them and applied only the
+	// built-in credential patterns.
+	it("honours the compiled profile's envPassthrough and envDeny", async () => {
+		const { backend, calls } = recordingBackend();
+		const compiled: CompiledProfile = {
+			backend: "seatbelt",
+			profile: { ...PROFILE, envPassthrough: ["OPS_KEEP_ME"], envDeny: ["OPS_APP_SECRET"] },
+			describe: () => "compiled",
+		};
+		const ops = createEnclaveBashOperations({ backend, getCompiled: () => compiled });
+
+		process.env.OPS_KEEP_ME = "kept";
+		process.env.OPS_APP_SECRET = "hidden";
+		try {
+			await ops.exec("true", "/work", { onData: () => {} });
+		} finally {
+			delete process.env.OPS_KEEP_ME;
+			delete process.env.OPS_APP_SECRET;
+		}
+		const env = calls[0]?.env ?? {};
+		expect(env.OPS_KEEP_ME).toBe("kept");
+		expect(env.OPS_APP_SECRET).toBeUndefined();
+	});
+
 	it("forwards the command, cwd, signal and timeout unchanged", async () => {
 		const { backend, calls } = recordingBackend();
 		const ops = createEnclaveBashOperations({ backend, getCompiled: () => COMPILED });
