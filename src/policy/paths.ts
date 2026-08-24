@@ -189,7 +189,11 @@ export function looksLikePath(token: string): boolean {
  */
 export function pathCandidatesInToken(token: string): string[] {
 	const out: string[] = [];
-	if (looksLikePath(token)) out.push(token);
+	// A `key=value` token (a flag like `--out=/p`, or an operand like `of=/p`)
+	// is never itself a path: only the value after `=` is. Considering the whole
+	// token recorded bogus paths such as `cwd/of=/work/x`.
+	const isAssignment = /^[A-Za-z_][\w-]*=/.test(token);
+	if (!isAssignment && looksLikePath(token)) out.push(token);
 	const eq = token.lastIndexOf("=");
 	if (eq > 0) {
 		const tail = token.slice(eq + 1).replace(/^["']|["']$/g, "");

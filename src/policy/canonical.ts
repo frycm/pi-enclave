@@ -129,6 +129,18 @@ export function canonicalize(options: CanonicalizeOptions): CanonicalAction {
 			// too: the cost of being wrong is an escalation, and the cost of the
 			// opposite is a silent write to a protected path.
 			const writes = !READ_ONLY_COMMANDS.has(command.name);
+			// dd names its files with `of=`/`if=` operand assignments, which the
+			// `NAME=value` filter below would otherwise skip -- so `dd
+			// of=authorized_keys` recorded no write to its target. Handled
+			// explicitly: `of=` is a write, `if=` a read.
+			if (command.name.slice(command.name.lastIndexOf("/") + 1) === "dd") {
+				for (const arg of command.args) {
+					const of = /^of=(.+)$/.exec(arg);
+					if (of?.[1]) addPath(of[1], true);
+					const inf = /^if=(.+)$/.exec(arg);
+					if (inf?.[1]) addPath(inf[1], false);
+				}
+			}
 			for (const arg of command.args) {
 				const candidates = pathCandidatesInToken(arg);
 				if (candidates.length > 0) {

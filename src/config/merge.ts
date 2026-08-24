@@ -30,7 +30,6 @@ import { canonical, isUnder, normalizePath } from "../backend/paths.ts";
 import type { DefaultProfileOptions } from "./defaults.ts";
 import { defaultProfile, enclaveStateDir } from "./defaults.ts";
 import type {
-	AttendedMode,
 	CapabilityMode,
 	ConfigDocument,
 	EffectiveProfile,

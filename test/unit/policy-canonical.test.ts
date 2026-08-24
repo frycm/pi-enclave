@@ -78,6 +78,19 @@ describe("canonicalize", () => {
 			expect(bash("git commit -m message").paths).toHaveLength(0);
 		});
 
+		// dd names its output with `of=`, which the assignment filter would skip;
+		// its bare-name target must still be recorded as a write.
+		it("records dd of= as a write target", () => {
+			const paths = bash("dd if=/dev/zero of=authorized_keys").paths;
+			const target = paths.find((p) => p.relative === "authorized_keys");
+			expect(target?.writes).toBe(true);
+		});
+
+		it("does not record a key=value token whole as a path", () => {
+			// Only the value half is a path, never `cwd/of=/work/x`.
+			expect(bash("dd of=/work/x bs=1M").paths.map((p) => p.typed)).not.toContain("/work/of=/work/x");
+		});
+
 		it("records &>> and >& redirect targets as writes", () => {
 			const target = bash("cmd &>> .git/hooks/pre-commit").paths.find((p) => p.typed.endsWith("pre-commit"));
 			expect(target?.writes).toBe(true);
