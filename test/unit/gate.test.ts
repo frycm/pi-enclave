@@ -409,6 +409,11 @@ describe("checkTool", () => {
 		});
 		expect(disposition.allowed && disposition.reviewed).toBe(true);
 	});
+
+	// A tool named after an Object.prototype member must not inherit a grant.
+	it.each(["toString", "constructor", "hasOwnProperty"])("denies a tool named %s with no own grant", (name) => {
+		expect(checkTool({ tool: name, tools: { allow: {} }, owned: OWNED_TOOLS }).allowed).toBe(false);
+	});
 });
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@
  * matched by every segment suffix rather than only as written.
  */
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { canonical, normalizePath } from "../backend/paths.ts";
 
 /**
@@ -33,7 +34,22 @@ export function resolveForPolicy(path: string, cwd: string): { typed: string; re
 /** Strip the decorations pi's own tools accept, so policy sees the same path they do. */
 export function normalizeInputPath(raw: string, home: string): string {
 	let path = raw.trim().replace(/^@/, "");
-	if (path.startsWith("file://")) path = path.slice("file://".length);
+	if (path.startsWith("file://")) {
+		// Percent-decode the URL the way pi's execution path does
+		// (`fileURLToPath`), or a `file:///work/%2Egithub/...` slips past the
+		// `**/.github/**` rule here while executing as `/work/.github/...`.
+		try {
+			path = fileURLToPath(path);
+		} catch {
+			// Not a well-formed file URL; decode the escapes at least, so an
+			// encoded protected path is still matched.
+			try {
+				path = decodeURIComponent(path.slice("file://".length));
+			} catch {
+				path = path.slice("file://".length);
+			}
+		}
+	}
 	if (path === "~") path = home;
 	else if (path.startsWith("~/")) path = `${home}/${path.slice(2)}`;
 	return path;

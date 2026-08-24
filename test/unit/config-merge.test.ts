@@ -78,6 +78,18 @@ describe("narrowerOrEqual", () => {
 			expect(fields(narrowerOrEqual(patched(wide), patched(narrow)))).toContain(field);
 		});
 
+		// tui and rpc are different channels, not a strong/weak pair: below
+		// user-global only the same mode or off is allowed.
+		it("attendance may be kept or turned off, never switched", () => {
+			const tui = patched({ attended: { mode: "tui" } });
+			const rpc = patched({ attended: { mode: "rpc" } });
+			const off = patched({ attended: { mode: "off" } });
+			expect(narrowerOrEqual(off, tui)).toEqual([]);
+			expect(narrowerOrEqual(tui, tui)).toEqual([]);
+			expect(fields(narrowerOrEqual(rpc, tui))).toEqual(["attended.mode"]);
+			expect(fields(narrowerOrEqual(tui, rpc))).toEqual(["attended.mode"]);
+		});
+
 		it("review.trigger may be raised but not lowered", () => {
 			const boundary = patched({ review: { trigger: "boundary" } });
 			const all = patched({ review: { trigger: "all" } });
@@ -222,15 +234,32 @@ describe("fold", () => {
 
 	it("accepts a project file that tightens", () => {
 		const result = fold(
-			[
-				{ source: "builtin" },
-				doc("project_shared", { rules: { deny: ["bash(terraform destroy*)"] }, review: { trigger: "all" } }),
-			],
+			[{ source: "builtin" }, doc("project_shared", { rules: { deny: ["bash(terraform destroy*)"] } })],
 			OPTIONS,
 		);
 		if (!result.ok) throw new Error(JSON.stringify(result.errors));
 		expect(result.profile.rules.deny).toContain("bash(terraform destroy*)");
-		expect(result.profile.review.trigger).toBe("all");
+	});
+
+	// In deterministic mode (reviewer.model "none", the only value in phase 2)
+	// there is no consumer for a raised trigger, so it is pinned to boundary
+	// rather than left claiming a review that never happens.
+	describe("deterministic mode", () => {
+		it("pins review.trigger to boundary when the reviewer is none", () => {
+			const result = fold([{ source: "builtin" }, doc("project_shared", { review: { trigger: "all" } })], OPTIONS);
+			if (!result.ok) throw new Error(JSON.stringify(result.errors));
+			expect(result.profile.review.trigger).toBe("boundary");
+		});
+
+		it("rejects a prose rulebook when the reviewer is none", () => {
+			const result = fold(
+				[{ source: "builtin" }, doc("user_global", { review: { soft_deny: ["never touch prod"] } })],
+				OPTIONS,
+			);
+			expect(result.ok).toBe(false);
+			if (result.ok) return;
+			expect(result.errors[0]?.field).toBe("review.soft_deny");
+		});
 	});
 
 	it("measures a project file against the user-global ceiling, not the defaults", () => {

@@ -15,7 +15,7 @@
  *   rather than passed over quietly, because a rule someone wrote and never saw
  *   applied is worse than one they know was skipped.
  */
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -35,7 +35,15 @@ export interface LoadOptions {
 	agentDir?: string;
 	/** Injected by tests. Returns undefined for a missing file, throws otherwise. */
 	readFile?: (path: string) => string | undefined;
+	/** Injected by tests. Metadata only; undefined for a missing path. */
+	statFile?: (path: string) => { size: number; regular: boolean } | undefined;
 }
+
+/**
+ * A config file is tiny; anything larger is not one, and a repository-controlled
+ * huge file must not be read into the privileged process to find that out.
+ */
+const MAX_CONFIG_BYTES = 1024 * 1024;
 
 export interface LoadedSource {
 	source: SourceId;
@@ -66,12 +74,43 @@ export function loadConfig(options: LoadOptions): LoadResult {
 	const defaults: DefaultProfileOptions = { cwd: options.cwd, home, tmp, agentDir };
 	const paths = configPaths({ cwd: options.cwd, agentDir });
 	const read = options.readFile ?? defaultReadFile;
+	// Metadata only. In tests it is derived from the injected reader; in
+	// production it is an `lstat`, so a repository-controlled FIFO, device, or
+	// oversized file is never opened or read by the privileged process.
+	const stat =
+		options.statFile ??
+		(options.readFile
+			? (path: string) => {
+					try {
+						const content = options.readFile?.(path);
+						return content === undefined ? undefined : { size: Buffer.byteLength(content), regular: true };
+					} catch {
+						return { size: 0, regular: false };
+					}
+				}
+			: defaultStatFile);
 
 	const sources: LoadedSource[] = [{ source: "builtin" }];
 	const documents: ConfigDocument[] = [{ source: "builtin" }];
 	const errors: string[] = [];
 
 	const ingest = (source: SourceId, path: string) => {
+		// Gate on metadata before reading: a non-regular file (FIFO/device/
+		// symlink-to-one) or one larger than a config could ever be is refused
+		// without ever being opened for content.
+		const meta = stat(path);
+		if (meta === undefined) return;
+		if (!meta.regular) {
+			errors.push(`pi-enclave: ${path} is not a regular file; refusing to read it.`);
+			sources.push({ source, path, ignored: "not a regular file" });
+			return;
+		}
+		if (meta.size > MAX_CONFIG_BYTES) {
+			errors.push(`pi-enclave: ${path} is ${meta.size} bytes, larger than a config file can be; refusing to read it.`);
+			sources.push({ source, path, ignored: "too large" });
+			return;
+		}
+
 		let text: string | undefined;
 		try {
 			text = read(path);
@@ -113,9 +152,9 @@ export function loadConfig(options: LoadOptions): LoadResult {
 		["project_shared", paths.projectShared],
 	] as const) {
 		if (!options.projectTrusted) {
-			// Only report it if it is actually there; otherwise every untrusted
-			// project would list two files that do not exist.
-			if (exists(read, path)) sources.push({ source, path, ignored: "project is not trusted" });
+			// Metadata only -- an untrusted project's file is never read here, so a
+			// FIFO or huge file cannot block the check. Only report it if present.
+			if (stat(path) !== undefined) sources.push({ source, path, ignored: "project is not trusted" });
 			continue;
 		}
 		ingest(source, path);
@@ -133,20 +172,25 @@ function hasContent(document: ConfigDocument): boolean {
 	return document.patch !== undefined || document.profile !== undefined || document.auto !== undefined;
 }
 
-function exists(read: (path: string) => string | undefined, path: string): boolean {
-	try {
-		return read(path) !== undefined;
-	} catch {
-		return true;
-	}
-}
-
 function defaultReadFile(path: string): string | undefined {
 	try {
 		return readFileSync(path, "utf8");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
+	}
+}
+
+/** `lstat`-based metadata: never follows a symlink into a device or FIFO. */
+function defaultStatFile(path: string): { size: number; regular: boolean } | undefined {
+	try {
+		const stats = lstatSync(path);
+		return { size: stats.size, regular: stats.isFile() };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		// An unreadable stat is reported as present-but-not-regular, so the
+		// caller refuses rather than assuming it is fine.
+		return { size: 0, regular: false };
 	}
 }
 

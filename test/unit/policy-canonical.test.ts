@@ -25,6 +25,15 @@ describe("canonicalize", () => {
 		expect(file("read", { path: "file:///etc/hosts" }).paths[0]?.typed).toBe("/etc/hosts");
 	});
 
+	// A percent-encoded file URL must decode the way pi's execution path does,
+	// or `file:///work/%2Egithub/...` misses `**/.github/**` here while executing
+	// as `/work/.github/...`.
+	it("percent-decodes a file URL so an encoded protected path still matches", () => {
+		expect(file("write", { path: "file:///work/%2Egithub/workflows/ci.yml" }).paths[0]?.typed).toBe(
+			"/work/.github/workflows/ci.yml",
+		);
+	});
+
 	describe("shell write targets", () => {
 		it("treats a redirect target as a write", () => {
 			const action = bash("echo hi > /work/out.txt");

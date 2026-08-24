@@ -34,7 +34,11 @@ export interface ToolCheckOptions {
 
 export function checkTool(options: ToolCheckOptions): ToolDisposition {
 	const { tool, tools, source, owned } = options;
-	const grant = tools.allow[tool];
+	// `Object.hasOwn`, not a plain lookup: `tools.allow["toString"]` (and
+	// `constructor`, `hasOwnProperty`, …) inherits a truthy function from
+	// Object.prototype, so a tool named after a prototype member would otherwise
+	// read as an allowed grant it never had.
+	const grant = Object.hasOwn(tools.allow, tool) ? tools.allow[tool] : undefined;
 
 	if (!grant) {
 		const known = Object.keys(tools.allow).sort().join(", ");

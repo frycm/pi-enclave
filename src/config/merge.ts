@@ -66,8 +66,6 @@ const CAPABILITY_RANK: Record<CapabilityMode, number> = { none: 0, reviewed: 1 }
 const HOST_EXEC_RANK: Record<HostExecMode, number> = { never: 0, human: 1 };
 /** More review is narrower, so the ranks run the other way and the comparison flips. */
 const TRIGGER_RANK: Record<ReviewTrigger, number> = { boundary: 0, mutating: 1, all: 2 };
-/** `off` denies every escalation, so it is the narrowest attendance. */
-const ATTENDED_RANK: Record<AttendedMode, number> = { off: 0, rpc: 1, tui: 2 };
 
 /**
  * How permissive a tool grant is.
@@ -159,7 +157,10 @@ export function narrowerOrEqual(a: EffectiveProfile, b: EffectiveProfile): Order
 	}
 
 	for (const [name, grant] of Object.entries(a.tools.allow)) {
-		const wider = b.tools.allow[name];
+		// Object.hasOwn, not a plain lookup: a tool named `toString`/`constructor`
+		// would otherwise inherit a truthy value from Object.prototype and read as
+		// allowed by the more trusted profile when it was not.
+		const wider = Object.hasOwn(b.tools.allow, name) ? b.tools.allow[name] : undefined;
 		if (!wider) {
 			fail("tools.allow", `"${name}" is not allowed by the more trusted profile`);
 			continue;
@@ -183,8 +184,15 @@ export function narrowerOrEqual(a: EffectiveProfile, b: EffectiveProfile): Order
 	if (a.breaker.window[0] > b.breaker.window[0]) fail("breaker.window", "cannot raise the windowed adverse limit");
 	if (a.breaker.window[1] < b.breaker.window[1]) fail("breaker.window", "cannot shrink the observation window");
 
-	if (ATTENDED_RANK[a.attended.mode] > ATTENDED_RANK[b.attended.mode]) {
-		fail("attended.mode", `cannot widen attendance from "${b.attended.mode}" to "${a.attended.mode}"`);
+	// `tui` and `rpc` are different authorization channels, not a strong/weak
+	// pair -- switching one for the other below user-global would turn a fatal
+	// TUI-in-RPC mismatch into handshake-backed RPC approval, or vice versa. A
+	// less-trusted source may only keep the mode or drop it to `off`.
+	if (a.attended.mode !== "off" && a.attended.mode !== b.attended.mode) {
+		fail(
+			"attended.mode",
+			`attendance may only be kept as "${b.attended.mode}" or turned off, not switched to "${a.attended.mode}"`,
+		);
 	}
 	if (a.attended.confirmTimeoutMs > b.attended.confirmTimeoutMs) {
 		fail("attended.confirmTimeoutMs", "cannot lengthen the confirmation timeout");
@@ -516,6 +524,29 @@ export function fold(documents: readonly ConfigDocument[], options: DefaultProfi
 					`    Fix it by moving pi's agent directory outside the workspace (unset PI_CODING_AGENT_DIR, or point ` +
 					`it somewhere the agent cannot write), or by narrowing sandbox.writableRoots so it does not contain that path.`,
 			});
+		}
+	}
+
+	// Deterministic mode (`reviewer.model: "none"`, the only value in this
+	// phase) has no runtime consumer for the prose rulebook or a raised trigger.
+	// Leaving them set would make the effective config claim protections that do
+	// not exist. A prose list is a hard error; the trigger is pinned to
+	// `boundary`, which is what the plan specifies -- reviewing nothing is the
+	// honest state when there is no reviewer.
+	if (current.reviewer.model === "none") {
+		for (const list of ["environment", "hard_deny", "soft_deny", "allow"] as const) {
+			if (current.review[list].length > 0) {
+				errors.push({
+					source: "user_global",
+					field: `review.${list}`,
+					message:
+						`a prose rulebook is set but reviewer.model is "none", so nothing reads it. ` +
+						`Set a reviewer (Phase 3) or remove review.${list}.`,
+				});
+			}
+		}
+		if (current.review.trigger !== "boundary") {
+			current = { ...current, review: { ...current.review, trigger: "boundary" } };
 		}
 	}
 

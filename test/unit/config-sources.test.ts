@@ -41,6 +41,36 @@ describe("loadConfig", () => {
 
 	// A file that exists and cannot be parsed must never be treated as absent:
 	// that is how a syntax error becomes a silently wider sandbox.
+	// A repository-controlled non-regular or oversized file must be refused on
+	// metadata, without its content ever being read into the privileged process.
+	it("refuses a non-regular config file without reading it", () => {
+		let readCalled = false;
+		const result = load(
+			{},
+			{
+				statFile: (p) => (p === PATHS.userGlobal ? { size: 10, regular: false } : undefined),
+				readFile: (p) => {
+					if (p === PATHS.userGlobal) readCalled = true;
+					return undefined;
+				},
+			},
+		);
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.message).toContain("not a regular file");
+		expect(readCalled).toBe(false);
+	});
+
+	it("refuses an oversized config file without reading it", () => {
+		const result = load(
+			{},
+			{ statFile: (p) => (p === PATHS.userGlobal ? { size: 5 * 1024 * 1024, regular: true } : undefined) },
+		);
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.message).toContain("larger than a config file");
+	});
+
 	it("refuses on malformed JSON rather than carrying on", () => {
 		const result = load({ [PATHS.userGlobal]: "{ not json" });
 		expect(result.ok).toBe(false);
