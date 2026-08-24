@@ -144,4 +144,49 @@ describe("parseShell", () => {
 			expect(parseShell("env").confident).toBe(true);
 		});
 	});
+
+	// A backslash-newline is a line continuation the shell deletes; keeping it as
+	// a literal newline left a confident parse whose command line matched no rule.
+	describe("line continuation", () => {
+		it("joins the lines so the command matches", () => {
+			const parsed = parseShell("rm \\\n-rf /work/.git");
+			expect(parsed.confident).toBe(true);
+			expect(parsed.commands.map(commandLine)).toEqual(["rm -rf /work/.git"]);
+		});
+	});
+
+	// A parameter expansion in command position reconstructs the command from a
+	// value the tokenizer cannot see; it must escalate rather than parse it away.
+	describe("parameter expansion", () => {
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: these are shell parameter expansions under test, not JS template placeholders
+		it.each(["$c -rf /x", "git${IFS}push${IFS}--force", "${cmd} arg", "a${IFS}b"])("%s is not confident", (command) => {
+			expect(parseShell(command).confident).toBe(false);
+		});
+
+		// A $VAR in an ordinary argument is common and does not reconstruct the
+		// command, so it must not escalate.
+		it.each(["echo $HOME", "npm run $script", "cat $file"])("%s stays confident", (command) => {
+			expect(parseShell(command).confident).toBe(true);
+		});
+	});
+
+	// Regressions from the glued-redirect splitter.
+	describe("redirect fidelity", () => {
+		it("keeps trailing digits that belong to an argument, not an fd", () => {
+			const parsed = parseShell("cat report2>out");
+			expect(parsed.commands[0]?.args).toEqual(["report2"]);
+			expect(parsed.commands[0]?.redirects).toEqual([{ op: ">", target: "out", writes: true }]);
+		});
+
+		it("treats a bare digit token as an fd", () => {
+			expect(parseShell("cmd 2>out").commands[0]?.redirects[0]?.op).toBe("2>");
+		});
+
+		it("records &>> and >& targets as writes", () => {
+			expect(parseShell("cmd &>>secret.txt").commands[0]?.redirects).toEqual([
+				{ op: "&>>", target: "secret.txt", writes: true },
+			]);
+			expect(parseShell("cmd &>> secret.txt").commands[0]?.redirects[0]?.target).toBe("secret.txt");
+		});
+	});
 });

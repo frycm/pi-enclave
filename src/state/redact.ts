@@ -60,6 +60,20 @@ const CREDENTIAL_PATTERNS: readonly RegExp[] = [
 	// Header and assignment forms, where the value is whatever follows.
 	/(?<=Authorization:\s*)(?:Bearer\s+|Basic\s+)?[A-Za-z0-9._~+/=-]{8,}/gi,
 	/(?<=(?:password|passwd|secret|token|api[_-]?key)\s*[=:]\s*)["']?[^\s"',;]{6,}/gi,
+	// A JWT (three base64url segments). Distinctive `eyJ` header, so it can be
+	// matched anywhere -- including a non-Authorization header the form above
+	// misses.
+	/eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}/g,
+	// The credential half of a connection string: `scheme://user:PASS@host`.
+	// The scheme/user/password up to `@` is replaced; the host and path after it
+	// stay readable, which is enough context to tell which DSN it was.
+	/[a-z][a-z0-9+.-]*:\/\/[^:@/\s]+:[^@/\s]+(?=@)/gi,
+	// `-u user:pass` / `--user user:pass` (curl and friends).
+	/(?<=(?:^|\s)(?:-u|--user)[=\s])[^\s:]+:[^\s]+/g,
+	// `-pSecret` with no space (mysql/mongo). Six or more trailing characters, so
+	// short flags like `-print` (four after `-p`) are left alone; over-matching a
+	// long non-secret only costs readability.
+	/(?<=(?:^|\s)-p)[^\s]{6,}/g,
 ];
 
 export function redactedMarker(value: string): string {

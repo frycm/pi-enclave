@@ -24,6 +24,15 @@
  * **A decision is never awaited on a write.** The gate records and moves on.
  * An audit log that adds latency to every tool call is one someone will turn
  * off, and the record is not the control -- the denial already happened.
+ *
+ * **The queue serializes one instance, not two processes.** Two `pi` runs that
+ * somehow share a session id (resuming a session while it is still live) would
+ * each seed from the same tail and both append `seq = N+1`, forking the chain.
+ * `verifyLog` then reports a repeated seq -- which reads as tampering. This is
+ * the safe direction (a concurrent-resume race degrades to "looks tampered", it
+ * does not hide a real edit) and pending records are still protected by atomic
+ * rename, so it is left as a known limitation rather than guarded with a
+ * lockfile whose stale-lock failure mode would block legitimate resumes.
  */
 
 import { createHash } from "node:crypto";
@@ -135,13 +144,18 @@ export class AuditLog {
 			// a gap that verifyLog reported as "records missing" forever after --
 			// a recoverable blip made indistinguishable from tampering.
 			const nextSeq = this.seq + 1;
+			// Reserved chain fields are spread *after* the body, so a caller field
+			// that happens to share a name (a `decision` body with a `kind`, or a
+			// stray `seq`/`prevHash`) can never clobber the record's own identity
+			// or break the chain. The body's colliding field is dropped, which is
+			// the safe direction; call sites use non-reserved names for their data.
 			const record: AuditRecord = {
+				...body,
 				seq: nextSeq,
 				ts: (this.options.now?.() ?? new Date()).toISOString(),
 				kind,
 				sessionId: this.options.sessionId,
 				prevHash: this.prevHash,
-				...body,
 			};
 			const line = JSON.stringify(record);
 			try {

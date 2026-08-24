@@ -272,6 +272,25 @@ describe("the audit log", () => {
 		expect(text).not.toContain("sk-abcdefghij0123456789");
 		expect(text).toContain("<redacted:sha256:");
 	});
+
+	// A caller field named `kind` (the violation record) must not overwrite the
+	// record's own kind, and no body field can clobber the chain fields.
+	it("reserves seq/kind/prevHash against colliding body fields", async () => {
+		const audit = log();
+		audit.append("violation", { violationKind: "write", op: "openat" });
+		audit.append("decision", { seq: 999, prevHash: "sha256:evil", kind: "spoofed" } as Record<string, unknown>);
+		await audit.flush();
+		const lines = readFileSync(audit.path, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		expect(lines[0].kind).toBe("violation");
+		expect(lines[0].violationKind).toBe("write");
+		expect(lines[1].seq).toBe(2);
+		expect(lines[1].kind).toBe("decision");
+		expect(lines[1].prevHash).not.toBe("sha256:evil");
+		expect(verifyLog(audit.path).ok).toBe(true);
+	});
 });
 
 describe("redaction", () => {
@@ -286,6 +305,23 @@ describe("redaction", () => {
 		const out = redactString(`export KEY=${secret} && run`);
 		expect(out).not.toContain(secret);
 		expect(out).toContain("<redacted:");
+	});
+
+	it.each([
+		["a DSN password", "psql postgres://admin:Sup3rSecret@db/app", "Sup3rSecret"],
+		["a -u user:pass", "curl -u admin:hunter2 https://x", "hunter2"],
+		["a -pPassword", "mysql -pSup3rSecret db", "Sup3rSecret"],
+		["a JWT", "X-Auth: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc123def456", "eyJzdWIiOiIxIn0"],
+	])("redacts %s", (_label, command, secret) => {
+		const out = redactString(command);
+		expect(out).not.toContain(secret);
+		expect(out).toContain("<redacted:");
+	});
+
+	// Over-redaction is acceptable, but a plain flag like `find -print` must stay
+	// readable so the log is still worth reading.
+	it("leaves -print and other short -p flags alone", () => {
+		expect(redactString("find . -print")).toBe("find . -print");
 	});
 
 	it("redacts a private key block whole", () => {

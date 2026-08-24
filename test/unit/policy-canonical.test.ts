@@ -68,6 +68,20 @@ describe("canonicalize", () => {
 			// A commit message word is not a file target.
 			expect(bash("git commit -m message").paths).toHaveLength(0);
 		});
+
+		it("records &>> and >& redirect targets as writes", () => {
+			const target = bash("cmd &>> .git/hooks/pre-commit").paths.find((p) => p.typed.endsWith("pre-commit"));
+			expect(target?.writes).toBe(true);
+		});
+
+		// chmod/chown/sed/dd take a non-file leading operand; recording it as a
+		// path produced spurious protectedPaths escalations.
+		it.each([
+			["chmod 755 file", "/work/755"],
+			["chown user:grp file", "/work/user:grp"],
+		])("does not record a non-file operand of %s", (command, spurious) => {
+			expect(bash(command).paths.map((p) => p.typed)).not.toContain(spurious);
+		});
 	});
 
 	// ls/find default their path to the working directory; recording it keeps the

@@ -29,7 +29,8 @@ export type ShellMarker =
 	| "eval"
 	| "shell-c"
 	| "xargs"
-	| "wrapper";
+	| "wrapper"
+	| "param-expansion";
 
 export interface Redirect {
 	/** The operator as written: `>`, `>>`, `2>`, `&>`, `<`. */
@@ -107,6 +108,9 @@ const WRAPPER_COMMANDS = new Set([
 	"nice",
 ]);
 
+/** `$IFS` / `${IFS}` -- the internal field separator, used to rebuild a command from an argument. */
+const IFS_EXPANSION = /\$\{?IFS\}?/;
+
 /** A path prefix such as `/usr/bin/env` still names `env`. */
 function baseName(command: string): string {
 	const slash = command.lastIndexOf("/");
@@ -136,6 +140,15 @@ export function parseShell(command: string): ParsedShell {
 		// wrapper's own options end and the inner command begins.
 		if (WRAPPER_COMMANDS.has(name) && cmd.args.some((arg) => !arg.startsWith("-"))) {
 			markers.add("wrapper");
+		}
+
+		// A parameter expansion in the command name reconstructs the command from
+		// a value the tokenizer cannot see: `$c -rf /`, `git${IFS}push`, `${cmd}`.
+		// The name matched literally, so no rule fired and the parse stayed
+		// confident. `$IFS` is a word-splitting trick with no benign use in a
+		// command an agent would write, so it is flagged wherever it appears.
+		if (cmd.name.includes("$") || cmd.args.some((arg) => IFS_EXPANSION.test(arg))) {
+			markers.add("param-expansion");
 		}
 	}
 
@@ -168,6 +181,15 @@ function splitSegments(command: string, markers: Set<ShellMarker>): string[] {
 		}
 
 		if (char === "\\") {
+			// A backslash before a newline is a line continuation the shell
+			// deletes entirely (joining the two physical lines); keeping it turned
+			// `rm \\\n-rf /x` into a confident parse whose command line began
+			// `rm \n-rf` and matched no `rm -rf *` rule. Drop both characters so
+			// the segment reads as the single command the shell will run.
+			if (next === "\n") {
+				i++;
+				continue;
+			}
 			// Single quotes are handled above, so anything reaching here is
 			// unquoted or double-quoted, where a backslash escapes.
 			current += char + (next ?? "");
@@ -241,7 +263,7 @@ function splitSegments(command: string, markers: Set<ShellMarker>): string[] {
 	return segments.map((segment) => segment.trim());
 }
 
-const REDIRECT = /^(\d*>>?|\d*<|&>|>&)$/;
+const REDIRECT = /^(\d*>>?|\d*<|&>>?|>&)$/;
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /** Split one segment into words, pulling out redirects and assignment prefixes. */
@@ -265,7 +287,7 @@ function parseSegment(segment: string, markers: Set<ShellMarker>): SimpleCommand
 			}
 			continue;
 		}
-		const attached = /^(\d*>>?|\d*<|&>)(.+)$/.exec(word);
+		const attached = /^(\d*>>?|\d*<|&>>?|>&)(.+)$/.exec(word);
 		if (attached?.[1] && attached[2]) {
 			redirects.push({ op: attached[1], target: attached[2], writes: !attached[1].endsWith("<") });
 			continue;
@@ -309,6 +331,13 @@ function splitWords(segment: string, markers: Set<ShellMarker>): string[] {
 		}
 		if (char === "\\") {
 			const next = segment[i + 1];
+			// A line continuation: the shell joins the lines and drops the
+			// backslash-newline, so it must not become a literal newline glued
+			// into the word (which left the parse confident but wrong).
+			if (next === "\n") {
+				i++;
+				continue;
+			}
 			if (next !== undefined) {
 				current += next;
 				i++;
@@ -338,12 +367,16 @@ function splitWords(segment: string, markers: Set<ShellMarker>): string[] {
 		// `<(`/`>(` are process substitution, already marked at the segment level;
 		// leave those alone so this does not invent a bogus redirect.
 		if ((char === ">" || char === "<") && segment[i + 1] !== "(") {
-			const fd = /(?:&|\d+)$/.exec(current);
-			if (fd) current = current.slice(0, current.length - fd[0].length);
+			// An fd prefix only when the *whole* preceding token is `&` or all
+			// digits, as bash requires. `report2>out` keeps `report2` as an
+			// argument and redirects fd 1 -- stripping the trailing `2` there
+			// corrupted the argument and misread the fd.
+			const fd = /^(?:&|\d+)$/.test(current) ? current : "";
+			if (fd) current = "";
 			if (current !== "") words.push(current);
 			current = "";
 			started = false;
-			let op = (fd?.[0] ?? "") + char;
+			let op = fd + char;
 			if (char === ">" && segment[i + 1] === ">") {
 				op += ">";
 				i++;

@@ -185,29 +185,17 @@ export function canonicalize(options: CanonicalizeOptions): CanonicalAction {
 }
 
 /**
- * Commands whose bare (slash-free) operands are file targets.
+ * Commands whose bare (slash-free) operands are *all* file targets.
  *
  * Only for these does a bare filename argument get recorded as a path, so an
- * ordinary word (a commit message, a subcommand) is not resolved as one. The
- * set is the common file-writing utilities; a slash-bearing path is caught for
- * every command regardless, and redirect targets always are.
+ * ordinary word (a commit message, a subcommand) is not resolved as one. Every
+ * operand here is a file, so recording each is right. Deliberately excluded:
+ * `chmod`/`chown` (leading operand is a mode/owner), `sed` (a script), and `dd`
+ * (targets are `of=`/`if=` assignments) -- their non-file leading operands would
+ * be resolved as spurious write paths. A slash-bearing path is still caught for
+ * every command by pathCandidatesInToken, and redirect targets always are.
  */
-const WRITER_COMMANDS = new Set([
-	"tee",
-	"cp",
-	"mv",
-	"dd",
-	"install",
-	"ln",
-	"touch",
-	"truncate",
-	"chmod",
-	"chown",
-	"rm",
-	"rmdir",
-	"mkdir",
-	"sed",
-]);
+const WRITER_COMMANDS = new Set(["tee", "cp", "mv", "install", "ln", "touch", "truncate", "rm", "rmdir", "mkdir"]);
 
 /**
  * Commands whose path arguments are reads.

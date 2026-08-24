@@ -275,7 +275,11 @@ export default function (pi: ExtensionAPI): void {
 		violations.push(...found);
 		for (const violation of found) {
 			audit?.append("violation", {
-				kind: violation.kind,
+				// `violationKind`, not `kind`: the record's own `kind` is
+				// "violation", and a field named `kind` would previously have
+				// overwritten it (the reserved keys now win, so this would simply be
+				// dropped -- either way the violation's own kind belongs on its own field).
+				violationKind: violation.kind,
 				op: violation.op,
 				source: violation.source,
 				backend: violation.backend,
