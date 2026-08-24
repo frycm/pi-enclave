@@ -262,7 +262,7 @@ describe("the confirm escalator", () => {
 		// Both commands are on their own line: a second command cannot hide below
 		// the fold of a dialog whose first line looks harmless.
 		expect(ui.confirms[0]?.message).toContain("    echo harmless");
-		expect(ui.confirms[0]?.message).toContain("    rm -rf /work");
+		expect(ui.confirms[0]?.message).toContain("; rm -rf /work");
 	});
 
 	it("tells the person that silence is a refusal", async () => {

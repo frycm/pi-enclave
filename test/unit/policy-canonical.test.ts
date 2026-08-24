@@ -146,6 +146,23 @@ describe("canonicalize", () => {
 			expect(build().hash).not.toBe(bash("rm -rf /work/x").hash);
 		});
 
+		// The hash must bind every execution-affecting field, or a pending
+		// approval could be replayed with different semantics.
+		it("binds shell control operators", () => {
+			expect(bash("false && sudo id").hash).not.toBe(bash("false || sudo id").hash);
+		});
+
+		it("binds a write body", () => {
+			const w = (content: string) => canonicalize({ ...BASE, tool: "write", input: { path: "/work/x", content } });
+			expect(w("SAFE").hash).not.toBe(w("EVIL").hash);
+		});
+
+		it("binds an edit replacement", () => {
+			const e = (newString: string) =>
+				canonicalize({ ...BASE, tool: "edit", input: { path: "/work/x", oldString: "a", newString } });
+			expect(e("b").hash).not.toBe(e("c").hash);
+		});
+
 		// A golden value, so a change to the serialization is a deliberate act
 		// rather than something that quietly invalidates every pending record.
 		it("has not drifted", () => {
@@ -162,10 +179,21 @@ describe("canonicalize", () => {
 	describe("describeAction", () => {
 		// A command with an embedded newline must not be able to hide a second
 		// command below the fold of a confirm dialog.
-		it("renders each simple command on its own line", () => {
+		it("renders each simple command on its own line, with its connector", () => {
 			const rendered = describeAction(bash("echo ok\nrm -rf /work"));
 			expect(rendered).toContain("    echo ok");
-			expect(rendered).toContain("    rm -rf /work");
+			// The connector is shown so a second command cannot hide as a bare arg.
+			expect(rendered).toContain("; rm -rf /work");
+		});
+
+		it("shows redirects and write bodies, not just the command name", () => {
+			const redirect = describeAction(bash("echo payload > .github/workflows/ci.yml"));
+			expect(redirect).toContain("> .github/workflows/ci.yml");
+			const write = describeAction(
+				canonicalize({ ...BASE, tool: "write", input: { path: "/work/x", content: "EVIL" } }),
+			);
+			expect(write).toContain("content:");
+			expect(write).toContain("EVIL");
 		});
 
 		it("says when the parse is not confident", () => {

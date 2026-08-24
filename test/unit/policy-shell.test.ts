@@ -170,6 +170,27 @@ describe("parseShell", () => {
 		});
 	});
 
+	// Compound and path-qualified forms the policy does not model must escalate
+	// rather than parse away.
+	describe("unsupported forms escalate", () => {
+		it.each([
+			"(cd /x && rm -rf /)",
+			"if true; then rm -rf /; fi",
+			"for f in *; do rm $f; done",
+			"echo x >| /work/.git/config",
+			"cat $DIR/../.ssh/id",
+		])("%s is not confident", (command) => {
+			expect(parseShell(command).confident).toBe(false);
+		});
+
+		it("records the connector between commands", () => {
+			expect(parseShell("a && b").commands[1]?.connector).toBe("&&");
+			expect(parseShell("a || b").commands[1]?.connector).toBe("||");
+			expect(parseShell("a | b").commands[1]?.connector).toBe("|");
+			expect(parseShell("a").commands[0]?.connector).toBeUndefined();
+		});
+	});
+
 	// Regressions from the glued-redirect splitter.
 	describe("redirect fidelity", () => {
 		it("keeps trailing digits that belong to an argument, not an fd", () => {

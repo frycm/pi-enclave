@@ -30,7 +30,10 @@ export type ShellMarker =
 	| "shell-c"
 	| "xargs"
 	| "wrapper"
-	| "param-expansion";
+	| "param-expansion"
+	| "subshell"
+	| "compound"
+	| "clobber";
 
 export interface Redirect {
 	/** The operator as written: `>`, `>>`, `2>`, `&>`, `<`. */
@@ -50,6 +53,12 @@ export interface SimpleCommand {
 	/** `VAR=value` prefixes, in order. */
 	assignments: string[];
 	redirects: Redirect[];
+	/**
+	 * The operator that joined this command to the one before it (`&&`, `||`,
+	 * `|`, `;`, `&`, or a newline), or undefined for the first. Part of the
+	 * canonical hash: `false && x` and `false || x` are different actions.
+	 */
+	connector?: string;
 }
 
 export interface ParsedShell {
@@ -111,6 +120,26 @@ const WRAPPER_COMMANDS = new Set([
 /** `$IFS` / `${IFS}` -- the internal field separator, used to rebuild a command from an argument. */
 const IFS_EXPANSION = /\$\{?IFS\}?/;
 
+/** Keywords that introduce a compound command the tokenizer does not model. */
+const SHELL_KEYWORDS = new Set([
+	"if",
+	"then",
+	"elif",
+	"else",
+	"fi",
+	"for",
+	"while",
+	"until",
+	"do",
+	"done",
+	"case",
+	"esac",
+	"select",
+	"function",
+	"{",
+	"}",
+]);
+
 /** A path prefix such as `/usr/bin/env` still names `env`. */
 function baseName(command: string): string {
 	const slash = command.lastIndexOf("/");
@@ -120,7 +149,13 @@ function baseName(command: string): string {
 export function parseShell(command: string): ParsedShell {
 	const markers = new Set<ShellMarker>();
 	const segments = splitSegments(command, markers);
-	const commands = segments.map((segment) => parseSegment(segment, markers)).filter((cmd) => cmd.text !== "");
+	const commands = segments
+		.map((segment) => {
+			const cmd = parseSegment(segment.text, markers);
+			if (segment.op !== undefined) cmd.connector = segment.op;
+			return cmd;
+		})
+		.filter((cmd) => cmd.text !== "");
 
 	for (const cmd of commands) {
 		// `/bin/bash -c` and `/usr/bin/env` name the same thing as `bash`/`env`.
@@ -146,10 +181,21 @@ export function parseShell(command: string): ParsedShell {
 		// a value the tokenizer cannot see: `$c -rf /`, `git${IFS}push`, `${cmd}`.
 		// The name matched literally, so no rule fired and the parse stayed
 		// confident. `$IFS` is a word-splitting trick with no benign use in a
-		// command an agent would write, so it is flagged wherever it appears.
-		if (cmd.name.includes("$") || cmd.args.some((arg) => IFS_EXPANSION.test(arg))) {
+		// command an agent would write, so it is flagged wherever it appears. An
+		// argument that is a *variable-expanded path* (`$DIR/../.ssh`) can resolve
+		// to a protected path the matcher cannot see, so it is flagged too -- but a
+		// bare `$VAR` argument (`echo $HOME`) is common and left alone.
+		if (
+			cmd.name.includes("$") ||
+			cmd.args.some((arg) => IFS_EXPANSION.test(arg) || (arg.includes("$") && arg.includes("/")))
+		) {
 			markers.add("param-expansion");
 		}
+
+		// A shell keyword introduces a compound command (if/for/while/case/{) the
+		// tokenizer does not model; escalate rather than treat the keyword as the
+		// command.
+		if (SHELL_KEYWORDS.has(name)) markers.add("compound");
 	}
 
 	return { commands, confident: markers.size === 0, markers: [...markers] };
@@ -163,9 +209,12 @@ export function parseShell(command: string): ParsedShell {
  * would hand the matcher a string no pattern for the second command can reach.
  * `&>` is excluded, because there it is a redirect operator.
  */
-function splitSegments(command: string, markers: Set<ShellMarker>): string[] {
-	const segments: string[] = [];
+function splitSegments(command: string, markers: Set<ShellMarker>): { text: string; op?: string }[] {
+	const segments: { text: string; op?: string }[] = [];
 	let current = "";
+	// The operator that split *before* the current segment; attached to it when
+	// it is pushed, so the hash can tell `a && b` from `a || b`.
+	let pendingOp: string | undefined;
 	let quote: '"' | "'" | "`" | undefined;
 	let depth = 0;
 
@@ -226,6 +275,9 @@ function splitSegments(command: string, markers: Set<ShellMarker>): string[] {
 			continue;
 		}
 		if (char === "(") {
+			// A bare `(` is a subshell/grouping whose contents the tokenizer does
+			// not parse as their own commands. `$(`/`<(`/`>(` are handled above.
+			markers.add("subshell");
 			depth++;
 			current += char;
 			continue;
@@ -242,16 +294,34 @@ function splitSegments(command: string, markers: Set<ShellMarker>): string[] {
 			continue;
 		}
 
+		// `>|` is a force-clobber redirect; the `|` is not a pipe here. Record it
+		// and consume both so it does not split into a bogus segment.
+		if (char === ">" && next === "|") {
+			markers.add("clobber");
+			current += ">|";
+			i++;
+			continue;
+		}
+
 		if (depth === 0 && SEPARATORS.has(char)) {
 			// `&>` and `>&` are redirects, not separators.
 			if (char === "&" && (next === ">" || command[i - 1] === ">")) {
 				current += char;
 				continue;
 			}
-			segments.push(current);
+			segments.push(pendingOp !== undefined ? { text: current, op: pendingOp } : { text: current });
 			current = "";
-			// Consume the second character of `&&` and `||`.
-			if ((char === "&" && next === "&") || (char === "|" && next === "|")) i++;
+			// The operator that will precede the next segment. `&&`/`||` consume a
+			// second character; a newline is normalised to `;` (same sequencing).
+			if (char === "&" && next === "&") {
+				pendingOp = "&&";
+				i++;
+			} else if (char === "|" && next === "|") {
+				pendingOp = "||";
+				i++;
+			} else {
+				pendingOp = char === "\n" ? ";" : char;
+			}
 			continue;
 		}
 
@@ -259,8 +329,11 @@ function splitSegments(command: string, markers: Set<ShellMarker>): string[] {
 	}
 
 	if (quote) markers.add("unbalanced-quote");
-	segments.push(current);
-	return segments.map((segment) => segment.trim());
+	segments.push(pendingOp !== undefined ? { text: current, op: pendingOp } : { text: current });
+	return segments.map((segment) => ({
+		text: segment.text.trim(),
+		...(segment.op !== undefined ? { op: segment.op } : {}),
+	}));
 }
 
 const REDIRECT = /^(\d*>>?|\d*<|&>>?|>&)$/;

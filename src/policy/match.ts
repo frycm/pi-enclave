@@ -107,7 +107,18 @@ export interface RuleMatch {
  */
 export function matchTargets(action: CanonicalAction): string[] {
 	if (action.tool === "bash") {
-		const lines = action.shell?.commands.map(commandLine).filter((line) => line !== "") ?? [];
+		const lines: string[] = [];
+		for (const command of action.shell?.commands ?? []) {
+			const line = commandLine(command);
+			if (line !== "") lines.push(line);
+			// Also a basename-normalized line, so a path-qualified command matches
+			// a rule anchored on the bare name: `/usr/bin/git push` must match
+			// `bash(git push *)`, and `/usr/bin/sudo` must match `bash(sudo *)`.
+			if (command.name.includes("/")) {
+				const bare = commandLine({ ...command, name: command.name.slice(command.name.lastIndexOf("/") + 1) });
+				if (bare !== "" && bare !== line) lines.push(bare);
+			}
+		}
 		// The whole line is included as well, so a pattern someone wrote against
 		// a pipeline as a unit still fires.
 		const whole = typeof action.input.command === "string" ? [action.input.command] : [];

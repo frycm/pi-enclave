@@ -251,6 +251,9 @@ function readCapability(input: Record<string, unknown>): Capability | undefined 
  */
 export function canonicalForm(action: Omit<CanonicalAction, "hash">): string {
 	const commands = action.shell?.commands.map((command) => ({
+		// The connector is bound too: `false && sudo id` and `false || sudo id`
+		// are different actions and must not share a hash.
+		connector: command.connector ?? null,
 		name: command.name,
 		args: command.args,
 		assignments: command.assignments,
@@ -267,11 +270,30 @@ export function canonicalForm(action: Omit<CanonicalAction, "hash">): string {
 			.map((path) => ({ resolved: path.resolved, writes: path.writes }))
 			.sort((a, b) => (a.resolved < b.resolved ? -1 : a.resolved > b.resolved ? 1 : 0)),
 		commands: commands ?? null,
-		// For tools with no shell and no path, the input itself is the action, so
-		// it is included with its keys sorted.
+		// The execution-affecting fields the command/paths projection does not
+		// already capture -- the write/edit body above all. Without this a `write`
+		// of "SAFE" and a `write` of "EVIL" to the same path hashed identically,
+		// so a pending approval could be replayed with different contents. The raw
+		// command string and path are excluded (they are captured, normalised,
+		// above); only body-bearing keys are bound here.
+		body: bodyFields(action.input),
+		// For a tool with no shell, no path and no body, the input itself is the
+		// action, so it is included with keys sorted.
 		input: commands || action.paths.length > 0 ? null : stableInput(action.input),
 		capability: action.capability ?? null,
 	});
+}
+
+/** Keys whose values change what a write/edit does but are not the path. */
+const BODY_KEYS = ["content", "newContent", "new_string", "newString", "oldContent", "old_string", "oldString"];
+
+/** The body-bearing input fields, sorted, or null when there are none. */
+function bodyFields(input: Record<string, unknown>): Record<string, unknown> | null {
+	const out: Record<string, unknown> = {};
+	for (const key of [...BODY_KEYS].sort()) {
+		if (Object.hasOwn(input, key)) out[key] = input[key];
+	}
+	return Object.keys(out).length > 0 ? out : null;
 }
 
 function stableInput(input: Record<string, unknown>): unknown {
@@ -301,13 +323,39 @@ export function hashAction(action: Omit<CanonicalAction, "hash">): string {
  * whose first line looked harmless.
  */
 export function describeAction(action: CanonicalAction): string {
+	const head = [`${action.tool} in ${action.cwd}`];
+
 	if (action.shell) {
-		const lines = action.shell.commands.map((command) => `    ${[command.name, ...command.args].join(" ")}`);
-		const head = [`${action.tool} in ${action.cwd}`, ...lines];
+		for (const command of action.shell.commands) {
+			// Assignments, the connector, name/args and every redirect -- so what
+			// the operator reads is what runs. Showing only name+args let
+			// `echo payload > .github/workflows/ci.yml` display as `echo payload`.
+			const parts = [...command.assignments, command.name, ...command.args];
+			for (const redirect of command.redirects) parts.push(`${redirect.op} ${redirect.target}`);
+			const prefix = command.connector ? `${command.connector} ` : "";
+			head.push(`    ${prefix}${parts.join(" ")}`);
+		}
 		if (!action.confident) head.push(`    (parse is not confident: ${action.shell.markers.join(", ")})`);
-		if (action.capability) head.push(`    requests ${action.capability.kind} access to ${action.capability.value}`);
-		return head.join("\n");
+	} else {
+		for (const path of action.paths) head.push(`    ${path.writes ? "writes" : "reads"} ${path.resolved}`);
+		// The body of a write/edit is part of what is being approved. Rendered as
+		// a bounded preview with its length, never silently omitted.
+		for (const [label, value] of bodyPreviews(action.input)) head.push(`    ${label}: ${value}`);
 	}
-	const targets = action.paths.map((path) => `    ${path.writes ? "writes" : "reads"} ${path.resolved}`);
-	return [`${action.tool} in ${action.cwd}`, ...targets].join("\n");
+
+	if (action.capability) head.push(`    requests ${action.capability.kind} access to ${action.capability.value}`);
+	return head.join("\n");
+}
+
+/** Bounded previews of write/edit body fields, for the approval dialog. */
+function bodyPreviews(input: Record<string, unknown>): [string, string][] {
+	const out: [string, string][] = [];
+	for (const key of BODY_KEYS) {
+		const value = input[key];
+		if (typeof value !== "string") continue;
+		const oneLine = value.replace(/\s+/g, " ").trim();
+		const preview = oneLine.length > 200 ? `${oneLine.slice(0, 200)}…` : oneLine;
+		out.push([key, `${JSON.stringify(preview)} (${value.length} chars)`]);
+	}
+	return out;
 }

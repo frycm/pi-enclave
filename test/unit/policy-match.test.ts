@@ -99,6 +99,12 @@ describe("evaluateRules", () => {
 		expect(evaluateRules(bash("cat x | sudo tee /etc/hosts"), rules({ deny: ["bash(sudo *)"] })).verdict).toBe("deny");
 	});
 
+	// A path-qualified command must match a rule anchored on the bare name.
+	it("matches a bare-name rule against a path-qualified command", () => {
+		expect(evaluateRules(bash("/usr/bin/sudo rm x"), rules({ deny: ["bash(sudo *)"] })).verdict).toBe("deny");
+		expect(evaluateRules(bash("/usr/bin/git push origin"), rules({ ask: ["bash(git push *)"] })).verdict).toBe("ask");
+	});
+
 	it("still matches a pattern written against a whole pipeline", () => {
 		expect(evaluateRules(bash("cat x | grep y"), rules({ ask: ["bash(cat x | grep y)"] })).verdict).toBe("ask");
 	});
