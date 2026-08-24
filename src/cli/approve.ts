@@ -102,7 +102,25 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 
 	const backend = options.backend ?? new SrtBackend();
 	try {
-		const compiled = await backend.compile(toBackendProfile(current));
+		// A pending capability request exists because its target is *outside* the
+		// current writable roots -- that is why it was escalated. Compiling the
+		// unextended profile would reach the same denial, so the approved
+		// capability is folded into a one-shot profile here. It is bound to the
+		// action hash (which includes the capability), and checkResume above
+		// re-derived that hash, so the extension can only be the one approved.
+		const backendProfile = toBackendProfile(current);
+		const capability = record.action.capability;
+		if (capability) {
+			if (capability.kind !== "write") {
+				return {
+					outcome: "unsupported",
+					reason: `${capability.kind} capabilities are Phase 3/4; only a one-shot write can be approved in this version.`,
+				};
+			}
+			const target = isAbsolute(capability.value) ? capability.value : resolve(record.action.cwd, capability.value);
+			backendProfile.writableRoots = [...backendProfile.writableRoots, target];
+		}
+		const compiled = await backend.compile(backendProfile);
 
 		if (tool === "bash") {
 			const command = record.action.input.command;

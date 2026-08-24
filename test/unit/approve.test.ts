@@ -29,9 +29,11 @@ class RecordingBackend implements SandboxBackend {
 	readonly name = "seatbelt" as const;
 	readonly commands: RunRequest[] = [];
 	readonly writes: { path: string; content: string }[] = [];
+	compiledProfile?: Profile;
 	disposed = false;
 
 	async compile(profile: Profile): Promise<CompiledProfile> {
+		this.compiledProfile = profile;
 		return { backend: this.name, profile, describe: () => "(fake)" };
 	}
 
@@ -283,6 +285,32 @@ describe("approving a record", () => {
 		expect(result.outcome).toBe("refused");
 		expect(channel.asked).toHaveLength(0);
 		expect(backend.commands).toHaveLength(0);
+	});
+
+	// A pending write capability targets a path outside the writable roots (that
+	// is why it was escalated); approving it must fold that path into a one-shot
+	// writable root, or the approval reaches the same denial.
+	it("applies an approved write capability as a one-shot writable root", async () => {
+		const backend = new RecordingBackend();
+		const p = profile();
+		const rec = writePending({
+			stateRoot,
+			sessionId: SESSION,
+			action: canonicalize({
+				tool: "bash",
+				input: { command: "touch /etc/x", allow_write: "/etc/x" },
+				cwd: "/work",
+				home: "/home/u",
+				profileName: "dev",
+			}),
+			profile: p,
+			configHash: configHash(p),
+			reason: "capability",
+			nonce: NONCE,
+		}).record;
+		const result = await approve({ record: rec, stateRoot, current: profile(), home: "/home/u", io: io().make(true), backend });
+		expect(result.outcome).toBe("executed");
+		expect(backend.compiledProfile?.writableRoots).toContain("/etc/x");
 	});
 
 	// It changes what the person is agreeing to, so it comes before the
