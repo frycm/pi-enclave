@@ -53,6 +53,31 @@ export class CircuitBreaker {
 		return { consecutive: this.consecutive, recent: [...this.recent] };
 	}
 
+	/** True if the turn has any recorded outcome yet. */
+	hasOutcome(turnIndex: number): boolean {
+		return this.turns.has(turnIndex);
+	}
+
+	/**
+	 * Would the breaker be open once the current turn's accumulated outcome is
+	 * folded in? Computed without mutating.
+	 *
+	 * The breaker opens in `turn_end`, after a batch has executed, so `open`
+	 * alone is still false while the tripping batch's siblings run. Because pi
+	 * prepares every call in a batch before executing any of them, the whole
+	 * batch's collapsed outcome is already recorded by the time the first sibling
+	 * executes -- so the execute-time guard checks this, and the batch that trips
+	 * the breaker does not get to run its remaining calls.
+	 */
+	pendingOpen(turnIndex: number): boolean {
+		if (this.open) return true;
+		const adverse = this.turns.get(turnIndex);
+		if (adverse === undefined) return false;
+		const consecutive = adverse ? this.consecutive + 1 : 0;
+		const recentAdverse = this.recent.filter(Boolean).length + (adverse ? 1 : 0);
+		return consecutive >= this.config.consecutive || recentAdverse >= this.config.window[0];
+	}
+
 	/**
 	 * Record one decision against its turn.
 	 *

@@ -308,7 +308,14 @@ describe("approving a record", () => {
 			reason: "capability",
 			nonce: NONCE,
 		}).record;
-		const result = await approve({ record: rec, stateRoot, current: profile(), home: "/home/u", io: io().make(true), backend });
+		const result = await approve({
+			record: rec,
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: io().make(true),
+			backend,
+		});
 		expect(result.outcome).toBe("executed");
 		expect(backend.compiledProfile?.writableRoots).toContain("/etc/x");
 	});

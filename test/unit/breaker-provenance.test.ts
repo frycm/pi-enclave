@@ -101,6 +101,36 @@ describe("the circuit breaker", () => {
 		expect(breaker.open).toBe(false);
 	});
 
+	// The breaker opens in turn_end, after the batch runs; pendingOpen lets the
+	// execute-time guard stop the tripping batch's siblings before they run.
+	describe("pendingOpen", () => {
+		it("is true once the current turn's recorded outcome would open it", () => {
+			const breaker = new CircuitBreaker({ consecutive: 3, window: [10, 50] });
+			for (let turn = 0; turn < 2; turn++) {
+				breaker.record(turn, true);
+				breaker.finishTurn(turn);
+			}
+			// Third adverse turn recorded but not yet finished.
+			breaker.record(2, true);
+			expect(breaker.open).toBe(false); // not opened until turn_end
+			expect(breaker.pendingOpen(2)).toBe(true); // but the guard already knows
+		});
+
+		it("is false for a non-adverse or unstarted turn", () => {
+			const breaker = new CircuitBreaker({ consecutive: 1, window: [10, 50] });
+			expect(breaker.pendingOpen(0)).toBe(false);
+			breaker.record(0, false);
+			expect(breaker.pendingOpen(0)).toBe(false);
+		});
+	});
+
+	it("reports whether a turn had a recorded outcome", () => {
+		const breaker = new CircuitBreaker(CONFIG);
+		expect(breaker.hasOutcome(0)).toBe(false);
+		breaker.record(0, true);
+		expect(breaker.hasOutcome(0)).toBe(true);
+	});
+
 	it("survives a resume", () => {
 		const breaker = new CircuitBreaker(CONFIG);
 		breaker.record(0, true);

@@ -146,7 +146,12 @@ export default function (pi: ExtensionAPI): void {
 	// closures below, which read `breaker` at call time rather than capturing it.
 	let breaker = new CircuitBreaker({ consecutive: 3, window: [10, 50] });
 	const directInput = new ProvenanceTracker();
-	const lock = new ActionLock({ breakerOpen: () => breaker.open });
+	// `pendingOpen`, not just `open`: the breaker only opens in turn_end, after a
+	// batch has run, but the whole batch's outcome is recorded before any of it
+	// executes -- so the execute-time guard stops the batch that trips the breaker
+	// from running its remaining calls, not just the next turn's.
+	const breakerBlocks = () => breaker.open || breaker.pendingOpen(currentTurn);
+	const lock = new ActionLock({ breakerOpen: breakerBlocks });
 
 	/**
 	 * L4. Rebuilt from live state on every call rather than captured, because a
@@ -345,7 +350,7 @@ export default function (pi: ExtensionAPI): void {
 		getCompiled: requireCompiled,
 		onViolations: recordViolations,
 		guard: () => {
-			if (effective?.auto && breaker.open) {
+			if (effective?.auto && breakerBlocks()) {
 				throw new Error("pi-enclave: the denial circuit breaker is open; this turn is over.");
 			}
 		},
@@ -392,16 +397,23 @@ export default function (pi: ExtensionAPI): void {
 		pi.registerTool(createFindTool(cwd, { operations: createFindOperations(fsClient, guardPath) }));
 
 		// grep is the exception: its operations object cannot redirect the `rg`
-		// spawn, so pi's tool is kept whole and only `execute` is replaced.
+		// spawn, so pi's tool is kept whole and only `execute` is replaced. It is
+		// read-only, so the lock's execute-once does not apply, but the breaker
+		// re-check does -- without it a grep queued before a breaker trip would
+		// still run. `runSandboxedGrep` is only reached after that guard.
 		const grepBase = createGrepTool(cwd);
 		pi.registerTool({
 			...grepBase,
 			label: "grep (sandboxed)",
-			execute: async (_id: string, params: unknown, signal?: AbortSignal) =>
-				runSandboxedGrep(
+			execute: async (_id: string, params: unknown, signal?: AbortSignal) => {
+				if (effective?.auto && breakerBlocks()) {
+					throw new Error("pi-enclave: the denial circuit breaker is open; this search will not run.");
+				}
+				return runSandboxedGrep(
 					{ fs: fsClient(), cwd, ...(signal ? { signal } : {}) },
 					params as Parameters<typeof runSandboxedGrep>[1],
-				),
+				);
+			},
 		} as Parameters<typeof pi.registerTool>[0]);
 	}
 
@@ -484,13 +496,19 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
-		if (!breaker.finishTurn(event.turnIndex)) return;
+		// Whether this turn contributed a strike, before finishTurn consumes it.
+		const recorded = breaker.hasOutcome(event.turnIndex);
+		const opened = breaker.finishTurn(event.turnIndex);
+		// Persist after every turn that had a gated outcome, not only when the
+		// breaker opens -- otherwise a partial count (one or two adverse turns) is
+		// lost on resume and the agent gets a fresh three attempts.
+		if (recorded) pi.appendEntry(BREAKER_ENTRY_TYPE, breaker.state);
+		if (!opened) return;
 		// pi honours `terminate` only when every finalized result in the batch
 		// carries it, and the calls already prepared will not. Aborting is what
 		// actually stops the turn; the message is what stops the next attempt.
 		ctx.abort();
 		pi.sendUserMessage(steerMessage(), { deliverAs: "followUp" });
-		pi.appendEntry(BREAKER_ENTRY_TYPE, breaker.state);
 		audit?.append("breaker", { event: "opened", turnIndex: event.turnIndex, state: breaker.state });
 		refreshStatusLine?.();
 	});
