@@ -320,6 +320,42 @@ describe("approving a record", () => {
 		expect(backend.compiledProfile?.writableRoots).toContain("/etc/x");
 	});
 
+	it("refuses an unsupported capability before asking or consuming the record", async () => {
+		const backend = new RecordingBackend();
+		const channel = io();
+		const result = await approve({
+			record: record("bash", { command: "cat /etc/x", allow_read: "/etc/x" }),
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: channel.make(true),
+			backend,
+		});
+		expect(result.outcome).toBe("unsupported");
+		expect(channel.asked).toHaveLength(0);
+		expect(channel.err.join("\n")).toContain("Phase 3/4");
+		expect(readdirSync(pendingDirs(stateRoot, SESSION).pending)).toEqual([`${NONCE}.json`]);
+		expect(backend.compiledProfile).toBeUndefined();
+	});
+
+	it("refuses capability metadata that differs from the hash-checked input", async () => {
+		const backend = new RecordingBackend();
+		const rec = record("bash", { command: "touch /srv/x", allow_write: "/srv/x" });
+		rec.action.capability = { kind: "write", value: "/etc" };
+		const result = await approve({
+			record: rec,
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: io().make(true),
+			backend,
+			assumeYes: true,
+		});
+		expect(result.outcome).toBe("refused");
+		expect(backend.compiledProfile).toBeUndefined();
+		expect(readdirSync(pendingDirs(stateRoot, SESSION).pending)).toEqual([`${NONCE}.json`]);
+	});
+
 	// It changes what the person is agreeing to, so it comes before the
 	// question rather than after it.
 	it("warns about a narrowed configuration before asking", async () => {

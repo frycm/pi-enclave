@@ -71,6 +71,14 @@ export function globToRegExp(pattern: string): RegExp {
 	let out = "";
 	for (let i = 0; i < pattern.length; i++) {
 		const char = pattern[i] as string;
+		// A protected descendant glob also protects the directory itself. Without
+		// this, `**/.git/hooks/**` caught files below hooks but not `rm -rf
+		// .git/hooks`, because the generated regex required a slash after `hooks`.
+		if (char === "/" && pattern[i + 1] === "*" && pattern[i + 2] === "*" && i + 3 === pattern.length) {
+			out += "(?:/.*)?";
+			i += 2;
+			continue;
+		}
 		if (char === "*") {
 			if (pattern[i + 1] === "*") {
 				// `**/` may match nothing at all, so `**/x` matches a bare `x`.

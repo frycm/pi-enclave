@@ -121,6 +121,7 @@ export function canonicalize(options: CanonicalizeOptions): CanonicalAction {
 	if (tool === "bash" && typeof input.command === "string") {
 		shell = parseShell(input.command);
 		for (const command of shell.commands) {
+			const commandName = command.name.slice(command.name.lastIndexOf("/") + 1);
 			// Redirect targets are writes by construction; `<` is a read.
 			for (const redirect of command.redirects) addPath(redirect.target, redirect.writes);
 			// Every path-shaped argument counts as a write unless the command is
@@ -128,12 +129,12 @@ export function canonicalize(options: CanonicalizeOptions): CanonicalAction {
 			// the README states for the read-only classifier and it applies here
 			// too: the cost of being wrong is an escalation, and the cost of the
 			// opposite is a silent write to a protected path.
-			const writes = !READ_ONLY_COMMANDS.has(command.name);
+			const writes = !READ_ONLY_COMMANDS.has(commandName);
 			// dd names its files with `of=`/`if=` operand assignments, which the
 			// `NAME=value` filter below would otherwise skip -- so `dd
 			// of=authorized_keys` recorded no write to its target. Handled
 			// explicitly: `of=` is a write, `if=` a read.
-			if (command.name.slice(command.name.lastIndexOf("/") + 1) === "dd") {
+			if (commandName === "dd") {
 				for (const arg of command.args) {
 					const of = /^of=(.+)$/.exec(arg);
 					if (of?.[1]) addPath(of[1], true);
@@ -148,7 +149,7 @@ export function canonicalize(options: CanonicalizeOptions): CanonicalAction {
 					// token is offered here before the bare-filename fallback below.
 					for (const candidate of candidates) addPath(candidate, writes);
 				} else if (
-					WRITER_COMMANDS.has(command.name) &&
+					WRITER_COMMANDS.has(commandName) &&
 					arg !== "" &&
 					!arg.startsWith("-") &&
 					!/^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)
@@ -270,9 +271,13 @@ export function canonicalForm(action: Omit<CanonicalAction, "hash">): string {
 		args: command.args,
 		assignments: command.assignments,
 		redirects: command.redirects.map((redirect) => ({ op: redirect.op, target: redirect.target })),
+		// Quote context changes shell expansion (`*` versus `"*"`) even when
+		// name/args are otherwise identical. The normalized syntax keeps that
+		// distinction while still ignoring harmless whitespace runs.
+		syntax: command.syntax,
 	}));
 	return JSON.stringify({
-		v: 1,
+		v: 2,
 		tool: action.tool,
 		cwd: action.cwd,
 		profile: action.profileName,
@@ -297,18 +302,27 @@ export function canonicalForm(action: Omit<CanonicalAction, "hash">): string {
 }
 
 /** Keys whose values change what a write/edit does but are not the path. */
-const BODY_KEYS = ["content", "newContent", "new_string", "newString", "oldContent", "old_string", "oldString"];
+const BODY_KEYS = [
+	"content",
+	"edits",
+	"newContent",
+	"new_string",
+	"newString",
+	"oldContent",
+	"old_string",
+	"oldString",
+];
 
 /** The body-bearing input fields, sorted, or null when there are none. */
 function bodyFields(input: Record<string, unknown>): Record<string, unknown> | null {
 	const out: Record<string, unknown> = {};
 	for (const key of [...BODY_KEYS].sort()) {
-		if (Object.hasOwn(input, key)) out[key] = input[key];
+		if (Object.hasOwn(input, key)) out[key] = stableInput(input[key]);
 	}
 	return Object.keys(out).length > 0 ? out : null;
 }
 
-function stableInput(input: Record<string, unknown>): unknown {
+function stableInput(input: unknown): unknown {
 	const sort = (value: unknown): unknown => {
 		if (Array.isArray(value)) return value.map(sort);
 		if (value && typeof value === "object") {
@@ -339,13 +353,10 @@ export function describeAction(action: CanonicalAction): string {
 
 	if (action.shell) {
 		for (const command of action.shell.commands) {
-			// Assignments, the connector, name/args and every redirect -- so what
-			// the operator reads is what runs. Showing only name+args let
-			// `echo payload > .github/workflows/ci.yml` display as `echo payload`.
-			const parts = [...command.assignments, command.name, ...command.args];
-			for (const redirect of command.redirects) parts.push(`${redirect.op} ${redirect.target}`);
+			// The quote-preserving syntax keeps expansion semantics visible while
+			// normalizeShellSyntax makes it safe to render on one line.
 			const prefix = command.connector ? `${command.connector} ` : "";
-			head.push(`    ${prefix}${parts.join(" ")}`);
+			head.push(`    ${prefix}${command.syntax}`);
 		}
 		if (!action.confident) head.push(`    (parse is not confident: ${action.shell.markers.join(", ")})`);
 	} else {
@@ -363,11 +374,11 @@ export function describeAction(action: CanonicalAction): string {
 function bodyPreviews(input: Record<string, unknown>): [string, string][] {
 	const out: [string, string][] = [];
 	for (const key of BODY_KEYS) {
-		const value = input[key];
-		if (typeof value !== "string") continue;
-		const oneLine = value.replace(/\s+/g, " ").trim();
-		const preview = oneLine.length > 200 ? `${oneLine.slice(0, 200)}…` : oneLine;
-		out.push([key, `${JSON.stringify(preview)} (${value.length} chars)`]);
+		if (!Object.hasOwn(input, key)) continue;
+		const serialized = JSON.stringify(stableInput(input[key])) ?? "undefined";
+		const preview = serialized.length > 200 ? `${serialized.slice(0, 100)}…${serialized.slice(-100)}` : serialized;
+		const digest = createHash("sha256").update(serialized).digest("hex");
+		out.push([key, `${preview} (${serialized.length} serialized chars, sha256:${digest})`]);
 	}
 	return out;
 }

@@ -49,6 +49,8 @@ describe("parseShell", () => {
 			["cat x >out", ">", "out"],
 			["cmd 2> err", "2>", "err"],
 			["cmd &> both", "&>", "both"],
+			["cmd <> read-write", "<>", "read-write"],
+			["cmd 1<>read-write", "1<>", "read-write"],
 		])("pulls %s out of the arguments", (command, op, target) => {
 			const parsed = parseShell(command);
 			expect(parsed.commands[0]?.redirects).toEqual([{ op, target, writes: true }]);
@@ -57,6 +59,12 @@ describe("parseShell", () => {
 
 		it("treats an input redirect as a read", () => {
 			expect(parseShell("cmd < in").commands[0]?.redirects[0]?.writes).toBe(false);
+		});
+
+		it("treats a read-write redirect as a write", () => {
+			expect(parseShell("cmd 1<>target").commands[0]?.redirects).toEqual([
+				{ op: "1<>", target: "target", writes: true },
+			]);
 		});
 
 		// `&>` is a redirect, not a background-and-then. Splitting there would
@@ -168,12 +176,23 @@ describe("parseShell", () => {
 		it.each(["echo $HOME", "npm run $script", "cat $file"])("%s stays confident", (command) => {
 			expect(parseShell(command).confident).toBe(true);
 		});
+
+		it.each([
+			'TARGET=.github/workflows/ci.yml; echo pwn > "$TARGET"',
+			'tee "$TARGET"',
+			"dd if=/dev/zero of=$TARGET",
+		])("%s escalates because a write target is expanded", (command) => {
+			const parsed = parseShell(command);
+			expect(parsed.confident).toBe(false);
+			expect(parsed.markers).toContain("param-expansion");
+		});
 	});
 
 	// Compound and path-qualified forms the policy does not model must escalate
 	// rather than parse away.
 	describe("unsupported forms escalate", () => {
 		it.each([
+			"! sudo id",
 			"(cd /x && rm -rf /)",
 			"if true; then rm -rf /; fi",
 			"for f in *; do rm $f; done",
@@ -189,6 +208,11 @@ describe("parseShell", () => {
 			expect(parseShell("a | b").commands[1]?.connector).toBe("|");
 			expect(parseShell("a").commands[0]?.connector).toBeUndefined();
 		});
+	});
+
+	it("preserves quote syntax while normalizing harmless whitespace", () => {
+		expect(parseShell('rm  "*"').commands[0]?.syntax).toBe('rm "*"');
+		expect(parseShell("rm  *").commands[0]?.syntax).toBe("rm *");
 	});
 
 	// Regressions from the glued-redirect splitter.
@@ -208,6 +232,11 @@ describe("parseShell", () => {
 				{ op: "&>>", target: "secret.txt", writes: true },
 			]);
 			expect(parseShell("cmd &>> secret.txt").commands[0]?.redirects[0]?.target).toBe("secret.txt");
+			expect(parseShell("cmd >&secret.txt").commands[0]?.redirects[0]).toEqual({
+				op: ">&",
+				target: "secret.txt",
+				writes: true,
+			});
 		});
 	});
 });

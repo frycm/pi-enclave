@@ -78,6 +78,16 @@ export function checkResume(options: ResumeOptions): ResumeCheck {
 			detail: [`recorded: ${record.action.hash}`, `derived:  ${recorded.hash}`],
 		};
 	}
+	const recordedCapability = record.action.capability;
+	if (
+		recorded.capability?.kind !== recordedCapability?.kind ||
+		recorded.capability?.value !== recordedCapability?.value
+	) {
+		return {
+			ok: false,
+			reason: "the record's capability metadata does not match the hash-checked action input -- the file was edited",
+		};
+	}
 
 	// 2. Host execution is not grantable by any profile in this version.
 	if (record.requiresHuman && current.sandbox.hostExec !== "human") {

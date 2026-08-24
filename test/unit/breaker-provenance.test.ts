@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { CircuitBreaker, isBreakerState, steerMessage } from "../../src/gate/breaker.ts";
+import {
+	BREAKER_ENTRY_TYPE,
+	CircuitBreaker,
+	isBreakerState,
+	resetAndPersistBreaker,
+	steerMessage,
+} from "../../src/gate/breaker.ts";
 import { ActionLock } from "../../src/gate/lock.ts";
 import { isProvenanceRecord, ProvenanceTracker, sha256 } from "../../src/gate/provenance.ts";
 import { canonicalize } from "../../src/policy/canonical.ts";
@@ -122,6 +128,15 @@ describe("the circuit breaker", () => {
 			breaker.record(0, false);
 			expect(breaker.pendingOpen(0)).toBe(false);
 		});
+
+		it("evicts the same oldest outcome that finishTurn will evict", () => {
+			const breaker = new CircuitBreaker({ consecutive: 100, window: [2, 3] });
+			breaker.restore({ consecutive: 0, recent: [true, false, false] });
+			breaker.record(3, true);
+			expect(breaker.pendingOpen(3)).toBe(false);
+			expect(breaker.finishTurn(3)).toBe(false);
+			expect(breaker.state.recent).toEqual([false, false, true]);
+		});
 	});
 
 	it("reports whether a turn had a recorded outcome", () => {
@@ -142,6 +157,18 @@ describe("the circuit breaker", () => {
 		resumed.restore(breaker.state);
 		resumed.record(2, true);
 		expect(resumed.finishTurn(2)).toBe(true);
+	});
+
+	it("persists a human reset so resume cannot restore an older trip", () => {
+		const breaker = new CircuitBreaker(CONFIG);
+		breaker.restore({ consecutive: 2, recent: [true, true] });
+		const entries = [{ type: BREAKER_ENTRY_TYPE, state: breaker.state }];
+		resetAndPersistBreaker(breaker, (type, state) => entries.push({ type, state }));
+
+		const resumed = new CircuitBreaker(CONFIG);
+		for (const entry of entries) resumed.restore(entry.state);
+		expect(resumed.state).toEqual({ consecutive: 0, recent: [] });
+		expect(resumed.open).toBe(false);
 	});
 
 	it("validates restored state", () => {

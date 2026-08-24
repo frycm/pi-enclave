@@ -82,6 +82,16 @@ describe("the gate", () => {
 			expect(decision.reason).toContain("could not be parsed with confidence");
 		});
 
+		it.each([
+			"! git push origin main",
+			'TARGET=.github/workflows/ci.yml; echo pwn > "$TARGET"',
+			'tee "$TARGET"',
+		])("fails closed for unsupported shell semantics in %s", async (command) => {
+			const decision = await gate("bash", { command });
+			expect(decision.outcome).toBe("ask-denied");
+			expect(decision.reason).toContain("could not be parsed with confidence");
+		});
+
 		it("does not ask for a command it parsed confidently", async () => {
 			expect((await gate("bash", { command: "ls -la" })).outcome).toBe("allow");
 		});
@@ -107,6 +117,21 @@ describe("the gate", () => {
 		it("catches a shell redirect to a protected path", async () => {
 			const decision = await gate("bash", { command: "echo x > .github/workflows/ci.yml" });
 			expect(decision.outcome).toBe("ask-denied");
+		});
+
+		it("denies a read-write redirect to a protected bare filename", async () => {
+			const decision = await gate("bash", { command: "printf PWN 1<>authorized_keys" });
+			expect(decision.outcome).toBe("deny");
+		});
+
+		it("denies a path-qualified writer targeting a protected bare filename", async () => {
+			const decision = await gate("bash", { command: "/usr/bin/tee authorized_keys" });
+			expect(decision.outcome).toBe("deny");
+		});
+
+		it("denies deletion of a protected directory root", async () => {
+			const decision = await gate("bash", { command: "rm -rf .git/hooks" });
+			expect(decision.outcome).toBe("deny");
 		});
 	});
 

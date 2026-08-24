@@ -74,7 +74,10 @@ export class CircuitBreaker {
 		const adverse = this.turns.get(turnIndex);
 		if (adverse === undefined) return false;
 		const consecutive = adverse ? this.consecutive + 1 : 0;
-		const recentAdverse = this.recent.filter(Boolean).length + (adverse ? 1 : 0);
+		// Project the same bounded window finishTurn() will commit. Counting before
+		// evicting the oldest item can report a trip that disappears at turn_end.
+		const projectedRecent = [...this.recent, adverse].slice(-this.config.window[1]);
+		const recentAdverse = projectedRecent.filter(Boolean).length;
 		return consecutive >= this.config.consecutive || recentAdverse >= this.config.window[0];
 	}
 
@@ -129,6 +132,15 @@ export class CircuitBreaker {
 }
 
 export const BREAKER_ENTRY_TYPE = "pi-enclave-breaker";
+
+/** Clear a human-reset breaker and persist that cleared state in one operation. */
+export function resetAndPersistBreaker(
+	breaker: CircuitBreaker,
+	appendEntry: (customType: string, state: BreakerState) => void,
+): void {
+	breaker.reset();
+	appendEntry(BREAKER_ENTRY_TYPE, breaker.state);
+}
 
 export function isBreakerState(value: unknown): value is BreakerState {
 	if (!value || typeof value !== "object") return false;

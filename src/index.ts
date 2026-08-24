@@ -42,7 +42,13 @@ import {
 import { createConfirmEscalator } from "./escalate/confirm.ts";
 import { describeHandshakeFailure, runHandshake } from "./escalate/handshake.ts";
 import { writePending } from "./escalate/pending.ts";
-import { BREAKER_ENTRY_TYPE, CircuitBreaker, isBreakerState, steerMessage } from "./gate/breaker.ts";
+import {
+	BREAKER_ENTRY_TYPE,
+	CircuitBreaker,
+	isBreakerState,
+	resetAndPersistBreaker,
+	steerMessage,
+} from "./gate/breaker.ts";
 import { decide, type GateDecision } from "./gate/gate.ts";
 import { ActionLock } from "./gate/lock.ts";
 import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
@@ -540,7 +546,7 @@ export default function (pi: ExtensionAPI): void {
 		// message resets it: an extension calling sendUserMessage reaches the
 		// same event with source "extension", and letting that clear a trip
 		// would hand the reset to the process the breaker exists to stop.
-		breaker.reset();
+		resetAndPersistBreaker(breaker, (customType, state) => pi.appendEntry(customType, state));
 		refreshStatusLine?.();
 	});
 

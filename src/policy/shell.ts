@@ -36,7 +36,7 @@ export type ShellMarker =
 	| "clobber";
 
 export interface Redirect {
-	/** The operator as written: `>`, `>>`, `2>`, `&>`, `<`. */
+	/** The operator as written: `>`, `>>`, `2>`, `&>`, `<`, `<>`. */
 	op: string;
 	target: string;
 	/** False for `<`, which reads rather than writes. */
@@ -46,6 +46,8 @@ export interface Redirect {
 export interface SimpleCommand {
 	/** The segment as written, trimmed. Kept for diagnostics and audit records. */
 	text: string;
+	/** One-line, whitespace-normalized syntax with quotes and escapes preserved. */
+	syntax: string;
 	/** The command name, after any `VAR=value` prefixes. Empty for a bare assignment. */
 	name: string;
 	/** Arguments, quotes removed. */
@@ -122,6 +124,7 @@ const IFS_EXPANSION = /\$\{?IFS\}?/;
 
 /** Keywords that introduce a compound command the tokenizer does not model. */
 const SHELL_KEYWORDS = new Set([
+	"!",
 	"if",
 	"then",
 	"elif",
@@ -138,6 +141,21 @@ const SHELL_KEYWORDS = new Set([
 	"function",
 	"{",
 	"}",
+]);
+
+/** Commands whose ordinary operands name files and may therefore expand to protected write targets. */
+const FILE_OPERAND_COMMANDS = new Set([
+	"tee",
+	"cp",
+	"mv",
+	"install",
+	"ln",
+	"touch",
+	"truncate",
+	"rm",
+	"rmdir",
+	"mkdir",
+	"dd",
 ]);
 
 /** A path prefix such as `/usr/bin/env` still names `env`. */
@@ -187,7 +205,9 @@ export function parseShell(command: string): ParsedShell {
 		// bare `$VAR` argument (`echo $HOME`) is common and left alone.
 		if (
 			cmd.name.includes("$") ||
-			cmd.args.some((arg) => IFS_EXPANSION.test(arg) || (arg.includes("$") && arg.includes("/")))
+			cmd.args.some((arg) => IFS_EXPANSION.test(arg) || (arg.includes("$") && arg.includes("/"))) ||
+			cmd.redirects.some((redirect) => redirect.target.includes("$")) ||
+			(FILE_OPERAND_COMMANDS.has(name) && cmd.args.some((arg) => arg.includes("$")))
 		) {
 			markers.add("param-expansion");
 		}
@@ -336,7 +356,7 @@ function splitSegments(command: string, markers: Set<ShellMarker>): { text: stri
 	}));
 }
 
-const REDIRECT = /^(\d*>>?|\d*<|&>>?|>&)$/;
+const REDIRECT = /^(\d*<>|\d*>>?|\d*<|&>>?|>&)$/;
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /** Split one segment into words, pulling out redirects and assignment prefixes. */
@@ -360,7 +380,7 @@ function parseSegment(segment: string, markers: Set<ShellMarker>): SimpleCommand
 			}
 			continue;
 		}
-		const attached = /^(\d*>>?|\d*<|&>>?|>&)(.+)$/.exec(word);
+		const attached = /^(\d*<>|\d*>>?|\d*<|&>>?|>&)(.+)$/.exec(word);
 		if (attached?.[1] && attached[2]) {
 			redirects.push({ op: attached[1], target: attached[2], writes: !attached[1].endsWith("<") });
 			continue;
@@ -377,7 +397,54 @@ function parseSegment(segment: string, markers: Set<ShellMarker>): SimpleCommand
 		args.push(word);
 	}
 
-	return { text: segment, name: name ?? "", args, assignments, redirects };
+	return { text: segment, syntax: normalizeShellSyntax(segment), name: name ?? "", args, assignments, redirects };
+}
+
+/**
+ * Preserve syntax that changes execution (quotes and escapes) while ignoring
+ * runs of whitespace outside quotes. Control characters are escaped so this is
+ * safe to show on one line in a confirmation dialog.
+ */
+function normalizeShellSyntax(segment: string): string {
+	let out = "";
+	let pendingSpace = false;
+	let quote: '"' | "'" | "`" | undefined;
+	const appendControlSafe = (char: string) => {
+		out += char === "\n" ? "\\n" : char === "\r" ? "\\r" : char === "\t" ? "\\t" : char;
+	};
+
+	for (let i = 0; i < segment.length; i++) {
+		const char = segment[i] as string;
+		const next = segment[i + 1];
+		if (char === "\\" && next !== undefined) {
+			if (pendingSpace && out !== "") out += " ";
+			pendingSpace = false;
+			out += char;
+			appendControlSafe(next);
+			i++;
+			continue;
+		}
+		if (quote) {
+			appendControlSafe(char);
+			if (char === quote) quote = undefined;
+			continue;
+		}
+		if (char === "'" || char === '"' || char === "`") {
+			if (pendingSpace && out !== "") out += " ";
+			pendingSpace = false;
+			quote = char;
+			out += char;
+			continue;
+		}
+		if (/\s/.test(char)) {
+			pendingSpace = out !== "";
+			continue;
+		}
+		if (pendingSpace && out !== "") out += " ";
+		pendingSpace = false;
+		out += char;
+	}
+	return out;
 }
 
 /** Whitespace split with quote removal. Quoting does not join separate words here. */
@@ -450,8 +517,14 @@ function splitWords(segment: string, markers: Set<ShellMarker>): string[] {
 			current = "";
 			started = false;
 			let op = fd + char;
-			if (char === ">" && segment[i + 1] === ">") {
+			if (char === "<" && segment[i + 1] === ">") {
 				op += ">";
+				i++;
+			} else if (char === ">" && segment[i + 1] === ">") {
+				op += ">";
+				i++;
+			} else if (char === ">" && segment[i + 1] === "&") {
+				op += "&";
 				i++;
 			}
 			words.push(op);

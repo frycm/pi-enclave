@@ -73,6 +73,10 @@ describe("canonicalize", () => {
 			expect(bash("tee authorized_keys").paths.map((path) => path.relative)).toContain("authorized_keys");
 		});
 
+		it("records a bare filename operand of a path-qualified writer command", () => {
+			expect(bash("/usr/bin/tee authorized_keys").paths.map((path) => path.relative)).toContain("authorized_keys");
+		});
+
 		it("does not turn a non-writer command's bare word into a path", () => {
 			// A commit message word is not a file target.
 			expect(bash("git commit -m message").paths).toHaveLength(0);
@@ -176,6 +180,20 @@ describe("canonicalize", () => {
 			expect(e("b").hash).not.toBe(e("c").hash);
 		});
 
+		it("binds pi's current batch edit schema", () => {
+			const e = (newText: string) =>
+				canonicalize({
+					...BASE,
+					tool: "edit",
+					input: { path: "/work/x", edits: [{ oldText: "a", newText }] },
+				});
+			expect(e("b").hash).not.toBe(e("c").hash);
+		});
+
+		it("binds quote context that changes shell expansion", () => {
+			expect(bash("rm *").hash).not.toBe(bash('rm "*"').hash);
+		});
+
 		// A golden value, so a change to the serialization is a deliberate act
 		// rather than something that quietly invalidates every pending record.
 		it("has not drifted", () => {
@@ -209,6 +227,37 @@ describe("canonicalize", () => {
 			expect(write).toContain("EVIL");
 		});
 
+		it("shows batch edit replacements", () => {
+			const edit = describeAction(
+				canonicalize({
+					...BASE,
+					tool: "edit",
+					input: { path: "/work/x", edits: [{ oldText: "SAFE", newText: "EVIL" }] },
+				}),
+			);
+			expect(edit).toContain("edits:");
+			expect(edit).toContain("EVIL");
+			expect(edit).toContain("sha256:");
+		});
+
+		it("distinguishes equal-prefix, equal-length bodies", () => {
+			const render = (tail: string) =>
+				describeAction(
+					canonicalize({
+						...BASE,
+						tool: "write",
+						input: { path: "/work/x", content: `${"A".repeat(200)}${tail}` },
+					}),
+				);
+			expect(render("SAFE")).not.toBe(render("EVIL"));
+			expect(render("SAFE")).toContain("SAFE");
+		});
+
+		it("shows quote context that changes shell expansion", () => {
+			expect(describeAction(bash("rm *"))).not.toBe(describeAction(bash('rm "*"')));
+			expect(describeAction(bash('rm "*"'))).toContain('rm "*"');
+		});
+
 		it("says when the parse is not confident", () => {
 			expect(describeAction(bash("eval $X"))).toContain("not confident");
 		});
@@ -219,7 +268,10 @@ describe("globs", () => {
 	it.each([
 		["**/.git/hooks/**", "/work/.git/hooks/pre-commit", true],
 		["**/.git/hooks/**", ".git/hooks/pre-commit", true],
+		["**/.git/hooks/**", "/work/.git/hooks", true],
+		["**/.git/hooks/**", ".git/hooks", true],
 		["infra/**", "infra/main.tf", true],
+		["infra/**", "infra", true],
 		["infra/**", "src/main.ts", false],
 		// `*` matches zero characters too, so a pattern written for env files
 		// catches the bare `.env` as well as `prod.env`.
@@ -249,6 +301,10 @@ describe("globs", () => {
 describe("matchesPathPattern", () => {
 	it("matches an in-tree path by its relative form", () => {
 		expect(matchesPathPattern(["infra/**"], "/work/infra/main.tf", "/work")).toBe("infra/**");
+	});
+
+	it("matches the root of a protected descendant glob", () => {
+		expect(matchesPathPattern(["**/.git/hooks/**"], "/work/.git/hooks", "/work")).toBe("**/.git/hooks/**");
 	});
 
 	// A pattern about `.git/config` is about the file, not about where the

@@ -6,7 +6,7 @@
 	"license": "MIT",
 	"main": "./src/index.ts",
 	"bin": {
-		"pi-enclave": "./bin/pi-enclave.ts"
+		"pi-enclave": "./bin/pi-enclave.mjs"
 	},
 	"pi": {
 		"extensions": [
@@ -27,7 +27,7 @@
 		"conformance:report": "tsx scripts/conformance-report.ts",
 		"policy:report": "tsx scripts/policy-report.ts",
 		"bench:fs": "tsx scripts/fs-bench.ts",
-		"enclave": "tsx bin/pi-enclave.ts"
+		"enclave": "node bin/pi-enclave.mjs"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": ">=0.84.2 <0.85.0"
