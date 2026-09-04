@@ -10,6 +10,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SrtBackend } from "../src/backend/srt.ts";
 import { createDevProfile } from "../src/config/profile.ts";
+import { sanitizeVerificationPath } from "./test-path.ts";
+
+sanitizeVerificationPath();
 
 const workspace = mkdtempSync(join(tmpdir(), "enclave-bench-"));
 const small = join(workspace, "small.txt");

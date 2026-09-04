@@ -56,6 +56,8 @@ export interface ProbeEnv {
 	which: (bin: string) => string | null;
 	/** Read a file as text; null when it does not exist or cannot be read. */
 	readText: (path: string) => string | null;
+	/** Host PATH must not let repository-writable entries shadow SRT helpers. */
+	pathSafety?: () => { ok: boolean; detail: string };
 	/**
 	 * Linux only: can this host actually give bubblewrap and the seccomp layer
 	 * the capability-bearing namespaces they need?
@@ -190,6 +192,21 @@ function checkPlatform(env: ProbeEnv): ProbeCheck {
 		status: "fail",
 		detail: `${env.platform} has no OS-enforced backend in v1`,
 		remediation: "macOS and Linux are supported. Windows arrives with the Docker backend in phase 4.",
+	};
+}
+
+function checkHostPath(env: ProbeEnv): ProbeCheck | null {
+	const result = env.pathSafety?.();
+	if (!result) return null;
+	if (result.ok) {
+		return { id: "host-path", title: "Host executable PATH", status: "ok", detail: result.detail };
+	}
+	return {
+		id: "host-path",
+		title: "Host executable PATH",
+		status: "fail",
+		detail: result.detail,
+		remediation: "Remove relative and workspace-writable entries from PATH before starting pi-enclave.",
 	};
 }
 
@@ -355,6 +372,8 @@ export function probe(env: ProbeEnv): ProbeReport {
 	const backend = backendForPlatform(env.platform);
 
 	if (backend) {
+		const hostPath = checkHostPath(env);
+		if (hostPath) checks.push(hostPath);
 		checks.push(...checkBinaries(env, backend));
 		if (env.platform === "linux") {
 			const userns = checkLinuxUserns(env);

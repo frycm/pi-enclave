@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canonicalize, describeAction, hashAction } from "../../src/policy/canonical.ts";
+import { canonicalize, describeAction, describeActionForApproval, hashAction } from "../../src/policy/canonical.ts";
 import { globToRegExp, looksLikePath, matchesPathPattern, pathCandidatesInToken } from "../../src/policy/paths.ts";
 
 const BASE = { cwd: "/work", home: "/home/u", profileName: "dev" };
@@ -135,17 +135,34 @@ describe("canonicalize", () => {
 			const b = canonicalize({ ...BASE, tool: "bash", input: { command: "x", allow_write: "/b" } });
 			expect(a.hash).not.toBe(b.hash);
 		});
+
+		it("refuses ambiguous multiple capability requests", () => {
+			expect(() =>
+				canonicalize({
+					...BASE,
+					tool: "bash",
+					input: { command: "x", allow_write: "/a", allow_read: "/b" },
+				}),
+			).toThrow("exactly one capability");
+		});
 	});
 
 	describe("the hash", () => {
-		it("is stable across reserialization and whitespace", () => {
-			expect(bash("rm  -rf   /work/x").hash).toBe(bash("rm -rf /work/x").hash);
+		it("binds the exact executor-consumed command", () => {
+			expect(bash("rm  -rf   /work/x").hash).not.toBe(bash("rm -rf /work/x").hash);
 		});
 
-		it("is stable across key order for a tool with no shell and no path", () => {
+		it("binds executor-observable key order for a tool with no shell and no path", () => {
 			const a = canonicalize({ ...BASE, tool: "thing", input: { a: 1, b: 2 } });
 			const b = canonicalize({ ...BASE, tool: "thing", input: { b: 2, a: 1 } });
-			expect(a.hash).toBe(b.hash);
+			expect(a.hash).not.toBe(b.hash);
+		});
+
+		it("distinguishes negative zero from zero", () => {
+			const positive = file("deploy", { amount: 0 });
+			const negative = file("deploy", { amount: -0 });
+			expect(negative.hash).not.toBe(positive.hash);
+			expect(describeAction(negative)).not.toBe(describeAction(positive));
 		});
 
 		it.each([
@@ -194,6 +211,16 @@ describe("canonicalize", () => {
 			expect(bash("rm *").hash).not.toBe(bash('rm "*"').hash);
 		});
 
+		it("binds every field for path-bearing and third-party tools", () => {
+			const grep = (pattern: string) => file("grep", { path: "/work", pattern });
+			expect(grep("safe").hash).not.toBe(grep("secret").hash);
+			const deploy = (mode: string) => file("deploy", { path: "prod", mode, force: true });
+			expect(deploy("dry-run").hash).not.toBe(deploy("destroy").hash);
+			expect(file("read", { path: "/work/x", offset: 1 }).hash).not.toBe(
+				file("read", { path: "/work/x", offset: 2 }).hash,
+			);
+		});
+
 		// A golden value, so a change to the serialization is a deliberate act
 		// rather than something that quietly invalidates every pending record.
 		it("has not drifted", () => {
@@ -217,14 +244,15 @@ describe("canonicalize", () => {
 			expect(rendered).toContain("; rm -rf /work");
 		});
 
-		it("shows redirects and write bodies, not just the command name", () => {
+		it("shows redirects and redacted write-body evidence, not just the command name", () => {
 			const redirect = describeAction(bash("echo payload > .github/workflows/ci.yml"));
 			expect(redirect).toContain("> .github/workflows/ci.yml");
 			const write = describeAction(
 				canonicalize({ ...BASE, tool: "write", input: { path: "/work/x", content: "EVIL" } }),
 			);
 			expect(write).toContain("content:");
-			expect(write).toContain("EVIL");
+			expect(write).not.toContain("EVIL");
+			expect(write).toContain("redacted:sha256");
 		});
 
 		it("shows batch edit replacements", () => {
@@ -236,7 +264,8 @@ describe("canonicalize", () => {
 				}),
 			);
 			expect(edit).toContain("edits:");
-			expect(edit).toContain("EVIL");
+			expect(edit).not.toContain("EVIL");
+			expect(edit).toContain("redacted:sha256");
 			expect(edit).toContain("sha256:");
 		});
 
@@ -250,7 +279,8 @@ describe("canonicalize", () => {
 					}),
 				);
 			expect(render("SAFE")).not.toBe(render("EVIL"));
-			expect(render("SAFE")).toContain("SAFE");
+			expect(render("SAFE")).not.toContain("SAFE");
+			expect(render("SAFE")).toContain("redacted:sha256");
 		});
 
 		it("shows quote context that changes shell expansion", () => {
@@ -260,6 +290,75 @@ describe("canonicalize", () => {
 
 		it("says when the parse is not confident", () => {
 			expect(describeAction(bash("eval $X"))).toContain("not confident");
+		});
+
+		it("shows every privileged third-party input field without calling it a read", () => {
+			const rendered = describeAction(file("deploy", { path: "prod", mode: "destroy", force: true }));
+			expect(rendered).toContain("input.path");
+			expect(rendered).toContain("input.mode");
+			expect(rendered).toContain("destroy");
+			expect(rendered).toContain("input.force");
+			expect(rendered).not.toContain("reads /work/prod");
+		});
+
+		it("escapes control characters in attacker-selected field names", () => {
+			const rendered = describeAction(file("deploy", { "mode\n    SAFE-LOOKING: allow": "destroy" }));
+			expect(rendered).toContain('input."mode\\n    SAFE-LOOKING: allow"');
+			expect(rendered).not.toContain("\n    SAFE-LOOKING: allow");
+		});
+
+		it("renders nested execution fields independently of large siblings", () => {
+			const rendered = describeAction(
+				file("deploy", {
+					config: { a: "A".repeat(200), mode: "destroy", z: "Z".repeat(200) },
+					content: { padding: "X".repeat(300), operation: "erase" },
+				}),
+			);
+			expect(rendered).toContain("input.config.mode");
+			expect(rendered).toContain("destroy");
+			expect(rendered).toContain("input.content.operation");
+			expect(rendered).toContain("erase");
+		});
+
+		it("distinguishes a dotted key from nested fields", () => {
+			const nested = describeAction(file("deploy", { config: { mode: "destroy" } }));
+			const dotted = describeAction(file("deploy", { "config.mode": "destroy" }));
+			expect(nested).toContain("input.config.mode");
+			expect(dotted).toContain('input."config.mode"');
+			expect(dotted).not.toBe(nested);
+		});
+
+		it("redacts nested body-like fields", () => {
+			const rendered = describeAction(file("deploy", { config: { content: "DO-NOT-LEAK" } }));
+			expect(rendered).not.toContain("DO-NOT-LEAK");
+			expect(rendered).toContain("redacted:sha256");
+		});
+	});
+
+	describe("describeActionForApproval", () => {
+		it("shows fields in the same order the executor observes", () => {
+			const input = Object.fromEntries([
+				["delete", "production"],
+				["backup", false],
+			]);
+			const rendered = describeActionForApproval(file("deploy", input));
+			expect(rendered.indexOf('"delete"')).toBeLessThan(rendered.indexOf('"backup"'));
+		});
+
+		it("shows the complete executor input without redaction or truncation", () => {
+			const content = `${"A".repeat(300)}ERASE-PRODUCTION${"Z".repeat(300)}`;
+			const rendered = describeActionForApproval(file("write", { path: "/work/prod", content }));
+			expect(rendered).toContain(content);
+			expect(rendered).not.toContain("redacted:sha256");
+			expect(rendered).not.toContain("…");
+		});
+
+		it("renders Unicode format controls as inert ASCII and distinguishes literal escapes", () => {
+			const controlled = describeActionForApproval(file("deploy", { mode: "safe\u202Eliated" }));
+			const literal = describeActionForApproval(file("deploy", { mode: "safe\\u202eliated" }));
+			expect(controlled).not.toContain("\u202E");
+			expect(controlled).toContain("\\u202e");
+			expect(literal).not.toBe(controlled);
 		});
 	});
 });

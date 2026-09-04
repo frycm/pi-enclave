@@ -8,9 +8,10 @@ every crossing an `ask`.
 `c49906e`. Local checkout `frycm/pi` is at `v0.84.2` (`914cf1472`); every file reference
 below was verified there and spot-checked against the installed `dist` types.
 
-**Builds on:** the Phase-1 sandbox core ([phase-1-plan.md](phase-1-plan.md)). Nothing in
-this phase touches the backend interface; L2 is finished and this phase puts L1, the lock,
-the breaker, L4 and the state machinery around it.
+**Builds on:** the Phase-1 sandbox core ([phase-1-plan.md](phase-1-plan.md)). L2 remains the
+floor while this phase puts L1, the lock, the breaker, L4 and the state machinery around it.
+The only backend-contract addition is an invocation-scoped, human-approved bash write grant;
+read and network capabilities remain refused.
 
 ## Verified integration facts
 
@@ -37,7 +38,7 @@ plan; the next section lists the places where it contradicts the README.
 | There is **no API to list loaded extensions or `tool_call` handlers**; only `getAllTools()` and `getCommands()` (duplicates suffixed `:1`, `:2` in load order) expose load order indirectly | `runner.ts:447-449` (not reachable from `pi`) | A foreign `tool_call` handler cannot be detected; the freeze makes one loaded after us harmless, and one loaded before us is inside the trusted-extension boundary |
 | Project `.pi/extensions` are loaded only when the project is trusted (`~/.pi/agent/trust.json`, `defaultProjectTrust`, `--approve`); `ctx.isProjectTrusted()` is readable; a `project_trust` handler may answer | `trust-manager.ts:29-95`; `package-manager.ts:2375-2412`; `types.ts:332, 519-541` | "Untrusted extension loaded" cannot happen — pi already refuses. The real hazard is a **trusted** project whose `.pi/extensions` the sandboxed agent can write to; that is what the check targets |
 | **pi 0.84.2 has no MCP support.** No dependency, no setting, no tool namespace | exhaustive grep; `docs/usage.md:304` | "MCP tools" means "tools from other extensions". The allowlist keys on tool name + `sourceInfo.path`, with no `mcp__` convention to special-case |
-| `pi enclave …` **cannot be a pi subcommand** — the subcommand set is closed (`install/remove/update/list/config/auth`) and any other bare word becomes a prompt | `cli/args.ts:229-231, 250-257`; `package-manager-cli.ts:189-199` | Out-of-session commands ship as a package `bin` (`pi-enclave`); every one is mirrored as `/enclave …` in-session |
+| `pi enclave …` **cannot be a pi subcommand** — the subcommand set is closed (`install/remove/update/list/config/auth`) and any other bare word becomes a prompt | `cli/args.ts:229-231, 250-257`; `package-manager-cli.ts:189-199` | Out-of-session commands ship as a package `bin` (`pi-enclave`); read-only inspection is mirrored as `/enclave …`, while approval intentionally stays outside the agent-driven session |
 | `registerCommand(name, { handler(args: string, ctx) })` — `args` is the raw remainder string | `types.ts:1175-1181, 1259` | `/enclave` stays one command with a sub-verb parser, as in Phase 1 |
 | `ctx.abort()` aborts the current agent run; `pi.sendMessage(…, { deliverAs: "steer" })` is fire-and-forget and requires a streaming turn | `types.ts:336, 1301-1315`; `agent-session.ts:1437-1471` | Breaker trip = block + terminate + abort, then a `nextTurn` custom message naming the outcome (steer is meaningless once the run is aborted) |
 
@@ -84,8 +85,9 @@ Phase 2 is done when, on both backends, in CI:
    field.
 3. Every `tool_call` passes through exactly one gate that canonicalizes, evaluates L1,
    locks, and records — and a tool not in `tools.allow` is denied.
-4. With `reviewer.model: "none"`, every L1 `ask` and every capability request reaches L4:
-   a `confirm` with timeout when attended, a pending record plus `terminate` when not.
+4. With `reviewer.model: "none"`, every L1 `ask` and supported write-capability request
+   reaches L4: a `confirm` with timeout when attended, a pending record plus `terminate` when
+   not. Read and network capabilities fail closed before escalation until Phases 3 and 4.
 5. A pending record survives a crash, is refused when tampered with, and resumes only under
    an equal-or-narrower profile.
 6. The audit log chains, `pi-enclave audit verify` detects truncation and edits, and
@@ -240,14 +242,17 @@ Produces `src/gate/provenance.ts`, `src/gate/breaker.ts`.
 - **Execute-time re-check**: the operations objects consult the breaker before running
   (fact 2 above); a call locked before the trip and executed after it is refused, audited
   as `blocked_after_trip`.
+- **Third-party batch closure**: pi exposes no execute-time wrapper for non-owned tools.
+  When the current counters are one runtime-only adverse outcome from opening, a non-owned
+  tool later in a prepared batch is therefore withheld if an owned call precedes it. This
+  is conservative for the one batch and preserves the breaker's stop guarantee.
 - **Persistence**: each turn's collapsed outcome and each lock-table transition is an
   `appendEntry`; `session_start` with `reason: "resume" | "fork"` rebuilds both from
   `getEntries()`. A bypass never persists because none exists.
 
-Verified by unit tests on the counters, by the fake-pi harness replaying a three-call
-batch where the second call trips (P2: all three blocked or refused, `terminate` on every
-block, abort called once, one batch outcome in the audit), and by a resume test that
-reconstructs the breaker from entries and asserts the next call is blocked.
+Verified by unit tests on the counters, execute-time lock, runtime-adverse projection and
+non-owned sibling withholding, and by a resume test that reconstructs the breaker from
+entries and asserts the next call is blocked.
 
 ### Step 5 — State directory, audit log, retention ✅ done
 
@@ -255,9 +260,9 @@ Produces `src/state/dir.ts`, `src/state/audit.ts`, `src/state/redact.ts`; the
 `pi-enclave audit [verify]` command and `/enclave audit`.
 
 - **State directory** `~/.pi/agent/enclave/` (or under `PI_CODING_AGENT_DIR`, matching
-  where pi keeps `auth.json`): created `0700`, verified on every open — mode, owner, not a
-  symlink — and refused otherwise. It is added to the default `readDeny` list and the fold
-  rejects any profile that makes it writable.
+  where pi keeps `auth.json`): created `0700`, and each state directory opened by the
+  implementation is checked for mode, owner and symlinks and refused otherwise. It is added
+  to the default `readDeny` list and the fold rejects any profile that makes it writable.
 - **Audit log** `audit/<session-id>.jsonl`, `0600`, `O_APPEND`; records carry `seq`,
   `prevHash`, `ts`, `kind`, `sessionId`, `turnIndex`, and a kind-specific body: decision
   records (canonical hash, L1 matches with sources, verdict, attendance), violations,
@@ -310,38 +315,35 @@ missing file and a timeout (P9), and a test that `tui` with no TTY refuses.
 
 ### Step 7 — Pending-approval records and resume ✅ done
 
-Produces `src/escalate/pending.ts`, `src/escalate/resume.ts`; `pi-enclave approve <nonce>`
-and `/enclave approve <nonce>`.
+Produces `src/escalate/pending.ts`, `src/escalate/resume.ts`; `pi-enclave approve <nonce>`.
+`/enclave pending` is read-only by design, so approval happens outside the agent-driven
+session.
 
 - **Write path**: `<state>/state/<session-id>/pending/<nonce>.json`, directory `0700`,
   written to `.tmp`, `fsync`, `rename`; body = full canonical action, the profile snapshot,
-  the effective config hash, `sessionId`, session file path, nonce, `createdAt`,
-  `expiresAt` (24 h), `requiresHuman` for host-exec requests (which in this phase, with
-  `hostExec: "never"` the only value, are denied outright and recorded for the audit
-  trail). Refused on read if mode, owner, or a symlink is wrong, if the nonce in the body
-  differs from the filename, or if expired (and then deleted).
-- **Approve** renders the canonical action and asks in *that* terminal (a `readline`
-  prompt in the `bin`, `ctx.ui.confirm` in-session). On yes: rename to `approved/`, then
-  the checks: re-canonicalize and compare the hash; re-run L1 under the *current* config
-  (a rule added since denies); recompile the *current* profile and require `current ⊑
-  snapshot` under the fold's order; refuse on any wider field or on a config-hash change
-  in a field the order does not cover. Then execute once under the current profile through
-  the same operations objects (the lock table gets the hash with state `approved`), rename
-  to `consumed/`, audit every transition. A second `approve` of the same nonce is a no-op
-  with an audit entry.
+  the effective config hash, Pi's independently observed tool `sourceInfo.path`, `sessionId`,
+  session file path, nonce, `createdAt`, and `expiresAt` (24 h). Host execution is not a
+  recordable action in this version. A record is refused on read if mode, owner, or a symlink
+  is wrong, if the nonce in the body differs from the filename, or if expired (and then
+  deleted).
+- **Approve** renders the action, then re-canonicalizes and compares the hash; re-runs L1
+  and the tool/source grant under the *current* config; and requires `current ⊑ snapshot`
+  under the fold's order before asking in that terminal. The stored config hash is audit
+  evidence rather than a blanket equality check, so safe narrowing can proceed. On yes, the
+  record is renamed to `approved/`, the current backend profile is compiled, and the action
+  executes once through the same sandbox operations before being renamed to `consumed/`.
+  A second `approve` finds no pending record and cannot re-run it.
 - **Out-of-session execution** needs a backend: the `bin` compiles the current profile with
   `SrtBackend` exactly as `session_start` does and disposes it afterwards. The result is
-  printed and appended to the originating session as a custom entry so the next resume
-  can show it; it is not injected as a tool result, because the turn that asked for it is
-  over.
+  printed as command output; it is not injected as a tool result, because the turn that
+  asked for it is over.
 - **Crash safety** (P3): a `.tmp` left behind is ignored; a record in `approved/` with no
-  `consumed/` counterpart on the next `approve` is reported, not re-run.
+  `consumed/` counterpart cannot be selected by the approval command and is never re-run.
 
 Verified by unit tests for each row of the pending-record table, the stale-resume matrix
-(P11: narrower config executes without the removed grant; wider or uncovered change
-refuses and leaves the record pending), tamper cases (P10: edited body, `0644`, reused
-nonce), and an end-to-end test through the `bin` against the real backend on both
-platforms.
+(P11: safe narrowing executes under current policy; a revoked tool/capability or wider
+profile refuses and leaves the record pending), and tamper cases (P10: edited body, `0644`,
+reused nonce). Native backend behavior is covered by the backend conformance suite.
 
 ### Step 8 — Policy conformance suite, commands, status, README sign-off ✅ done
 
@@ -368,7 +370,7 @@ verbs, and the README update.
   The falsifiability meta-test from Phase 1 is reused: every P row names its control and
   the suite asserts each control actually fails, so a row cannot pass vacuously.
 - **Commands**: `/enclave status | backend | violations | rules defaults|config | audit
-  [verify] | approve <nonce> | pending` and the `bin` with `rules`, `audit`, `approve`,
+  [verify] | pending` and the `bin` with `rules`, `audit`, `approve`,
   `pending`, `attend-secret`. `on`/`off` are not implemented (see decisions below).
 - **Status line** grows `L1 · L4:<mode in force> · breaker n/3` and the refusal states;
   `status` lists the effective profile name, config sources used and rejected, attendance
@@ -440,10 +442,10 @@ pi-enclave/
 
 The reviewer and everything that only exists for it: `review.*` prose rendering,
 `review.trigger` values other than `boundary`, the read-only classification table,
-`rules critique`, `backend.extend` and the capability retry hatch's reviewed path (a
-capability request in this phase is an `ask`), the eval corpus. The egress proxy, Docker
-backend, ops profile and `hostExec: "human"`. The core changes to pi (the plan works on
-upstream 0.84.2 without them).
+`rules critique`, reviewed read-capability support and the eval corpus. Phase 2 implements
+only the human-approved, one-shot bash write grant; the egress proxy and `allow_host`, Docker
+backend, ops profile and any host-execution design remain later work. The core changes to pi
+(the plan works on upstream 0.84.2 without them) are also out of scope.
 
 ## Decisions settled before step 1
 
@@ -462,17 +464,22 @@ All three were confirmed by the project owner; they are requirements, not option
    registered by a different extension does not inherit the grant. An addition to the
    README schema.
 3. **Capability requests are an `ask` in deterministic mode**, not a deny: attended gets a
-   confirm, unattended gets a pending record. `backend.extend` is pulled forward from
-   Phase 3 for the **`write` capability only** — step 0 already confirmed SRT's
-   per-invocation `customConfig` does this — and `read` and `host` stay Phase 3/4.
+   confirm, unattended gets a pending record. The per-invocation SRT `customConfig` path is
+   pulled forward from Phase 3 for the **`write` capability only**; `read` and `host` stay
+   Phase 3/4.
 
 ---
 
 ## Phase 2: done
 
-Steps 1–8 are complete. 625 tests, green on macOS; `tsc` and biome clean. The Phase-1
-conformance suite still passes unchanged, which is the property that matters most: nothing
-in this phase touched the backend interface or the sandbox path.
+Steps 1–8 are complete. The unit, policy and backend-conformance suites are green in CI;
+`tsc` and biome are clean. The Phase-1 guarantees remain the floor, and the one backend
+extension is tested to prove a write grant applies to one invocation without leaking to its
+sibling. Identical concurrent Bash calls with different authority fail closed because pi's
+operations interface does not expose the tool-call id at execution time; grants also refuse
+immutable deny-tree and host-executable/PATH intersections before a sandbox is widened.
+Linux supplies the invocation lifetime with bubblewrap's PID namespace; macOS Bash grants
+fail closed because a deliberately detached Seatbelt child can escape process-group cleanup.
 
 **Exit criteria:**
 
@@ -481,7 +488,7 @@ in this phase touched the backend interface or the sandbox path.
 | 1 | Phase-2 matrix rows pass with a control that fails | ✅ P1–P11, `npm run policy:report` |
 | 2 | `merge(a, b) ⊑ a` holds; project violations reject the whole file | ✅ property test at 500 runs, plus a generator-reach assertion |
 | 3 | One gate canonicalizes, evaluates L1, locks and records; unlisted tools denied | ✅ |
-| 4 | With `reviewer.model: "none"`, every `ask` and capability request reaches L4 | ✅ confirm when attended, pending record when not |
+| 4 | With `reviewer.model: "none"`, every `ask` and supported write capability reaches L4; unsupported capabilities fail closed | ✅ Linux bash write: confirm/pending; macOS bash write and read/network: explicit deny |
 | 5 | A pending record survives a crash, is refused when tampered with, resumes only under an equal-or-narrower profile | ✅ P3, P10, P11 |
 | 6 | The audit log chains, `verify` detects truncation and edits, redaction asserted | ✅ |
 | 7 | Status line and report say what is active | ✅ backend, mode, `L1 off`, attendance in force, breaker, audit path |

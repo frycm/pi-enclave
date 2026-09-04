@@ -2,6 +2,7 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { canonical } from "../../src/backend/paths.ts";
 import type { CompiledProfile, FsClient, Profile, RunRequest, SandboxBackend } from "../../src/backend/types.ts";
 import { type ApproveIO, approve } from "../../src/cli/approve.ts";
 import { defaultProfile } from "../../src/config/defaults.ts";
@@ -31,8 +32,10 @@ class RecordingBackend implements SandboxBackend {
 	readonly writes: { path: string; content: string }[] = [];
 	compiledProfile?: Profile;
 	disposed = false;
+	beforeCompile?: () => void;
 
 	async compile(profile: Profile): Promise<CompiledProfile> {
+		this.beforeCompile?.();
 		this.compiledProfile = profile;
 		return { backend: this.name, profile, describe: () => "(fake)" };
 	}
@@ -114,6 +117,25 @@ describe("approving a record", () => {
 		expect(channel.asked).toHaveLength(1);
 	});
 
+	it("shows complete terminal-safe evidence before asking", async () => {
+		const backend = new RecordingBackend();
+		const channel = io();
+		const content = `${"A".repeat(300)}ERASE-PRODUCTION${"Z".repeat(300)}`;
+		await approve({
+			record: record("write", { path: "/work/prod", content, note: "safe\u202Eliated" }),
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: channel.make(false),
+			backend,
+		});
+		const shown = channel.out.join("\n");
+		expect(shown).toContain(content);
+		expect(shown).toContain("\\u202e");
+		expect(shown).not.toContain("\u202E");
+		expect(channel.asked).toHaveLength(1);
+	});
+
 	it("runs the command through the sandbox when the person says yes", async () => {
 		const backend = new RecordingBackend();
 		const result = await approve({
@@ -162,6 +184,50 @@ describe("approving a record", () => {
 		expect(result).toEqual({ outcome: "declined" });
 		expect(backend.commands).toHaveLength(0);
 		expect(readdirSync(pendingDirs(stateRoot, SESSION).pending)).toEqual([`${NONCE}.json`]);
+	});
+
+	it("refuses when a record expires while the approval prompt is open", async () => {
+		const backend = new RecordingBackend();
+		const rec = record("bash", { command: "git push origin main" });
+		rec.expiresAt = new Date(1_000).toISOString();
+		const result = await approve({
+			record: rec,
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: io().make(true),
+			backend,
+			now: () => 2_000,
+		});
+
+		expect(result.outcome).toBe("refused");
+		expect(backend.compiledProfile).toBeUndefined();
+		expect(backend.commands).toHaveLength(0);
+		expect(readdirSync(pendingDirs(stateRoot, SESSION).pending)).toEqual([`${NONCE}.json`]);
+	});
+
+	it("refuses when a record expires while the sandbox profile compiles", async () => {
+		const backend = new RecordingBackend();
+		const rec = record("bash", { command: "git push origin main" });
+		rec.expiresAt = new Date(1_000).toISOString();
+		let now = 0;
+		backend.beforeCompile = () => {
+			now = 2_000;
+		};
+		const result = await approve({
+			record: rec,
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: io().make(true),
+			backend,
+			now: () => now,
+		});
+
+		expect(result.outcome).toBe("refused");
+		expect(backend.commands).toHaveLength(0);
+		expect(readdirSync(pendingDirs(stateRoot, SESSION).approved)).toEqual([`${NONCE}.json`]);
+		expect(backend.disposed).toBe(true);
 	});
 
 	// pending → approved before execution and approved → consumed after, so a
@@ -315,9 +381,50 @@ describe("approving a record", () => {
 			home: "/home/u",
 			io: io().make(true),
 			backend,
+			platform: "linux",
 		});
 		expect(result.outcome).toBe("executed");
-		expect(backend.compiledProfile?.writableRoots).toContain("/etc/x");
+		expect(backend.compiledProfile?.writableRoots).toContain(canonical("/etc/x"));
+	});
+
+	it("leaves a credential-overlapping write capability pending without asking", async () => {
+		const backend = new RecordingBackend();
+		const channel = io();
+		const result = await approve({
+			record: record("bash", {
+				command: "cat /home/u/.ssh/id_ed25519",
+				allow_write: "/home/u/.ssh/out",
+			}),
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: channel.make(true),
+			backend,
+			platform: "linux",
+		});
+		expect(result.outcome).toBe("refused");
+		expect(channel.asked).toHaveLength(0);
+		expect(channel.err.join("\n")).toContain("immutable denied path");
+		expect(readdirSync(pendingDirs(stateRoot, SESSION).pending)).toEqual([`${NONCE}.json`]);
+		expect(backend.compiledProfile).toBeUndefined();
+	});
+
+	it("refuses a macOS Bash write capability whose widened process could detach", async () => {
+		const backend = new RecordingBackend();
+		const channel = io();
+		const result = await approve({
+			record: record("bash", { command: "touch /srv/result", allow_write: "/srv/result" }),
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: channel.make(true),
+			backend,
+			platform: "darwin",
+		});
+		expect(result.outcome).toBe("refused");
+		expect(channel.asked).toHaveLength(0);
+		expect(channel.err.join("\n")).toContain("could outlive the invocation");
+		expect(backend.compiledProfile).toBeUndefined();
 	});
 
 	it("refuses an unsupported capability before asking or consuming the record", async () => {

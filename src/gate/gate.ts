@@ -15,6 +15,8 @@
  * happens in the operations objects, which consult the lock again at the moment
  * they act -- see `lock.ts` for why that second check is not redundant.
  */
+
+import { capabilityIntersects, resolveCapabilityTarget } from "../backend/capability.ts";
 import type { EffectiveProfile } from "../config/types.ts";
 import { type CanonicalAction, canonicalize, describeAction } from "../policy/canonical.ts";
 import { type Evaluation, evaluateRules, type RuleMatch } from "../policy/match.ts";
@@ -42,6 +44,8 @@ export type GateOutcome =
 	| "skip-review"
 	/** The breaker was already open. */
 	| "breaker-open"
+	/** A non-owned call was withheld because an earlier sibling could open it at runtime. */
+	| "batch-withheld"
 	/** The gate itself failed. Always a denial. */
 	| "error";
 
@@ -63,7 +67,7 @@ export interface GateDecision {
  * both are denials, and the escalator records which for the audit log.
  */
 export interface Escalator {
-	confirm(action: CanonicalAction, reason: string): Promise<boolean>;
+	confirm(action: CanonicalAction, reason: string, toolSource?: string): Promise<boolean>;
 }
 
 /** The escalator in force before the attendance layer exists, and when nobody is there. */
@@ -80,6 +84,10 @@ export interface GateDeps {
 	breakerOpen?: () => boolean;
 	/** Where a tool came from, for grant pinning. */
 	toolSource?: (tool: string) => string | undefined;
+	/** Backend-aware last check that a write capability is structurally grantable. */
+	writeCapabilityIssue?: (value: string, cwd: string, tool: string) => string | undefined;
+	/** Last admission check for boundaries that have no execute-time guard. */
+	withholdBeforeExecution?: (action: CanonicalAction) => string | undefined;
 	onDecision?: (decision: GateDecision) => void;
 }
 
@@ -147,6 +155,62 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 		};
 	}
 
+	if (action.capability && profile.sandbox.capabilities !== "reviewed") {
+		return {
+			outcome: "deny",
+			block: true,
+			reason:
+				`pi-enclave: ${action.capability.kind} capabilities are disabled by the current profile.\n` +
+				"  A disabled capability is a revocation, not a request that can be escalated.",
+			matches: evaluation.matches,
+			adverse: true,
+			action,
+		};
+	}
+
+	// Phase 2 implements the one-shot write extension. Read-deny lifting needs
+	// the immutable/grantable split and host access needs the authenticated proxy;
+	// both arrive in later phases and must be refused rather than approved under
+	// the unchanged base profile.
+	if (action.capability && action.capability.kind !== "write") {
+		return {
+			outcome: "deny",
+			block: true,
+			reason: `pi-enclave: ${action.capability.kind} capabilities are not implemented in this phase.`,
+			matches: evaluation.matches,
+			adverse: true,
+			action,
+		};
+	}
+
+	if (action.capability?.kind === "write") {
+		const target = resolveCapabilityTarget(action.cwd, action.capability.value);
+		const denied = capabilityIntersects(target, profile.sandbox.readDeny);
+		if (denied) {
+			return {
+				outcome: "deny",
+				block: true,
+				reason:
+					`pi-enclave: write capability ${target} intersects immutable read-deny path ${denied}.\n` +
+					"  Read-denied credentials and state cannot be exposed by a write grant.",
+				matches: evaluation.matches,
+				adverse: true,
+				action,
+			};
+		}
+		const issue = deps.writeCapabilityIssue?.(action.capability.value, action.cwd, action.tool);
+		if (issue) {
+			return {
+				outcome: "deny",
+				block: true,
+				reason: `${issue}\n  This boundary is not grantable by approval.`,
+				matches: evaluation.matches,
+				adverse: true,
+				action,
+			};
+		}
+	}
+
 	// Resolved once: in the wiring this is a fresh `getAllTools()` allocation and
 	// a linear scan, and it ran twice per gated call for the `!== undefined` test
 	// and then the value.
@@ -168,12 +232,24 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 		};
 	}
 
+	const withheld = deps.withholdBeforeExecution?.(action);
+	if (withheld !== undefined) {
+		return {
+			outcome: "batch-withheld",
+			block: true,
+			reason: withheld,
+			matches: evaluation.matches,
+			adverse: false,
+			action,
+		};
+	}
+
 	// What needs a human. In deterministic mode this is the only escalation
 	// there is: `reviewer.model` is "none", `review.trigger` is "boundary", and
 	// every boundary crossing is an ask.
 	const askReason = needsHuman(action, evaluation, disposition.reviewed);
 	if (askReason) {
-		const approved = await (deps.escalator ?? DENY_ESCALATOR).confirm(action, askReason);
+		const approved = await (deps.escalator ?? DENY_ESCALATOR).confirm(action, askReason, toolSource);
 		if (!approved) {
 			return {
 				outcome: "ask-denied",

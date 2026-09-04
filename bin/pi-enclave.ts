@@ -8,9 +8,9 @@
  * (`cli/args.ts:229-231`). `pi enclave approve …` would therefore not run a
  * command; it would ask the agent to do something called "enclave approve".
  *
- * Every verb here is also available in-session as `/enclave …`, and both call
- * the same functions with different input and output adapters, so the two
- * cannot drift.
+ * Read-only inspection is also available in-session as `/enclave …`.
+ * `approve` and `attend-secret` deliberately remain outside the session the
+ * agent is driving.
  */
 import { readdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -32,7 +32,8 @@ const USAGE = `pi-enclave <command>
   audit [verify] [--session id] read or re-chain the audit log
   attend-secret                 provision the RPC attendance secret
 
-Every command is also available inside pi as /enclave <command>.`;
+Read-only status, rules, pending, and audit inspection are also available inside pi as
+/enclave <command>. Approval and secret provisioning are CLI-only.`;
 
 async function main(argv: string[]): Promise<number> {
 	const [command, ...rest] = argv;
@@ -53,7 +54,7 @@ async function main(argv: string[]): Promise<number> {
 			return pending(rest);
 
 		case "approve":
-			return runApprove(rest, cwd);
+			return runApprove(rest);
 
 		case "audit":
 			return auditCommand(rest);
@@ -126,7 +127,7 @@ function pending(argv: string[]): number {
 	return 0;
 }
 
-async function runApprove(argv: string[], cwd: string): Promise<number> {
+async function runApprove(argv: string[]): Promise<number> {
 	const nonce = argv[0];
 	if (!nonce) {
 		process.stderr.write("pi-enclave: approve needs a nonce. Run `pi-enclave pending` to see them.\n");
@@ -155,7 +156,7 @@ async function runApprove(argv: string[], cwd: string): Promise<number> {
 		return 1;
 	}
 
-	const loaded = currentConfig(cwd);
+	const loaded = currentConfig(read.record.action.cwd);
 	if (!loaded) return 1;
 
 	const rl = createInterface({ input: process.stdin, output: process.stdout });

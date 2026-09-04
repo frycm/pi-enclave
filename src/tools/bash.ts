@@ -15,9 +15,55 @@
  *   permitted" with no explanation will usually retry the same thing with
  *   `sudo`. Telling it which boundary it hit is what lets it change approach.
  */
+import { isUnderAny } from "../backend/paths.ts";
 import type { CompiledProfile, SandboxBackend, Violation } from "../backend/types.ts";
 import { formatViolations } from "../backend/violations.ts";
 import { buildChildEnv } from "../env/child-env.ts";
+import type { CanonicalAction } from "../policy/canonical.ts";
+
+function pathMayBeReached(action: CanonicalAction, raw: string): boolean {
+	if (!action.shell) return true;
+	let mentioned = false;
+	let possibleStatus = new Set([true]);
+	for (let index = 0; index < action.shell.commands.length; index++) {
+		const command = action.shell.commands[index];
+		if (!command) continue;
+
+		const connector = command.connector;
+		const reachable =
+			index === 0 ||
+			connector === undefined ||
+			(connector === "&&" && possibleStatus.has(true)) ||
+			(connector === "||" && possibleStatus.has(false)) ||
+			(connector !== "&&" && connector !== "||");
+		const namesPath =
+			command.name.includes(raw) ||
+			command.args.some((arg) => arg.includes(raw)) ||
+			command.redirects.some((redirect) => redirect.target.includes(raw));
+		if (namesPath) {
+			mentioned = true;
+			if (reachable) return true;
+		}
+
+		const commandName = command.name.slice(command.name.lastIndexOf("/") + 1);
+		const commandStatus =
+			commandName === "true" ? new Set([true]) : commandName === "false" ? new Set([false]) : new Set([true, false]);
+		if (index === 0 || connector === undefined || (connector !== "&&" && connector !== "||")) {
+			possibleStatus = commandStatus;
+		} else if (connector === "&&") {
+			possibleStatus = new Set([
+				...(possibleStatus.has(false) ? [false] : []),
+				...(possibleStatus.has(true) ? commandStatus : []),
+			]);
+		} else {
+			possibleStatus = new Set([
+				...(possibleStatus.has(true) ? [true] : []),
+				...(possibleStatus.has(false) ? commandStatus : []),
+			]);
+		}
+	}
+	return !mentioned;
+}
 
 /**
  * The subset of pi's `BashOperations` we implement, restated so this module
@@ -48,6 +94,12 @@ export interface EnclaveBashOptions {
 	/** Called for every violation, for the phase-2 audit log and status line. */
 	onViolations?: (violations: Violation[]) => void;
 	/**
+	 * A locked agent action explicitly named a configured read-deny target.
+	 * Needed for breaker accounting on Linux, where bwrap emits no read event
+	 * and a shell can suppress the final failure status with `|| true`.
+	 */
+	onDeniedReadAttempt?: (paths: readonly string[]) => void;
+	/**
 	 * Asked again, here, whether this command may run.
 	 *
 	 * Not redundant with the gate. pi prepares every tool call in a batch before
@@ -55,7 +107,7 @@ export interface EnclaveBashOptions {
 	 * already prepared when it trips and blocking cannot un-prepare it. This is
 	 * the only place left to stop it. Throwing refuses the command.
 	 */
-	guard?: (command: string) => void;
+	guard?: (command: string) => CanonicalAction | undefined;
 }
 
 /**
@@ -74,11 +126,11 @@ export function nextCommandId(): string {
 }
 
 export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOperationsLike {
-	const { backend, getCompiled, passthrough, envDeny, onViolations } = options;
+	const { backend, getCompiled, passthrough, envDeny, onViolations, onDeniedReadAttempt } = options;
 
 	return {
 		async exec(command, cwd, execOptions) {
-			options.guard?.(command);
+			const action = options.guard?.(command);
 			const compiled = getCompiled();
 			// The compiled profile's env settings are the configured ones and win;
 			// the static options remain only as a fallback for callers (tests, the
@@ -90,6 +142,8 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 				passthrough: compiled.profile.envPassthrough ?? passthrough ?? [],
 				envDeny: compiled.profile.envDeny ?? envDeny ?? [],
 				readDeny: compiled.profile.readDeny,
+				writableRoots: compiled.profile.writableRoots,
+				...(compiled.profile.tmpDir ? { tmpdir: compiled.profile.tmpDir } : {}),
 			});
 
 			const result = await backend.run(compiled, {
@@ -97,16 +151,41 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 				cwd,
 				env,
 				commandId: nextCommandId(),
+				...(action?.capability?.kind === "write" ? { writeCapability: action.capability.value } : {}),
 				onData: execOptions.onData,
 				...(execOptions.signal ? { signal: execOptions.signal } : {}),
 				...(execOptions.timeout !== undefined ? { timeout: execOptions.timeout } : {}),
 			});
 
-			if (result.violations.length > 0) {
-				onViolations?.(result.violations);
+			const violations = [...result.violations];
+			const deniedReadPaths = action?.paths
+				.filter((path) => isUnderAny(path.resolved, compiled.profile.readDeny) && pathMayBeReached(action, path.raw))
+				.map((path) => path.resolved);
+			if (deniedReadPaths && deniedReadPaths.length > 0) onDeniedReadAttempt?.(deniedReadPaths);
+			// bubblewrap reports denied writes through SRT's observer, but a denied
+			// read is only an errno in the child and produces no event. When the exact
+			// locked action explicitly names a configured read-deny target and the
+			// command fails, retain that conservative policy evidence so repeated
+			// retries reach the breaker. Never synthesize this on success: doing so
+			// could hide a backend that accidentally disclosed the file.
+			if (violations.length === 0 && result.exitCode !== 0 && action) {
+				for (const path of action.paths) {
+					if (!deniedReadPaths?.includes(path.resolved)) continue;
+					violations.push({
+						kind: path.writes ? "write" : "read",
+						source: "policy",
+						op: "read-deny-exit",
+						path: path.resolved,
+						backend: compiled.backend,
+					});
+				}
+			}
+
+			if (violations.length > 0) {
+				onViolations?.(violations);
 				// Appended after the command's own output so it reads as a postscript
 				// rather than interleaving with whatever the command printed.
-				execOptions.onData(Buffer.from(`\n${formatViolations(result.violations)}\n`, "utf8"));
+				execOptions.onData(Buffer.from(`\n${formatViolations(violations)}\n`, "utf8"));
 			}
 
 			return { exitCode: result.exitCode };

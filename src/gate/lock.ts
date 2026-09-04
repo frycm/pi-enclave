@@ -41,7 +41,7 @@ export interface LockEntry {
 }
 
 export class LockViolation extends Error {
-	readonly kind: "not-locked" | "already-consumed" | "breaker-open";
+	readonly kind: "not-locked" | "already-consumed" | "ambiguous" | "breaker-open";
 
 	constructor(kind: LockViolation["kind"], message: string) {
 		super(message);
@@ -126,13 +126,29 @@ export class ActionLock {
 				"pi-enclave: this call did not pass the policy gate, so it will not run. This is a bug in pi-enclave or another extension reached the tool directly.",
 			);
 		}
-		// The first entry not yet finished. Two identical calls each find their
-		// own; a lone entry already consumed reports it rather than re-running.
-		const entry = list.find((candidate) => candidate.state !== "consumed");
+		const isBash = key.startsWith("bash:");
+		const live = list.filter((candidate) => candidate.state !== "consumed");
+		// BashOperations.exec receives command and cwd, but not pi's tool-call id.
+		// If two queued calls have the same command but different canonical
+		// identities (most importantly, one has allow_write and one does not), no
+		// observation at execute time can tell which one pi started first. Refuse
+		// while both are live instead of lending either call the other's grant.
+		if (isBash && new Set(live.map((candidate) => candidate.action.hash)).size > 1) {
+			throw new LockViolation(
+				"ambiguous",
+				"pi-enclave: concurrent bash calls with the same command request different authority; they cannot be safely correlated and will not run together.",
+			);
+		}
+		// A bash operations object acts once, so an entry already executing belongs
+		// to another invocation. File tools are different: edit legitimately reads
+		// and writes through the same entry before tool_result consumes it.
+		const entry = list.find(
+			(candidate) => candidate.state === "locked" || (!isBash && candidate.state === "executing"),
+		);
 		if (!entry) {
 			throw new LockViolation(
 				"already-consumed",
-				"pi-enclave: this action has already run once and will not be repeated.",
+				"pi-enclave: this action is already running or has run once and will not be repeated.",
 			);
 		}
 		// The re-check that closes the parallel-batch window.

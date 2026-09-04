@@ -16,9 +16,10 @@
  *   applied is worse than one they know was skipped.
  */
 import { lstatSync, readFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { SANDBOX_TMPDIR } from "../backend/types.ts";
 import type { DefaultProfileOptions } from "./defaults.ts";
 import { type FoldError, fold, formatFoldErrors } from "./merge.ts";
 import { type Diagnostic, formatDiagnostics, parseDocument, parseEnvironment } from "./schema.ts";
@@ -68,10 +69,10 @@ export function configPaths(options: Pick<LoadOptions, "cwd" | "agentDir">) {
 
 export function loadConfig(options: LoadOptions): LoadResult {
 	const home = options.home ?? homedir();
-	const tmp = options.tmp ?? tmpdir();
+	const tmp = options.tmp ?? SANDBOX_TMPDIR;
 	const agentDir = options.agentDir ?? getAgentDir();
 	const env = options.env ?? process.env;
-	const defaults: DefaultProfileOptions = { cwd: options.cwd, home, tmp, agentDir };
+	const defaults: DefaultProfileOptions = { cwd: options.cwd, home, tmp, agentDir, env };
 	const paths = configPaths({ cwd: options.cwd, agentDir });
 	const read = options.readFile ?? defaultReadFile;
 	// Metadata only. In tests it is derived from the injected reader; in

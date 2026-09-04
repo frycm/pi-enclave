@@ -24,8 +24,10 @@
  *   before anything runs.
  */
 
+import { OWNED_TOOLS } from "../config/defaults.ts";
 import { narrowerOrEqual, type OrderViolation } from "../config/merge.ts";
 import type { EffectiveProfile } from "../config/types.ts";
+import { checkTool } from "../gate/tools.ts";
 import { type CanonicalAction, canonicalize } from "../policy/canonical.ts";
 import type { RuleMatch } from "../policy/match.ts";
 import { evaluateRules } from "../policy/match.ts";
@@ -87,6 +89,26 @@ export function checkResume(options: ResumeOptions): ResumeCheck {
 			ok: false,
 			reason: "the record's capability metadata does not match the hash-checked action input -- the file was edited",
 		};
+	}
+
+	// Revocation is a narrowing, but it is also an explicit veto. The partial
+	// order below cannot substitute for re-authorizing the mechanism needed by
+	// this exact action under current policy.
+	if (action.capability && current.sandbox.capabilities !== "reviewed") {
+		return { ok: false, reason: "the current profile has disabled capability requests" };
+	}
+	// The approval CLI has no live Pi registry to query, so it must use the
+	// independently observed sourceInfo.path stored when the action was gated.
+	// A legacy record without that evidence still works under an unpinned grant,
+	// but fails closed when current policy requires an implementation identity.
+	const tool = checkTool({
+		tool: action.tool,
+		tools: current.tools,
+		owned: OWNED_TOOLS,
+		...(record.toolSource !== undefined ? { source: record.toolSource } : {}),
+	});
+	if (!tool.allowed) {
+		return { ok: false, reason: "the current profile no longer authorizes this tool", detail: [tool.reason] };
 	}
 
 	// 2. Host execution is not grantable by any profile in this version.

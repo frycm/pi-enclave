@@ -17,6 +17,7 @@
  * depending on it.
  */
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import {
 	accessSync,
 	closeSync,
@@ -52,11 +53,31 @@ const MAX_READ_BYTES = 32 * 1024 * 1024;
  */
 const MAX_SEARCH_OUTPUT_BYTES = 16 * 1024 * 1024;
 
-function writeFrame(message) {
+function encodeResponseFrame(message) {
 	const payload = Buffer.from(JSON.stringify(message), "utf8");
+	if (payload.length > MAX_FRAME_BYTES) throw new Error(`response frame is too large (${payload.length} bytes)`);
 	const header = Buffer.allocUnsafe(HEADER_BYTES);
 	header.writeUInt32BE(payload.length, 0);
-	process.stdout.write(Buffer.concat([header, payload]));
+	return Buffer.concat([header, payload]);
+}
+
+function writeFrame(message) {
+	process.stdout.write(encodeResponseFrame(message));
+}
+
+let responseWrite = Promise.resolve();
+
+/** Serialize non-ready responses and wait for stdout to drain before allocating the next frame. */
+function queueFrame(message) {
+	const current = responseWrite.then(async () => {
+		const frame = encodeResponseFrame(message);
+		if (!process.stdout.write(frame)) await once(process.stdout, "drain");
+	});
+	responseWrite = current.catch((error) => {
+		process.stderr.write(`pi-enclave-fs: cannot write response: ${error.message}\n`);
+		process.exitCode = 1;
+	});
+	return current;
 }
 
 /**
@@ -75,6 +96,29 @@ const TOOL_PATHS = {
 
 /** Search tools still running, by request id, so a cancel can reach them. */
 const running = new Map();
+/** One potentially large response at a time bounds aggregate helper and parent memory. */
+const MAX_CONCURRENT_LARGE_RESPONSES = 1;
+const LARGE_RESPONSE_OPS = new Set(["readFile", "glob", "grep"]);
+let activeLargeResponses = 0;
+const largeResponseWaiters = [];
+const cancelledSearches = new Set();
+const pendingSearches = new Set();
+
+function acquireLargeResponse(requestId) {
+	if (activeLargeResponses < MAX_CONCURRENT_LARGE_RESPONSES) {
+		activeLargeResponses++;
+		return Promise.resolve(true);
+	}
+	return new Promise((resolve) => largeResponseWaiters.push({ requestId, resolve }));
+}
+
+function releaseLargeResponse() {
+	activeLargeResponses--;
+	const next = largeResponseWaiters.shift();
+	if (!next) return;
+	activeLargeResponses++;
+	next.resolve(true);
+}
 
 /**
  * Run a search tool and collect its output. Spawned here so it runs under the
@@ -193,6 +237,7 @@ async function handle(request) {
 		case "cancel": {
 			const child = running.get(request.target);
 			if (child) child.kill("SIGKILL");
+			else if (pendingSearches.has(request.target)) cancelledSearches.add(request.target);
 			return null;
 		}
 		case "glob": {
@@ -309,6 +354,51 @@ function resolveForReport(path) {
  */
 const MASKABLE = new Set(["exists", "readdir", "stat", "glob", "grep", "readFile", "head", "access"]);
 
+/**
+ * Keep the large-response permit through the stdout drain. Releasing when rg
+ * exits would let the next search allocate its 16 MiB while completed responses
+ * accumulate behind a blocked pipe, restoring N-times growth.
+ */
+async function respond(request) {
+	const large = LARGE_RESPONSE_OPS.has(request.op);
+	const search = request.op === "grep" || request.op === "glob";
+	if (search) pendingSearches.add(request.id);
+	if (large) await acquireLargeResponse(request.id);
+	try {
+		if (search && cancelledSearches.delete(request.id)) {
+			throw Object.assign(new Error("Operation aborted before search started"), { code: "ECANCELED" });
+		}
+		try {
+			const result = await handle(request);
+			await queueFrame({
+				id: request.id,
+				ok: true,
+				result,
+				// For the operations a masking tmpfs can answer "successfully" --
+				// an empty listing of a denied directory -- the client needs to
+				// know where the answer came from to say what it really means.
+				...(MASKABLE.has(request.op) && typeof (request.path ?? request.cwd) === "string"
+					? { resolvedPath: resolveForReport(request.path ?? request.cwd) }
+					: {}),
+			});
+		} catch (error) {
+			await queueFrame({
+				id: request.id,
+				ok: false,
+				code: error?.code,
+				syscall: error?.syscall,
+				message: String(error?.message ?? error),
+				...(typeof (request.path ?? request.cwd) === "string"
+					? { resolvedPath: resolveForReport(request.path ?? request.cwd) }
+					: {}),
+			});
+		}
+	} finally {
+		if (search) pendingSearches.delete(request.id);
+		if (large) releaseLargeResponse();
+	}
+}
+
 let buffer = Buffer.alloc(0);
 
 process.stdin.on("data", (chunk) => {
@@ -333,33 +423,12 @@ process.stdin.on("data", (chunk) => {
 			continue;
 		}
 
-		// Requests are served concurrently and answered by id, so one slow search
-		// does not stall every read behind it.
-		void handle(request).then(
-			(result) =>
-				writeFrame({
-					id: request.id,
-					ok: true,
-					result,
-					// For the operations a masking tmpfs can answer "successfully" --
-					// an empty listing of a denied directory -- the client needs to
-					// know where the answer came from to say what it really means.
-					...(MASKABLE.has(request.op) && typeof (request.path ?? request.cwd) === "string"
-						? { resolvedPath: resolveForReport(request.path ?? request.cwd) }
-						: {}),
-				}),
-			(error) =>
-				writeFrame({
-					id: request.id,
-					ok: false,
-					code: error?.code,
-					syscall: error?.syscall,
-					message: String(error?.message ?? error),
-					...(typeof (request.path ?? request.cwd) === "string"
-						? { resolvedPath: resolveForReport(request.path ?? request.cwd) }
-						: {}),
-				}),
-		);
+		// Small requests remain concurrent. Full reads and searches share one
+		// permit through response delivery so their advertised per-call limit is
+		// also an aggregate bound.
+		void respond(request).catch((error) => {
+			process.stderr.write(`pi-enclave-fs: response failed: ${error.message}\n`);
+		});
 	}
 });
 

@@ -21,13 +21,14 @@
  * with the rule relaxed instead.
  */
 import { isAbsolute, resolve } from "node:path";
+import { shellWriteCapabilityIssue, validateWriteCapability } from "../backend/capability.ts";
 import { SrtBackend } from "../backend/srt.ts";
 import type { SandboxBackend } from "../backend/types.ts";
 import { formatViolations } from "../backend/violations.ts";
 import { toBackendProfile } from "../config/profile.ts";
 import type { EffectiveProfile } from "../config/types.ts";
 import { buildChildEnv } from "../env/child-env.ts";
-import { describeRecord, type PendingRecord, transition } from "../escalate/pending.ts";
+import { describeRecordForApproval, type PendingRecord, transition } from "../escalate/pending.ts";
 import { checkResume, describeNarrowing, formatResumeFailure } from "../escalate/resume.ts";
 
 export interface ApproveIO {
@@ -47,6 +48,10 @@ export interface ApproveOptions {
 	backend?: SandboxBackend;
 	/** Skip the interactive question. Only for a caller that already asked. */
 	assumeYes?: boolean;
+	/** Trusted clock, injected by expiry tests. */
+	now?: () => number;
+	/** Host platform, injected only by cross-platform refusal tests. */
+	platform?: NodeJS.Platform;
 }
 
 export type ApproveResult =
@@ -57,8 +62,13 @@ export type ApproveResult =
 
 export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 	const { record, io, current } = options;
+	const expired = () => Date.parse(record.expiresAt) <= (options.now?.() ?? Date.now());
+	const expiredResult = (): ApproveResult => ({
+		outcome: "refused",
+		reason: `the approval record expired at ${record.expiresAt} before execution`,
+	});
 
-	io.out(describeRecord(record));
+	io.out(describeRecordForApproval(record));
 
 	const narrowing = describeNarrowing(record, current);
 	if (narrowing.length > 0) {
@@ -92,6 +102,20 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 		io.err(`\npi-enclave: ${reason}`);
 		return { outcome: "unsupported", reason };
 	}
+	const backendProfile = toBackendProfile(current, action.cwd);
+	let capabilityTarget: string | undefined;
+	if (capability) {
+		try {
+			const lifetimeIssue = tool === "bash" ? shellWriteCapabilityIssue(options.platform) : undefined;
+			if (lifetimeIssue) throw new Error(lifetimeIssue);
+			capabilityTarget = validateWriteCapability(backendProfile, action.cwd, capability.value);
+		} catch (error) {
+			const reason = (error as Error).message;
+			io.err(`\n${reason}`);
+			io.err("  The record is left pending.");
+			return { outcome: "refused", reason };
+		}
+	}
 
 	if (!options.assumeYes) {
 		const yes = await io.ask("\nRun this action now? [y/N] ");
@@ -99,6 +123,12 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 			io.out("Left pending.");
 			return { outcome: "declined" };
 		}
+	}
+	// The prompt is intentionally unbounded. Freshness therefore has to be
+	// checked after the answer, not only when the record was opened.
+	if (expired()) {
+		io.err(`\npi-enclave: the approval record expired at ${record.expiresAt}; nothing ran.`);
+		return expiredResult();
 	}
 
 	// Renamed *before* execution, so a crash mid-run leaves the record in
@@ -115,12 +145,16 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 		// capability is folded into a one-shot profile here. It is bound to the
 		// action hash (which includes the capability), and checkResume above
 		// re-derived that hash, so the extension can only be the one approved.
-		const backendProfile = toBackendProfile(current);
-		if (capability) {
-			const target = isAbsolute(capability.value) ? capability.value : resolve(action.cwd, capability.value);
-			backendProfile.writableRoots = [...backendProfile.writableRoots, target];
+		if (capabilityTarget) {
+			backendProfile.writableRoots = [...backendProfile.writableRoots, capabilityTarget];
 		}
 		const compiled = await backend.compile(backendProfile);
+		// Compilation can take long enough to cross the TTL too. An approved/
+		// record is retained as crash-safe evidence, but no action executes.
+		if (expired()) {
+			io.err(`\npi-enclave: the approval record expired at ${record.expiresAt} while preparing; nothing ran.`);
+			return expiredResult();
+		}
 
 		if (tool === "bash") {
 			const command = action.input.command;
@@ -132,6 +166,7 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 					passthrough: current.sandbox.env.passthrough,
 					envDeny: current.sandbox.env.envDeny,
 					readDeny: current.sandbox.readDeny,
+					writableRoots: compiled.profile.writableRoots,
 				}),
 				commandId: `enclave-approve-${record.nonce}`,
 				onData: (chunk) => io.out(chunk.toString("utf8")),

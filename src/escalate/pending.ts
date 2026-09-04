@@ -37,7 +37,13 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import type { EffectiveProfile } from "../config/types.ts";
-import type { CanonicalAction, Capability } from "../policy/canonical.ts";
+import {
+	approvalSerialize,
+	type CanonicalAction,
+	type Capability,
+	executionSerialize,
+	inputFieldPreviews,
+} from "../policy/canonical.ts";
 import { checkSecureFile, ensureSecureDir } from "../state/dir.ts";
 
 export const PENDING_VERSION = 1;
@@ -67,6 +73,8 @@ export interface PendingRecord {
 	configHash: string;
 	/** The profile itself: evidence for the approver, and an upper bound on resume. */
 	profileSnapshot: EffectiveProfile;
+	/** Pi's independently observed sourceInfo.path for the registered tool. */
+	toolSource?: string;
 	action: RecordedAction;
 	/** Why it needed a person. */
 	reason: string;
@@ -104,6 +112,7 @@ export interface WriteOptions {
 	profile: EffectiveProfile;
 	configHash: string;
 	reason: string;
+	toolSource?: string;
 	requiresHuman?: boolean;
 	ttlMs?: number;
 	now?: () => number;
@@ -127,6 +136,7 @@ export function writePending(options: WriteOptions): { path: string; record: Pen
 		configHash: options.configHash,
 		profileSnapshot: options.profile,
 		reason: options.reason,
+		...(options.toolSource !== undefined ? { toolSource: options.toolSource } : {}),
 		action: {
 			tool: options.action.tool,
 			input: options.action.input as Record<string, unknown>,
@@ -145,7 +155,10 @@ export function writePending(options: WriteOptions): { path: string; record: Pen
 
 	const path = join(dirs.pending, `${nonce}.json`);
 	const tmp = `${path}.tmp`;
-	writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+	// Use the same injective JSON spelling as the action hash. Native
+	// JSON.stringify turns -0 into 0, which would make a freshly written record
+	// fail its own resume hash check and misdescribe the approved input.
+	writeFileSync(tmp, `${executionSerialize(record)}\n`, { mode: 0o600 });
 	// fsync before rename: a rename is atomic with respect to *readers*, not
 	// with respect to a power cut, and the point of the whole dance is that a
 	// crash never leaves a half-written approval.
@@ -231,6 +244,7 @@ function validateRecord(record: unknown): string | undefined {
 	if (typeof r.sessionId !== "string") return "the record has no session id";
 	if (typeof r.expiresAt !== "string" || Number.isNaN(Date.parse(r.expiresAt))) return "the record has no valid expiry";
 	if (typeof r.configHash !== "string") return "the record has no configuration hash";
+	if (r.toolSource !== undefined && typeof r.toolSource !== "string") return "the record has an invalid tool source";
 	if (!r.profileSnapshot || typeof r.profileSnapshot !== "object") return "the record has no profile snapshot";
 	if (!r.action || typeof r.action !== "object") return "the record has no action";
 	const action = r.action as Partial<RecordedAction>;
@@ -302,20 +316,58 @@ export function listSessions(stateRoot: string): string[] {
 
 /** What the approver reads before deciding. The whole action, in full. */
 export function describeRecord(record: PendingRecord): string {
+	const text = (value: string) => approvalSerialize(value).slice(1, -1);
 	const lines = [
-		`nonce:    ${record.nonce}`,
-		`created:  ${record.createdAt}`,
-		`expires:  ${record.expiresAt}`,
-		`session:  ${record.sessionId}`,
-		`profile:  ${record.action.profileName}`,
-		`reason:   ${record.reason}`,
+		`nonce:    ${text(record.nonce)}`,
+		`created:  ${text(record.createdAt)}`,
+		`expires:  ${text(record.expiresAt)}`,
+		`session:  ${text(record.sessionId)}`,
+		`profile:  ${text(record.action.profileName)}`,
+		`reason:   ${text(record.reason)}`,
 		"",
-		`${record.action.tool} in ${record.action.cwd}`,
+		`${text(record.action.tool)} in ${text(record.action.cwd)}`,
 	];
-	for (const command of record.action.commands ?? []) lines.push(`    ${command}`);
-	for (const path of record.action.paths ?? []) lines.push(`    ${path.writes ? "writes" : "reads"} ${path.path}`);
+	for (const command of record.action.commands ?? []) lines.push(`    ${text(command)}`);
+	for (const path of record.action.paths ?? [])
+		lines.push(`    ${path.writes ? "writes" : "reads"} ${text(path.path)}`);
+	for (const [field, preview] of inputFieldPreviews(record.action.input)) {
+		lines.push(`    input.${field}: ${preview}`);
+	}
 	if (record.action.capability) {
-		lines.push(`    requests ${record.action.capability.kind} access to ${record.action.capability.value}`);
+		lines.push(`    requests ${record.action.capability.kind} access to ${text(record.action.capability.value)}`);
+	}
+	if (record.requiresHuman) {
+		lines.push("", "This asked for unsandboxed host execution, which no profile in this version can grant.");
+	}
+	lines.push("", `hash: ${text(record.action.hash)}`);
+	return lines.join("\n");
+}
+
+/**
+ * Full-fidelity, terminal-safe evidence shown at the authorization boundary.
+ *
+ * The in-session pending list deliberately uses bounded/redacted previews: it
+ * is agent-visible diagnostic output. The standalone approval CLI must instead
+ * show the complete executor-consumed input before asking a person to run it.
+ */
+export function describeRecordForApproval(record: PendingRecord): string {
+	const lines = [
+		`nonce: ${approvalSerialize(record.nonce)}`,
+		`created: ${approvalSerialize(record.createdAt)}`,
+		`expires: ${approvalSerialize(record.expiresAt)}`,
+		`session: ${approvalSerialize(record.sessionId)}`,
+		`profile: ${approvalSerialize(record.action.profileName)}`,
+		`reason: ${approvalSerialize(record.reason)}`,
+		"",
+		`tool: ${approvalSerialize(record.action.tool)}`,
+		`cwd: ${approvalSerialize(record.action.cwd)}`,
+		`input: ${approvalSerialize(record.action.input)}`,
+	];
+	for (const path of record.action.paths ?? []) {
+		lines.push(`${path.writes ? "writes" : "reads"}: ${approvalSerialize(path.path)}`);
+	}
+	if (record.action.capability) {
+		lines.push(`capability: ${approvalSerialize(record.action.capability)}`);
 	}
 	if (record.requiresHuman) {
 		lines.push("", "This asked for unsandboxed host execution, which no profile in this version can grant.");

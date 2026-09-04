@@ -92,6 +92,8 @@ describe("parseShell", () => {
 			["ls | xargs rm", "xargs"],
 			["sh -c 'rm -rf /'", "shell-c"],
 			["bash -c 'x'", "shell-c"],
+			["PATH=/tmp/agent-bin git status", "environment-assignment"],
+			["LD_PRELOAD=/work/agent.so true", "environment-assignment"],
 			["echo 'unterminated", "unbalanced-quote"],
 		])("%s is not confident (%s)", (command, marker) => {
 			const parsed = parseShell(command);
@@ -100,13 +102,11 @@ describe("parseShell", () => {
 		});
 
 		it("an ordinary command is confident", () => {
-			expect(parseShell("npm run build && npm test").confident).toBe(true);
+			expect(parseShell("git status --short && ls").confident).toBe(true);
 		});
 
-		// `sh script.sh` runs a file; only `-c` hides a command line the
-		// tokenizer will never see.
-		it("sh without -c stays confident", () => {
-			expect(parseShell("sh ./deploy.sh").confident).toBe(true);
+		it("a shell script is opaque too", () => {
+			expect(parseShell("sh ./deploy.sh").confident).toBe(false);
 		});
 	});
 
@@ -144,6 +144,8 @@ describe("parseShell", () => {
 			["timeout 30 rm -rf .", "timeout"],
 			["/usr/bin/env curl x", "path-qualified env"],
 			["bash -lc 'git push'", "clustered -lc"],
+			["builtin eval 'git reset --hard'", "builtin"],
+			["env -S 'git reset --hard'", "env -S"],
 		])("%s is not confident (%s)", (command) => {
 			expect(parseShell(command).confident).toBe(false);
 		});
@@ -171,10 +173,14 @@ describe("parseShell", () => {
 			expect(parseShell(command).confident).toBe(false);
 		});
 
-		// A $VAR in an ordinary argument is common and does not reconstruct the
-		// command, so it must not escalate.
-		it.each(["echo $HOME", "npm run $script", "cat $file"])("%s stays confident", (command) => {
-			expect(parseShell(command).confident).toBe(true);
+		// Argument expansion can select a sensitive dispatcher verb or path.
+		it.each([
+			"echo $HOME",
+			"npm run $script",
+			"cat $file",
+			'x=reset; git "$x" --hard',
+		])("%s is not confident", (command) => {
+			expect(parseShell(command).confident).toBe(false);
 		});
 
 		it.each([
@@ -185,6 +191,42 @@ describe("parseShell", () => {
 			const parsed = parseShell(command);
 			expect(parsed.confident).toBe(false);
 			expect(parsed.markers).toContain("param-expansion");
+		});
+	});
+
+	describe("hidden filesystem effects", () => {
+		it.each([
+			["cd .pi && touch extensions/x", "cwd-change"],
+			['python3 -c \'open(".pi/extensions/x", "w")\'', "interpreter"],
+			["node build.js", "interpreter"],
+			["nodejs -e 'process.exit()'", "interpreter"],
+			["/usr/bin/nodejs -e 'process.exit()'", "interpreter"],
+			["python3.12 deploy.py", "interpreter"],
+			["ruby3.3 deploy.rb", "interpreter"],
+			["lua5.4 deploy.lua", "interpreter"],
+			[". ./deploy.sh", "source-script"],
+			["source ./deploy.sh", "source-script"],
+			["npm run deploy", "script-runner"],
+			["./deploy.sh", "workspace-executable"],
+			["find . -exec git reset --hard ';'", "command-dispatch"],
+			["sed -n 'e git reset --hard' /dev/null", "command-dispatch"],
+			["busybox sh -c 'git reset --hard'", "command-dispatch"],
+			["fish -c 'git reset --hard'", "shell-c"],
+			["trap 'git reset --hard' EXIT", "command-dispatch"],
+			["cmake -P agent.cmake", "script-runner"],
+			["printf x | awk 'system(\"git reset --hard\")'", "interpreter"],
+			["R -e 'system(\"git reset --hard\")'", "interpreter"],
+			["/usr/bin/../../work/evil", "workspace-executable"],
+			["printf 'git reset --hard\\n' | sh", "shell-c"],
+			["sh < ./agent-script", "shell-c"],
+			["tar -xf payload.tar", "archive-extract"],
+			["printf x > .pi/extensions/*", "pathname-expansion"],
+			["touch reset; git r?set --hard", "pathname-expansion"],
+			["touch git; gi? reset --hard", "pathname-expansion"],
+		])("%s is not confident (%s)", (command, marker) => {
+			const parsed = parseShell(command);
+			expect(parsed.confident).toBe(false);
+			expect(parsed.markers).toContain(marker);
 		});
 	});
 

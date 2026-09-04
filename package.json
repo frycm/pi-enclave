@@ -23,10 +23,10 @@
 		"test:unit": "vitest --run test/unit",
 		"test:conformance": "vitest --run --passWithNoTests test/conformance",
 		"test:policy": "vitest --run test/policy",
-		"probe": "tsx scripts/probe.ts",
-		"conformance:report": "tsx scripts/conformance-report.ts",
-		"policy:report": "tsx scripts/policy-report.ts",
-		"bench:fs": "tsx scripts/fs-bench.ts",
+		"probe": "node --import tsx scripts/probe.ts",
+		"conformance:report": "node --import tsx scripts/conformance-report.ts",
+		"policy:report": "node --import tsx scripts/policy-report.ts",
+		"bench:fs": "node --import tsx scripts/fs-bench.ts",
 		"enclave": "node bin/pi-enclave.mjs"
 	},
 	"peerDependencies": {

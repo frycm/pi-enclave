@@ -75,6 +75,7 @@ export interface Scenario {
 export function scenarioEnv(fixture: Fixture): Readonly<Record<string, string>> {
 	return buildChildEnv(process.env, {
 		readDeny: fixture.profile.readDeny,
+		writableRoots: fixture.profile.writableRoots,
 		tmpdir: fixture.workspace,
 	});
 }
@@ -113,6 +114,62 @@ export const SCENARIOS: Scenario[] = [
 				created = false;
 			}
 			return { ok: !created, detail: created ? `WROTE ${target} outside the workspace` : "write denied" };
+		},
+	},
+	{
+		id: "C15",
+		title: "protected persistence paths remain read-only inside a writable workspace",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const extension = join(fixture.workspace, ".pi", "extensions", "evil.ts");
+			const hook = join(fixture.workspace, ".git", "hooks", "pre-commit");
+			const config = join(fixture.workspace, ".git", "config");
+			for (const target of [extension, hook, config]) {
+				await sh(
+					`python3 -c "from pathlib import Path; p=Path('${target}'); p.parent.mkdir(parents=True, exist_ok=True); p.write_text('pwn')"`,
+				);
+			}
+			const changed = [extension, hook, config].filter((target) => {
+				try {
+					return readFileSync(target, "utf8").includes("pwn");
+				} catch {
+					return false;
+				}
+			});
+			return {
+				ok: changed.length === 0,
+				detail: changed.length > 0 ? `WROTE executable persistence path(s): ${changed.join(", ")}` : "writes denied",
+			};
+		},
+	},
+	{
+		id: "C16",
+		title: "a protected persistence leaf cannot be displaced by moving its ancestor",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const metadata = join(fixture.workspace, ".git");
+			const moved = join(fixture.workspace, ".git-displaced");
+			const hook = join(metadata, "hooks", "pre-commit");
+			await sh(
+				`mv ${metadata} ${moved} && mkdir -p ${join(metadata, "hooks")} && ` +
+					`printf pwn > ${hook} && printf '[core]\\nhooksPath=hooks\\n' > ${join(metadata, "config")}`,
+			);
+			let replaced = false;
+			try {
+				replaced = readFileSync(hook, "utf8") === "pwn";
+			} catch {
+				// Expected: the ancestor move or replacement write was denied.
+			}
+			return {
+				ok: !replaced,
+				detail: replaced
+					? "DISPLACED the protected Git metadata tree and wrote a hook"
+					: "ancestor displacement denied",
+			};
 		},
 	},
 	{
@@ -284,7 +341,7 @@ for p in ['${fixture.socketPath}', '/var/run/docker.sock']:
 			// does, and both backends deny PTYs by default, so a profile that lost
 			// allowPty in translation would have left this row green.
 			const r = await sh(
-				`git init -q . && git -c user.email=a@b -c user.name=a commit -q --allow-empty -m x && ` +
+				`git -c user.email=a@b -c user.name=a commit -q --allow-empty -m x && ` +
 					`git log --oneline | head -1 && echo GIT-OK; ` +
 					`python3 -c "import pty,os; m,s=pty.openpty(); os.close(s); os.close(m); print('PTY-'+'OK')" 2>&1 || echo PTY-DENIED`,
 			);

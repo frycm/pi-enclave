@@ -96,6 +96,14 @@ export function createFixture(): Fixture {
 	server.unref();
 
 	writeFileSync(join(workspace, "ok.txt"), "workspace content\n");
+	mkdirSync(join(workspace, ".pi"));
+	// Repository creation is a trusted setup action. The live gate deliberately
+	// refuses agent-driven `git init`, because it would establish new config and
+	// hook execution surfaces after the sandbox profile was compiled. C6 can then
+	// prove ordinary Git writes (index, objects and refs) remain usable while the
+	// pre-existing config and hooks stay read-only.
+	const initialized = spawnSync("git", ["init", "-q", workspace], { encoding: "utf8" });
+	if (initialized.status !== 0) throw new Error(initialized.stderr || "conformance fixture git init failed");
 
 	// The symlink-race pair: both live inside the writable workspace but resolve
 	// outside it. The kernel decides on the resolved path, which is the whole
@@ -145,6 +153,7 @@ export function createFixture(): Fixture {
 	const profile: Profile = {
 		mode: "workspace-write",
 		writableRoots: [workspace],
+		writeDeny: [join(workspace, ".pi"), join(workspace, ".git", "hooks"), join(workspace, ".git", "config")],
 		readDeny: [deniedHome, lateDenied, deniedFile, deniedLink, deniedUnderLink],
 		network: "off",
 		allowPty: true,

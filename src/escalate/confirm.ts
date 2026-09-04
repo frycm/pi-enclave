@@ -15,7 +15,7 @@
 
 import type { Escalator } from "../gate/gate.ts";
 import type { CanonicalAction } from "../policy/canonical.ts";
-import { describeAction } from "../policy/canonical.ts";
+import { approvalSerialize, describeActionForApproval } from "../policy/canonical.ts";
 import type { AttendanceState } from "./attendance.ts";
 
 export interface ConfirmUI {
@@ -38,17 +38,17 @@ export interface ConfirmEscalatorOptions {
 	confirmTimeoutMs: () => number;
 	onEscalation?: (event: EscalationEvent) => void;
 	/** Called when nobody was there, so a pending record can be written. */
-	onUnattended?: (action: CanonicalAction, reason: string) => void | Promise<void>;
+	onUnattended?: (action: CanonicalAction, reason: string, toolSource?: string) => void | Promise<void>;
 }
 
 export function createConfirmEscalator(options: ConfirmEscalatorOptions): Escalator {
 	return {
-		async confirm(action, reason) {
+		async confirm(action, reason, toolSource) {
 			const attendance = options.attendance();
 			const ui = options.ui();
 
 			if (attendance.effective === "off" || !ui) {
-				await options.onUnattended?.(action, reason);
+				await options.onUnattended?.(action, reason, toolSource);
 				options.onEscalation?.({ action, reason, outcome: "unattended", attended: attendance.effective });
 				return false;
 			}
@@ -74,21 +74,21 @@ export function createConfirmEscalator(options: ConfirmEscalatorOptions): Escala
 
 			const outcome: EscalationOutcome = answered ? "approved" : controller.signal.aborted ? "timeout" : "declined";
 			options.onEscalation?.({ action, reason, outcome, attended: attendance.effective });
-			if (!answered) await options.onUnattended?.(action, reason);
+			if (!answered) await options.onUnattended?.(action, reason, toolSource);
 			return answered;
 		},
 	};
 }
 
 export function escalationTitle(action: CanonicalAction): string {
-	return `pi-enclave: approve this ${action.tool} call?`;
+	return `pi-enclave: approve this ${approvalSerialize(action.tool)} call?`;
 }
 
 export function escalationMessage(action: CanonicalAction, reason: string, timeoutMs: number): string {
 	return [
-		reason,
+		`reason: ${approvalSerialize(reason)}`,
 		"",
-		describeAction(action),
+		describeActionForApproval(action),
 		"",
 		`No answer within ${Math.round(timeoutMs / 1000)}s is a refusal.`,
 	].join("\n");

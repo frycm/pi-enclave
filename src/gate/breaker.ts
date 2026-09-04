@@ -73,6 +73,22 @@ export class CircuitBreaker {
 		if (this.open) return true;
 		const adverse = this.turns.get(turnIndex);
 		if (adverse === undefined) return false;
+		return this.projectedOpen(adverse);
+	}
+
+	/**
+	 * Would one runtime-only adverse outcome in this turn open the breaker?
+	 *
+	 * Non-owned tools have no execute wrapper where pendingOpen can be checked.
+	 * The gate uses this projection to withhold a later non-owned batch sibling
+	 * when an earlier owned call could be the runtime event that opens it.
+	 */
+	wouldOpenOnAdverse(): boolean {
+		if (this.open) return true;
+		return this.projectedOpen(true);
+	}
+
+	private projectedOpen(adverse: boolean): boolean {
 		const consecutive = adverse ? this.consecutive + 1 : 0;
 		// Project the same bounded window finishTurn() will commit. Counting before
 		// evicting the oldest item can report a trip that disappears at turn_end.
@@ -131,6 +147,19 @@ export class CircuitBreaker {
 	}
 }
 
+/**
+ * Pi cannot re-check a third-party tool at execution time. Conservatively keep
+ * one out of a prepared batch when an earlier owned call could trip the
+ * breaker through a runtime-only denial before the third-party call executes.
+ */
+export function shouldWithholdNonOwnedSibling(
+	breaker: CircuitBreaker,
+	earlierOwnedCall: boolean,
+	toolIsOwned: boolean,
+): boolean {
+	return !toolIsOwned && earlierOwnedCall && breaker.wouldOpenOnAdverse();
+}
+
 export const BREAKER_ENTRY_TYPE = "pi-enclave-breaker";
 
 /** Clear a human-reset breaker and persist that cleared state in one operation. */
@@ -140,6 +169,18 @@ export function resetAndPersistBreaker(
 ): void {
 	breaker.reset();
 	appendEntry(BREAKER_ENTRY_TYPE, breaker.state);
+}
+
+/** Fold a runtime L2 denial into the current turn's sticky gate outcome. */
+export function recordRuntimeViolation(
+	breaker: CircuitBreaker,
+	turnIndex: number,
+	violationCount: number,
+	agentOrigin: boolean,
+): void {
+	// Direct `!` commands are human-originated: they remain audited but are not
+	// evidence that an agent is searching for a workaround.
+	if (agentOrigin && violationCount > 0) breaker.record(turnIndex, true);
 }
 
 export function isBreakerState(value: unknown): value is BreakerState {

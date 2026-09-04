@@ -18,8 +18,8 @@
  * proxy configuration while leaking none of the parent's secrets. Verified in
  * step 0 on both backends, including `/proc/self/environ` on Linux.
  */
-import { delimiter } from "node:path";
-import { isUnderAny } from "../backend/paths.ts";
+import { delimiter, isAbsolute } from "node:path";
+import { canonical, isUnderAny } from "../backend/paths.ts";
 
 /**
  * The only variables copied from the pi process by default. Everything else is
@@ -105,6 +105,7 @@ export function globToRegExp(pattern: string): RegExp {
 }
 
 const DENY_REGEXPS = CREDENTIAL_DENY_PATTERNS.map(globToRegExp);
+const XDG_DIRECTORY_NAMES = new Set(["XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]);
 
 /** True when a variable name is forbidden by the credential deny list. */
 export function isCredentialName(name: string, extraPatterns: readonly string[] = []): boolean {
@@ -164,6 +165,11 @@ export interface ChildEnvOptions {
 	 * never be the thing that reveals a denied location exists.
 	 */
 	readDeny?: readonly string[];
+	/**
+	 * Writable roots. Relative PATH entries and entries inside these roots are
+	 * dropped so project-controlled executables cannot impersonate a command.
+	 */
+	writableRoots?: readonly string[];
 }
 
 /**
@@ -177,12 +183,17 @@ export function buildChildEnv(
 	parentEnv: Readonly<Record<string, string | undefined>>,
 	options: ChildEnvOptions = {},
 ): Readonly<Record<string, string>> {
-	const { passthrough = [], envDeny = [], home, tmpdir, readDeny = [] } = options;
+	const { passthrough = [], envDeny = [], home, tmpdir, readDeny = [], writableRoots = [] } = options;
 	const env: Record<string, string> = {};
 
 	for (const name of [...CHILD_ENV_BASE, ...passthrough]) {
 		const value = parentEnv[name];
-		if (typeof value === "string") env[name] = value;
+		if (typeof value !== "string") continue;
+		// The XDG specification requires absolute base-directory values. Passing a
+		// relative value would make the repository cwd choose where tools look for
+		// configuration and credentials.
+		if (XDG_DIRECTORY_NAMES.has(name) && !isAbsolute(value)) continue;
+		env[name] = value;
 	}
 
 	Object.assign(env, CHILD_ENV_FORCED);
@@ -192,7 +203,16 @@ export function buildChildEnv(
 	if (tmpdir !== undefined) env.TMPDIR = tmpdir;
 
 	if (env.PATH !== undefined) {
-		const kept = env.PATH.split(delimiter).filter((entry) => entry && !isUnderAny(entry, readDeny));
+		const kept = env.PATH.split(delimiter).filter((entry) => {
+			if (!entry || !isAbsolute(entry)) return false;
+			const resolved = canonical(entry);
+			return (
+				!isUnderAny(entry, readDeny) &&
+				!isUnderAny(resolved, readDeny) &&
+				!isUnderAny(entry, writableRoots) &&
+				!isUnderAny(resolved, writableRoots)
+			);
+		});
 		if (kept.length > 0) env.PATH = kept.join(delimiter);
 		else delete env.PATH;
 	}

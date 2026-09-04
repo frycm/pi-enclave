@@ -1,4 +1,6 @@
-import { delimiter } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	buildChildEnv,
@@ -181,6 +183,13 @@ describe("buildChildEnv: credential exclusion", () => {
 });
 
 describe("buildChildEnv: sandbox view of HOME, TMPDIR and PATH", () => {
+	it("keeps absolute XDG roots and drops relative ones", () => {
+		const absolute = buildChildEnv({ ...PARENT, XDG_CONFIG_HOME: "/srv/config" });
+		expect(absolute.XDG_CONFIG_HOME).toBe("/srv/config");
+		const relative = buildChildEnv({ ...PARENT, XDG_CONFIG_HOME: ".repo-config" });
+		expect(relative.XDG_CONFIG_HOME).toBeUndefined();
+	});
+
 	it("rewrites HOME and TMPDIR to the sandbox's own paths", () => {
 		const env = buildChildEnv(PARENT, { home: "/tmp/box/home", tmpdir: "/tmp/box/tmp" });
 		expect(env.HOME).toBe("/tmp/box/home");
@@ -205,6 +214,40 @@ describe("buildChildEnv: sandbox view of HOME, TMPDIR and PATH", () => {
 			{ readDeny: ["/opt/secrets"] },
 		);
 		expect(env.PATH).toBe("/opt/secretsbin");
+	});
+
+	it("drops relative and workspace-writable PATH entries", () => {
+		const env = buildChildEnv(
+			{ ...PARENT, PATH: [".", "tools/bin", "/work/bin", "/usr/bin"].join(delimiter) },
+			{ writableRoots: ["/work"] },
+		);
+		expect(env.PATH).toBe("/usr/bin");
+	});
+
+	it("does not drop an absolute PATH entry that merely shares a writable prefix", () => {
+		const env = buildChildEnv(
+			{ ...PARENT, PATH: ["/workspace-tools/bin", "/workspace/bin"].join(delimiter) },
+			{ writableRoots: ["/workspace"] },
+		);
+		expect(env.PATH).toBe("/workspace-tools/bin");
+	});
+
+	it("drops a PATH symlink that resolves into a writable root", () => {
+		const root = mkdtempSync(join(tmpdir(), "enclave-path-"));
+		try {
+			const writable = join(root, "workspace");
+			const tools = join(writable, "bin");
+			mkdirSync(tools, { recursive: true });
+			const alias = join(root, "trusted-looking-bin");
+			symlinkSync(tools, alias);
+			const env = buildChildEnv(
+				{ ...PARENT, PATH: [alias, "/usr/bin"].join(delimiter) },
+				{ writableRoots: [writable] },
+			);
+			expect(env.PATH).toBe("/usr/bin");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("removes PATH entirely rather than setting it empty", () => {
