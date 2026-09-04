@@ -506,6 +506,7 @@ describe("approving a record", () => {
 			home: "/home/u",
 			io: channel.make(true),
 			backend,
+			platform: "linux",
 		});
 		expect(result.outcome).toBe("refused");
 		expect(channel.asked).toHaveLength(0);
