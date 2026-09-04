@@ -292,27 +292,34 @@ describe.skipIf(!supported)("invocation-scoped write capability", () => {
 		60_000,
 	);
 
-	it("refuses a write capability inside or above a read-denied credential root", async () => {
-		const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
-		const fixture = createFixture();
-		try {
-			const compiled = await backend.compile(fixture.profile);
-			for (const target of [join(fixture.deniedHome, "out"), dirname(fixture.deniedHome)]) {
-				await expect(
-					backend.run(compiled, {
-						command: "true",
-						cwd: fixture.workspace,
-						env: { PATH: process.env.PATH ?? "" },
-						commandId: `denied-write-capability-${target.length}`,
-						writeCapability: target,
-					}),
-				).rejects.toThrow(/immutable denied path/);
+	it.skipIf(process.platform === "darwin")(
+		"refuses a write capability inside or above a read-denied credential root",
+		async () => {
+			// macOS refuses every Bash write capability before profile widening; the
+			// adjacent native test covers that stronger platform boundary. This case
+			// exercises the overlap check on Linux, where capabilities are supported.
+			const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
+			const fixture = createFixture();
+			try {
+				const compiled = await backend.compile(fixture.profile);
+				for (const target of [join(fixture.deniedHome, "out"), dirname(fixture.deniedHome)]) {
+					await expect(
+						backend.run(compiled, {
+							command: "true",
+							cwd: fixture.workspace,
+							env: { PATH: process.env.PATH ?? "" },
+							commandId: `denied-write-capability-${target.length}`,
+							writeCapability: target,
+						}),
+					).rejects.toThrow(/immutable denied path/);
+				}
+			} finally {
+				await backend.dispose();
+				fixture.cleanup();
 			}
-		} finally {
-			await backend.dispose();
-			fixture.cleanup();
-		}
-	}, 60_000);
+		},
+		60_000,
+	);
 });
 
 describe.skipIf(!supported)("stale profile guard", () => {
