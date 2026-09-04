@@ -21,7 +21,14 @@
  * with the rule relaxed instead.
  */
 import { isAbsolute, resolve } from "node:path";
-import { shellWriteCapabilityIssue, validateWriteCapability } from "../backend/capability.ts";
+import {
+	resolveCapabilityTarget,
+	shellCapabilityIssue,
+	shellWriteCapabilityIssue,
+	validateReadCapability,
+	validateWriteCapability,
+} from "../backend/capability.ts";
+import { canonical, isUnder } from "../backend/paths.ts";
 import { SrtBackend } from "../backend/srt.ts";
 import type { SandboxBackend } from "../backend/types.ts";
 import { formatViolations } from "../backend/violations.ts";
@@ -97,18 +104,46 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 		return { outcome: "unsupported", reason };
 	}
 	const capability = action.capability;
-	if (capability && capability.kind !== "write") {
-		const reason = `${capability.kind} capabilities are Phase 3/4; only a one-shot write can be approved in this version.`;
+	if (capability?.kind === "host") {
+		const reason = "host capabilities require the Phase 4 authenticated egress proxy and cannot be approved yet.";
 		io.err(`\npi-enclave: ${reason}`);
 		return { outcome: "unsupported", reason };
 	}
 	const backendProfile = toBackendProfile(current, action.cwd);
-	let capabilityTarget: string | undefined;
-	if (capability) {
+	let writeCapabilityTarget: string | undefined;
+	let readCapabilityTarget: string | undefined;
+	if (capability?.kind === "write") {
 		try {
 			const lifetimeIssue = tool === "bash" ? shellWriteCapabilityIssue(options.platform) : undefined;
 			if (lifetimeIssue) throw new Error(lifetimeIssue);
-			capabilityTarget = validateWriteCapability(backendProfile, action.cwd, capability.value);
+			const target = validateWriteCapability(backendProfile, action.cwd, capability.value);
+			writeCapabilityTarget = target;
+			if (!action.paths.some((path) => path.writes && isUnder(path.resolved, target))) {
+				throw new Error(
+					`pi-enclave: write capability ${writeCapabilityTarget} does not cover a concrete write in this action`,
+				);
+			}
+		} catch (error) {
+			const reason = (error as Error).message;
+			io.err(`\n${reason}`);
+			io.err("  The record is left pending.");
+			return { outcome: "refused", reason };
+		}
+	}
+	if (capability?.kind === "read") {
+		try {
+			const lifetimeIssue = tool === "bash" ? shellCapabilityIssue("read", options.platform) : undefined;
+			if (lifetimeIssue) throw new Error(lifetimeIssue);
+			readCapabilityTarget = validateReadCapability(backendProfile, action.cwd, capability.value);
+			if (!current.sandbox.grantableReadDeny.some((entry) => canonical(entry) === readCapabilityTarget)) {
+				throw new Error(
+					`pi-enclave: read capability ${readCapabilityTarget} is not an exact user-global grantableReadDeny entry`,
+				);
+			}
+			const target = resolveCapabilityTarget(action.cwd, capability.value);
+			if (!action.paths.some((path) => !path.writes && isUnder(path.resolved, target))) {
+				throw new Error(`pi-enclave: read capability ${target} does not cover a concrete read in this action`);
+			}
 		} catch (error) {
 			const reason = (error as Error).message;
 			io.err(`\n${reason}`);
@@ -145,8 +180,8 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 		// capability is folded into a one-shot profile here. It is bound to the
 		// action hash (which includes the capability), and checkResume above
 		// re-derived that hash, so the extension can only be the one approved.
-		if (capabilityTarget) {
-			backendProfile.writableRoots = [...backendProfile.writableRoots, capabilityTarget];
+		if (writeCapabilityTarget) {
+			backendProfile.writableRoots = [...backendProfile.writableRoots, writeCapabilityTarget];
 		}
 		const compiled = await backend.compile(backendProfile);
 		// Compilation can take long enough to cross the TTL too. An approved/
@@ -169,6 +204,7 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 					writableRoots: compiled.profile.writableRoots,
 				}),
 				commandId: `enclave-approve-${record.nonce}`,
+				...(readCapabilityTarget ? { readCapability: readCapabilityTarget } : {}),
 				onData: (chunk) => io.out(chunk.toString("utf8")),
 			});
 			if (result.violations.length > 0) io.err(formatViolations(result.violations));

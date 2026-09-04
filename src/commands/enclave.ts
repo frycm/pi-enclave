@@ -126,7 +126,9 @@ export function renderStatus(state: EnclaveState): string {
 			"",
 			`config:     profile "${state.effective.name}"${state.effective.auto ? "" : "   L1/L4 disabled by PI_ENCLAVE_AUTO=off"}`,
 			`rules:      ${state.effective.rules.deny.length} deny, ${state.effective.rules.ask.length} ask, ${state.effective.rules.skipReview.length} skipReview`,
-			`reviewer:   ${state.effective.reviewer.model} (deterministic mode: every crossing is an ask)`,
+			state.effective.reviewer.model === "none"
+				? `reviewer:   none (deterministic mode: every crossing is an ask)`
+				: `reviewer:   ${state.effective.reviewer.model} (trigger ${state.effective.review.trigger})`,
 			`attended:   ${state.attendance ?? state.effective.attended.mode}`,
 			`breaker:    ${state.breaker?.open ? "OPEN -- the turn is stopped" : `${state.breaker?.consecutive ?? 0} of ${state.effective.breaker.consecutive} consecutive`}`,
 			`audit:      ${state.auditPath ?? "(not open)"}${state.auditDegraded ? "   WRITES ARE FAILING" : ""}`,
@@ -169,7 +171,8 @@ export interface CommandOutput {
 	level: CommandLevel;
 }
 
-const USAGE = "usage: /enclave [status|backend|violations|rules defaults|rules config|audit [verify]|pending]";
+const USAGE =
+	"usage: /enclave [status|backend|violations|rules defaults|rules config|rules critique|eval-reviewer|audit [verify]|pending]";
 
 /**
  * `rules defaults` and `rules config`.
@@ -191,6 +194,11 @@ function renderRules(state: EnclaveState, argv: readonly string[]): CommandOutpu
 			if (!state.effective || !state.provenance)
 				return { text: "configuration has not been loaded yet", level: "warning" };
 			return { text: renderConfig(state.effective, state.provenance), level: "info" };
+		case "critique":
+			return {
+				text: "rulebook critique needs the live isolated reviewer; run /enclave rules critique after session startup",
+				level: "warning",
+			};
 		default:
 			return { text: `unknown rules subcommand "${verb}"\n${USAGE}`, level: "warning" };
 	}

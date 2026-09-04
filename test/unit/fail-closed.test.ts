@@ -34,7 +34,7 @@ type Handler = (...args: unknown[]) => unknown;
 
 /** The slice of ExtensionAPI the entry point touches, recording what it gets. */
 function fakePi() {
-	const tools = new Map<string, { execute: Handler }>();
+	const tools = new Map<string, { execute: Handler; parameters?: { properties?: Record<string, unknown> } }>();
 	const handlers = new Map<string, Handler[]>();
 	return {
 		tools,
@@ -73,6 +73,20 @@ describe("entry point with a failed probe", () => {
 		// pi-enclave did not register is a name pi serves unsandboxed.
 		for (const name of PI_TOOLS) {
 			expect(fake.tools.has(name), `${name} was left to pi's unsandboxed built-in`).toBe(true);
+		}
+	});
+
+	it("advertises capabilities only on executors with an isolated lifetime", () => {
+		const properties = (name: string) => fake.tools.get(name)?.parameters?.properties ?? {};
+		expect(properties("bash")).toHaveProperty("allow_write");
+		expect(properties("bash")).toHaveProperty("allow_read");
+		for (const name of ["read", "ls", "find", "grep"]) {
+			expect(properties(name), `${name} does not advertise allow_read`).toHaveProperty("allow_read");
+			expect(properties(name), `${name} advertises unsafe allow_write`).not.toHaveProperty("allow_write");
+		}
+		for (const name of ["edit", "write"]) {
+			expect(properties(name)).not.toHaveProperty("allow_read");
+			expect(properties(name)).not.toHaveProperty("allow_write");
 		}
 	});
 

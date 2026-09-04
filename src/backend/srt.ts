@@ -30,11 +30,12 @@ import { buildChildEnv } from "../env/child-env.ts";
 import { HelperFsClient } from "../fs/client.ts";
 import type { BackendName } from "../probe.ts";
 import { hostRuntimeSafety, whichSync } from "../probe-host.ts";
-import { shellWriteCapabilityIssue, validateWriteCapability } from "./capability.ts";
+import { shellCapabilityIssue, validateReadCapability, validateWriteCapability } from "./capability.ts";
 import { canonical, isUnder } from "./paths.ts";
 import {
 	type CompiledProfile,
 	type FsClient,
+	type FsClientLease,
 	type Profile,
 	type RunRequest,
 	type RunResult,
@@ -540,8 +541,12 @@ export class SrtBackend implements SandboxBackend {
 
 	async run(compiled: CompiledProfile, request: RunRequest): Promise<RunResult> {
 		this.assertCurrent(compiled);
-		if (request.writeCapability) {
-			const lifetimeIssue = shellWriteCapabilityIssue();
+		if (request.writeCapability && request.readCapability) {
+			throw new Error("pi-enclave: one invocation cannot carry both read and write capabilities");
+		}
+		const capabilityKind = request.writeCapability ? "write" : request.readCapability ? "read" : undefined;
+		if (capabilityKind) {
+			const lifetimeIssue = shellCapabilityIssue(capabilityKind);
 			if (lifetimeIssue) throw new Error(lifetimeIssue);
 		}
 		// Shell commands are wrapped per call, but the manager resolves deny
@@ -549,15 +554,23 @@ export class SrtBackend implements SandboxBackend {
 		// needs the configuration re-applied here too.
 		await this.refreshHelperIfStale(compiled);
 
-		const capabilityTarget = request.writeCapability
+		const writeTarget = request.writeCapability
 			? validateWriteCapability(compiled.profile, request.cwd, request.writeCapability)
 			: undefined;
-		const customProfile = capabilityTarget
+		const readTarget = request.readCapability
+			? validateReadCapability(compiled.profile, request.cwd, request.readCapability)
+			: undefined;
+		const customProfile = writeTarget
 			? effectiveProfile({
 					...compiled.profile,
-					writableRoots: [...compiled.profile.writableRoots, capabilityTarget],
+					writableRoots: [...compiled.profile.writableRoots, writeTarget],
 				})
-			: undefined;
+			: readTarget
+				? {
+						...compiled.profile,
+						readDeny: compiled.profile.readDeny.filter((entry) => canonical(entry) !== readTarget),
+					}
+				: undefined;
 		const customConfig = customProfile
 			? toSrtConfig(customProfile, this.weakened, process.platform, this.hostTools)
 			: undefined;
@@ -734,6 +747,48 @@ export class SrtBackend implements SandboxBackend {
 	}
 
 	/**
+	 * Start a helper under a one-call profile with one exact read denial lifted.
+	 *
+	 * This helper is never cached and the process-global SRT configuration is
+	 * never updated. Its caller owns the lease and must dispose it after the tool
+	 * call, which keeps concurrent ordinary helpers on the base profile.
+	 */
+	async fsWithReadCapability(
+		compiled: CompiledProfile,
+		value: string,
+		actionHash: string,
+		cwd = compiled.profile.writableRoots[0] ?? process.cwd(),
+	): Promise<FsClientLease> {
+		this.assertCurrent(compiled);
+		await this.refreshHelperIfStale(compiled);
+		const target = validateReadCapability(compiled.profile, cwd, value);
+		const customProfile: Profile = {
+			...compiled.profile,
+			readDeny: compiled.profile.readDeny.filter((entry) => canonical(entry) !== target),
+		};
+		const customConfig = toSrtConfig(customProfile, this.weakened, process.platform, this.hostTools);
+		const { argv } = await SandboxManager.wrapWithSandboxArgv(
+			`exec ${shellQuote(process.execPath)} ${shellQuote(HELPER_PATH)}`,
+			"/bin/bash",
+			customConfig as never,
+			undefined,
+			customProfile.writableRoots[0] ?? process.cwd(),
+			{ commandId: `enclave-fs-cap-${actionHash.slice(0, 24)}`, commandText: "pi-enclave-fs-read-capability" },
+		);
+		const capabilityCompiled: CompiledProfile = {
+			backend: compiled.backend,
+			profile: customProfile,
+			describe: () => compiled.describe(),
+		};
+		const client = new HelperFsClient({
+			compiled: capabilityCompiled,
+			spawnHelper: () => this.spawnPreparedHelper(argv, customProfile),
+			...(this.onFsViolation ? { onViolation: this.onFsViolation } : {}),
+		});
+		return { client, dispose: () => client.dispose() };
+	}
+
+	/**
 	 * Start the helper inside the sandbox.
 	 *
 	 * `exec` replaces the shell with node, so the helper is the process the
@@ -747,11 +802,16 @@ export class SrtBackend implements SandboxBackend {
 		const argv = this.helperArgv;
 		if (!argv) throw new Error("pi-enclave: the helper argv was not prepared; compile() must run first");
 
+		return this.spawnPreparedHelper(argv, compiled.profile);
+	}
+
+	/** Spawn a helper from an already wrapped argv under the matching profile. */
+	private spawnPreparedHelper(argv: string[], profile: Profile): ChildProcessWithoutNullStreams {
 		const [bin, ...args] = argv;
 		if (!bin) throw new Error("pi-enclave: sandbox-runtime returned an empty argv for the helper");
 
 		return spawn(bin, args, {
-			cwd: compiled.profile.writableRoots[0] ?? process.cwd(),
+			cwd: profile.writableRoots[0] ?? process.cwd(),
 			// The same allowlist the shell gets -- the helper reads files on the
 			// agent's behalf, so a credential in its environment is exactly as
 			// disclosable as one in bash's -- plus the resolved search-tool paths.
@@ -761,15 +821,15 @@ export class SrtBackend implements SandboxBackend {
 			// has to happen on this side while it still can.
 			env: {
 				...buildChildEnv(process.env, {
-					readDeny: compiled.profile.readDeny,
-					writableRoots: compiled.profile.writableRoots,
-					...(compiled.profile.tmpDir ? { tmpdir: compiled.profile.tmpDir } : {}),
+					readDeny: profile.readDeny,
+					writableRoots: profile.writableRoots,
+					...(profile.tmpDir ? { tmpdir: profile.tmpDir } : {}),
 					// The helper reads files on the agent's behalf, so it must honour
 					// the same configured passthrough/envDeny the shell does; without
 					// these a user's custom envDeny protected bash but not the file
 					// helper, which reads through /proc/self/environ just as readily.
-					...(compiled.profile.envPassthrough ? { passthrough: compiled.profile.envPassthrough } : {}),
-					...(compiled.profile.envDeny ? { envDeny: compiled.profile.envDeny } : {}),
+					...(profile.envPassthrough ? { passthrough: profile.envPassthrough } : {}),
+					...(profile.envDeny ? { envDeny: profile.envDeny } : {}),
 				}),
 				...resolveSearchTools(this.hostTools.rg, this.hostTools.fd),
 			},

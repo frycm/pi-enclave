@@ -37,6 +37,8 @@ export interface StateDirs {
 	audit: string;
 	/** Per-session pending approval records live under here. */
 	state: string;
+	/** Reviewer qualification records, outside every workspace. */
+	qualified: string;
 	attendSecret: string;
 }
 
@@ -46,6 +48,7 @@ export function stateDirs(agentDir = getAgentDir()): StateDirs {
 		root,
 		audit: join(root, "audit"),
 		state: join(root, "state"),
+		qualified: join(root, "qualified"),
 		attendSecret: join(root, "attend.secret"),
 	};
 }
@@ -97,6 +100,7 @@ export function ensureStateDirs(agentDir = getAgentDir()): StateDirs {
 	ensureSecureDir(dirs.root);
 	ensureSecureDir(dirs.audit);
 	ensureSecureDir(dirs.state);
+	ensureSecureDir(dirs.qualified);
 	return dirs;
 }
 

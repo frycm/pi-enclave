@@ -6,6 +6,8 @@ import { assertJsonLike, freezeToolInput, LockViolation } from "../../src/gate/l
 import { checkOwnership } from "../../src/gate/ownership.ts";
 import { checkTool } from "../../src/gate/tools.ts";
 import { canonicalize } from "../../src/policy/canonical.ts";
+import { buildReviewEvidence } from "../../src/reviewer/evidence.ts";
+import type { ActionReviewer, ReviewerResult } from "../../src/reviewer/types.ts";
 import { FakePi } from "../harness/fake-pi.ts";
 
 const OPTIONS = { cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" };
@@ -17,6 +19,23 @@ function profile(edit: (p: EffectiveProfile) => void = () => {}): EffectiveProfi
 }
 
 const YES: Escalator = { confirm: async () => true };
+
+function fakeReviewer(
+	result:
+		| Omit<Extract<ReviewerResult, { ok: true }>, "evidence">["review"]
+		| { failure: "invalid-output" | "unavailable" },
+): ActionReviewer & { calls: number } {
+	return {
+		calls: 0,
+		async review(request) {
+			this.calls++;
+			const evidence = buildReviewEvidence({ action: request.action, trigger: request.trigger, attended: "off" });
+			return "failure" in result
+				? { ok: false, kind: result.failure, reason: "scripted failure", evidence }
+				: { ok: true, review: result, modelReview: result, evidence };
+		},
+	};
+}
 
 function deps(overrides: Partial<Parameters<typeof decide>[1]> = {}) {
 	return {
@@ -84,8 +103,22 @@ describe("the gate", () => {
 		// The whole of deterministic mode: with no reviewer, a boundary crossing
 		// has nowhere to go but a person.
 		it("asks for a capability request", async () => {
-			const decision = await gate("bash", { command: "echo x", allow_write: "/etc/hosts" }, { escalator: YES });
+			const decision = await gate(
+				"bash",
+				{ command: "printf x > /etc/hosts", allow_write: "/etc/hosts" },
+				{ escalator: YES },
+			);
 			expect(decision.outcome).toBe("ask-approved");
+		});
+
+		it("refuses a speculative write capability unrelated to the action", async () => {
+			const decision = await gate(
+				"bash",
+				{ command: "touch /work/output", allow_write: "/srv/unrelated" },
+				{ escalator: YES },
+			);
+			expect(decision.outcome).toBe("deny");
+			expect(decision.reason).toContain("does not cover a concrete write");
 		});
 
 		it("refuses a write capability intersecting read-denied credentials before asking", async () => {
@@ -127,11 +160,11 @@ describe("the gate", () => {
 			expect(asked).toBe(false);
 		});
 
-		it.each(["allow_read", "allow_host"])("refuses unsupported %s capabilities before asking", async (key) => {
+		it("refuses a forged write capability on a file tool", async () => {
 			let asked = false;
 			const decision = await gate(
-				"bash",
-				{ command: "echo x", [key]: "/outside" },
+				"write",
+				{ path: "/work/output", content: "x", allow_write: "/work/output" },
 				{
 					escalator: {
 						confirm: async () => {
@@ -142,7 +175,64 @@ describe("the gate", () => {
 				},
 			);
 			expect(decision.outcome).toBe("deny");
+			expect(decision.reason).toContain("supported only by the sandboxed bash tool");
 			expect(asked).toBe(false);
+		});
+
+		it("permits an exact user-grantable read denial after escalation", async () => {
+			const decision = await gate(
+				"read",
+				{ path: "/work/private/report.txt", allow_read: "/work/private" },
+				{
+					profile: profile((p) => {
+						p.sandbox.readDeny.push("/work/private");
+						p.sandbox.grantableReadDeny.push("/work/private");
+					}),
+					escalator: YES,
+				},
+			);
+			expect(decision.outcome).toBe("ask-approved");
+			expect(decision.block).toBe(false);
+		});
+
+		it("refuses a read grant that is not user-grantable before asking", async () => {
+			let asked = false;
+			const decision = await gate(
+				"read",
+				{ path: "/work/private/report.txt", allow_read: "/work/private" },
+				{
+					profile: profile((p) => p.sandbox.readDeny.push("/work/private")),
+					escalator: {
+						confirm: async () => {
+							asked = true;
+							return true;
+						},
+					},
+				},
+			);
+			expect(decision.outcome).toBe("deny");
+			expect(asked).toBe(false);
+		});
+
+		it("refuses a read grant unrelated to the action before asking", async () => {
+			const decision = await gate(
+				"read",
+				{ path: "/work/public/report.txt", allow_read: "/work/private" },
+				{
+					profile: profile((p) => {
+						p.sandbox.readDeny.push("/work/private");
+						p.sandbox.grantableReadDeny.push("/work/private");
+					}),
+					escalator: YES,
+				},
+			);
+			expect(decision.outcome).toBe("deny");
+			expect(decision.reason).toContain("does not cover a concrete read");
+		});
+
+		it("continues to refuse host capabilities before asking", async () => {
+			const decision = await gate("bash", { command: "echo x", allow_host: "example.com:443" }, { escalator: YES });
+			expect(decision.outcome).toBe("deny");
 		});
 
 		it("does not escalate a capability disabled by current policy", async () => {
@@ -213,6 +303,141 @@ describe("the gate", () => {
 
 		it("does not ask for a command it parsed confidently", async () => {
 			expect((await gate("bash", { command: "ls -la" })).outcome).toBe("allow");
+		});
+	});
+
+	describe("isolated reviewer", () => {
+		const allow = () =>
+			fakeReviewer({
+				decision: "allow",
+				risk: "medium",
+				reason: "routine mutation",
+				modelRisk: "low",
+				minimumRisk: "medium",
+				authorizationCovers: false,
+			});
+
+		const reviewProfile = () =>
+			profile((p) => {
+				p.reviewer.model = "ollama/reviewer";
+				p.review.trigger = "mutating";
+			});
+
+		it("reviews a mutation and locks an allow", async () => {
+			let frozen = false;
+			const reviewer: ActionReviewer = {
+				async review(request) {
+					frozen = Object.isFrozen(request.action.input);
+					const evidence = buildReviewEvidence({
+						action: request.action,
+						trigger: request.trigger,
+						attended: "off",
+					});
+					const review = {
+						decision: "allow" as const,
+						risk: "medium" as const,
+						reason: "routine mutation",
+						modelRisk: "low" as const,
+						minimumRisk: "medium" as const,
+						authorizationCovers: false,
+					};
+					return { ok: true, review, modelReview: review, evidence };
+				},
+			};
+			const decision = await gate("bash", { command: "touch output.txt" }, { profile: reviewProfile(), reviewer });
+			expect(decision.outcome).toBe("review-allow");
+			expect(decision.block).toBe(false);
+			expect(frozen).toBe(true);
+		});
+
+		it("keeps a classified read on the fast path", async () => {
+			const reviewer = allow();
+			const decision = await gate("bash", { command: "git status --short" }, { profile: reviewProfile(), reviewer });
+			expect(decision.outcome).toBe("allow");
+			expect(reviewer.calls).toBe(0);
+		});
+
+		it("sends all actions to a trigger configured as all", async () => {
+			const reviewer = allow();
+			const configured = reviewProfile();
+			configured.review.trigger = "all";
+			expect((await gate("bash", { command: "git status --short" }, { profile: configured, reviewer })).outcome).toBe(
+				"review-allow",
+			);
+		});
+
+		it("does not let the reviewer clear an L1 ask", async () => {
+			const reviewer = allow();
+			const decision = await gate(
+				"bash",
+				{ command: "git push origin main" },
+				{
+					profile: reviewProfile(),
+					reviewer,
+					escalator: YES,
+				},
+			);
+			expect(decision.outcome).toBe("ask-approved");
+			expect(reviewer.calls).toBe(0);
+		});
+
+		it("turns reviewer ask into L4 confirmation", async () => {
+			const reviewer = fakeReviewer({
+				decision: "ask",
+				risk: "medium",
+				reason: "ambiguous intent",
+				modelRisk: "medium",
+				minimumRisk: "medium",
+				authorizationCovers: false,
+			});
+			expect(
+				(await gate("bash", { command: "touch output.txt" }, { profile: reviewProfile(), reviewer, escalator: YES }))
+					.outcome,
+			).toBe("ask-approved");
+		});
+
+		it("does not let a reviewer alone admit an explicitly reviewed third-party tool", async () => {
+			const configured = reviewProfile();
+			configured.tools.allow.deploy = { reviewed: true };
+			const reviewer = allow();
+			const decision = await gate("deploy", { env: "preview" }, { profile: configured, reviewer });
+			expect(decision.outcome).toBe("ask-denied");
+			expect(decision.reason).toContain("runs outside the sandbox and requires human approval");
+			expect(reviewer.calls).toBe(1);
+		});
+
+		it("fails closed without retrying or escalating invalid output", async () => {
+			let asked = false;
+			const decision = await gate(
+				"bash",
+				{ command: "touch output.txt" },
+				{
+					profile: reviewProfile(),
+					reviewer: fakeReviewer({ failure: "invalid-output" }),
+					escalator: {
+						confirm: async () => {
+							asked = true;
+							return true;
+						},
+					},
+				},
+			);
+			expect(decision.outcome).toBe("review-deny");
+			expect(decision.terminate).toBe(true);
+			expect(asked).toBe(false);
+		});
+
+		it("turns exhausted availability errors into an ask", async () => {
+			const decision = await gate(
+				"bash",
+				{ command: "touch output.txt" },
+				{
+					profile: reviewProfile(),
+					reviewer: fakeReviewer({ failure: "unavailable" }),
+					escalator: YES,
+				},
+			);
+			expect(decision.outcome).toBe("ask-approved");
 		});
 	});
 
@@ -356,6 +581,13 @@ describe("the gate", () => {
 	});
 
 	describe("failure", () => {
+		it("freezes input before an already-open breaker short-circuits", async () => {
+			const input = { command: "ls" };
+			const decision = await gate("bash", input, { breakerOpen: () => true });
+			expect(decision.outcome).toBe("breaker-open");
+			expect(Object.isFrozen(input)).toBe(true);
+		});
+
 		it("turns an internal error into a denial", async () => {
 			const decision = await decide(
 				{ toolName: "bash", toolCallId: "c1", input: { command: "ls" } },

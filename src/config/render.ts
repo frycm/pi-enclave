@@ -8,6 +8,8 @@
  * that contributed it, so "why is this denied?" has an answer that does not
  * require reading three files and simulating a merge.
  */
+
+import { READ_ONLY_CLASSIFIER } from "../reviewer/classifier.ts";
 import { type DefaultProfileOptions, defaultProfile } from "./defaults.ts";
 import type { EffectiveProfile, Provenance, SourceId } from "./types.ts";
 import { provenanceOf } from "./types.ts";
@@ -15,6 +17,7 @@ import { provenanceOf } from "./types.ts";
 const LIST_PATHS = [
 	"sandbox.writableRoots",
 	"sandbox.readDeny",
+	"sandbox.grantableReadDeny",
 	"sandbox.env.passthrough",
 	"sandbox.env.envDeny",
 	"rules.deny",
@@ -34,6 +37,8 @@ function listAt(profile: EffectiveProfile, path: string): readonly string[] {
 			return profile.sandbox.writableRoots;
 		case "sandbox.readDeny":
 			return profile.sandbox.readDeny;
+		case "sandbox.grantableReadDeny":
+			return profile.sandbox.grantableReadDeny;
 		case "sandbox.env.passthrough":
 			return profile.sandbox.env.passthrough;
 		case "sandbox.env.envDeny":
@@ -65,16 +70,15 @@ function listAt(profile: EffectiveProfile, path: string): readonly string[] {
 export function renderDefaults(options: DefaultProfileOptions, readonlyOnly = false): string {
 	const profile = defaultProfile(options);
 	if (readonlyOnly) {
-		// The read-only predicate table is Phase 3; saying so beats printing an
-		// empty object that reads as "nothing is read-only".
 		return JSON.stringify(
 			{
-				note: "the read-only classification table arrives with the reviewer in Phase 3; in deterministic mode nothing is fast-pathed",
+				note: "the shell table is versioned code and intentionally not configurable; unknown means mutating",
 				tools: Object.fromEntries(
 					Object.entries(profile.tools.allow)
 						.filter(([, grant]) => grant.readOnly)
 						.map(([name]) => [name, { readOnly: true }]),
 				),
+				shell: READ_ONLY_CLASSIFIER,
 			},
 			null,
 			2,

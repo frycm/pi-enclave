@@ -152,6 +152,7 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 				env,
 				commandId: nextCommandId(),
 				...(action?.capability?.kind === "write" ? { writeCapability: action.capability.value } : {}),
+				...(action?.capability?.kind === "read" ? { readCapability: action.capability.value } : {}),
 				onData: execOptions.onData,
 				...(execOptions.signal ? { signal: execOptions.signal } : {}),
 				...(execOptions.timeout !== undefined ? { timeout: execOptions.timeout } : {}),
@@ -208,6 +209,9 @@ export const BASH_PROMPT_GUIDELINES: string[] = [
 	"- Writes elsewhere, reads of credential stores, and all network access are refused by the kernel.",
 	"- A refusal is not something you can retry your way past, and sudo is not available.",
 	"- When a refusal is detected it is reported after the command output as 'sandbox denied:'.",
+	"- If a required write is denied, retry the exact command with allow_write set to that exact path and explain why.",
+	"- If a configured, grantable read denial blocks the command, retry with allow_read set to that exact denied root.",
+	"  Capability requests are reviewed, apply to one action only, and may still be refused.",
 	"- On some platforms a denied read is reported as a missing file. If a path you expect to exist",
 	"  appears absent and it looks like a credential location, treat it as denied rather than missing.",
 ];

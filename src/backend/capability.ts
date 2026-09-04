@@ -1,4 +1,4 @@
-/** Validation for Phase-2's one invocation-scoped write capability. */
+/** Validation for invocation-scoped filesystem capabilities. */
 import { isAbsolute, resolve } from "node:path";
 import { hostRuntimeSafety } from "../probe-host.ts";
 import { canonical, isUnder } from "./paths.ts";
@@ -6,9 +6,17 @@ import type { Profile } from "./types.ts";
 
 /** Why a shell-scoped write grant cannot be contained on this platform, if any. */
 export function shellWriteCapabilityIssue(platform: NodeJS.Platform = process.platform): string | undefined {
+	return shellCapabilityIssue("write", platform);
+}
+
+/** Why a shell-scoped grant cannot be contained on this platform, if any. */
+export function shellCapabilityIssue(
+	kind: "read" | "write",
+	platform: NodeJS.Platform = process.platform,
+): string | undefined {
 	if (platform !== "darwin") return undefined;
 	return (
-		"pi-enclave: Bash write capabilities are unavailable on macOS because Seatbelt has no " +
+		`pi-enclave: Bash ${kind} capabilities are unavailable on macOS because Seatbelt has no ` +
 		"reliable way to reap a child that escapes its process group; the widened profile could outlive the invocation"
 	);
 }
@@ -53,6 +61,23 @@ export function validateWriteCapability(profile: Profile, cwd: string, value: st
 	const pathSafety = hostRuntimeSafety([...profile.writableRoots, target]);
 	if (!pathSafety.ok) {
 		throw new Error(`pi-enclave: refusing write capability ${target}: ${pathSafety.detail}`);
+	}
+	return target;
+}
+
+/**
+ * Return the exact denied root a read capability may lift.
+ *
+ * Grantability is checked by the policy gate against the user-global config.
+ * The backend repeats the structural half so a caller cannot use this method to
+ * remove an arbitrary or merely overlapping denial.
+ */
+export function validateReadCapability(profile: Profile, cwd: string, value: string): string {
+	const target = resolveCapabilityTarget(cwd, value);
+	if (target === "/") throw new Error('pi-enclave: refusing read capability "/"');
+	const exact = profile.readDeny.find((entry) => canonical(entry) === target);
+	if (!exact) {
+		throw new Error(`pi-enclave: refusing read capability ${target}: it is not an exact read-deny entry`);
 	}
 	return target;
 }

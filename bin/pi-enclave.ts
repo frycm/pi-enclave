@@ -27,6 +27,7 @@ const USAGE = `pi-enclave <command>
 
   rules defaults [--readonly]   print the built-in rule lists
   rules config                  print the effective rulebook, tagged by source
+	                              (use /enclave rules critique inside pi for model critique)
   pending [--all]               list approval records awaiting a decision
   approve <nonce>               show an action, ask, and run it once
   audit [verify] [--session id] read or re-chain the audit log
@@ -96,6 +97,12 @@ function rules(argv: string[], cwd: string): number {
 		return 0;
 	}
 	if (verb !== "config") {
+		if (verb === "critique") {
+			process.stderr.write(
+				"pi-enclave: rules critique needs pi's qualified model registry; run `/enclave rules critique` in a pi session.\n",
+			);
+			return 2;
+		}
 		process.stderr.write(`pi-enclave: unknown rules subcommand "${verb}"\n`);
 		return 2;
 	}

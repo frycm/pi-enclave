@@ -15,9 +15,10 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { effectiveProfile, partitionSrtDefaults, SrtBackend, srtTmpDir, toSrtConfig } from "../../src/backend/srt.ts";
+import { SandboxDenied } from "../../src/backend/types.ts";
 import { formatProbeReport } from "../../src/probe.ts";
 import { probeHost } from "../../src/probe-host.ts";
-import { createFixture, plantSecrets } from "./fixture.ts";
+import { createFixture, plantSecrets, SECRET_FILE_CONTENT } from "./fixture.ts";
 import { type ConformanceRow, formatRows, runConformance } from "./runner.ts";
 import { SCENARIOS } from "./scenarios.ts";
 
@@ -313,6 +314,105 @@ describe.skipIf(!supported)("invocation-scoped write capability", () => {
 						}),
 					).rejects.toThrow(/immutable denied path/);
 				}
+			} finally {
+				await backend.dispose();
+				fixture.cleanup();
+			}
+		},
+		60_000,
+	);
+});
+
+describe.skipIf(!supported)("invocation-scoped read capability", () => {
+	it("uses an ephemeral file helper without widening an overlapping base helper", async () => {
+		const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
+		const fixture = createFixture();
+		try {
+			const compiled = await backend.compile(fixture.profile);
+			const deniedFile = join(fixture.deniedHome, ".ssh", "id_ed25519");
+			const base = backend.fs(compiled);
+			const lease = await backend.fsWithReadCapability(
+				compiled,
+				fixture.deniedHome,
+				"sha256:read-capability",
+				fixture.workspace,
+			);
+			try {
+				const [widened, ordinary] = await Promise.allSettled([
+					lease.client.readFile(deniedFile),
+					base.readFile(deniedFile),
+				]);
+				expect(widened.status).toBe("fulfilled");
+				if (widened.status === "fulfilled") expect(widened.value.toString()).toContain(SECRET_FILE_CONTENT);
+				expect(ordinary.status).toBe("rejected");
+				if (ordinary.status === "rejected") expect(ordinary.reason).toBeInstanceOf(SandboxDenied);
+			} finally {
+				await lease.dispose();
+			}
+
+			await expect(base.readFile(deniedFile)).rejects.toBeInstanceOf(SandboxDenied);
+		} finally {
+			await backend.dispose();
+			fixture.cleanup();
+		}
+	}, 60_000);
+
+	it.skipIf(process.platform === "darwin")(
+		"widens one Bash call and not its sibling",
+		async () => {
+			const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
+			const fixture = createFixture();
+			try {
+				const compiled = await backend.compile(fixture.profile);
+				const deniedFile = join(fixture.deniedHome, ".ssh", "id_ed25519");
+				let widened = "";
+				await backend.run(compiled, {
+					command: `cat ${JSON.stringify(deniedFile)}`,
+					cwd: fixture.workspace,
+					env: { PATH: process.env.PATH ?? "" },
+					commandId: "read-capability-shell",
+					readCapability: fixture.deniedHome,
+					onData: (chunk) => {
+						widened += chunk.toString();
+					},
+				});
+				expect(widened).toContain(SECRET_FILE_CONTENT);
+
+				let ordinary = "";
+				await backend.run(compiled, {
+					command: `cat ${JSON.stringify(deniedFile)}`,
+					cwd: fixture.workspace,
+					env: { PATH: process.env.PATH ?? "" },
+					commandId: "read-capability-shell-sibling",
+					onData: (chunk) => {
+						ordinary += chunk.toString();
+					},
+				});
+				expect(ordinary).not.toContain(SECRET_FILE_CONTENT);
+			} finally {
+				await backend.dispose();
+				fixture.cleanup();
+			}
+		},
+		60_000,
+	);
+
+	it.skipIf(process.platform !== "darwin")(
+		"refuses a Bash grant whose process lifetime cannot be bounded",
+		async () => {
+			const backend = new SrtBackend();
+			const fixture = createFixture();
+			try {
+				const compiled = await backend.compile(fixture.profile);
+				await expect(
+					backend.run(compiled, {
+						command: "true",
+						cwd: fixture.workspace,
+						env: { PATH: process.env.PATH ?? "" },
+						commandId: "macos-read-capability",
+						readCapability: fixture.deniedHome,
+					}),
+				).rejects.toThrow(/could outlive the invocation/);
 			} finally {
 				await backend.dispose();
 				fixture.cleanup();

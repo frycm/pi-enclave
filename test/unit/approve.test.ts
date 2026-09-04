@@ -387,6 +387,24 @@ describe("approving a record", () => {
 		expect(backend.compiledProfile?.writableRoots).toContain(canonical("/etc/x"));
 	});
 
+	it("refuses a write capability unrelated to the recorded action before asking", async () => {
+		const backend = new RecordingBackend();
+		const channel = io();
+		const result = await approve({
+			record: record("bash", { command: "touch /work/output", allow_write: "/srv/unrelated" }),
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: channel.make(true),
+			backend,
+			platform: "linux",
+		});
+		expect(result.outcome).toBe("refused");
+		expect(channel.asked).toHaveLength(0);
+		expect(channel.err.join("\n")).toContain("does not cover a concrete write");
+		expect(backend.compiledProfile).toBeUndefined();
+	});
+
 	it("leaves a credential-overlapping write capability pending without asking", async () => {
 		const backend = new RecordingBackend();
 		const channel = io();
@@ -427,20 +445,71 @@ describe("approving a record", () => {
 		expect(backend.compiledProfile).toBeUndefined();
 	});
 
-	it("refuses an unsupported capability before asking or consuming the record", async () => {
+	it("applies an approved user-grantable Bash read capability to one invocation", async () => {
+		const backend = new RecordingBackend();
+		const p = profile((current) => {
+			current.sandbox.readDeny.push("/work/private");
+			current.sandbox.grantableReadDeny.push("/work/private");
+		});
+		const rec = writePending({
+			stateRoot,
+			sessionId: SESSION,
+			action: canonicalize({
+				tool: "bash",
+				input: { command: "cat /work/private/report", allow_read: "/work/private" },
+				cwd: "/work",
+				home: "/home/u",
+				profileName: "dev",
+			}),
+			profile: p,
+			configHash: configHash(p),
+			reason: "read capability",
+			nonce: NONCE,
+		}).record;
+		const result = await approve({
+			record: rec,
+			stateRoot,
+			current: p,
+			home: "/home/u",
+			io: io().make(true),
+			backend,
+			platform: "linux",
+		});
+		expect(result.outcome).toBe("executed");
+		expect(backend.commands[0]?.readCapability).toBe(canonical("/work/private"));
+		expect(backend.compiledProfile?.readDeny).toContain("/work/private");
+	});
+
+	it("refuses a read capability that is not user-grantable before asking", async () => {
 		const backend = new RecordingBackend();
 		const channel = io();
-		const result = await approve({
-			record: record("bash", { command: "cat /etc/x", allow_read: "/etc/x" }),
+		const p = profile((current) => current.sandbox.readDeny.push("/work/private"));
+		const rec = writePending({
 			stateRoot,
-			current: profile(),
+			sessionId: SESSION,
+			action: canonicalize({
+				tool: "bash",
+				input: { command: "cat /work/private/report", allow_read: "/work/private" },
+				cwd: "/work",
+				home: "/home/u",
+				profileName: "dev",
+			}),
+			profile: p,
+			configHash: configHash(p),
+			reason: "read capability",
+			nonce: NONCE,
+		}).record;
+		const result = await approve({
+			record: rec,
+			stateRoot,
+			current: p,
 			home: "/home/u",
 			io: channel.make(true),
 			backend,
 		});
-		expect(result.outcome).toBe("unsupported");
+		expect(result.outcome).toBe("refused");
 		expect(channel.asked).toHaveLength(0);
-		expect(channel.err.join("\n")).toContain("Phase 3/4");
+		expect(channel.err.join("\n")).toContain("grantableReadDeny");
 		expect(readdirSync(pendingDirs(stateRoot, SESSION).pending)).toEqual([`${NONCE}.json`]);
 		expect(backend.compiledProfile).toBeUndefined();
 	});

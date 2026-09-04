@@ -67,9 +67,9 @@ export function checkTool(options: ToolCheckOptions): ToolDisposition {
 		allowed: true,
 		grant,
 		readOnly: grant.readOnly === true,
-		// Without a reviewer, `reviewed: true` cannot mean "a model looks at it".
-		// It means the strongest thing still available, which is a human -- so an
-		// unattended session denies it rather than running it unexamined.
+		// Without a reviewer this goes straight to a human. With one, the model may
+		// veto or recommend, but gate.ts still leaves the final unsandboxed permit
+		// to the human.
 		reviewed: grant.reviewed === true && !isOwned,
 	};
 }

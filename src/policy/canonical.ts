@@ -3,8 +3,8 @@
  *
  * One object, produced once per tool call, that every layer above L2 reads: L1
  * matches patterns against it, the lock hashes it, the audit log records it,
- * the pending-approval record persists it, and Phase 3 will send it to the
- * reviewer. Its shape is therefore fixed here and exported rather than being an
+ * the pending-approval record persists it, and the isolated reviewer receives
+ * it. Its shape is therefore fixed here and exported rather than being an
  * internal of the gate.
  *
  * Neither reference extension has one. Guardian hands the reviewer the raw

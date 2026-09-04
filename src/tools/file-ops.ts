@@ -11,8 +11,9 @@
  * supplied (`find.ts:225`), so providing one is what keeps that search inside
  * the boundary rather than merely filtering its results afterwards.
  */
-import type { FsClient } from "../backend/types.ts";
+import type { FsClient, FsClientLease } from "../backend/types.ts";
 import { SandboxDenied } from "../backend/types.ts";
+import type { CanonicalAction } from "../policy/canonical.ts";
 import { detectImageMimeType, IMAGE_SNIFF_BYTES } from "./image-mime.ts";
 
 /**
@@ -24,7 +25,7 @@ import { detectImageMimeType, IMAGE_SNIFF_BYTES } from "./image-mime.ts";
  * recompilation exists -- keep a tool bound to a retired helper still enforcing
  * an older profile.
  */
-export type FsClientRef = () => FsClient;
+export type FsClientRef = (action?: CanonicalAction) => FsClient | FsClientLease | Promise<FsClient | FsClientLease>;
 
 /**
  * Asked again, here, whether this operation may run.
@@ -34,10 +35,25 @@ export type FsClientRef = () => FsClient;
  * trip. Throwing refuses the operation. Absent in Phase 1's tests and in the
  * benchmark, where there is no gate to have passed.
  */
-export type ToolGuard = (tool: string, path: string) => void;
+export type ToolGuard = (tool: string, path: string) => CanonicalAction | undefined;
 
-function guarded(guard: ToolGuard | undefined, tool: string, path: string): void {
-	guard?.(tool, path);
+function guarded(guard: ToolGuard | undefined, tool: string, path: string): CanonicalAction | undefined {
+	return guard?.(tool, path);
+}
+
+function isLease(value: FsClient | FsClientLease): value is FsClientLease {
+	return "client" in value && "dispose" in value;
+}
+
+/** Resolve the base or one-shot helper and always tear a one-shot helper down. */
+async function withFs<T>(ref: FsClientRef, action: CanonicalAction | undefined, run: (client: FsClient) => Promise<T>) {
+	const resolved = await ref(action);
+	const client = isLease(resolved) ? resolved.client : resolved;
+	try {
+		return await run(client);
+	} finally {
+		if (isLease(resolved)) await resolved.dispose();
+	}
 }
 
 /**
@@ -67,20 +83,22 @@ const protect = async <T>(run: () => Promise<T>): Promise<T> => {
 export function createReadOperations(fs: FsClientRef, guard?: ToolGuard) {
 	return {
 		readFile: (path: string) => {
-			guarded(guard, "read", path);
-			return protect(() => fs().readFile(path));
+			const action = guarded(guard, "read", path);
+			return protect(() => withFs(fs, action, (client) => client.readFile(path)));
 		},
 		access: (path: string) => {
-			guarded(guard, "read", path);
-			return protect(() => fs().access(path, "read"));
+			const action = guarded(guard, "read", path);
+			return protect(() => withFs(fs, action, (client) => client.access(path, "read")));
 		},
 		// pi does not fall back to sniffing the buffer when this is absent: it
 		// decodes the bytes as text. So the magic bytes are fetched through the
 		// helper -- the open stays inside the sandbox -- and judged by pi's own
 		// detector on this side.
 		detectImageMimeType: (path: string) => {
-			guarded(guard, "read", path);
-			return protect(async () => detectImageMimeType(await fs().head(path, IMAGE_SNIFF_BYTES)));
+			const action = guarded(guard, "read", path);
+			return protect(() =>
+				withFs(fs, action, async (client) => detectImageMimeType(await client.head(path, IMAGE_SNIFF_BYTES))),
+			);
 		},
 	};
 }
@@ -88,16 +106,16 @@ export function createReadOperations(fs: FsClientRef, guard?: ToolGuard) {
 export function createEditOperations(fs: FsClientRef, guard?: ToolGuard) {
 	return {
 		readFile: (path: string) => {
-			guarded(guard, "edit", path);
-			return protect(() => fs().readFile(path));
+			const action = guarded(guard, "edit", path);
+			return protect(() => withFs(fs, action, (client) => client.readFile(path)));
 		},
 		writeFile: (path: string, content: string) => {
-			guarded(guard, "edit", path);
-			return protect(() => fs().writeFile(path, content));
+			const action = guarded(guard, "edit", path);
+			return protect(() => withFs(fs, action, (client) => client.writeFile(path, content)));
 		},
 		access: (path: string) => {
-			guarded(guard, "edit", path);
-			return protect(() => fs().access(path, "write"));
+			const action = guarded(guard, "edit", path);
+			return protect(() => withFs(fs, action, (client) => client.access(path, "write")));
 		},
 	};
 }
@@ -105,34 +123,43 @@ export function createEditOperations(fs: FsClientRef, guard?: ToolGuard) {
 export function createWriteOperations(fs: FsClientRef, guard?: ToolGuard) {
 	return {
 		writeFile: (path: string, content: string) => {
-			guarded(guard, "write", path);
-			return protect(() => fs().writeFile(path, content));
+			const action = guarded(guard, "write", path);
+			return protect(() => withFs(fs, action, (client) => client.writeFile(path, content)));
 		},
 		// `mkdir` is guarded against the *file* path the action named: pi creates
 		// the parent directory of a write target, so the directory itself never
 		// appears in the tool input and would never be in the table.
-		mkdir: (path: string) => protect(() => fs().mkdir(path)),
+		mkdir: (path: string) => protect(() => withFs(fs, undefined, (client) => client.mkdir(path))),
 	};
 }
 
 export function createLsOperations(fs: FsClientRef, guard?: ToolGuard) {
 	return {
-		exists: (path: string) => protect(() => fs().exists(path)),
-		stat: (path: string) => protect(() => fs().stat(path)),
+		exists: (path: string) => {
+			const action = guarded(guard, "ls", path);
+			return protect(() => withFs(fs, action, (client) => client.exists(path)));
+		},
+		stat: (path: string) => {
+			const action = guarded(guard, "ls", path);
+			return protect(() => withFs(fs, action, (client) => client.stat(path)));
+		},
 		readdir: (path: string) => {
-			guarded(guard, "ls", path);
-			return protect(() => fs().readdir(path));
+			const action = guarded(guard, "ls", path);
+			return protect(() => withFs(fs, action, (client) => client.readdir(path)));
 		},
 	};
 }
 
 export function createFindOperations(fs: FsClientRef, guard?: ToolGuard) {
 	return {
-		exists: (path: string) => protect(() => fs().exists(path)),
+		exists: (path: string) => {
+			const action = guarded(guard, "find", path);
+			return protect(() => withFs(fs, action, (client) => client.exists(path)));
+		},
 		// Supplying glob is what stops pi spawning `fd` in its own process.
 		glob: (pattern: string, cwd: string, options: { ignore: string[]; limit: number }) => {
-			guarded(guard, "find", cwd);
-			return protect(() => fs().glob(pattern, cwd, options));
+			const action = guarded(guard, "find", cwd);
+			return protect(() => withFs(fs, action, (client) => client.glob(pattern, cwd, options)));
 		},
 	};
 }

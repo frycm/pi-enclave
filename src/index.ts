@@ -26,9 +26,16 @@ import {
 	createWriteTool,
 	VERSION as PI_VERSION,
 } from "@earendil-works/pi-coding-agent";
-import { shellWriteCapabilityIssue, validateWriteCapability } from "./backend/capability.ts";
+import {
+	resolveCapabilityTarget,
+	shellCapabilityIssue,
+	shellWriteCapabilityIssue,
+	validateReadCapability,
+	validateWriteCapability,
+} from "./backend/capability.ts";
+import { canonical as canonicalPath, isUnder } from "./backend/paths.ts";
 import { SrtBackend } from "./backend/srt.ts";
-import type { CompiledProfile, Violation } from "./backend/types.ts";
+import type { CompiledProfile, FsClient, FsClientLease, Violation } from "./backend/types.ts";
 import { type EnclaveState, handleEnclaveCommand, renderStatusLine } from "./commands/enclave.ts";
 import { OWNED_TOOLS } from "./config/defaults.ts";
 import { createDevProfile, toBackendProfile } from "./config/profile.ts";
@@ -58,6 +65,13 @@ import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
 import { PROVENANCE_ENTRY_TYPE, ProvenanceTracker } from "./gate/provenance.ts";
 import { formatProbeReport } from "./probe.ts";
 import { probeHost } from "./probe-host.ts";
+import { critiqueRulebook, formatCritique } from "./reviewer/critique.ts";
+import { MAX_AUTHORIZATION_ENTRIES, MAX_CONTEXT_ENTRIES } from "./reviewer/evidence.ts";
+import { restoreReviewHistory } from "./reviewer/history.ts";
+import { formatQualificationRuns, qualifyConfiguredReviewers } from "./reviewer/qualify.ts";
+import { IsolatedReviewer } from "./reviewer/reviewer.ts";
+import { prepareQualifiedReviewer } from "./reviewer/setup.ts";
+import type { ActionReviewer, ReviewAuthorization, ReviewContextEntry } from "./reviewer/types.ts";
 import { AuditLog, configFields, configHash, decisionFields } from "./state/audit.ts";
 import { ensureStateDirs, StateDirError, stateDirs } from "./state/dir.ts";
 import { applyRetention } from "./state/retention.ts";
@@ -115,6 +129,29 @@ function messageText(message: { content?: unknown }): string {
 	return content
 		.map((part) => (part && typeof part === "object" && "text" in part ? String((part as { text: unknown }).text) : ""))
 		.join("");
+}
+
+/** Add optional capability fields without replacing pi's upstream tool schema. */
+function addCapabilityParameters<T>(tool: T, fields: Readonly<Record<string, string>>): T {
+	const shaped = tool as T & {
+		parameters: { properties?: Record<string, unknown>; [key: string]: unknown };
+	};
+	return {
+		...shaped,
+		parameters: {
+			...shaped.parameters,
+			properties: {
+				...(shaped.parameters.properties ?? {}),
+				...Object.fromEntries(
+					Object.entries(fields).map(([name, description]) => [name, { type: "string", description }]),
+				),
+			},
+		},
+	};
+}
+
+function isFsClientLease(value: FsClient | FsClientLease): value is FsClientLease {
+	return "client" in value && "dispose" in value;
 }
 
 type ConfirmFn = (
@@ -234,6 +271,10 @@ export default function (pi: ExtensionAPI): void {
 	let piMode: "tui" | "rpc" | "json" | "print" = "print";
 	let sessionId: string | undefined;
 	let sessionFile: string | undefined;
+	let actionReviewer: ActionReviewer | undefined;
+	let reviewerSetup: Awaited<ReturnType<typeof prepareQualifiedReviewer>>;
+	const reviewAuthorization: ReviewAuthorization[] = [];
+	const reviewContext: ReviewContextEntry[] = [];
 
 	/**
 	 * When the lock is not the right thing to complain about.
@@ -256,8 +297,8 @@ export default function (pi: ExtensionAPI): void {
 		return lock.beginExecution(`bash:${command}`).action;
 	};
 	const guardPath = (tool: string, path: string) => {
-		if (lockNotApplicable()) return;
-		lock.beginPathExecution(tool, path);
+		if (lockNotApplicable()) return undefined;
+		return lock.beginPathExecution(tool, path).action;
 	};
 
 	/** A snapshot for rendering. Rebuilt per call so it never goes stale. */
@@ -375,7 +416,13 @@ export default function (pi: ExtensionAPI): void {
 		},
 	});
 
-	const fsClient = () => backend.fs(requireCompiled());
+	const fsClient = (action?: import("./policy/canonical.ts").CanonicalAction) => {
+		const compiledProfile = requireCompiled();
+		if (action?.capability?.kind === "read") {
+			return backend.fsWithReadCapability(compiledProfile, action.capability.value, action.hash, action.cwd);
+		}
+		return backend.fs(compiledProfile);
+	};
 	const grepQueue = new GrepExecutionQueue();
 
 	// Registered unconditionally. pi's registry starts with every built-in tool
@@ -385,7 +432,10 @@ export default function (pi: ExtensionAPI): void {
 	// fail-closed probe exists to prevent. A failed probe therefore still takes
 	// the tools over; they just refuse every call with the diagnosis.
 	{
-		const base = createBashTool(cwd, { operations });
+		const base = addCapabilityParameters(createBashTool(cwd, { operations }), {
+			allow_write: "One exact filesystem path to make writable for this action only, subject to review",
+			allow_read: "One exact configured read-deny root to lift for this action only, subject to review",
+		});
 		pi.registerTool({ ...base, label: "bash (sandboxed)", promptGuidelines: BASH_PROMPT_GUIDELINES });
 
 		// `!` and `!!` run through the sandbox by construction, but not through the
@@ -410,33 +460,51 @@ export default function (pi: ExtensionAPI): void {
 		// Each closes over fsClient() rather than a captured client, so a
 		// recompiled profile retires the old helper without leaving a tool bound
 		// to it.
-		pi.registerTool(createReadTool(cwd, { operations: createReadOperations(fsClient, guardPath) }));
+		pi.registerTool(
+			addCapabilityParameters(createReadTool(cwd, { operations: createReadOperations(fsClient, guardPath) }), {
+				allow_read: "One exact configured read-deny root to lift for this action only, subject to review",
+			}),
+		);
 		pi.registerTool(createEditTool(cwd, { operations: createEditOperations(fsClient, guardPath) }));
 		pi.registerTool(createWriteTool(cwd, { operations: createWriteOperations(fsClient, guardPath) }));
-		pi.registerTool(createLsTool(cwd, { operations: createLsOperations(fsClient, guardPath) }));
-		pi.registerTool(createFindTool(cwd, { operations: createFindOperations(fsClient, guardPath) }));
+		pi.registerTool(
+			addCapabilityParameters(createLsTool(cwd, { operations: createLsOperations(fsClient, guardPath) }), {
+				allow_read: "One exact configured read-deny root to lift for this action only, subject to review",
+			}),
+		);
+		pi.registerTool(
+			addCapabilityParameters(createFindTool(cwd, { operations: createFindOperations(fsClient, guardPath) }), {
+				allow_read: "One exact configured read-deny root to lift for this action only, subject to review",
+			}),
+		);
 
 		// grep is the exception: its operations object cannot redirect the `rg`
 		// spawn, so pi's tool is kept whole and only `execute` is replaced. It is
 		// read-only, so the lock's execute-once does not apply, but the breaker
 		// re-check does -- without it a grep queued before a breaker trip would
 		// still run. `runSandboxedGrep` is only reached after that guard.
-		const grepBase = createGrepTool(cwd);
+		const grepBase = addCapabilityParameters(createGrepTool(cwd), {
+			allow_read: "One exact configured read-deny root to lift for this action only, subject to review",
+		});
 		pi.registerTool({
 			...grepBase,
 			label: "grep (sandboxed)",
 			execute: async (_id: string, params: unknown, signal?: AbortSignal) => {
-				if (effective?.auto && breakerBlocks()) {
-					throw new Error("pi-enclave: the denial circuit breaker is open; this search will not run.");
-				}
-				return grepQueue.run(
-					() =>
-						runSandboxedGrep(
-							{ fs: fsClient(), cwd, ...(signal ? { signal } : {}) },
-							params as Parameters<typeof runSandboxedGrep>[1],
-						),
-					signal,
-				);
+				const args = params as Parameters<typeof runSandboxedGrep>[1];
+				return grepQueue.run(async () => {
+					// Begin execution only after this search reaches the head of the
+					// queue. Otherwise a breaker that opens while it is waiting could
+					// be missed between admission and the actual filesystem access.
+					const action = guardPath("grep", args.path ?? cwd);
+					const resolved = await fsClient(action);
+					const lease = isFsClientLease(resolved) ? resolved : undefined;
+					const client = isFsClientLease(resolved) ? resolved.client : resolved;
+					try {
+						return await runSandboxedGrep({ fs: client, cwd, ...(signal ? { signal } : {}) }, args);
+					} finally {
+						await lease?.dispose();
+					}
+				}, signal);
 			},
 		} as Parameters<typeof pi.registerTool>[0]);
 	}
@@ -475,12 +543,23 @@ export default function (pi: ExtensionAPI): void {
 				lock,
 				owned: OWNED_TOOLS,
 				escalator,
+				...(actionReviewer ? { reviewer: actionReviewer } : {}),
 				toolSource: (tool) => pi.getAllTools?.().find((entry) => entry.name === tool)?.sourceInfo?.path,
 				writeCapabilityIssue: (value, actionCwd, tool) => {
 					try {
 						const lifetimeIssue = tool === "bash" ? shellWriteCapabilityIssue() : undefined;
 						if (lifetimeIssue) return lifetimeIssue;
 						validateWriteCapability(profile, actionCwd, value);
+						return undefined;
+					} catch (error) {
+						return (error as Error).message;
+					}
+				},
+				readCapabilityIssue: (value, actionCwd, tool) => {
+					try {
+						const lifetimeIssue = tool === "bash" ? shellCapabilityIssue("read") : undefined;
+						if (lifetimeIssue) return lifetimeIssue;
+						validateReadCapability(profile, actionCwd, value);
 						return undefined;
 					} catch (error) {
 						return (error as Error).message;
@@ -522,6 +601,16 @@ export default function (pi: ExtensionAPI): void {
 				},
 			},
 		);
+		if (decision.action) {
+			reviewContext.push({
+				provenance: "assistant_tool_call",
+				tool: decision.action.tool,
+				input: structuredClone(decision.action.input),
+			});
+			if (reviewContext.length > MAX_CONTEXT_ENTRIES) {
+				reviewContext.splice(0, reviewContext.length - MAX_CONTEXT_ENTRIES);
+			}
+		}
 		refreshStatusLine?.();
 		if (!decision.block) {
 			if (ownedTool) queuedOwnedCall = true;
@@ -558,8 +647,8 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	// ---------------------------------------------------------------------
-	// Provenance. Phase 2's only consumer is the breaker reset; Phase 3's is
-	// the reviewer's authorization evidence.
+	// Provenance feeds the breaker reset and the reviewer's authorization
+	// evidence. Only direct human input is allowed into the latter.
 	// ---------------------------------------------------------------------
 
 	pi.on("input", (event) => {
@@ -580,6 +669,14 @@ export default function (pi: ExtensionAPI): void {
 		const record = directInput.recordForMessage(text, Date.now());
 		if (!record) return;
 		pi.appendEntry(PROVENANCE_ENTRY_TYPE, record);
+		reviewAuthorization.push({
+			provenance: "direct",
+			channel: record.source,
+			text: record.rawText ?? text,
+		});
+		if (reviewAuthorization.length > MAX_AUTHORIZATION_ENTRIES) {
+			reviewAuthorization.splice(0, reviewAuthorization.length - MAX_AUTHORIZATION_ENTRIES);
+		}
 		// A person said something, so the count starts again. Only a *direct*
 		// message resets it: an extension calling sendUserMessage reaches the
 		// same event with source "extension", and letting that clear a trip
@@ -595,6 +692,11 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		actionReviewer = undefined;
+		reviewerSetup = undefined;
+		directInput.reset();
+		reviewAuthorization.length = 0;
+		reviewContext.length = 0;
 		if (!report.ok) {
 			ctx.ui.notify(formatProbeReport(report), "error");
 			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
@@ -619,6 +721,9 @@ export default function (pi: ExtensionAPI): void {
 		effective = loaded.profile;
 		provenance = loaded.provenance;
 		profile = toBackendProfile(loaded.profile, cwd);
+		const restored = restoreReviewHistory(ctx.sessionManager.getBranch());
+		reviewAuthorization.push(...restored.authorization);
+		reviewContext.push(...restored.context);
 
 		// Ownership is checked after the configuration, because the diagnosis is
 		// only actionable once we know auto mode was going to start at all.
@@ -641,8 +746,10 @@ export default function (pi: ExtensionAPI): void {
 		// failure to secure it stops auto mode: pending approval records and the
 		// attendance secret live there, and a directory anyone can write is one
 		// where an approval can be forged.
+		let qualifiedDir: string;
 		try {
 			const dirs = ensureStateDirs();
+			qualifiedDir = dirs.qualified;
 			applyRetention({
 				dir: dirs.audit,
 				retentionDays: loaded.profile.audit.retentionDays,
@@ -670,6 +777,22 @@ export default function (pi: ExtensionAPI): void {
 				error instanceof StateDirError
 					? error.message
 					: `pi-enclave: cannot prepare the state directory: ${(error as Error).message}`;
+			configError = message;
+			process.stderr.write(`${message}\n`);
+			ctx.ui.notify(message, "error");
+			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
+			return;
+		}
+
+		try {
+			reviewerSetup = await prepareQualifiedReviewer(
+				loaded.profile,
+				loaded.provenance,
+				ctx.modelRegistry,
+				qualifiedDir,
+			);
+		} catch (error) {
+			const message = (error as Error).message;
 			configError = message;
 			process.stderr.write(`${message}\n`);
 			ctx.ui.notify(message, "error");
@@ -722,12 +845,46 @@ export default function (pi: ExtensionAPI): void {
 		}
 
 		uiContext = { confirm: (title, message, options) => ctx.ui.confirm(title, message, options) };
+		if (reviewerSetup) {
+			actionReviewer = new IsolatedReviewer({
+				profile: loaded.profile,
+				prompt: reviewerSetup.prompt,
+				primary: reviewerSetup.primary,
+				...(reviewerSetup.fallback ? { fallback: reviewerSetup.fallback } : {}),
+				timeoutMs: loaded.profile.reviewer.timeoutMs,
+				evidence: (request) => {
+					// A stale or unrelated denial is not evidence for this decision.
+					// Violations are supplied only for a capability retry of the same
+					// kind whose target actually contains the denied path.
+					const capability = request.action.capability;
+					const target =
+						capability && capability.kind !== "host"
+							? resolveCapabilityTarget(request.action.cwd, capability.value)
+							: undefined;
+					const violation = target
+						? [...violations]
+								.reverse()
+								.find(
+									(entry) =>
+										entry.kind === capability?.kind &&
+										entry.path !== undefined &&
+										isUnder(canonicalPath(entry.path), target),
+								)
+						: undefined;
+					return {
+						attended: attendance.effective,
+						authorization: reviewAuthorization,
+						context: reviewContext,
+						...(violation ? { violation } : {}),
+					};
+				},
+			});
+		}
 
 		// The breaker survives a resume. Guardian deliberately drops its counters
 		// at session start; here they persist, because an unattended run that is
 		// resumed after tripping should not get three fresh attempts at whatever
 		// tripped it.
-		directInput.reset();
 		lock.reset();
 		// Rebuilt from the configured thresholds now that the fold has run, then
 		// restored from the session's persisted state. Building it here rather
@@ -760,6 +917,48 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerCommand("enclave", {
 		description: "pi-enclave status and diagnostics",
 		handler: async (args, ctx) => {
+			if (args.trim() === "rules critique") {
+				if (!effective || !provenance) {
+					ctx.ui.notify(configError ?? "pi-enclave: configuration has not been loaded yet", "error");
+					return;
+				}
+				const result = await critiqueRulebook({
+					profile: effective,
+					provenance,
+					...(reviewerSetup?.primary ? { primary: reviewerSetup.primary } : {}),
+					...(reviewerSetup?.fallback ? { fallback: reviewerSetup.fallback } : {}),
+					timeoutMs: effective.reviewer.timeoutMs,
+				});
+				ctx.ui.notify(formatCritique(result), result.note?.startsWith("reviewer critique failed") ? "warning" : "info");
+				return;
+			}
+			if (args.trim() === "eval-reviewer") {
+				const loadedForEval =
+					effective && provenance
+						? { ok: true as const, profile: effective, provenance }
+						: loadConfig({ cwd, projectTrusted: ctx.isProjectTrusted() });
+				if (!loadedForEval.ok) {
+					ctx.ui.notify(loadedForEval.message, "error");
+					return;
+				}
+				ctx.ui.notify("pi-enclave: running the reviewer qualification corpus; this may take several minutes.", "info");
+				try {
+					const runs = await qualifyConfiguredReviewers({
+						profile: loadedForEval.profile,
+						provenance: loadedForEval.provenance,
+						registry: ctx.modelRegistry,
+						qualifiedDir: ensureStateDirs().qualified,
+					});
+					const allPassed = runs.every((run) => run.record.passed);
+					ctx.ui.notify(
+						`${formatQualificationRuns(runs)}\n\n${allPassed ? "Restart pi to activate this qualification." : "The reviewer remains disabled."}`,
+						allPassed ? "info" : "error",
+					);
+				} catch (error) {
+					ctx.ui.notify(`pi-enclave: reviewer evaluation failed: ${(error as Error).message}`, "error");
+				}
+				return;
+			}
 			const output = handleEnclaveCommand(state(), args);
 			ctx.ui.notify(output.text, output.level);
 		},

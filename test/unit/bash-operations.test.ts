@@ -152,6 +152,23 @@ describe("createEnclaveBashOperations", () => {
 		expect(calls[1]?.writeCapability).toBeUndefined();
 	});
 
+	it("binds an approved read capability to the one backend invocation", async () => {
+		const { backend, calls } = recordingBackend();
+		const action = canonicalize({
+			tool: "bash",
+			input: { command: "cat /srv/private/report", allow_read: "/srv/private" },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+			writableRoots: ["/work"],
+		});
+		const ops = createEnclaveBashOperations({ backend, getCompiled: () => COMPILED, guard: () => action });
+
+		await ops.exec("cat /srv/private/report", "/work", { onData: () => {} });
+		expect(calls[0]?.readCapability).toBe("/srv/private");
+		expect(calls[0]?.writeCapability).toBeUndefined();
+	});
+
 	it("returns the backend's exit code", async () => {
 		const { backend } = recordingBackend({ exitCode: 3 });
 		const ops = createEnclaveBashOperations({ backend, getCompiled: () => COMPILED });
