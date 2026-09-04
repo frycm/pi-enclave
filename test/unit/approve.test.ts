@@ -2,6 +2,7 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { canonical } from "../../src/backend/paths.ts";
 import type { CompiledProfile, FsClient, Profile, RunRequest, SandboxBackend } from "../../src/backend/types.ts";
 import { type ApproveIO, approve } from "../../src/cli/approve.ts";
 import { defaultProfile } from "../../src/config/defaults.ts";
@@ -383,7 +384,7 @@ describe("approving a record", () => {
 			platform: "linux",
 		});
 		expect(result.outcome).toBe("executed");
-		expect(backend.compiledProfile?.writableRoots).toContain("/etc/x");
+		expect(backend.compiledProfile?.writableRoots).toContain(canonical("/etc/x"));
 	});
 
 	it("leaves a credential-overlapping write capability pending without asking", async () => {
