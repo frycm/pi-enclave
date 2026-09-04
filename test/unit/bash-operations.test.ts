@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { canonical } from "../../src/backend/paths.ts";
 import type {
 	CompiledProfile,
 	Profile,
@@ -20,6 +21,7 @@ const PROFILE: Profile = {
 };
 
 const COMPILED: CompiledProfile = { backend: "seatbelt", profile: PROFILE, describe: () => "compiled" };
+const DENIED_SSH_CONFIG = canonical("/home/u/.ssh/config");
 
 /** Records what the operations layer hands the backend. */
 function recordingBackend(result: Partial<RunResult> = {}) {
@@ -219,7 +221,7 @@ describe("createEnclaveBashOperations", () => {
 		await ops.exec("cat /home/u/.ssh/config", "/work", { onData: () => {} });
 
 		expect(onViolations).toHaveBeenCalledWith([
-			expect.objectContaining({ kind: "read", source: "policy", path: "/home/u/.ssh/config" }),
+			expect.objectContaining({ kind: "read", source: "policy", path: DENIED_SSH_CONFIG }),
 		]);
 	});
 
@@ -244,7 +246,7 @@ describe("createEnclaveBashOperations", () => {
 
 		await ops.exec("cat /home/u/.ssh/config", "/work", { onData: () => {} });
 		expect(onViolations).not.toHaveBeenCalled();
-		expect(onDeniedReadAttempt).toHaveBeenCalledWith(["/home/u/.ssh/config"]);
+		expect(onDeniedReadAttempt).toHaveBeenCalledWith([DENIED_SSH_CONFIG]);
 	});
 
 	it("keeps read-deny attempt accounting when the shell suppresses the exit status", async () => {
@@ -265,7 +267,7 @@ describe("createEnclaveBashOperations", () => {
 		});
 
 		await ops.exec("cat /home/u/.ssh/config >/dev/null || true", "/work", { onData: () => {} });
-		expect(onDeniedReadAttempt).toHaveBeenCalledWith(["/home/u/.ssh/config"]);
+		expect(onDeniedReadAttempt).toHaveBeenCalledWith([DENIED_SSH_CONFIG]);
 	});
 
 	it("accounts for a denied copy source even when the command also writes", async () => {
@@ -286,7 +288,7 @@ describe("createEnclaveBashOperations", () => {
 		});
 
 		await ops.exec("cp /home/u/.ssh/config /work/copy || true", "/work", { onData: () => {} });
-		expect(onDeniedReadAttempt).toHaveBeenCalledWith(["/home/u/.ssh/config"]);
+		expect(onDeniedReadAttempt).toHaveBeenCalledWith([DENIED_SSH_CONFIG]);
 	});
 
 	it("does not count a read in a statically unreachable command", async () => {
@@ -329,7 +331,7 @@ describe("createEnclaveBashOperations", () => {
 		});
 
 		await ops.exec(command, "/work", { onData: () => {} });
-		expect(onDeniedReadAttempt).toHaveBeenCalledWith(["/home/u/.ssh/config"]);
+		expect(onDeniedReadAttempt).toHaveBeenCalledWith([DENIED_SSH_CONFIG]);
 	});
 
 	it("refuses to run before the profile is compiled", async () => {

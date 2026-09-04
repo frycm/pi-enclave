@@ -341,7 +341,7 @@ for p in ['${fixture.socketPath}', '/var/run/docker.sock']:
 			// does, and both backends deny PTYs by default, so a profile that lost
 			// allowPty in translation would have left this row green.
 			const r = await sh(
-				`git init -q . && git -c user.email=a@b -c user.name=a commit -q --allow-empty -m x && ` +
+				`git -c user.email=a@b -c user.name=a commit -q --allow-empty -m x && ` +
 					`git log --oneline | head -1 && echo GIT-OK; ` +
 					`python3 -c "import pty,os; m,s=pty.openpty(); os.close(s); os.close(m); print('PTY-'+'OK')" 2>&1 || echo PTY-DENIED`,
 			);

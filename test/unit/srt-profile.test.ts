@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { shellWriteCapabilityIssue, validateWriteCapability } from "../../src/backend/capability.ts";
+import { canonical } from "../../src/backend/paths.ts";
 import {
 	effectiveProfile,
 	linuxWriteMountPins,
@@ -31,6 +32,14 @@ const profile = (writableRoots: string[]): Profile => ({
 function initGit(root: string): void {
 	const result = spawnSync("git", ["init", "-q", root], { encoding: "utf8" });
 	if (result.status !== 0) throw new Error(result.stderr || "git init failed");
+}
+
+function expectWriteDenied(profile: Profile, path: string): void {
+	expect((profile.writeDeny ?? []).map(canonical)).toContain(canonical(path));
+}
+
+function expectWriteAllowed(profile: Profile, path: string): void {
+	expect((profile.writeDeny ?? []).map(canonical)).not.toContain(canonical(path));
 }
 
 describe("sandbox profile authority", () => {
@@ -145,8 +154,8 @@ describe("sandbox profile authority", () => {
 		materializeWriteDenyAnchors(backend);
 		expect(() => mkdirSync(join(root, ".git", "hooks"))).toThrow();
 		expect(() => writeFileSync(join(root, ".git", "config"), "", { flag: "wx" })).toThrow();
-		expect(backend.writeDeny).toContain(join(root, ".git", "hooks"));
-		expect(backend.writeDeny).toContain(join(root, ".git", "config"));
+		expectWriteDenied(backend, join(root, ".git", "hooks"));
+		expectWriteDenied(backend, join(root, ".git", "config"));
 	});
 
 	it("protects the active metadata behind a gitfile", () => {
@@ -158,9 +167,9 @@ describe("sandbox profile authority", () => {
 		const effective = defaultProfile({ cwd: root, home: "/home/u", tmp: SANDBOX_TMPDIR, agentDir: "/agent" });
 		const backend = toBackendProfile(effective, root);
 		materializeWriteDenyAnchors(backend);
-		expect(backend.writeDeny).toContain(join(root, ".git"));
-		expect(backend.writeDeny).toContain(join(actual, "hooks"));
-		expect(backend.writeDeny).toContain(join(actual, "config"));
+		expectWriteDenied(backend, join(root, ".git"));
+		expectWriteDenied(backend, join(actual, "hooks"));
+		expectWriteDenied(backend, join(actual, "config"));
 		expect(() => mkdirSync(join(actual, "hooks"))).toThrow();
 	});
 
@@ -170,12 +179,12 @@ describe("sandbox profile authority", () => {
 		const effective = defaultProfile({ cwd: root, home: "/home/u", tmp: SANDBOX_TMPDIR, agentDir: "/agent" });
 		const backend = toBackendProfile(effective, root);
 		materializeWriteDenyAnchors(backend);
-		expect(backend.writeDeny).toContain(join(root, ".git", "hooks"));
-		expect(backend.writeDeny).toContain(join(root, ".git", "config"));
+		expectWriteDenied(backend, join(root, ".git", "hooks"));
+		expectWriteDenied(backend, join(root, ".git", "config"));
 		expect(existsSync(join(root, ".git"))).toBe(true);
 		expect(existsSync(join(root, ".git", "hooks"))).toBe(true);
 		expect(existsSync(join(root, ".git", "config"))).toBe(true);
-		expect(backend.writeDeny).not.toContain(join(root, ".git", "index"));
+		expectWriteAllowed(backend, join(root, ".git", "index"));
 		writeFileSync(join(root, ".git", "index"), "ordinary metadata stays writable");
 	});
 
@@ -198,13 +207,13 @@ describe("sandbox profile authority", () => {
 		const backend = toBackendProfile(effective, root);
 		materializeWriteDenyAnchors(backend);
 
-		expect(backend.writeDeny).toContain(activeConfig);
-		expect(backend.writeDeny).toContain(conditionalConfig);
-		expect(backend.writeDeny).toContain(join(root, ".githooks"));
-		expect(backend.writeDeny).toContain(join(root, ".conditional-hooks"));
+		expectWriteDenied(backend, activeConfig);
+		expectWriteDenied(backend, conditionalConfig);
+		expectWriteDenied(backend, join(root, ".githooks"));
+		expectWriteDenied(backend, join(root, ".conditional-hooks"));
 		expect(existsSync(join(root, ".githooks"))).toBe(true);
 		expect(existsSync(join(root, ".conditional-hooks"))).toBe(true);
-		expect(backend.writeDeny).not.toContain(join(root, ".git", "index"));
+		expectWriteAllowed(backend, join(root, ".git", "index"));
 	});
 
 	it("honors /dev/null as an explicit hook-disable path", () => {
@@ -226,10 +235,10 @@ describe("sandbox profile authority", () => {
 		if (initialized.status !== 0) throw new Error(initialized.stderr || "git init --bare failed");
 		const effective = defaultProfile({ cwd: root, home: "/home/u", tmp: SANDBOX_TMPDIR, agentDir: "/agent" });
 		const backend = toBackendProfile(effective, root);
-		expect(backend.writeDeny).toContain(join(root, "config"));
-		expect(backend.writeDeny).toContain(join(root, "hooks"));
-		expect(backend.writeDeny).not.toContain(join(root, "objects"));
-		expect(backend.writeDeny).not.toContain(join(root, "refs"));
+		expectWriteDenied(backend, join(root, "config"));
+		expectWriteDenied(backend, join(root, "hooks"));
+		expectWriteAllowed(backend, join(root, "objects"));
+		expectWriteAllowed(backend, join(root, "refs"));
 	});
 
 	it("protects existing submodule config and hooks using the submodule worktree as the hook base", () => {
@@ -252,14 +261,14 @@ describe("sandbox profile authority", () => {
 		const backend = toBackendProfile(effective, root);
 		materializeWriteDenyAnchors(backend);
 
-		expect(backend.writeDeny).toContain(join(metadata, "config"));
-		expect(backend.writeDeny).toContain(join(metadata, "hooks"));
-		expect(backend.writeDeny).toContain(join(worktree, ".git"));
-		expect(backend.writeDeny).toContain(join(worktree, ".githooks"));
+		expectWriteDenied(backend, join(metadata, "config"));
+		expectWriteDenied(backend, join(metadata, "hooks"));
+		expectWriteDenied(backend, join(worktree, ".git"));
+		expectWriteDenied(backend, join(worktree, ".githooks"));
 		expect(existsSync(join(metadata, "hooks"))).toBe(true);
 		expect(existsSync(join(worktree, ".githooks"))).toBe(true);
-		expect(backend.writeDeny).not.toContain(join(metadata, "objects"));
-		expect(backend.writeDeny).not.toContain(join(metadata, "refs"));
+		expectWriteAllowed(backend, join(metadata, "objects"));
+		expectWriteAllowed(backend, join(metadata, "refs"));
 	});
 
 	it("infers a submodule worktree from its validated gitfile when core.worktree is absent", () => {
@@ -283,9 +292,9 @@ describe("sandbox profile authority", () => {
 		const backend = toBackendProfile(effective, root);
 		materializeWriteDenyAnchors(backend);
 
-		expect(backend.writeDeny).toContain(join(worktree, ".git"));
-		expect(backend.writeDeny).toContain(join(worktree, ".githooks"));
-		expect(backend.writeDeny).not.toContain(join(metadata, ".githooks"));
+		expectWriteDenied(backend, join(worktree, ".git"));
+		expectWriteDenied(backend, join(worktree, ".githooks"));
+		expectWriteAllowed(backend, join(metadata, ".githooks"));
 	});
 
 	it("materializes a missing reachable include before the sandbox starts", () => {
@@ -297,7 +306,7 @@ describe("sandbox profile authority", () => {
 		const effective = defaultProfile({ cwd: root, home: "/home/u", tmp: SANDBOX_TMPDIR, agentDir: "/agent" });
 		const backend = toBackendProfile(effective, root);
 		materializeWriteDenyAnchors(backend);
-		expect(backend.writeDeny).toContain(future);
+		expectWriteDenied(backend, future);
 		expect(existsSync(future)).toBe(true);
 	});
 
