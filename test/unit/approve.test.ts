@@ -380,6 +380,7 @@ describe("approving a record", () => {
 			home: "/home/u",
 			io: io().make(true),
 			backend,
+			platform: "linux",
 		});
 		expect(result.outcome).toBe("executed");
 		expect(backend.compiledProfile?.writableRoots).toContain("/etc/x");
@@ -398,6 +399,7 @@ describe("approving a record", () => {
 			home: "/home/u",
 			io: channel.make(true),
 			backend,
+			platform: "linux",
 		});
 		expect(result.outcome).toBe("refused");
 		expect(channel.asked).toHaveLength(0);
