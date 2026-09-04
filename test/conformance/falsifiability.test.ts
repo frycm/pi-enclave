@@ -98,7 +98,14 @@ describe("conformance suite falsifiability", () => {
 	});
 
 	it("the allowed scenarios pass, so a failure there means broken tooling not a weak sandbox", () => {
-		const brokenBaseline = rows.filter((row) => row.expectation === "allowed" && !row.ok);
+		// F11 drives fd as an allowed compatibility control. A host without the
+		// search prerequisites cannot run that control; CI installs both tools and
+		// therefore exercises it, while a developer host reports the exemption
+		// alongside F6/F7 instead of turning a missing binary into a product failure.
+		const searchControlAvailable = hostHasSearchTools();
+		const brokenBaseline = rows.filter(
+			(row) => row.expectation === "allowed" && !row.ok && !(row.id === "F11" && !searchControlAvailable),
+		);
 		expect(
 			brokenBaseline,
 			"These check ordinary work still functions and should pass even unsandboxed. A failure " +
@@ -123,7 +130,7 @@ describe("conformance suite falsifiability", () => {
 		const capEff = hostCapEff();
 		const notes = [
 			`C5 network control: ${hostHasNetwork() ? "ran" : "skipped -- host has no egress"}`,
-			`F6/F7 search control: ${hostHasSearchTools() ? "ran" : "skipped -- rg or fd not on PATH"}`,
+			`F6/F7/F11 search controls: ${hostHasSearchTools() ? "ran" : "skipped -- rg or fd not on PATH"}`,
 			`C12 capability control: ${
 				hostHoldsCapabilities()
 					? `ran -- host CapEff=${capEff}`

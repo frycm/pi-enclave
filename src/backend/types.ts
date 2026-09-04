@@ -12,6 +12,14 @@ import type { BackendName } from "../probe.ts";
 
 export type { BackendName };
 
+/**
+ * The scratch directory sandbox-runtime grants intrinsically.
+ *
+ * Keep this independent of the parent process's TMPDIR: environment values are
+ * execution data, not authorization to widen the sandbox.
+ */
+export const SANDBOX_TMPDIR = "/tmp/claude";
+
 // ---------------------------------------------------------------------------
 // Profile
 // ---------------------------------------------------------------------------
@@ -29,8 +37,19 @@ export interface Profile {
 	mode: "workspace-write";
 	/** Absolute paths that may be written. Everything else is read-only. */
 	writableRoots: readonly string[];
+	/** Paths kept read-only even when they sit below a writable root. */
+	writeDeny?: readonly string[];
+	/**
+	 * Deny anchors the trusted parent may create before compiling the sandbox.
+	 * Linux bind-mount denials need the mount point to exist.
+	 */
+	materializeWriteDeny?: readonly string[];
+	/** Missing protected metadata files the trusted parent creates atomically. */
+	materializeWriteDenyFiles?: readonly string[];
 	/** Absolute paths that may not be read, even though reads are otherwise open. */
 	readDeny: readonly string[];
+	/** The explicitly selected scratch path exposed to children as TMPDIR. */
+	tmpDir?: string;
 	/**
 	 * "off" means no host is allowlisted. It does *not* mean no network stack:
 	 * both backends still run an egress proxy the child can reach, which denies
@@ -91,8 +110,10 @@ export type ViolationKind = "read" | "write" | "network" | "exec" | "socket";
  * - `errno`      -- exact and synchronous, from the syscall the helper made.
  * - `kernel-log` -- a parsed log line, asynchronous, backend-specific text.
  * - `proxy`      -- a userspace decision by the egress proxy, not the kernel.
+ * - `policy`     -- a failed bash invocation explicitly targeted a configured
+ *                  denied read path on a backend that emits no read event.
  */
-export type ViolationSource = "errno" | "kernel-log" | "proxy";
+export type ViolationSource = "errno" | "kernel-log" | "proxy" | "policy";
 
 export interface Violation {
 	kind: ViolationKind;
@@ -119,6 +140,13 @@ export interface RunRequest {
 	command: string;
 	cwd: string;
 	env: ChildEnv;
+	/**
+	 * Phase-2's only invocation-scoped widening: one human-approved write
+	 * target, already bound into the canonical action hash. The backend derives
+	 * the custom profile from the compiled base so callers cannot replace any
+	 * other security field.
+	 */
+	writeCapability?: string;
 	/**
 	 * Correlation key for violations from this invocation. Use the tool-use id,
 	 * never the command text: sandbox-runtime compares only the first 100

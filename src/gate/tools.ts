@@ -51,18 +51,18 @@ export function checkTool(options: ToolCheckOptions): ToolDisposition {
 		};
 	}
 
-	if (grant.source !== undefined && source !== undefined && grant.source !== source) {
+	const isOwned = owned.includes(tool);
+	if (grant.source !== undefined && grant.source !== source) {
 		return {
 			allowed: false,
 			reason:
-				`pi-enclave: "${tool}" is allowed only from ${grant.source}, but this registration comes from ${source}.\n` +
+				`pi-enclave: "${tool}" is allowed only from ${grant.source}, but this registration comes from ${source ?? "an unknown source"}.\n` +
 				`  A tool name is not an identity: another extension registering the same name would otherwise inherit the grant.`,
 		};
 	}
 
 	// A tool pi-enclave owns is sandboxed whatever the grant says; `readOnly`
 	// and `reviewed` on it describe the action, not the enforcement.
-	const isOwned = owned.includes(tool);
 	return {
 		allowed: true,
 		grant,

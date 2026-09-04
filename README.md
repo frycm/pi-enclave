@@ -141,8 +141,8 @@ exposes everything required: built-in tool overrides with pluggable operations, 
   isolating pi itself in a VM or container — documented as the outer ring, not solved here.
 - Kernel-exploit-grade isolation. Seatbelt and bwrap are the bar; a microVM backend is a
   later option.
-- A general DLP system. Secret handling is limited to path deny-lists and proxy-side
-  credential masking.
+- A general DLP system. Secret handling is limited to path deny-lists and, for compatible
+  Phase-4 clients, brokered credential substitution at a TLS-terminating proxy.
 - Native Windows sandboxing. On Windows the answer is the Docker backend.
 
 ---
@@ -154,7 +154,7 @@ exposes everything required: built-in tool overrides with pluggable operations, 
 | Prompt injection via repo files, tool output, or fetched content steering the agent to run `curl … \| sh`, read `~/.ssh`, or push secrets | Sandbox: filesystem deny-read on secrets, no network except the proxy allowlist | Pattern `deny` rules; reviewer |
 | Injection aimed at the **reviewer** (text in arguments or messages telling it to allow) | Reviewer sees structured, provenance-labelled evidence only; only direct TUI/RPC input can carry authorization | A reviewer `allow` can only widen the sandbox by one declared capability for one action — it can never produce unsandboxed host execution, so the sandbox still bounds a wrong allow |
 | Agent tampers with pi-enclave's own state (approval records, config) from inside the sandbox | All extension state lives outside every writable root, mode `0600`, written atomically; project-local config is tighten-only | Session-bound nonces and expiry on approval records |
-| Exfiltration to an **allowed** host (`network.allowHosts` contains `github.com`; the agent pushes secrets to any repo there) | Not prevented by a domain allowlist — see [residual risks](#residual-risks) | `readDeny` on secrets; credential masking in the proxy (v2); `network.mode: "off"` by default |
+| Exfiltration to an **allowed** host (`network.allowHosts` contains `github.com`; the agent pushes secrets to any repo there) | Not prevented by a domain allowlist — see [residual risks](#residual-risks) | `readDeny` on secrets; brokered substitution for compatible TLS-terminating clients; `network.mode: "off"` by default |
 | Honest agent mistake (`rm -rf` on the wrong path, `git push --force`) | Pattern `ask` rule → L4; otherwise the reviewer's prose `soft_deny` rulebook | Sandbox write roots |
 | Workaround loops after a denial (same goal, different command) | Circuit breaker: `block` + `terminate` after N equivalent denials | Audit log |
 | TOCTOU: input mutated between approval and execution by a later `tool_call` handler | Canonicalize → hash → deep-freeze → execute the frozen snapshot | Refuse auto mode when untrusted repo-local extensions are loaded |
@@ -179,16 +179,16 @@ L2 always runs and that no layer below L4 can remove it.
 | **L1** | Deterministic rules | Pattern rules on tool and arguments with exactly two verbs: `deny` (never runs, nothing below can override) and `ask` (always a human decision, the reviewer cannot auto-approve it), plus protected paths. Never touches a model. Runs before everything else in under a millisecond. |
 | **L2** | **OS enforcement** | Every shell command **and every file/search operation** executes inside a Seatbelt / bwrap / Docker boundary: explicit writable roots (everything else read-only), declared paths and secrets denied for reading, network only via the egress proxy. Note the asymmetry, which the backends impose and pi-enclave inherits: **writes are an allow-list, reads are a deny-list.** There is no way to say "the agent may only read the workspace"; anything absent from the read-deny list is readable. An L3 `allow` still lands here; so does a `skipReview` match. Sandbox denials are returned to the agent as a structured violation, which is the only way a request can *widen* the profile (via an L3-reviewed capability retry). |
 | **L3** | Isolated model reviewer | For every action L1 did not decide that is either selected by `review.trigger` (`mutating` by default; `all` selects read-only actions too; `boundary` selects none) or a request to widen the sandbox by one declared capability (`--allow-write <path>`, `--allow-host <host>`) for one action. Judges it against a **prose rulebook** (`review.environment` / `hard_deny` / `soft_deny` / `allow`) and the user's direct authorization. Fresh completion, own system prompt, structured evidence, strict JSON output with `allow` / `deny` / `ask`. **An L3 `allow` never leaves the sandbox** — it re-runs the locked action under a one-shot profile that is the base profile plus exactly the requested capability. |
-| **L4** | Human escalation | Attended: `ctx.ui.confirm` with the exact canonical action. Unattended: `ask` means deny, stop the turn, and write a resumable "needs approval" record outside the workspace. Unsandboxed host execution, if a profile permits it at all, is reachable **only** from this layer. |
+| **L4** | Human escalation | Attended: `ctx.ui.confirm` with the exact canonical action. Unattended: `ask` means deny, stop the turn, and write a resumable "needs approval" record outside the workspace. v1 has no unsandboxed host-execution path; a future one would require a separate canonical action and this verified human channel. |
 
 Three cross-cutting mechanisms: the **action lock** (canonical snapshot, hashed, frozen,
 executed once), the **circuit breaker** (per-turn and sliding-window denial counters), and
 the **audit log** (JSONL, one record per decision, including sandbox violations).
 
 **Monotonic escalation.** Each layer can only make the effective sandbox *wider by a declared,
-bounded amount* and never *absent*: L1 cannot widen it at all, L3 can add one capability to
-one action, and only L4 (a human, through a verified channel) can authorize host execution.
-This is the invariant the rest of the document protects.
+bounded amount* and never *absent*: L1 cannot widen it at all and L3 can add one capability
+to one action. v1 never removes L2, including after an L4 approval. This is the invariant
+the rest of the document protects.
 
 ### Decision path for one tool call
 
@@ -232,8 +232,9 @@ particular command.
 ## Sandbox backends
 
 The backend is a small interface. The profile — what is readable, writable and reachable —
-is backend-independent and compiled per backend at session start. Selection order:
-native for the host OS → Docker → **refuse to enter auto mode**. There is no silent
+is backend-independent and compiled per backend at session start. The target selection order
+after Phase 4 is native for the host OS → Docker → **refuse to enter auto mode**. Today it is
+native → refuse because the Docker backend is not implemented. There is never a silent
 unsandboxed fallback.
 
 ```ts
@@ -248,30 +249,50 @@ interface SandboxBackend {
   // sandboxed helper process under `compiled` — the pi process never touches the path itself.
   fs(compiled: CompiledProfile): ReadOperations & WriteOperations & EditOperations
                                  & GrepOperations & FindOperations & LsOperations;
-  // Widen `compiled` by exactly one declared capability for one action (L3 allow).
-  extend(compiled: CompiledProfile, cap: Capability): Promise<CompiledProfile>;
+  // Build an invocation-scoped view for exactly one locked action. This must use
+  // per-call backend policy (SRT customConfig), never mutate process-global state.
+  extend(compiled: CompiledProfile, cap: Capability,
+         actionHash: string): Promise<InvocationProfile>;
 }
 
 type Capability =
   | { kind: "write"; path: string }          // one extra writable path (file or directory)
-  | { kind: "read"; path: string }           // lift one readDeny entry
+  | { kind: "read"; path: string }           // lift one grantable readDeny only
   | { kind: "host"; host: string; port: number };  // one extra proxy-allowed host
+
+type InvocationProfile = {
+  base: CompiledProfile;
+  actionHash: string;
+  capability: Capability;
+}; // consumed once by run()/an ephemeral fs helper
 
 interface SandboxProfile {
   mode: "read-only" | "workspace-write" | "custom";
   writableRoots: string[];   // workspace, scratch, $TMPDIR, optional extras
+  writeDeny: string[];       // protected persistence paths inside writable roots
   readDeny: string[];        // ~/.ssh, ~/.aws, ~/.gnupg, ~/.pi/**/auth*, keychains…
+  immutableReadDeny: string[]; // credentials/state; no capability can lift these
+  grantableReadDeny: string[]; // user-global subset eligible for one-shot allow_read
   readAllow?: string[];      // custom mode only
   network: { mode: "off" | "proxy"; allowHosts: string[]; allowLocalPorts: number[] };
   capabilities: "none" | "reviewed";  // may the agent request a one-shot Capability (→ L3)?
-  hostExec: "never" | "human";        // may a HUMAN (L4, never L3) approve an unsandboxed run?
+  hostExec: "never" | "human";        // "human" is reserved and rejected throughout v1
   pty: boolean;
   env?: { passthrough?: string[] };  // extra host vars to forward, by exact name; user-global only
 }
 ```
 
-`hostExec` defaults to `"never"`. There is deliberately no `"reviewer"` value: nothing a model
-says can produce unsandboxed execution.
+`hostExec` defaults to `"never"`, and `"never"` is the only accepted value through v1. The
+reserved `"human"` schema value is rejected until a separately designed host-execution action
+exists. There is deliberately no `"reviewer"` value: nothing a model says can produce
+unsandboxed execution. A capability whose kind is `host` means one proxy destination in
+Phase 4; it never means host-process execution.
+
+Capabilities are canonicalized before review. Filesystem targets must be absolute after
+normalization, resolve beneath the denied object they are intended to satisfy, and may not be
+`/`, a home/state/credential/persistence ancestor, or any `immutableReadDeny` target. A
+capability is bound to the locked action hash and the concrete denied operation; a request
+cannot be used as a free-standing way to widen the profile.
 
 ### The child environment is built, not inherited
 
@@ -302,16 +323,20 @@ const CHILD_ENV_BASE = [
   `ANTHROPIC_*`, `GH_TOKEN`, `GITHUB_TOKEN`, `NPM_TOKEN`, `SSH_AUTH_SOCK`, `GPG_AGENT_INFO`,
   `KUBECONFIG`, `DOCKER_HOST`, `PI_*`. The list is the default `envDeny` in `$defaults` and
   can be extended, never shortened, below user-global.
-- `HOME` and `TMPDIR` are rewritten to the sandbox's view (`$TMPDIR` is a writable root; the
-  real home is not), and `PATH` is filtered to entries under read-allowed roots. Under
-  sandbox-runtime the child's `TMPDIR` is `/tmp/claude` (or `CLAUDE_CODE_TMPDIR`), which SRT
-  makes writable in every profile; pi-enclave advertises it as a writable root rather than
-  describe a narrower sandbox than the one in force, and denies every other SRT default
-  that is not a device node.
+- `TMPDIR` is pinned to the sandbox scratch path and `PATH` is filtered to absolute,
+  read-allowed, non-writable entries. Both each entry and its canonical symlink target are
+  checked; relative entries and directories beneath a writable root are removed so a
+  repository cannot substitute its own `git`, interpreter or build tool. The default is
+  `/tmp/claude`; ambient `TMPDIR` never grants write
+  authority. An SRT `CLAUDE_CODE_TMPDIR` / `CLAUDE_TMPDIR` override is accepted only when
+  its canonical target is already beneath a configured writable root, otherwise startup
+  refuses. `HOME` remains the real home for tool compatibility, while credential/state
+  subpaths are kernel-denied. Every other SRT write default that is not a device node is
+  explicitly denied.
 - **Provider credentials stay in the pi parent.** The reviewer call, the session model and
-  the egress proxy's credential masking all run in pi's process; nothing inside the sandbox
-  needs a credential to do the task, and if a task genuinely does (a deploy key for a
-  `git push` to an allowed host) that is what v2 proxy-side masking is for.
+  Phase-4 credential broker all run in pi's process; nothing inside the sandbox needs a
+  credential to do the task. Compatible clients may receive scoped substitution through a
+  TLS-terminating proxy; opaque CONNECT/SOCKS and certificate-pinned clients cannot.
 - The Docker backend builds the same `ChildEnv` into `docker exec -e`; it does not rely on
   the container having a clean environment by accident.
 
@@ -328,10 +353,10 @@ resolved-path checks in the pi process. Those checks run in a privileged process
 OS boundary, and are exposed to symlink and TOCTOU races (the agent can swap a path component
 for a symlink between the check and the `open`). Instead each backend's `fs()` dispatches
 every operation to a small **sandboxed helper** (`pi-enclave-fs`) that runs under the same
-compiled profile as `bash`: the helper is started by `backend.run`, speaks a length-prefixed
-JSON protocol over its stdio, and performs the actual `open`/`readdir`/`rg` call from inside
-the boundary. If the kernel denies it, the helper reports a `Violation` exactly as a shell
-command would.
+compiled profile as `bash`: the helper is started lazily on the first `backend.fs()` operation
+using argv prepared when the profile was compiled, speaks a length-prefixed JSON protocol over
+its stdio, and performs the actual `open`/`readdir`/`rg` call from inside the boundary. If the
+kernel denies it, the helper reports a `Violation` exactly as a shell command would.
 
 This also handles a concrete gap in pi's current `grep` tool: its operations object only
 abstracts the filesystem walk, while the tool itself still
@@ -386,10 +411,14 @@ with the workspace bind-mounted; each action is a `docker exec`.
   `readDeny` is trivially satisfied: the host home directory is never mounted.
 - **Network** — `--network none`, plus an optional sidecar proxy on a user-defined network
   for `proxy` mode.
-- **Caveats** — the toolchain must exist in the image (project-defined `Dockerfile`, or a
-  default). UID mapping is needed for file ownership. Startup is slower, amortized by the
-  session-long container. On macOS, Docker Desktop is a VM — actually *stronger* isolation
-  than Seatbelt, with slower I/O.
+- **Caveats** — the toolchain must exist in a trusted, digest-pinned image. A repository
+  `Dockerfile` is untrusted executable build input and is never built automatically. A
+  separately approved build uses a no-network, no-secret isolated builder, a minimal
+  allowlisted context, no SSH/socket mounts, no host Docker socket and no privileged
+  BuildKit entitlements; the resulting digest is what the session profile records. UID
+  mapping is needed for file ownership. Startup is slower, amortized by the session-long
+  container. On macOS, Docker Desktop is a VM — actually *stronger* isolation than
+  Seatbelt, with slower I/O.
 
 ### Later — microVM
 
@@ -404,18 +433,34 @@ It enforces `network.allowHosts`, logs every connection, and (v2) substitutes ma
 credentials on egress to allowed hosts only.
 
 The proxy is deliberately **deterministic and model-free**. It never consults the reviewer:
-a CONNECT request carries a destination but no evidence of *why*, and a model deciding in the
-connection path would be slow, evidence-blind and reachable by attacker-controlled hostnames.
-Instead, a denied connection is rejected synchronously (not dropped) and logged with the
-current action hash, so the tool output can name the host in its `<sandbox_violation>` block.
-The agent then retries with `allow_host=<host>` and the decision is made at L3, where the
-locked action, the requested host and the direct user authorization are all visible — see the
-[capability retry hatch](#the-capability-retry-hatch). A grant is one host for one action;
-a session-scoped host grant is a possible later option, user-global config only.
+a connection carries too little authorization evidence, and putting a model in the data path
+would make attacker-controlled hostnames part of the control path. Each sandbox invocation
+instead receives an unguessable, single-use proxy credential bound server-side to its locked
+action hash and effective host capability. Client-supplied hashes are audit labels only, not
+authorization. A denied connection is rejected synchronously and attributed through that
+credential, so concurrent actions cannot borrow one another's `allow_host` grants. The agent
+may retry with `allow_host=<host>`; L3 sees the locked action, exact destination and direct
+authorization. The resulting credential is one destination for one invocation and expires
+when that invocation exits.
 
-In `off` mode it is never started — the default for offline use. Local model endpoints
-(`localhost:11434` and friends) are reached by **pi itself**, not from inside the sandbox,
-so the sandbox needs no network at all for the agent to work.
+Destination enforcement canonicalizes IDNA, case, trailing dots, IPv4/IPv6 literals and
+ports before matching. The parent resolves the name, rejects loopback, link-local, private,
+multicast and cloud-metadata ranges unless an exact user-global rule permits them, and
+connects to the validated address rather than resolving again. Redirects repeat the full
+check. This pins policy to the actual connection and closes DNS rebinding.
+
+Credential substitution for HTTPS requires an explicit TLS-terminating HTTP proxy; an opaque
+CONNECT or SOCKS5 tunnel cannot inspect encrypted headers. The session CA private key stays
+in the parent, only its trust certificate is added to the invocation, and substitution rules
+are scoped by canonical host, port, method and path. Clients using certificate pinning are
+denied with a clear diagnostic rather than silently falling back to an opaque tunnel. SOCKS5
+never receives credential substitution. Plain CONNECT/SOCKS remains destination filtering
+only, and the UI states that distinction.
+
+In `off` mode the Phase-4 application proxy is not started — the default for offline use.
+SRT may still bind its internal loopback denial machinery, but its domain list is empty and
+the child has no external destination. Local model endpoints (`localhost:11434` and friends)
+are reached by **pi itself**, not from inside the sandbox.
 
 > [!WARNING]
 > **A domain allowlist is not an exfiltration control.** Allowing `github.com` lets a process
@@ -526,6 +571,10 @@ prose rule reaches an action a pattern `deny` already blocked.
 
 ### Configuration sources
 
+This table describes the schema after Phases 3–5. The Phase-2 parser implements the
+deterministic subset: native backend selection, `network.mode: "off"`, and no Docker image.
+Future fields are rejected rather than accepted and ignored.
+
 | Source | Location | May | May not |
 |---|---|---|---|
 | Built-in defaults | package | — | — |
@@ -548,7 +597,7 @@ the result must satisfy `effective ⊑ incoming` under a partial order defined p
 | `sandbox.writableRoots` | Subset, after resolution, and every added root must be inside the workspace |
 | `sandbox.readDeny` | Superset |
 | `sandbox.network.allowHosts` | Subset; `mode` may go `proxy → off`, never the reverse |
-| `sandbox.capabilities` / `hostExec` | `none ⊑ reviewed`, `never ⊑ human`; may only move left |
+| `sandbox.capabilities` / `hostExec` | `none ⊑ reviewed`, `never ⊑ human`; may only move left. `human` is reserved and rejected throughout v1. |
 | `rules.deny` / `rules.ask` / `rules.protectedPaths.*` | Superset |
 | `rules.skipReview` | Subset — user-global only; any project-file entry rejects the file |
 | `review.environment` / `hard_deny` / `soft_deny` / `allow` (the four prose lists) | **Immutable below user-global.** Prose has no partial order a merge can check: "append only" is a syntactic superset, not a semantic tightening, and a project-supplied string inside the reviewer prompt is the repo-to-reviewer injection path the threat model excludes. A project file that contains any of these four keys is rejected whole. `review.trigger` is the only `review` key a project may set. |
@@ -574,8 +623,10 @@ Any project-local field that would violate the order is not "clamped" — the wh
 rejected with a diagnostic and auto mode refuses to start, because a half-applied config is
 harder to reason about than none. The rule is a pure function with a property-based test
 (`merge(a, b) ⊑ a` for all `a`, `b`) that is part of the conformance suite. This is what
-makes it safe for `.pi/enclave.json` and `.pi/enclave.local.json` to live in a directory the
-sandboxed agent can write to: the worst the agent can do is tighten its own leash.
+makes repository configuration safe as data. The built-in L2 profile additionally keeps
+the workspace `.pi` directory read-only, because it also contains executable extensions;
+configuration monotonicity is defense in depth, not the reason executable project state is
+safe.
 
 The fold is only sound for fields with a checkable partial order. Prose has none, which is
 why the `review.*` lists follow Claude Code exactly: they are read from the user-global file
@@ -590,7 +641,36 @@ text the agent could have written.
 `rules.protectedPaths` is the path-shaped half of L1: `{ "deny": [glob…], "ask": [glob…] }`,
 matched against every resolved path the canonical action writes to (file tools directly;
 shell commands via the write-target heuristic, with the same "unknown means mutating"
-rule as the read-only classifier). Both lists are supersets under the fold.
+rule as the read-only classifier). Both lists are supersets under the fold. Because no
+static shell projection can see writes hidden in sourced scripts, interpreters, archives,
+project executables or build/package runners, those dispatch forms clear parse confidence
+and require a person. Inline environment assignments, shell dispatchers such as `trap` and
+`env -S`, CMake script/build entry points, and Git invocations with process-wide options
+are treated the same way; Git's documented global options are also stripped for matching so
+`git -C nested init`, `git -c … reset --hard`, and `git -C . push` still hit their built-in
+rules. The built-in executable persistence roots (`$WORKSPACE/.pi`, the active Git hooks
+directory, normal, bare and existing submodule repository config/hooks and worktree
+`.git` files, and any top-level `.git` gitfile) and credential
+roots are also `writeDeny` entries in L2. Before compiling the sandbox, the trusted parent
+asks Git for its effective configuration, recursively follows both `include.path` and every
+reachable `includeIf.*.path`, and protects each config origin and each possible
+`core.hooksPath` that lies in a writable root. Submodule worktrees are cross-checked against
+their real, singly-linked `.git` gitfiles and `.gitmodules`; that mapping remains authoritative
+when `core.worktree` is absent. `/dev/null` remains the explicit hook-disable value. Existing
+protected configs, gitfiles and hook trees must be real, singly-linked files/directories—
+symlink and hard-link aliases fail closed. Ordinary Git index, object and ref updates remain
+writable.
+
+The Linux backend materializes absent deny mount points before wrapping a process. In a
+non-Git workspace this creates an inert `.git/` skeleton containing only protected empty
+`config` and `hooks` anchors, because bubblewrap cannot mount a denial over a missing parent.
+Agent-driven Git operations that create or relocate metadata (`init`, `clone`, worktree
+`add`/`move`/`repair`, and submodule `add`/`update --init`/`absorbgitdirs`) remain
+deterministically denied; a person can perform them outside the agent sandbox so the next
+session compiles their persistence paths. If a configured include or hook path has
+an absent or symlinked parent that cannot be mounted safely, profile compilation fails
+closed. L1 improves diagnostics and handles `ask`; it is never the sole enforcement of a
+non-overridable persistence denial.
 
 ```json
 {
@@ -647,9 +727,11 @@ rule as the read-only classifier). Both lists are supersets under the fold.
 ```
 
 `rules.*` matching runs against the canonical action, not raw text: shell commands are
-tokenized (pipelines, `&&` and subshells split, each simple command matched) and paths are
-resolved. This is the same heuristic both existing extensions use; v2 can swap in a real
-shell parser without changing the rule format. `review.*` entries are never matched — they
+tokenized (pipelines and connectors split, each simple command matched) and paths are
+resolved. Directory changes, interpreters/scripts, archive extraction, pathname expansion,
+and parameter-expanded arguments are deliberately non-confident and therefore never
+fast-pathed. This remains a heuristic; a real parser can replace it without changing the
+rule format. `review.*` entries are never matched — they
 are spliced, in order, into the reviewer prompt. `"$defaults"` in any list splices the
 built-in entries at that position; omitting it takes full ownership of that list, and
 `pi enclave rules defaults` prints what is being given up.
@@ -695,9 +777,9 @@ mutating, so that predicate is a policy contract, not an implementation detail:
 `pi enclave …` **is not possible**: pi 0.84.2's subcommand set is closed (`install`,
 `remove`, `update`, `list`, `config`, `auth`) and any other bare word on its command line
 becomes a prompt for the model, so `pi enclave approve` would ask the agent to do something
-called "enclave approve". The commands ship as their own `pi-enclave` binary, and every one
-is mirrored in-session as `/enclave …`. Both call the same functions with different input
-and output adapters, so the two cannot drift.
+called "enclave approve". Out-of-session commands ship as their own `pi-enclave` binary.
+Read-only inspection is also available through `/enclave …`, but approval intentionally is
+not: the decision must happen outside the session the agent is driving.
 
 | Command | Does |
 |---|---|
@@ -780,8 +862,12 @@ rules end in `deny` or `ask` before L3 exists.
   unfiltered; automode already excludes them — pi-enclave follows automode.
 - **Output:** strict JSON, fixed key order —
   `{"decision":"allow"|"deny"|"ask","risk":"low"|"medium"|"high"|"critical","reason":"…"}`.
-  Consistency rules borrowed from guardian: `allow` with `critical` is a parse failure, and
-  `allow` with `high` requires a `direct` authorization entry to be present.
+  The model's `risk` is advisory and can only raise the result. Code computes a
+  deterministic `minimumRisk` from tool class, requested capability, target breadth,
+  protected/credential ancestry and destructive flags, then evaluates consistency against
+  `max(modelRisk, minimumRisk)`. `critical` can never be allowed; effective `high` requires
+  direct authorization that deterministically covers this action. A model cannot emit
+  `allow` plus `low` to bypass those requirements.
 - **Two-stage for small models** (from automode): a one-token gate ("does the direct
   authorization plausibly cover this action? 0/1"), then the structured decision. This keeps
   the total prompt under roughly 2k tokens, so a local model answers in seconds.
@@ -837,22 +923,50 @@ When a command fails on a sandbox violation, the agent sees this appended to the
 ```
 
 A retry carrying a capability request (`allow_write`, `allow_read`, `allow_host`) is a
-boundary crossing: it always goes to L3. A reviewer `allow` re-runs **exactly that hash,
-once, inside the sandbox**, under the base profile extended by exactly that one capability
-(`backend.extend`). `ask` escalates to L4; `deny` counts toward the breaker.
+boundary crossing. In Phase 2, a write request goes directly to L4; on Linux a human
+approval is applied to one bash invocation, while macOS refuses Bash widening because
+Seatbelt cannot prevent a deliberately detached descendant from retaining the profile.
+Read and host requests are refused. In Phase 3 and later, supported requests always go to
+L3. A reviewer `allow` re-runs **exactly that hash, once, inside the sandbox**, under the
+base profile extended by exactly that one capability (`backend.extend`). `ask` escalates to
+L4; `deny` counts toward the breaker.
+
+The Phase-2 write path cannot intersect an immutable read-deny or write-deny root in either
+direction: granting a child of a masked credential directory would re-bind real host content
+over Linux's read-deny tmpfs, while granting an ancestor would lift the whole boundary. The
+gate rejects read-deny intersections before asking, and both the in-session backend and the
+standalone approver repeat the complete read/write-deny check. A grant that could create or
+replace any executable in a host `PATH` directory is refused for the same reason.
+
+`backend.extend` is invocation-scoped: SRT receives a `customConfig` on the one
+`wrapWithSandboxArgv` call, and a filesystem capability uses an ephemeral helper created
+for that action. It never calls the process-global `SandboxManager.updateConfig`, and the
+base helper is never reused for a widened profile. Conformance runs overlapping ordinary
+and capability-bearing read/write/host actions and proves that no sibling inherits the
+grant.
+
+`allow_read` can lift only a user-configured, explicitly grantable denial. The built-in
+credential, keychain, authentication and pi-enclave state roots form
+`immutableReadDeny`; neither L3 nor L4 can remove them. A task that genuinely needs such a
+secret must use a purpose-built broker that keeps the value outside the sandbox, not read
+the credential into agent-controlled memory.
 
 What the hatch is *not*: there is no `unsandboxed=true`. An earlier draft of this document
 had one, and the threat model then contradicted itself — it claimed the sandbox bounded a
 mistaken reviewer allow while letting a reviewer allow remove the sandbox. A prompt-injected
-local model would have been one `allow` away from the host. Host execution is a **human-only**
-decision (`hostExec: "human"`), requested through the same hatch with `host=true`, surfaced
-only via `ctx.ui.confirm` in a verified attended session, and never possible unattended.
-`hostExec: "never"` (the default, and mandatory for ops) removes even that; it is the
-equivalent of Claude Code's `allowUnsandboxedCommands: false`.
+local model would have been one `allow` away from the host. v1 therefore accepts only
+`hostExec: "never"`. If host execution is ever added, it must be a distinct canonical action,
+must require a verified L4 decision, and must never reuse the Phase-4 network `host`
+capability.
 
 The reviewer is also shown the *capability*, not just the command, and the capability is
 part of the locked hash: an `allow` for `allow_write=/Users/m/.zshrc` cannot be replayed for
 `allow_write=/Users/m/.ssh/authorized_keys`.
+
+Phase 3 does not cache verdicts. A later cache requires the complete canonical input,
+tool-registration identity, direct-authorization evidence, model/prompt/corpus/config
+hashes, effective minimum risk and exact capability target in its key; omission of any one
+turns a performance feature into an authorization replay surface.
 
 ### Attendance is a setting, not an inference
 
@@ -928,31 +1042,37 @@ in the workspace, which the sandboxed agent can write to.
 | Location | `~/.pi/agent/enclave/state/<session-id>/pending/<nonce>.json`, under the extension's own state directory. That directory is in the default `readDeny` list and is never a writable root in any profile; the monotonic rule forbids a project from adding it. |
 | Permissions | Directory `0700`, file `0600`, owned by the pi user. A record with any other mode or owner is refused on read. |
 | Atomicity | Written to `<nonce>.json.tmp` in the same directory, `fsync`, then `rename`. A partial file is never observable. |
-| Content | The **full canonical action** — tool, argv, cwd, env subset, resolved paths, requested capability, and the profile it was evaluated against — not just a hash. The approver sees what will run; a hash would force them to trust whatever the agent put in the workspace. The canonical hash is included and re-verified on resume. |
-| Session binding | `sessionId`, the pi session file path, and the hash of the session's config snapshot. Approval in one session cannot be replayed in another. |
+| Content | The **full canonical action** — tool, complete executor input, cwd, resolved paths, requested capability, and the profile it was evaluated against — not just a hash. Child environment values are rebuilt from the current approved configuration at execution time; secrets are never persisted here. Executor-observable input property order is preserved in the hash, approval display and pending record. The independently observed `sourceInfo.path` for the registered tool is persisted too. The approver sees what will run; a hash would force them to trust whatever the agent put in the workspace. The canonical hash is included and re-verified on resume. |
+| Session binding | `sessionId`, the pi session file path, and the configuration hash recorded as audit evidence. The record is found only within its named session state directory; its action hash and nonce cannot be replayed as another action. |
 | Nonce | 128-bit random, in the filename and the body. The resume command must present it. |
-| Expiry | `expiresAt`, default 24 h from creation. Expired records are refused and deleted. |
+| Expiry | `expiresAt`, default 24 h from creation. Expired records are refused and deleted; freshness is checked again after an interactive prompt and after sandbox compilation, immediately before execution. |
 | Single use | On resume the record is atomically renamed to `approved/` before execution, then to `consumed/` after. A second resume with the same nonce is a no-op with an audit entry. |
-| Approval | `pi enclave approve <nonce>` displays the canonical action and asks for confirmation *in that terminal*; or, for the `rpc` attendance mode, an `enclave/approve` request over the verified channel. There is no way to approve by editing the file. |
+| Approval | `pi-enclave approve <nonce>` displays the canonical action and asks for confirmation *in that terminal*. `/enclave pending` is deliberately read-only, and no RPC approval method exists yet. There is no way to approve by editing the file. |
 
 On resume, the action is re-canonicalized from the record and the hash is compared. Then
-the **current** effective profile is recompiled from the configuration as it is *now*, and
+the **current** effective profile is loaded from the recorded action's working directory
+(not the directory from which the approval CLI happened to be invoked), recompiled from the
+configuration as it is *now*, and
 the resume proceeds only if:
 
 - the current policy still reaches the same decision point (a rule added in the meantime
   denies; a record cannot bypass it), and
+- the current tool grant still authorizes the recorded implementation identity (a newly
+  added source pin fails closed for a legacy record that has no independent source evidence),
+  and
 - the recompiled profile is **equal to or narrower than** the snapshot in the record under
   the [monotonic order](#monotonic-configuration-rule) — a writable root, a host grant, a
   capability or a `readDeny` relaxation that the user has since removed is simply not there
   any more.
 
 If the current profile is *wider* than the snapshot (the user loosened config after the
-record was written), or if the config hash differs in any field the order does not cover,
-the resume is **refused** with a diagnostic and the record is left in `pending/`; the user
-re-runs the task. The action never executes under the recorded profile — the snapshot is
-evidence for the approver and an upper bound for the check, not an execution input.
-Execution is sandboxed unless the record explicitly carries a human `hostExec` approval
-*and* the current profile still has `hostExec: "human"`.
+record was written), the resume is **refused** with a diagnostic and the record is left in
+`pending/`; the user re-runs the task. The stored configuration hash is audit evidence, not
+a blanket equality check: safe narrowing is intentionally allowed, while explicit policy,
+tool/source, capability-revocation and partial-order checks are authoritative. New fields
+must be added to those comparisons before their schema is accepted. The action never executes
+under the recorded profile — the snapshot is evidence for the approver and an upper bound
+for the check, not an execution input. Every resumed action remains sandboxed.
 
 ### Outcome matrix
 
@@ -960,7 +1080,7 @@ Execution is sandboxed unless the record explicitly carries a human `hostExec` a
 |---|---|---|---|
 | Reviewer returns `ask` | `ctx.ui.confirm` showing the canonical action and reason, raced against `confirmTimeoutMs`; timeout = deny | Deny, `terminate`, write a [pending-approval record](#pending-approval-records) |
 | Reviewer returns `allow` on a capability request | Re-run the locked hash once under the extended profile, still sandboxed | Same |
-| Agent requests host execution | Only if `hostExec: "human"`: treated as `ask`, never sent to the reviewer | Deny; write a pending-approval record marked `requiresHuman` |
+| Agent requests host execution | Refused: v1 accepts only `hostExec: "never"` and defines no host-execution action | Same |
 | Reviewer timeout or error | Retry ×3 with backoff, then treat as `ask` | Retry ×3, then deny and terminate (counts as adverse for the breaker) |
 | Reviewer output unparsable | Deny — fail closed. Never re-prompt the reviewer with "fix your JSON"; that is an injection vector. | Same |
 | Breaker opens | `block` + `terminate`, plus a steer message naming the denied *outcome*. Resets on the next direct user input. | Same |
@@ -978,7 +1098,7 @@ trips, attendance changes, and pending-approval lifecycle events.
 | Location | `~/.pi/agent/enclave/audit/<session-id>.jsonl` — same extension-owned, `readDeny`-listed directory as the state. Never the workspace. |
 | Permissions | Directory `0700`, file `0600`, opened `O_APPEND`. |
 | Integrity | Each record carries `seq` (monotonic per session) and `prevHash` (SHA-256 of the previous line), so truncation or edits are detectable by `pi enclave audit verify`. Not tamper-*proof* against root; tamper-*evident* against the agent and against accidents. |
-| Redaction | Argument values matching the `readDeny` path list, anything shaped like a credential (`AKIA…`, `ghp_…`, `-----BEGIN`, `Authorization:` headers) and the bodies of `write`/`edit` tool calls are replaced by `<redacted:sha256:…>` before writing. The hash lets an investigator confirm a value without the log storing it. The full canonical action is in the record only for pending-approval events, where the approver needs it. |
+| Redaction | Argument values matching the `readDeny` path list, anything shaped like a credential (`AKIA…`, `ghp_…`, `-----BEGIN`, `Authorization:` headers) and the bodies of `write`/`edit` tool calls are replaced by `<redacted:sha256:…>` before writing—including when an action description is embedded in a denial reason. The hash lets an investigator confirm a value without the log storing it. The full canonical action is in the record only for pending-approval events, where the standalone approval boundary renders it completely and with terminal controls escaped. |
 | Retention | Default 30 days or 200 MB per user, whichever first; configurable in the user-global file only. |
 | Rotation | Per session file; sessions older than retention are deleted on session start. No in-session rotation, so `prevHash` chains stay unbroken. |
 | Reading | `pi enclave audit [--session <id>] [--since …] [--json]`; also surfaced in `/enclave violations`. |
@@ -988,7 +1108,10 @@ trips, attendance changes, and pending-approval lifecycle events.
 Taken from guardian: open after 3 consecutive adverse outcomes in a turn, or 10 adverse
 outcomes in the last 50 batches. Denials, timeouts, failures and sandbox violations on retry
 all count. A batch of parallel tool calls collapses into a single outcome, so one denied
-batch does not trip it.
+batch does not trip it. Owned operations re-check the breaker at execution time. Because pi
+has no equivalent execution hook for third-party tools, the gate conservatively withholds a
+later non-owned sibling when an earlier owned call could produce the runtime-only strike
+that opens the breaker.
 
 ---
 
@@ -1005,8 +1128,9 @@ rather than widen the sandbox**.
 
 **Sandbox shape**
 
-- Mode `custom`: `writableRoots` are the exact config trees in scope (`/etc/nginx`,
-  `/etc/systemd/system`, `/var/lib/app`), and nothing else.
+- Mode `custom`: `writableRoots` contain only the workspace and an unprivileged staging
+  directory. Host configuration and service-state trees (`/etc/nginx`,
+  `/etc/systemd/system`, `/var/lib/app`) are read-only or absent inside the sandbox.
 - `readDeny` keeps `/etc/shadow`, `/root`, key material, and other services' secrets out.
 - `network.mode: "proxy"` with `allowHosts` set to the hosts this runner manages; `off` when
   operating on a single host.
@@ -1015,13 +1139,16 @@ rather than widen the sandbox**.
 **Narrow tools instead of raw bash**
 
 - `service(unit, start|stop|restart|reload|status)` — allowlisted units.
-- `apply_config(path, content)` — writes with backup and diff, validates (`nginx -t`),
-  reloads, and rolls back on failure. Only paths under `writableRoots`.
+- `apply_config(path, stagedPath, digest)` — the agent writes content only to staging; the
+  broker verifies the digest, writes with backup and diff, validates (`nginx -t`), reloads,
+  and rolls back on failure. Targets are exact broker-configured roots, never sandbox
+  `writableRoots`.
 - `ssh(host, argv)` — hosts from config, keys constrained with `command=` and `restrict` in
   `authorized_keys`.
-- `bash` remains available but read-only by policy (`rules.deny` on writes and sudo). The
-  narrow tools are the only mutation path, and each is `reviewed: true` for anything that is
-  not idempotent.
+- `bash` remains available, but L2 exposes privileged targets read-only or not at all.
+  Pattern rules improve diagnostics; they are not what makes bash read-only. The narrow
+  tools are the only mutation path, and each is `reviewed: true` for anything that is not
+  idempotent.
 
 ### The privilege boundary: a broker, not `sudoers`
 
@@ -1055,10 +1182,23 @@ which takes two things:
    and **is never bound into any sandbox**: Seatbelt denies `network-outbound` to that path,
    bwrap's network namespace and a `--tmpfs /run/pi-enclave` mask hide it, and the Docker
    backend simply does not mount it. The broker accepts a small typed protocol
-   (`{ op: "service", unit, verb }`, `{ op: "apply_config", path, content }`), validates every
-   argument against *its own* copy of the allowlist (it does not trust the pi process either),
-   and refuses anything else. Each request carries the locked action hash and the session ID,
-   and the broker writes its own audit line.
+   (`{ op: "service", unit, verb }`, `{ op: "apply_config", path, stagedPath, digest }`),
+   validates every argument against *its own* copy of the allowlist, and refuses anything
+   else. It verifies `SO_PEERCRED`, issues a per-session secret only to the configured pi uid,
+   and requires a single-use MAC over the request, locked action hash, session ID and nonce.
+   The hash/session are identifiers and audit correlation, not authentication by themselves.
+   Under this project's stated model the pi process is trusted; the independent validation
+   and MAC limit accidental misuse and same-group socket clients rather than pretending to
+   contain a compromised pi process.
+
+   `apply_config` pre-opens allowlisted target directories and resolves names descriptor-
+   relatively (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+   RESOLVE_NO_MAGICLINKS`, or a fail-closed equivalent). It rejects hard-link/symlink and
+   mount escapes, locks each target, validates the staged file, writes a same-directory
+   temporary file, preserves configured owner/mode, `fsync`s file and directory, atomically
+   renames, validates the installed configuration, and rolls back with the same procedure.
+   Service calls use a fixed unit/verb-to-argv table; SSH uses fixed hosts, pinned host keys
+   and forced-command argv templates—never a shell string supplied by the agent.
 
    The `service`, `apply_config` and `ssh` tools are therefore thin clients of the broker,
    called from the pi process — which, by the [non-goals](#non-goals), is the trusted process
@@ -1161,11 +1301,20 @@ document, and what it does not cover.
 *Outcome: mutations and boundary crossings get a model opinion, and small local models are admitted only
 after passing the eval.*
 
-- Structured-evidence prompt, two-stage flow, `allow`/`deny`/`ask`, capability retry hatch
-  and `backend.extend`.
+- Structured-evidence prompt, two-stage flow, `allow`/`deny`/`ask`, and the capability retry
+  hatch. Phase 2 already supplies a one-shot Linux bash write through SRT `customConfig`
+  (macOS refuses until it has an unescapable lifetime boundary); Phase 3 generalizes the
+  invocation-scoped mechanism to reviewed read grants and ephemeral file helpers without
+  mutating process-global configuration or adding a verdict cache.
+- Immutable credential/state read denials, canonical capability-target validation,
+  deterministic minimum risk, complete-input/tool-identity binding, and overlapping-action
+  isolation conformance tests.
 - Prose rulebook (`review.environment` / `hard_deny` / `soft_deny` / `allow`) rendered into
   the system prompt with the four-tier precedence; `review.trigger`; read-only classification
   for the fast path; `pi enclave rules critique`.
+- The read-only classifier is conservative: unknown or multi-effect actions are mutating.
+  Model evidence remains provenance-labelled untrusted input; deterministic hard denials and
+  minimum risk are applied after the model result and cannot be lowered by it.
 - Eval corpus, `eval-reviewer` command, qualification records; publish results for local
   models (Qwen3, Gemma, gpt-oss, Llama) and cloud ones.
 
@@ -1175,17 +1324,24 @@ after passing the eval.*
 
 *Outcome: allowlisted network for online use; Windows and locked-down Linux hosts.*
 
-- CONNECT/SOCKS5 proxy, per-host allowlist, credential masking, `allow_host` capability.
-- Session container lifecycle, project `Dockerfile` support, UID mapping; Docker passes the
-  conformance suite.
+- Per-invocation authenticated proxy grants; canonical DNS/address checks and rebinding-safe
+  connects; explicit TLS termination for scoped HTTPS credential substitution; destination-
+  only CONNECT/SOCKS5; `allow_host` capability with canonical host and port. Redirects repeat
+  destination validation; opaque tunnels never receive credential substitution.
+- Session container lifecycle, trusted digest-pinned images, separately approved offline
+  untrusted-Dockerfile builds, UID mapping; Docker passes the conformance suite.
 
 ### Phase 5 — Ops profile
 
 *Outcome: unattended server management on an offline host.*
 
 - `pi-enclave-broker`, its protocol and conformance tests; exec-denial clauses per backend.
-- `custom` sandbox mode, the `service` / `apply_config` / `ssh` tools, plus `sudoers` (for
-  the broker user) and `authorized_keys` templates and documentation.
+- Broker-only privileged mutations, peer credentials and one-shot request MACs, descriptor-
+  relative atomic config installation/rollback, fixed service/SSH argv tables, and a separate
+  broker uid. No broad agent-facing sudo rule is permitted.
+- `custom` sandbox mode with unprivileged staging only, the `service` / `apply_config` /
+  `ssh` tools, plus `sudoers` (for the broker user) and `authorized_keys` templates and
+  documentation.
 
 ### Platform matrix
 
@@ -1233,12 +1389,14 @@ sandbox's, so a green row on a restricted host is not read as stronger evidence 
 | Read `~/.ssh/id_ed25519` (`bash`, `read`, `grep`, `find`) | Violation | 1 | C2, C2b, F1 |
 | **Symlink race**: create `ws/link → ~/.ssh` after canonicalization, then `read ws/link/id_ed25519` | Violation — the helper's `open` is denied regardless of what pi resolved | 1 | C3, F3 |
 | **Symlink write**: `ws/out → /etc/passwd`, then `write ws/out` | Violation | 1 | C4, F2 |
+| Interpreter/archive writes `$WORKSPACE/.pi/extensions` inside a writable workspace | Violation from L2 `writeDeny`; static shell inference is not the boundary | 1 | C15 |
+| Rename a writable ancestor of a protected Git config/hook leaf, recreate the original tree, then write a hook | Ancestor displacement or replacement write is denied by the native backend | 1 | C16 |
 | `curl`, `nc`, `python -c "socket…"`, DNS lookup | Violation (`off` mode) | 1 | C5 |
 | Spawn a PTY (`vim`, `less`), Python multiprocessing, `git worktree` outside cwd | Works / violation as configured. **Linux:** bubblewrap cannot deny PTYs, so `allowPty: false` is not enforceable there and the compiled profile reports `pty on` | 1 | C6 |
 | Script that calls `sudo` / `su` / `systemctl` | Violation, not a policy denial | 1 | C7 |
 | **IPC sockets**: connect to `/var/run/docker.sock`, `~/.gnupg/S.gpg-agent`, `$SSH_AUTH_SOCK`, the broker socket, an X11/Wayland socket | Violation; `allowUnixSockets` is not exposed in the dev profile | 1 | C8 |
 | **Tool ownership**: another extension provides `bash` or a file tool. pi keeps the **first** extension's registration, so the hazard is one loaded *before* pi-enclave, not after | Auto mode refuses to start, naming the extension that owns the tool. A handler loaded *after* pi-enclave cannot mutate a frozen input; one loaded before is inside the trusted-extension boundary, and `tool_call_final` is tracked in [core changes](#core-changes-to-propose-to-pi) | 2 | P1 |
-| **Parallel batch termination**: three tool calls in one batch, the second trips the breaker | No call from that batch executes after the trip, `terminate` fires once, the audit log shows one batch outcome. pi prepares every call in a batch before executing any of them, so blocking cannot un-prepare a sibling — the operations objects re-check the breaker at execute time | 2 | P2 |
+| **Parallel batch termination**: three tool calls in one batch, the second trips the breaker | No owned call from that batch executes after the trip, `terminate` fires once, and the audit log shows one batch outcome. pi prepares every call before execution, so owned operations re-check at execution time; a non-owned sibling is withheld during preparation when a preceding owned call could trip the breaker only at runtime | 2 | P2 + unit batch-risk regressions |
 | **Crash / recovery**: kill pi mid-action, resume the session | The breaker state is restored from session entries; a half-written pending record is invisible (atomic rename); the audit chain verifies up to the last complete line; the helper and any container are reaped (`--die-with-parent`, `--rm`) | 2 | P3 |
 | Project-local config that selects a wider profile / adds `rules.skipReview` or `review.allow` / adds a trust entry to `review.environment` / changes the reviewer | Whole file rejected, auto mode refuses to start, diagnostic names the field | 2 | P4 |
 | Project-shared or project-local config contains any of `review.environment` / `hard_deny` / `soft_deny` / `allow` (even an empty list, and even a `soft_deny` that reads as tightening) | Whole file rejected, auto mode refuses to start, diagnostic names the key; presence is the test, and the value is never examined | 2 | P5 |
@@ -1250,7 +1408,7 @@ sandbox's, so a green row on a restricted host is not read as stronger evidence 
 | Reviewer `allow` on `allow_write=X`, then the same hash replayed with `allow_write=Y` | Second request is a fresh L3 review, not a replay | 3 | — |
 | Pending record edited on disk, or mode changed to `0644`, or nonce reused, or a nonce containing a path | Refused with an audit entry | 2 | P10 |
 | **Environment leak**: provider keys set in the pi process; `env`, `$VAR` expansion, `os.environ`, `/proc/self/environ` inside the sandbox | None of the values appear; a `passthrough` entry matching `envDeny` is rejected at config load | 1 | C9 |
-| **Stale resume**: pending record written, user then removes a writable root / re-adds a `readDeny` entry / loosens config; `pi-enclave approve` | Narrower config: executes under the *current* profile and the removed grant is absent. Wider config or uncovered hash change: refused, record stays pending | 2 | P11 |
+| **Stale resume**: pending record written, user then removes a writable root/tool grant, disables capabilities, re-adds a `readDeny`, or loosens config; `pi-enclave approve` | Safe narrowing executes under current policy; a revoked tool/capability or wider config is refused and remains pending | 2 | P11 |
 
 ---
 
@@ -1270,7 +1428,26 @@ do, which differs from each other more than the design assumed.
   `open` and `readdir` calls happen inside the boundary rather than in the pi process.
 - **`grep` keeps pi's tool and replaces only `execute`.** Its operations object cannot
   redirect the `rg` spawn, so without this a search over a credential directory would read
-  it with the user's full privileges whatever profile was in force.
+  it with the user's full privileges whatever profile was in force. Search output is bounded
+  per request; complete parent-side grep executions (including parsing and context reads)
+  are serialized, the helper admits one potentially large response at a time, and response
+  framing honors stdout backpressure before allocating the next frame.
+- **Executable project state is an L2 denial.** The workspace `.pi` root, Git hooks/config,
+  and submodule worktree gitfiles (including gitfile-inferred worktrees) are
+  read-only inside an otherwise writable workspace, so an interpreter, archive or build
+  script cannot plant code for a later privileged Pi/Git launch. Credential read-deny roots
+  are write-denied too.
+- **Scratch authority is explicit.** Ambient `TMPDIR` never enters the profile; SRT-specific
+  overrides are accepted only when already contained by a configured writable root, and the
+  selected path is pinned into the child environment.
+- **Credential roots follow XDG configuration.** An absolute `XDG_CONFIG_HOME` adds its
+  `gh` and `claude` stores to the read/write denials without dropping the conventional
+  `~/.config` locations; a relative XDG root is not exported to sandboxed children.
+- **Action processes have a lifecycle boundary.** Commands run in their own process group,
+  and ordinary background descendants in that group are killed when the foreground action
+  exits instead of surviving the completed tool call. A macOS process can deliberately
+  escape that group with `setsid`/`setpgid`, so Bash write capabilities fail closed there;
+  Linux contains them with bubblewrap's PID namespace and `--die-with-parent`.
 - **`probe()` fails closed** on an unsupported pi (in *either* direction), a missing
   backend binary, or a host that cannot give bubblewrap capability-bearing user namespaces.
   That last check runs the real chain rather than inferring from a sysctl, because inside a
@@ -1304,13 +1481,17 @@ change the I/O path.
 ### Known gaps
 
 - **MCP and third-party tools are not sandboxed.** They execute in the pi process with the
-  user's privileges. Closing this needs either the policy layer's tool allowlist (phase 2)
-  or an execution hook in pi core.
-- **On Linux, a denied read through `bash` is invisible.** Deny-read is a tmpfs overlay, so
-  the shell reports `ENOENT` and no violation event is emitted. Enforcement holds — the
-  agent does not get the file — but pi-enclave cannot tell it apart from a typo. The file
-  tools are unaffected: the helper sees the real errno and classifies it against the profile.
-  A denied `grep` on Linux likewise returns "no matches" rather than a denial.
+  user's privileges. Phase 2 denies them by default, source-pins explicit grants, and closes
+  the runtime-breaker batch window conservatively; true sandboxing still needs an execution
+  hook in pi core.
+- **On Linux, a denied read through `bash` has no native event.** Deny-read is a tmpfs
+  overlay, so the shell reports `ENOENT`. When a hash-locked bash action explicitly names a
+  reachable configured read-deny target, pi-enclave records conservative attempt evidence
+  so retries count toward the breaker even when `|| true` suppresses the exit or the same
+  command also has a write destination. It still cannot distinguish a missing file beneath
+  that target from a denied existing file, or classify an indirect read. The
+  file tools are unaffected: the helper sees the real errno and classifies it against the
+  profile. A denied `grep` on Linux likewise returns "no matches" rather than a native event.
 - **`enableWeakerNestedSandbox` exists for containers**, where capability-bearing user
   namespaces are unavailable. It skips `--cap-drop ALL`, leaving the sandboxed process with
   a full capability set. It is an explicit opt-in, never inferred, and appears in the status
@@ -1328,6 +1509,13 @@ change the I/O path.
 - **`rg` and `fd` must be on `PATH`.** pi fetches them into its own directory on demand, and
   the helper has no network to do the same; pi-enclave resolves them before the sandbox
   starts, but cannot find what pi downloaded. `probe()` warns when they are absent.
+- **The host `PATH` is part of the startup boundary.** Every entry must be absolute and
+  outside configured writable roots; launching through a repository-local `node_modules/.bin`
+  (including ordinary `npm`/`npx` PATH injection) is refused. Canonical executable targets
+  are checked too, so a safe-looking directory cannot symlink `bwrap` into the workspace.
+  Configurable helpers are pinned into SRT, the shell is fixed to `/bin/bash`, and a one-shot
+  write grant is rechecked against every host lookup directory so it cannot plant a helper
+  for the next action.
 - **One profile at a time.** sandbox-runtime's manager is process-global, so only the most
   recently compiled profile is in force. The backend refuses to run against a stale one
   rather than silently applying the newer.
@@ -1349,15 +1537,19 @@ does not do. The [Phase 2 plan](docs/phase-2-plan.md) records how each step was 
   `b`, `merge(a, b)` is either rejected or at most as permissive as `a`. Five sources,
   `$defaults` splicing, whole-file rejection with the field named.
 - **The action lock**: guardian's deep-freeze plus a canonical hash and an execute-once
-  table. A later extension mutating `event.input` throws, and pi does not catch it, so the
-  tool never runs.
+  table. The hash always includes the complete executor input, including observable property
+  order, as well as semantic projections; approval text renders that same ordered input.
+  A later extension mutating
+  `event.input` throws, and pi does not catch it, so the tool never runs.
 - **The circuit breaker**, collapsed per turn, surviving a resume, and tripping with
   `terminate` + `ctx.abort()` + a message naming the *outcome*.
 - **Attendance** as an explicit contract with an RPC handshake, and **pending approval
   records** with an atomic write, a single-use lifecycle, and a resume that re-derives the
-  hash, re-runs L1, and refuses a configuration wider than the one approved.
-- **A hash-chained audit log** with redaction and `verify`, in a `0700` state directory
-  checked for mode, owner and symlink on every open.
+  hash, re-runs L1 and the current tool/capability grants, and refuses a configuration wider
+  than the one approved.
+- **A hash-chained audit log** with redaction and `verify`, under a state-directory hierarchy
+  checked for mode, owner and symlinks when opened. Audit files are created `0600`; unlike
+  pending records, an existing audit file is not yet independently revalidated on every open.
 - **The `pi-enclave` binary**, mirrored as `/enclave …` in-session.
 
 ### What building it corrected in this document
@@ -1371,7 +1563,7 @@ quietly absorbs its own corrections teaches nobody anything.
 | An extension registering `bash` *after* pi-enclave is the hazard | Across extensions the **first** registration wins; a later one is ignored | The check is *ownership* — is every sandboxed tool ours? — not load order. The dangerous extension loads **before** us |
 | Blocking the calls after a breaker trip stops the batch | A batch's `tool_call` events all complete **before any tool executes** | A call gated before the trip is already prepared. Every operations object pi-enclave owns re-checks the breaker at execute time |
 | Guardian's `tool-input-lock.ts` can be ported as-is, hash included | Guardian has no hash, no canonical snapshot and no execute-once | The freeze ports; the canonical action, its hash and the lock table are new design |
-| `pi enclave approve …` | pi's subcommand set is closed; any other bare word becomes a prompt | A `pi-enclave` binary, mirrored as `/enclave` |
+| `pi enclave approve …` | pi's subcommand set is closed; any other bare word becomes a prompt | A `pi-enclave` binary; read-only inspection is mirrored as `/enclave`, while approval stays CLI-only |
 | "MCP and custom tools" | pi 0.84.2 has no MCP at all | The allowlist covers third-party extension tools, and grants may pin `source` |
 | An untrusted repo-local extension is the refusal case | pi does not load project extensions from an untrusted project | The refusal is for a **trusted** project whose `.pi/extensions` the agent can write |
 | `PI_ENCLAVE_AUTO=off` "refuses to enter auto mode at all" | — | It clears L1 and L4 and **never** the sandbox |
@@ -1384,10 +1576,10 @@ quietly absorbs its own corrections teaches nobody anything.
   exactly what the canonical hash exists to prevent. An `edit` record is refused with that
   explanation and left pending; re-run the task instead.
 - **The shell tokenizer is a heuristic.** It records what it cannot follow — command and
-  process substitution, backticks, heredocs, `eval`, `xargs`, `sh -c`, an unbalanced quote
-  — and a non-confident parse escalates to a person rather than being trusted. That is the
-  safe direction, and it means a repository full of `$(...)` will ask more often. A real
-  parser (tree-sitter-bash) remains the v2 answer.
+  process substitution, backticks, heredocs, `eval`, `xargs`, scripts/interpreters, archive
+  extraction, directory changes, parameter/pathname expansion and unbalanced quotes — and
+  a non-confident parse escalates rather than being trusted. L2, not this heuristic, denies
+  executable persistence paths. A real parser (tree-sitter-bash) remains the v2 answer.
 - **A `tool_call` handler in another extension is invisible.** pi exposes no API to
   enumerate extensions or handlers. One loaded after pi-enclave cannot change a frozen
   input; one loaded before is inside the trusted-extension boundary the threat model
@@ -1439,7 +1631,8 @@ These are accepted, not solved, and the README says so rather than implying othe
 
 - **Exfiltration to an allowed host.** A domain allowlist bounds destinations, not content.
   See the [egress proxy](#egress-proxy) warning. Mitigated by `readDeny`, `off` by default,
-  and (v2) credential masking; not eliminated.
+  and (v2) brokered credential substitution for compatible TLS-terminating clients; not
+  eliminated. Opaque CONNECT and SOCKS tunnels cannot mask application credentials.
 - **A malicious or buggy extension in the pi process** can bypass everything here; that is
   the outer ring and a stated non-goal. The "untrusted repo-local extension" refusal is a
   heuristic, not a boundary.
@@ -1449,18 +1642,22 @@ These are accepted, not solved, and the README says so rather than implying othe
 
 ### Open questions
 
-- **SRT's profile model.** v1 depends on `@anthropic-ai/sandbox-runtime`. The open question
-  is whether its configuration can express `readDeny` *inside* a writable root, the
-  per-action `extend` needed for capabilities, and later the ops `custom` mode with
-  exec-denial clauses. If not, the conformance suite lets an owned backend replace it
-  without touching anything above the interface. Its own
+- **SRT's profile model.** v1 depends on `@anthropic-ai/sandbox-runtime`. Phase 3 has a hard
+  acceptance gate: its per-invocation `customConfig` must express immutable `readDeny`
+  inside a writable root and an exact capability extension without mutating the
+  process-global manager or leaking into concurrent actions. Phase 5 likewise requires
+  exec-denial clauses for the ops `custom` mode. If those properties cannot be demonstrated
+  by the conformance suite, an owned backend replaces SRT without changing anything above
+  the interface. SRT's own
   [security limitations](https://github.com/anthropic-experimental/sandbox-runtime/blob/bcad38810efcc2b7342bbc6ec26d15b7bbbabcfb/README.md#L772-L785)
   (weaker nested mode, `enableWeakerNetworkIsolation`, `allowAppleEvents`,
   `allowUnixSockets`) are all options pi-enclave does **not** expose in the dev profile.
-- **Shell parsing fidelity.** Heuristic tokenization will miss `$(…)`, `eval` and heredocs.
-  The sandbox is the real control, which mitigates this — but the ops profile's `rules.deny`
-  on writes via bash does depend on it, which is one more reason the ops profile's real
-  boundary is the broker and exec denial, not rules. Consider a real parser
+- **Shell parsing fidelity.** Heuristic tokenization recognizes many forms it cannot safely
+  model — including substitutions, `eval`, heredocs, scripts, interpreters, archive
+  extraction, directory changes and pathname expansion — and escalates them rather than
+  treating them as proof of safety. It still cannot prove arbitrary shell effects. L2 is
+  the persistence boundary, while the ops profile's real mutation boundary is the broker
+  plus exec denial, not `rules.deny`. Consider a real parser
   (tree-sitter-bash WASM) in v2.
 - **macOS Seatbelt longevity.** Apple could remove `sandbox-exec`. The Docker backend is the
   contingency, which is why it is in scope rather than "maybe later".
@@ -1480,7 +1677,9 @@ These are accepted, not solved, and the README says so rather than implying othe
   command now waits on the local model. The two-stage gate keeps the prompt near 2k tokens,
   but on a laptop this may still be seconds per action. If it is, the pressure will be to
   grow `rules.skipReview`, which is the hand-written allow list coming back by another name.
-  Measure before v1 and consider caching verdicts by canonical-action hash within a session.
+  Measure before v1. Phase 3 deliberately does not cache verdicts; any later cache must bind
+  the complete canonical input, tool/source identity, effective profile and rulebook,
+  reviewer prompt/model/version, and capability scope, and must remain invocation-scoped.
 - **RPC attendance handshake.** The HMAC-over-`ctx.ui.input` exchange is a pi-enclave
   convention; it needs a client to implement it before `"rpc"` attendance is usable by
   anyone. Until then `"rpc"` behaves as `"off"`, which is the safe direction. It binds the

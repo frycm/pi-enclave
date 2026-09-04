@@ -26,6 +26,7 @@ import {
 	createWriteTool,
 	VERSION as PI_VERSION,
 } from "@earendil-works/pi-coding-agent";
+import { shellWriteCapabilityIssue, validateWriteCapability } from "./backend/capability.ts";
 import { SrtBackend } from "./backend/srt.ts";
 import type { CompiledProfile, Violation } from "./backend/types.ts";
 import { type EnclaveState, handleEnclaveCommand, renderStatusLine } from "./commands/enclave.ts";
@@ -46,7 +47,9 @@ import {
 	BREAKER_ENTRY_TYPE,
 	CircuitBreaker,
 	isBreakerState,
+	recordRuntimeViolation,
 	resetAndPersistBreaker,
+	shouldWithholdNonOwnedSibling,
 	steerMessage,
 } from "./gate/breaker.ts";
 import { decide, type GateDecision } from "./gate/gate.ts";
@@ -66,7 +69,7 @@ import {
 	createReadOperations,
 	createWriteOperations,
 } from "./tools/file-ops.ts";
-import { runSandboxedGrep } from "./tools/grep.ts";
+import { GrepExecutionQueue, runSandboxedGrep } from "./tools/grep.ts";
 
 /**
  * A fallback spelling of this module's path.
@@ -168,7 +171,7 @@ export default function (pi: ExtensionAPI): void {
 		ui: () => uiContext,
 		attendance: () => attendance,
 		confirmTimeoutMs: () => effective?.attended.confirmTimeoutMs ?? 300_000,
-		onUnattended: (action, reason) => {
+		onUnattended: (action, reason, toolSource) => {
 			// A record is written whenever an escalation did not get a yes --
 			// unattended, declined or timed out. The turn is over either way, and
 			// the difference between "nobody was asked" and "someone said not now"
@@ -193,6 +196,7 @@ export default function (pi: ExtensionAPI): void {
 					profile: effective,
 					configHash: configHash(effective),
 					reason,
+					...(toolSource !== undefined ? { toolSource } : {}),
 				});
 				audit?.append("pending", { event: "written", nonce: record.nonce, hash: action.hash, path });
 				process.stderr.write(
@@ -220,6 +224,8 @@ export default function (pi: ExtensionAPI): void {
 	});
 	/** Set by turn_start; every decision is attributed to the turn it happened in. */
 	let currentTurn = 0;
+	/** An admitted owned call earlier in the current prepared batch. */
+	let queuedOwnedCall = false;
 	let audit: AuditLog | undefined;
 	let attendance: AttendanceState = { configured: "off", effective: "off" };
 	/** Rebuilt per escalation from the live context, so a lost channel is seen. */
@@ -246,8 +252,8 @@ export default function (pi: ExtensionAPI): void {
 		!report.ok || configError !== undefined || ownershipError !== undefined || effective?.auto === false;
 
 	const guardCommand = (command: string) => {
-		if (lockNotApplicable()) return;
-		lock.beginExecution(`bash:${command}`);
+		if (lockNotApplicable()) return undefined;
+		return lock.beginExecution(`bash:${command}`).action;
 	};
 	const guardPath = (tool: string, path: string) => {
 		if (lockNotApplicable()) return;
@@ -282,8 +288,13 @@ export default function (pi: ExtensionAPI): void {
 	/** Set by session_start, so denials can refresh the footer as they happen. */
 	let refreshStatusLine: (() => void) | undefined;
 
-	const recordViolations = (found: Violation[]) => {
+	const recordViolations = (found: Violation[], adverseForBreaker: boolean) => {
 		violations.push(...found);
+		// Gate approval is provisional with respect to L2. A runtime denial is an
+		// adverse outcome of the agent's action and must remain sticky for the turn,
+		// even if the pre-execution gate already recorded an allow. Direct `!` input
+		// is human-originated and passes false at its separate call site.
+		if (effective?.auto) recordRuntimeViolation(breaker, currentTurn, found.length, adverseForBreaker);
 		for (const violation of found) {
 			audit?.append("violation", {
 				// `violationKind`, not `kind`: the record's own `kind` is
@@ -304,7 +315,7 @@ export default function (pi: ExtensionAPI): void {
 	// Denials seen by the filesystem helper reach the same counter and footer as
 	// shell ones. Without this the file tools would enforce silently -- the whole
 	// point of step 7 being invisible in the one place a user looks.
-	backend.onFsViolation = (violation) => recordViolations([violation]);
+	backend.onFsViolation = (violation) => recordViolations([violation], true);
 
 	if (!report.ok) {
 		// Refuse loudly, on stderr, at load time. ctx.ui.notify from session_start
@@ -336,7 +347,8 @@ export default function (pi: ExtensionAPI): void {
 	const operations = createEnclaveBashOperations({
 		backend,
 		getCompiled: requireCompiled,
-		onViolations: recordViolations,
+		onViolations: (found) => recordViolations(found, true),
+		onDeniedReadAttempt: (paths) => recordRuntimeViolation(breaker, currentTurn, paths.length, true),
 		guard: guardCommand,
 	});
 
@@ -354,15 +366,17 @@ export default function (pi: ExtensionAPI): void {
 	const userBashOperations = createEnclaveBashOperations({
 		backend,
 		getCompiled: requireCompiled,
-		onViolations: recordViolations,
+		onViolations: (found) => recordViolations(found, false),
 		guard: () => {
 			if (effective?.auto && breakerBlocks()) {
 				throw new Error("pi-enclave: the denial circuit breaker is open; this turn is over.");
 			}
+			return undefined;
 		},
 	});
 
 	const fsClient = () => backend.fs(requireCompiled());
+	const grepQueue = new GrepExecutionQueue();
 
 	// Registered unconditionally. pi's registry starts with every built-in tool
 	// and an extension only displaces one by registering the same name, so
@@ -415,9 +429,13 @@ export default function (pi: ExtensionAPI): void {
 				if (effective?.auto && breakerBlocks()) {
 					throw new Error("pi-enclave: the denial circuit breaker is open; this search will not run.");
 				}
-				return runSandboxedGrep(
-					{ fs: fsClient(), cwd, ...(signal ? { signal } : {}) },
-					params as Parameters<typeof runSandboxedGrep>[1],
+				return grepQueue.run(
+					() =>
+						runSandboxedGrep(
+							{ fs: fsClient(), cwd, ...(signal ? { signal } : {}) },
+							params as Parameters<typeof runSandboxedGrep>[1],
+						),
+					signal,
 				);
 			},
 		} as Parameters<typeof pi.registerTool>[0]);
@@ -438,6 +456,8 @@ export default function (pi: ExtensionAPI): void {
 		if (ownershipError) return { block: true, reason: ownershipError };
 		if (!effective) return { block: true, reason: "pi-enclave: no policy is loaded yet, so nothing may run." };
 
+		const ownedTool = OWNED_TOOLS.includes(event.toolName);
+
 		// A channel can be lost mid-session. Re-checked here rather than only at
 		// session start, and only ever narrowing.
 		attendance = recheckAttendance(attendance, {
@@ -456,7 +476,21 @@ export default function (pi: ExtensionAPI): void {
 				owned: OWNED_TOOLS,
 				escalator,
 				toolSource: (tool) => pi.getAllTools?.().find((entry) => entry.name === tool)?.sourceInfo?.path,
-				breakerOpen: () => breaker.open,
+				writeCapabilityIssue: (value, actionCwd, tool) => {
+					try {
+						const lifetimeIssue = tool === "bash" ? shellWriteCapabilityIssue() : undefined;
+						if (lifetimeIssue) return lifetimeIssue;
+						validateWriteCapability(profile, actionCwd, value);
+						return undefined;
+					} catch (error) {
+						return (error as Error).message;
+					}
+				},
+				breakerOpen: breakerBlocks,
+				withholdBeforeExecution: () =>
+					shouldWithholdNonOwnedSibling(breaker, queuedOwnedCall, ownedTool)
+						? "pi-enclave: this third-party tool is withheld because an earlier sandboxed call in the same batch could open the denial circuit breaker at runtime."
+						: undefined,
 				onDecision: (result) => {
 					// A breaker-open decision is not evidence: the breaker already
 					// opened, and feeding this turn back in as a (non-adverse) outcome
@@ -489,7 +523,10 @@ export default function (pi: ExtensionAPI): void {
 			},
 		);
 		refreshStatusLine?.();
-		if (!decision.block) return {};
+		if (!decision.block) {
+			if (ownedTool) queuedOwnedCall = true;
+			return {};
+		}
 		return { block: true, reason: decision.reason ?? "denied", ...(decision.terminate ? { terminate: true } : {}) };
 	});
 
@@ -499,6 +536,7 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("turn_start", (event) => {
 		currentTurn = event.turnIndex;
+		queuedOwnedCall = false;
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
@@ -580,7 +618,7 @@ export default function (pi: ExtensionAPI): void {
 		configError = undefined;
 		effective = loaded.profile;
 		provenance = loaded.provenance;
-		profile = toBackendProfile(loaded.profile);
+		profile = toBackendProfile(loaded.profile, cwd);
 
 		// Ownership is checked after the configuration, because the diagnosis is
 		// only actionable once we know auto mode was going to start at all.

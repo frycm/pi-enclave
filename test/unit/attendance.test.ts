@@ -217,8 +217,8 @@ describe("the confirm escalator", () => {
 				attendance: () => ({ configured: options.attended, effective: options.attended }),
 				confirmTimeoutMs: () => options.timeoutMs ?? 300_000,
 				onEscalation: (event) => events.push(event),
-				onUnattended: (a, reason) => {
-					unattended.push(`${a.hash}:${reason}`);
+				onUnattended: (a, reason, toolSource) => {
+					unattended.push(`${a.hash}:${reason}:${toolSource ?? "unknown"}`);
 				},
 			}),
 		};
@@ -228,6 +228,24 @@ describe("the confirm escalator", () => {
 		const { escalator: esc, events } = escalator({ attended: "tui", answer: async () => true });
 		expect(await esc.confirm(action, "matches ask rule")).toBe(true);
 		expect(events[0]?.outcome).toBe("approved");
+	});
+
+	it("shows complete terminal-safe input in the attended confirmation", async () => {
+		const content = `${"A".repeat(300)}ERASE-PRODUCTION${"Z".repeat(300)}`;
+		const reviewed = canonicalize({
+			tool: "write",
+			input: { path: "/work/prod", content, note: "safe\u202Eliated" },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+		});
+		const { escalator: esc, ui } = escalator({ attended: "tui", answer: async () => false });
+		await esc.confirm(reviewed, "matches protected path");
+		const message = ui.confirms[0]?.message ?? "";
+		expect(message).toContain(content);
+		expect(message).toContain("\\u202e");
+		expect(message).not.toContain("\u202E");
+		expect(message).not.toContain("redacted:sha256");
 	});
 
 	it("denies when the person says no", async () => {
@@ -249,7 +267,13 @@ describe("the confirm escalator", () => {
 		expect(unattended).toHaveLength(1);
 	});
 
-	it("shows the canonical action, not the raw string", async () => {
+	it("carries the independently observed tool source into an unattended record callback", async () => {
+		const { escalator: esc, unattended } = escalator({ attended: "off" });
+		await esc.confirm(action, "matches ask rule", "/ext/pi-enclave.ts");
+		expect(unattended[0]).toContain(":/ext/pi-enclave.ts");
+	});
+
+	it("shows the complete input with command newlines escaped", async () => {
 		const multiline = canonicalize({
 			tool: "bash",
 			input: { command: "echo harmless\nrm -rf /work" },
@@ -259,10 +283,10 @@ describe("the confirm escalator", () => {
 		});
 		const { escalator: esc, ui } = escalator({ attended: "tui", answer: async () => true });
 		await esc.confirm(multiline, "unparsed");
-		// Both commands are on their own line: a second command cannot hide below
-		// the fold of a dialog whose first line looks harmless.
-		expect(ui.confirms[0]?.message).toContain("    echo harmless");
-		expect(ui.confirms[0]?.message).toContain("; rm -rf /work");
+		// The raw newline is inert JSON text, so an embedded command cannot create
+		// a fake field or hide below an apparently harmless first line.
+		expect(ui.confirms[0]?.message).toContain("echo harmless\\nrm -rf /work");
+		expect(ui.confirms[0]?.message).not.toContain("echo harmless\nrm -rf /work");
 	});
 
 	it("tells the person that silence is a refusal", async () => {

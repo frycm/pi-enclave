@@ -98,8 +98,12 @@ export function classifyErrno(input: ClassifyInput): Violation | null {
 
 	if (PERMISSION_ERRNOS.has(code)) {
 		if (kind === "write") {
-			// Writes are an allow-list: a refusal inside a writable root is not the
-			// sandbox's doing.
+			// Explicit write-deny carve-outs override their containing writable root.
+			// Check them first or helper denials for persistence paths look like an
+			// ordinary application error and never reach the audit/breaker.
+			if (isUnderAny(path, profile.writeDeny ?? [])) return { ...base, kind };
+			// Other writes are an allow-list: a refusal inside a writable root is not
+			// the sandbox's doing.
 			return isUnderAny(path, profile.writableRoots) ? null : { ...base, kind };
 		}
 		// Reads are a deny-list: the sandbox refuses nothing outside readDeny, so

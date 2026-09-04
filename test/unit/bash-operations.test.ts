@@ -8,6 +8,7 @@ import type {
 	Violation,
 } from "../../src/backend/types.ts";
 import { createDevProfile, defaultReadDeny } from "../../src/config/profile.ts";
+import { canonicalize } from "../../src/policy/canonical.ts";
 import { BASH_PROMPT_GUIDELINES, createEnclaveBashOperations, nextCommandId } from "../../src/tools/bash.ts";
 
 const PROFILE: Profile = {
@@ -94,6 +95,26 @@ describe("createEnclaveBashOperations", () => {
 		expect(env.OPS_APP_SECRET).toBeUndefined();
 	});
 
+	it("pins the child TMPDIR to the compiled sandbox scratch path", async () => {
+		const { backend, calls } = recordingBackend();
+		const compiled: CompiledProfile = {
+			backend: "seatbelt",
+			profile: { ...PROFILE, tmpDir: "/work/.tmp" },
+			describe: () => "compiled",
+		};
+		const previous = process.env.TMPDIR;
+		process.env.TMPDIR = "/ambient";
+		try {
+			await createEnclaveBashOperations({ backend, getCompiled: () => compiled }).exec("true", "/work", {
+				onData: () => {},
+			});
+		} finally {
+			if (previous === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = previous;
+		}
+		expect(calls[0]?.env.TMPDIR).toBe("/work/.tmp");
+	});
+
 	it("forwards the command, cwd, signal and timeout unchanged", async () => {
 		const { backend, calls } = recordingBackend();
 		const ops = createEnclaveBashOperations({ backend, getCompiled: () => COMPILED });
@@ -103,6 +124,30 @@ describe("createEnclaveBashOperations", () => {
 
 		expect(calls[0]).toMatchObject({ command: "echo hi", cwd: "/work/sub", timeout: 42 });
 		expect(calls[0]?.signal).toBe(controller.signal);
+	});
+
+	it("binds an approved write capability to the one backend invocation", async () => {
+		const { backend, calls } = recordingBackend();
+		const action = canonicalize({
+			tool: "bash",
+			input: { command: "touch /srv/result", allow_write: "/srv/result" },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+			writableRoots: ["/work"],
+		});
+		const ops = createEnclaveBashOperations({
+			backend,
+			getCompiled: () => COMPILED,
+			guard: () => action,
+		});
+
+		await ops.exec("touch /srv/result", "/work", { onData: () => {} });
+		expect(calls[0]?.writeCapability).toBe("/srv/result");
+
+		const ordinary = createEnclaveBashOperations({ backend, getCompiled: () => COMPILED });
+		await ordinary.exec("true", "/work", { onData: () => {} });
+		expect(calls[1]?.writeCapability).toBeUndefined();
 	});
 
 	it("returns the backend's exit code", async () => {
@@ -152,6 +197,139 @@ describe("createEnclaveBashOperations", () => {
 		const ops = createEnclaveBashOperations({ backend, getCompiled: () => COMPILED, onViolations });
 		await ops.exec("curl x.com", "/work", { onData: () => {} });
 		expect(onViolations).toHaveBeenCalledWith([violation]);
+	});
+
+	it("classifies a failed explicit read-deny target when the backend emits no event", async () => {
+		const action = canonicalize({
+			tool: "bash",
+			input: { command: "cat /home/u/.ssh/config" },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+		});
+		const { backend } = recordingBackend({ exitCode: 1, violations: [] });
+		const onViolations = vi.fn();
+		const ops = createEnclaveBashOperations({
+			backend,
+			getCompiled: () => COMPILED,
+			guard: () => action,
+			onViolations,
+		});
+
+		await ops.exec("cat /home/u/.ssh/config", "/work", { onData: () => {} });
+
+		expect(onViolations).toHaveBeenCalledWith([
+			expect.objectContaining({ kind: "read", source: "policy", path: "/home/u/.ssh/config" }),
+		]);
+	});
+
+	it("never masks a successful explicit read-deny target as a denial", async () => {
+		const action = canonicalize({
+			tool: "bash",
+			input: { command: "cat /home/u/.ssh/config" },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+		});
+		const { backend } = recordingBackend({ exitCode: 0, violations: [] });
+		const onViolations = vi.fn();
+		const onDeniedReadAttempt = vi.fn();
+		const ops = createEnclaveBashOperations({
+			backend,
+			getCompiled: () => COMPILED,
+			guard: () => action,
+			onViolations,
+			onDeniedReadAttempt,
+		});
+
+		await ops.exec("cat /home/u/.ssh/config", "/work", { onData: () => {} });
+		expect(onViolations).not.toHaveBeenCalled();
+		expect(onDeniedReadAttempt).toHaveBeenCalledWith(["/home/u/.ssh/config"]);
+	});
+
+	it("keeps read-deny attempt accounting when the shell suppresses the exit status", async () => {
+		const action = canonicalize({
+			tool: "bash",
+			input: { command: "cat /home/u/.ssh/config >/dev/null || true" },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+		});
+		const { backend } = recordingBackend({ exitCode: 0, violations: [] });
+		const onDeniedReadAttempt = vi.fn();
+		const ops = createEnclaveBashOperations({
+			backend,
+			getCompiled: () => COMPILED,
+			guard: () => action,
+			onDeniedReadAttempt,
+		});
+
+		await ops.exec("cat /home/u/.ssh/config >/dev/null || true", "/work", { onData: () => {} });
+		expect(onDeniedReadAttempt).toHaveBeenCalledWith(["/home/u/.ssh/config"]);
+	});
+
+	it("accounts for a denied copy source even when the command also writes", async () => {
+		const action = canonicalize({
+			tool: "bash",
+			input: { command: "cp /home/u/.ssh/config /work/copy || true" },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+		});
+		const { backend } = recordingBackend({ exitCode: 0, violations: [] });
+		const onDeniedReadAttempt = vi.fn();
+		const ops = createEnclaveBashOperations({
+			backend,
+			getCompiled: () => COMPILED,
+			guard: () => action,
+			onDeniedReadAttempt,
+		});
+
+		await ops.exec("cp /home/u/.ssh/config /work/copy || true", "/work", { onData: () => {} });
+		expect(onDeniedReadAttempt).toHaveBeenCalledWith(["/home/u/.ssh/config"]);
+	});
+
+	it("does not count a read in a statically unreachable command", async () => {
+		const action = canonicalize({
+			tool: "bash",
+			input: { command: "false && cat /home/u/.ssh/config" },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+		});
+		const { backend } = recordingBackend({ exitCode: 1, violations: [] });
+		const onDeniedReadAttempt = vi.fn();
+		const ops = createEnclaveBashOperations({
+			backend,
+			getCompiled: () => COMPILED,
+			guard: () => action,
+			onDeniedReadAttempt,
+		});
+
+		await ops.exec("false && cat /home/u/.ssh/config", "/work", { onData: () => {} });
+		expect(onDeniedReadAttempt).not.toHaveBeenCalled();
+	});
+
+	it("accounts for left-associative mixed AND/OR lists", async () => {
+		const command = "true || false && cat /home/u/.ssh/config || true";
+		const action = canonicalize({
+			tool: "bash",
+			input: { command },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+		});
+		const { backend } = recordingBackend({ exitCode: 0, violations: [] });
+		const onDeniedReadAttempt = vi.fn();
+		const ops = createEnclaveBashOperations({
+			backend,
+			getCompiled: () => COMPILED,
+			guard: () => action,
+			onDeniedReadAttempt,
+		});
+
+		await ops.exec(command, "/work", { onData: () => {} });
+		expect(onDeniedReadAttempt).toHaveBeenCalledWith(["/home/u/.ssh/config"]);
 	});
 
 	it("refuses to run before the profile is compiled", async () => {
@@ -237,5 +415,22 @@ describe("createDevProfile", () => {
 		for (const suffix of [".ssh", ".aws", ".gnupg", ".kube", ".docker", ".netrc", ".npmrc"]) {
 			expect(deny, suffix).toContain(`/home/u/${suffix}`);
 		}
+	});
+
+	it("denies credential stores under an absolute custom XDG configuration root", () => {
+		const deny = defaultReadDeny("/home/u", "/home/u/.pi/agent", {
+			XDG_CONFIG_HOME: "/srv/user-config",
+		});
+		expect(deny).toContain("/srv/user-config/gh");
+		expect(deny).toContain("/srv/user-config/claude");
+		// Migrating the setting does not make stale credentials readable.
+		expect(deny).toContain("/home/u/.config/gh");
+	});
+
+	it("does not resolve a relative XDG configuration root against the workspace", () => {
+		const deny = defaultReadDeny("/home/u", "/home/u/.pi/agent", {
+			XDG_CONFIG_HOME: ".repo-config",
+		});
+		expect(deny.some((path) => path.includes(".repo-config"))).toBe(false);
 	});
 });

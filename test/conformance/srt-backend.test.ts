@@ -10,9 +10,9 @@
  * bubblewrap a capability-bearing user namespace, which `probe()` reports with
  * the sysctl remediation rather than letting every row fail obscurely.
  */
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { effectiveProfile, partitionSrtDefaults, SrtBackend, srtTmpDir, toSrtConfig } from "../../src/backend/srt.ts";
 import { formatProbeReport } from "../../src/probe.ts";
@@ -20,6 +20,25 @@ import { probeHost } from "../../src/probe-host.ts";
 import { createFixture, plantSecrets } from "./fixture.ts";
 import { type ConformanceRow, formatRows, runConformance } from "./runner.ts";
 import { SCENARIOS } from "./scenarios.ts";
+
+// npm prepends this checkout's node_modules/.bin to PATH before starting
+// Vitest. Production correctly refuses that host-code lookup path; the native
+// conformance harness removes only npm's test-runner injection so it can test
+// the sandbox itself under the same safe PATH production requires.
+const ambientPath = process.env.PATH;
+const checkoutRoot = resolve(process.cwd());
+process.env.PATH = (ambientPath ?? "")
+	.split(delimiter)
+	.filter((entry) => {
+		if (!isAbsolute(entry)) return false;
+		const resolved = resolve(entry);
+		return resolved !== checkoutRoot && !resolved.startsWith(`${checkoutRoot}/`);
+	})
+	.join(delimiter);
+afterAll(() => {
+	if (ambientPath === undefined) delete process.env.PATH;
+	else process.env.PATH = ambientPath;
+});
 
 const report = probeHost("0.84.2");
 
@@ -217,6 +236,85 @@ describe.skipIf(!supported)("pty policy", () => {
 	}, 60_000);
 });
 
+describe.skipIf(!supported)("invocation-scoped write capability", () => {
+	it.skipIf(process.platform === "darwin")(
+		"widens exactly one call and does not leak the grant to the next call",
+		async () => {
+			const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
+			const fixture = createFixture();
+			try {
+				const compiled = await backend.compile(fixture.profile);
+				await backend.run(compiled, {
+					command: `printf capability > ${JSON.stringify(fixture.outsideFile)}`,
+					cwd: fixture.workspace,
+					env: { PATH: process.env.PATH ?? "" },
+					commandId: "write-capability-1",
+					writeCapability: fixture.outsideFile,
+				});
+				expect(readFileSync(fixture.outsideFile, "utf8")).toBe("capability");
+
+				await backend.run(compiled, {
+					command: `printf leaked > ${JSON.stringify(fixture.outsideFile)}`,
+					cwd: fixture.workspace,
+					env: { PATH: process.env.PATH ?? "" },
+					commandId: "write-capability-base-sibling",
+				});
+				expect(readFileSync(fixture.outsideFile, "utf8")).toBe("capability");
+			} finally {
+				await backend.dispose();
+				fixture.cleanup();
+			}
+		},
+		60_000,
+	);
+
+	it.skipIf(process.platform !== "darwin")(
+		"refuses a Bash grant that a detached Seatbelt child could retain",
+		async () => {
+			const backend = new SrtBackend();
+			const fixture = createFixture();
+			try {
+				const compiled = await backend.compile(fixture.profile);
+				await expect(
+					backend.run(compiled, {
+						command: "true",
+						cwd: fixture.workspace,
+						env: { PATH: process.env.PATH ?? "" },
+						commandId: "macos-detached-write-capability",
+						writeCapability: fixture.outsideFile,
+					}),
+				).rejects.toThrow(/could outlive the invocation/);
+			} finally {
+				await backend.dispose();
+				fixture.cleanup();
+			}
+		},
+		60_000,
+	);
+
+	it("refuses a write capability inside or above a read-denied credential root", async () => {
+		const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
+		const fixture = createFixture();
+		try {
+			const compiled = await backend.compile(fixture.profile);
+			for (const target of [join(fixture.deniedHome, "out"), dirname(fixture.deniedHome)]) {
+				await expect(
+					backend.run(compiled, {
+						command: "true",
+						cwd: fixture.workspace,
+						env: { PATH: process.env.PATH ?? "" },
+						commandId: `denied-write-capability-${target.length}`,
+						writeCapability: target,
+					}),
+				).rejects.toThrow(/immutable denied path/);
+			}
+		} finally {
+			await backend.dispose();
+			fixture.cleanup();
+		}
+	}, 60_000);
+});
+
 describe.skipIf(!supported)("stale profile guard", () => {
 	it("refuses to run against a profile the manager no longer holds", async () => {
 		// sandbox-runtime is process-global: wrapWithSandboxArgv reads the
@@ -252,6 +350,28 @@ describe.skipIf(!supported)("stale profile guard", () => {
 			await backend.dispose();
 		}
 	});
+});
+
+describe.skipIf(!supported || process.platform !== "darwin")("macOS process lifecycle", () => {
+	it("reaps a descriptor-closed background descendant when the foreground command succeeds", async () => {
+		const backend = new SrtBackend();
+		const fixture = createFixture();
+		const sentinel = join(fixture.workspace, "background-survived");
+		try {
+			const compiled = await backend.compile(fixture.profile);
+			await backend.run(compiled, {
+				command: `(sleep 0.4; printf survived > ${JSON.stringify(sentinel)}) </dev/null >/dev/null 2>&1 &`,
+				cwd: fixture.workspace,
+				env: { PATH: process.env.PATH ?? "" },
+				commandId: "background-reap-1",
+			});
+			await new Promise((resolve) => setTimeout(resolve, 700));
+			expect(existsSync(sentinel), "a process from a completed sandbox action was still running").toBe(false);
+		} finally {
+			await backend.dispose();
+			fixture.cleanup();
+		}
+	}, 60_000);
 });
 
 describe.skipIf(supported)("conformance skipped", () => {

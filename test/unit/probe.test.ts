@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import {
 	backendForPlatform,
 	compareVersions,
@@ -13,6 +16,12 @@ import {
 	probe,
 	USERNS_SYSCTL_PATH,
 } from "../../src/probe.ts";
+import { hostExecutableSafety, hostPathSafety } from "../../src/probe-host.ts";
+
+const tempRoots: string[] = [];
+afterEach(() => {
+	for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 
 /**
  * A host where everything is fine. Each test overrides exactly the one thing it
@@ -134,6 +143,43 @@ describe("probe: platform and backend selection", () => {
 });
 
 describe("probe: backend prerequisites", () => {
+	it("fails closed when host PATH can resolve repository-controlled executables", () => {
+		const env = healthyEnv({ pathSafety: () => hostPathSafety(["/work"], "/usr/bin:.:/work/bin") });
+		const report = probe(env);
+		expect(report.ok).toBe(false);
+		expect(byId(env, "host-path")?.detail).toContain(".");
+		expect(byId(env, "host-path")?.detail).toContain("/work/bin");
+	});
+
+	it("accepts absolute PATH entries outside writable roots", () => {
+		const env = healthyEnv({ pathSafety: () => hostPathSafety(["/work"], "/usr/local/bin:/usr/bin:/bin") });
+		expect(byId(env, "host-path")?.status).toBe("ok");
+	});
+
+	it("refuses a narrow writable grant inside a host PATH directory", () => {
+		const result = hostPathSafety(["/usr/local/bin/which"], "/usr/local/bin:/usr/bin:/bin");
+		expect(result.ok).toBe(false);
+		expect(result.detail).toContain("/usr/local/bin");
+	});
+
+	it("refuses a safe-looking executable symlink whose canonical target is writable", () => {
+		const root = mkdtempSync(join(tmpdir(), "enclave-host-exec-"));
+		tempRoots.push(root);
+		const writable = join(root, "workspace");
+		const safeBin = join(root, "outside-bin");
+		mkdirSync(writable);
+		mkdirSync(safeBin);
+		const target = join(writable, "bwrap");
+		writeFileSync(target, "#!/bin/sh\nexit 0\n");
+		chmodSync(target, 0o755);
+		const link = join(safeBin, "bwrap");
+		symlinkSync(target, link);
+
+		const result = hostExecutableSafety([writable], [link]);
+		expect(result.ok).toBe(false);
+		expect(result.detail).toContain("agent-writable");
+	});
+
 	it("requires sandbox-exec on macOS", () => {
 		const env = healthyEnv({ platform: "darwin", which: (b) => (b === "/usr/bin/sandbox-exec" ? null : "/x") });
 		const check = byId(env, "backend-binaries");

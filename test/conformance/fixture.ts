@@ -96,6 +96,9 @@ export function createFixture(): Fixture {
 	server.unref();
 
 	writeFileSync(join(workspace, "ok.txt"), "workspace content\n");
+	mkdirSync(join(workspace, ".pi"));
+	mkdirSync(join(workspace, ".git", "hooks"), { recursive: true });
+	writeFileSync(join(workspace, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
 
 	// The symlink-race pair: both live inside the writable workspace but resolve
 	// outside it. The kernel decides on the resolved path, which is the whole
@@ -145,6 +148,7 @@ export function createFixture(): Fixture {
 	const profile: Profile = {
 		mode: "workspace-write",
 		writableRoots: [workspace],
+		writeDeny: [join(workspace, ".pi"), join(workspace, ".git", "hooks"), join(workspace, ".git", "config")],
 		readDeny: [deniedHome, lateDenied, deniedFile, deniedLink, deniedUnderLink],
 		network: "off",
 		allowPty: true,

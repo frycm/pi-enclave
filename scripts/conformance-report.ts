@@ -10,6 +10,9 @@ import type { SandboxBackend } from "../src/backend/types.ts";
 import { createFixture, plantSecrets } from "../test/conformance/fixture.ts";
 import { NoopBackend } from "../test/conformance/noop-backend.ts";
 import { runConformance } from "../test/conformance/runner.ts";
+import { sanitizeVerificationPath } from "./test-path.ts";
+
+sanitizeVerificationPath();
 
 const which = process.argv[2] ?? "noop";
 // PI_ENCLAVE_WEAKER_NESTED exists for running this suite inside a container,

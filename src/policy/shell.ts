@@ -19,6 +19,8 @@
  * pipeline is the standard way past a command allowlist.
  */
 
+import { posix } from "node:path";
+
 /** Something the tokenizer saw but cannot follow. Each one clears `confident`. */
 export type ShellMarker =
 	| "command-substitution"
@@ -31,6 +33,15 @@ export type ShellMarker =
 	| "xargs"
 	| "wrapper"
 	| "param-expansion"
+	| "cwd-change"
+	| "interpreter"
+	| "source-script"
+	| "script-runner"
+	| "workspace-executable"
+	| "command-dispatch"
+	| "archive-extract"
+	| "environment-assignment"
+	| "pathname-expansion"
 	| "subshell"
 	| "compound"
 	| "clobber";
@@ -81,12 +92,17 @@ const SEPARATORS = new Set([";", "\n", "|", "&"]);
 /** Commands whose arguments are another command the tokenizer will not see. */
 const OPAQUE_COMMANDS: Record<string, ShellMarker> = {
 	eval: "eval",
+	trap: "command-dispatch",
 	xargs: "xargs",
 	sh: "shell-c",
 	bash: "shell-c",
 	zsh: "shell-c",
 	dash: "shell-c",
 	ksh: "shell-c",
+	ash: "shell-c",
+	csh: "shell-c",
+	tcsh: "shell-c",
+	fish: "shell-c",
 };
 
 /**
@@ -113,6 +129,8 @@ const WRAPPER_COMMANDS = new Set([
 	"stdbuf",
 	"setsid",
 	"command",
+	"builtin",
+	"enable",
 	"exec",
 	"time",
 	"watch",
@@ -143,20 +161,78 @@ const SHELL_KEYWORDS = new Set([
 	"}",
 ]);
 
-/** Commands whose ordinary operands name files and may therefore expand to protected write targets. */
-const FILE_OPERAND_COMMANDS = new Set([
-	"tee",
-	"cp",
-	"mv",
-	"install",
-	"ln",
-	"touch",
-	"truncate",
-	"rm",
-	"rmdir",
-	"mkdir",
-	"dd",
+/** Interpreters can perform writes that are absent from their argv. */
+const INTERPRETER_NAMES = new Set([
+	"deno",
+	"bun",
+	"tsx",
+	"ts-node",
+	"qjs",
+	"julia",
+	"rscript",
+	"r",
+	"java",
+	"groovy",
+	"scala",
+	"clojure",
 ]);
+
+function isInterpreterCommand(name: string): boolean {
+	return (
+		/^(?:node|nodejs)(?:\d+(?:\.\d+)*)?$/.test(name) ||
+		/^(?:python|pypy)(?:\d+(?:\.\d+)*)?$/.test(name) ||
+		/^(?:perl|ruby|php|lua)(?:\d+(?:\.\d+)*)?$/.test(name) ||
+		/^(?:g|m|n)?awk(?:\d+(?:\.\d+)*)?$/.test(name) ||
+		INTERPRETER_NAMES.has(name.toLowerCase())
+	);
+}
+
+/** Dispatchers whose project-controlled configuration selects executable code. */
+const SCRIPT_RUNNERS = new Set([
+	"npm",
+	"npx",
+	"pnpm",
+	"yarn",
+	"corepack",
+	"make",
+	"gmake",
+	"ninja",
+	"just",
+	"task",
+	"cargo",
+	"go",
+	"gradle",
+	"gradlew",
+	"mvn",
+	"mvnw",
+	"ant",
+	"bazel",
+	"buck",
+	"poetry",
+	"pipenv",
+	"tox",
+	"cmake",
+	"ctest",
+]);
+
+const TRUSTED_EXECUTABLE_PREFIXES = [
+	"/bin/",
+	"/sbin/",
+	"/usr/bin/",
+	"/usr/sbin/",
+	"/usr/local/bin/",
+	"/usr/local/sbin/",
+];
+
+/** A path-selected executable may be project-controlled and hide all effects. */
+function isWorkspaceExecutable(command: string): boolean {
+	if (!command.includes("/")) return false;
+	if (!command.startsWith("/")) return true;
+	const normalized = posix.normalize(command);
+	return !TRUSTED_EXECUTABLE_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+}
+
+const PATHNAME_EXPANSION = /[*?[{]/;
 
 /** A path prefix such as `/usr/bin/env` still names `env`. */
 function baseName(command: string): string {
@@ -179,11 +255,39 @@ export function parseShell(command: string): ParsedShell {
 		// `/bin/bash -c` and `/usr/bin/env` name the same thing as `bash`/`env`.
 		const name = baseName(cmd.name);
 
+		// Canonical paths are resolved against the action cwd. Once a shell changes
+		// directory, later relative operands no longer have that meaning.
+		if (name === "cd" || name === "pushd" || name === "popd") markers.add("cwd-change");
+
+		// Script/interpreter and archive contents can name writes that never appear
+		// in argv. L2 remains the enforcement boundary; L1 must not claim a
+		// confident parse of effects it cannot see.
+		if (isInterpreterCommand(name)) markers.add("interpreter");
+		if ((name === "." || name === "source") && cmd.args.length > 0) markers.add("source-script");
+		if (SCRIPT_RUNNERS.has(name)) markers.add("script-runner");
+		if (cmd.assignments.length > 0) markers.add("environment-assignment");
+		if (isWorkspaceExecutable(cmd.name)) markers.add("workspace-executable");
+		if (name === "git" && cmd.args[0]?.startsWith("-")) markers.add("command-dispatch");
+		if (name === "sed" && cmd.args.length > 0) markers.add("command-dispatch");
+		if (name === "find" && cmd.args.some((arg) => ["-exec", "-execdir", "-ok", "-okdir", "-delete"].includes(arg))) {
+			markers.add("command-dispatch");
+		}
+		if (name === "busybox" && cmd.args.length > 0) markers.add("command-dispatch");
+		if (
+			(name === "tar" && !cmd.args.some((arg) => /^-[^-]*t/.test(arg) || arg === "--list")) ||
+			(name === "unzip" && !cmd.args.some((arg) => arg === "-l" || arg === "-p")) ||
+			name === "cpio"
+		) {
+			markers.add("archive-extract");
+		}
+
 		const marker = OPAQUE_COMMANDS[name];
 		if (marker) {
-			// `sh script.sh` is ordinary; `sh -c '…'` (or `-lc`, `-xc`, …) hides a
-			// whole command line. Any clustered short flag containing `c` counts.
-			if (marker === "shell-c" && !cmd.args.some((arg) => /^-[a-z]*c[a-z]*$/i.test(arg))) continue;
+			// A shell script is as opaque as `-c`: its writes are not represented in
+			// this argv. A bare interactive shell has no hidden input and stays ordinary.
+			if (marker === "shell-c" && cmd.args.length === 0 && cmd.redirects.length === 0 && cmd.connector !== "|") {
+				continue;
+			}
 			markers.add(marker);
 			continue;
 		}
@@ -191,7 +295,7 @@ export function parseShell(command: string): ParsedShell {
 		// A wrapper with a real (non-option) argument is running a command the
 		// rules were never matched against. Escalate rather than guess where the
 		// wrapper's own options end and the inner command begins.
-		if (WRAPPER_COMMANDS.has(name) && cmd.args.some((arg) => !arg.startsWith("-"))) {
+		if (WRAPPER_COMMANDS.has(name) && cmd.args.length > 0) {
 			markers.add("wrapper");
 		}
 
@@ -200,16 +304,28 @@ export function parseShell(command: string): ParsedShell {
 		// The name matched literally, so no rule fired and the parse stayed
 		// confident. `$IFS` is a word-splitting trick with no benign use in a
 		// command an agent would write, so it is flagged wherever it appears. An
-		// argument that is a *variable-expanded path* (`$DIR/../.ssh`) can resolve
-		// to a protected path the matcher cannot see, so it is flagged too -- but a
-		// bare `$VAR` argument (`echo $HOME`) is common and left alone.
+		// argument expansion can change a policy-sensitive subcommand just as easily
+		// as a path (`verb=reset; git "$verb" --hard`), so every argument expansion
+		// is uncertain. Quoted literals containing `$` may over-ask; silently
+		// treating an expansion as literal would let it bypass configured rules.
 		if (
 			cmd.name.includes("$") ||
-			cmd.args.some((arg) => IFS_EXPANSION.test(arg) || (arg.includes("$") && arg.includes("/"))) ||
-			cmd.redirects.some((redirect) => redirect.target.includes("$")) ||
-			(FILE_OPERAND_COMMANDS.has(name) && cmd.args.some((arg) => arg.includes("$")))
+			cmd.args.some((arg) => IFS_EXPANSION.test(arg) || arg.includes("$")) ||
+			cmd.redirects.some((redirect) => redirect.target.includes("$"))
 		) {
 			markers.add("param-expansion");
+		}
+
+		// Pathname expansion can reconstruct a policy-sensitive subcommand as
+		// well as a file target (`git r?set --hard`). The tokenizer does not keep
+		// enough per-argument quote state to prove a metacharacter was literal, so
+		// every argument/redirect occurrence is conservatively non-confident.
+		if (
+			PATHNAME_EXPANSION.test(cmd.name) ||
+			cmd.redirects.some((redirect) => PATHNAME_EXPANSION.test(redirect.target)) ||
+			cmd.args.some((arg) => PATHNAME_EXPANSION.test(arg))
+		) {
+			markers.add("pathname-expansion");
 		}
 
 		// A shell keyword introduces a compound command (if/for/while/case/{) the

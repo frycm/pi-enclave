@@ -16,6 +16,7 @@ import { defaultProfile } from "../../src/config/defaults.ts";
 import type { EffectiveProfile } from "../../src/config/types.ts";
 import {
 	describeRecord,
+	describeRecordForApproval,
 	listPending,
 	pendingDirs,
 	readPending,
@@ -91,6 +92,11 @@ describe("writing a record", () => {
 		expect(record.profileSnapshot.sandbox.writableRoots).toEqual(["/work", "/tmp"]);
 	});
 
+	it("carries the independently observed tool source", () => {
+		const { record } = write({ toolSource: "/ext/pi-enclave.ts" });
+		expect(record.toolSource).toBe("/ext/pi-enclave.ts");
+	});
+
 	it("expires 24 hours out by default", () => {
 		const { record } = write({ now: () => 0 });
 		expect(Date.parse(record.expiresAt) - Date.parse(record.createdAt)).toBe(24 * 3600 * 1000);
@@ -106,6 +112,20 @@ describe("reading a record", () => {
 		expect(result.ok).toBe(true);
 		if (!result.ok) return;
 		expect(result.record.nonce).toBe(NONCE);
+	});
+
+	it("preserves executor-observable input property order", () => {
+		const input = Object.fromEntries([
+			["delete", "production"],
+			["backup", false],
+		]);
+		write({
+			action: canonicalize({ tool: "deploy", input, cwd: "/work", home: "/home/u", profileName: "dev" }),
+		});
+		const result = read();
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(Object.keys(result.record.action.input)).toEqual(["delete", "backup"]);
 	});
 
 	// Every one of these is a way the record could have been tampered with, and
@@ -224,6 +244,99 @@ describe("the single-use lifecycle", () => {
 		expect(text).toContain(NONCE);
 		expect(text).toContain("sha256:");
 	});
+
+	it("renders pending-list text without terminal control sequences", () => {
+		const { record } = write({
+			action: action("printf '\u001b]8;;https://example.invalid\u0007click\u001b]8;;\u0007 safe\u202Eliated'"),
+			reason: "rule\u001b[2Jmatch",
+		});
+		const rendered = describeRecord(record);
+		expect(rendered).not.toContain("\u001b");
+		expect(rendered).not.toContain("\u0007");
+		expect(rendered).not.toContain("\u202E");
+		expect(rendered).toContain("\\u001b");
+		expect(rendered).toContain("\\u0007");
+		expect(rendered).toContain("\\u202e");
+	});
+
+	it("renders every stored input field for the approver", () => {
+		const p = profile((value) => {
+			value.tools.allow.deploy = { reviewed: true };
+		});
+		const { record } = write({
+			profile: p,
+			action: canonicalize({
+				tool: "deploy",
+				input: { path: "prod", mode: "destroy", force: true },
+				cwd: "/work",
+				home: "/home/u",
+				profileName: "dev",
+			}),
+		});
+		const text = describeRecord(record);
+		expect(text).toContain("input.path");
+		expect(text).toContain("input.mode");
+		expect(text).toContain("destroy");
+		expect(text).toContain("input.force");
+	});
+
+	it("escapes control characters in stored input field names", () => {
+		const p = profile((value) => {
+			value.tools.allow.deploy = { reviewed: true };
+		});
+		const { record } = write({
+			profile: p,
+			action: canonicalize({
+				tool: "deploy",
+				input: { "mode\n    SAFE-LOOKING: allow": "destroy" },
+				cwd: "/work",
+				home: "/home/u",
+				profileName: "dev",
+			}),
+		});
+		const text = describeRecord(record);
+		expect(text).toContain('input."mode\\n    SAFE-LOOKING: allow"');
+		expect(text).not.toContain("\n    SAFE-LOOKING: allow");
+	});
+
+	it("renders nested stored fields independently of large siblings", () => {
+		const p = profile((value) => {
+			value.tools.allow.deploy = { reviewed: true };
+		});
+		const { record } = write({
+			profile: p,
+			action: canonicalize({
+				tool: "deploy",
+				input: { config: { a: "A".repeat(200), mode: "destroy", z: "Z".repeat(200) } },
+				cwd: "/work",
+				home: "/home/u",
+				profileName: "dev",
+			}),
+		});
+		const text = describeRecord(record);
+		expect(text).toContain("input.config.mode");
+		expect(text).toContain("destroy");
+	});
+
+	it("renders complete, terminal-safe input only at the approval boundary", () => {
+		const content = `${"A".repeat(300)}ERASE-PRODUCTION${"Z".repeat(300)}`;
+		const { record } = write({
+			action: canonicalize({
+				tool: "write",
+				input: { path: "/work/prod", content, note: "safe\u202Eliated" },
+				cwd: "/work",
+				home: "/home/u",
+				profileName: "dev",
+			}),
+		});
+		const human = describeRecordForApproval(record);
+		expect(human).toContain(content);
+		expect(human).toContain("\\u202e");
+		expect(human).not.toContain("\u202E");
+		expect(human).not.toContain("redacted:sha256");
+		// Agent-visible diagnostics retain their bounded/redacted representation.
+		expect(describeRecord(record)).toContain("redacted:sha256");
+	});
 });
 
 describe("resuming", () => {
@@ -234,6 +347,33 @@ describe("resuming", () => {
 		const { record } = write();
 		const result = check(record, profile());
 		expect(result.ok).toBe(true);
+	});
+
+	it("permits an owned tool whose current grant has a source pin", () => {
+		const pinned = profile((p) => {
+			p.tools.allow.bash = { ...(p.tools.allow.bash ?? {}), source: "/ext/pi-enclave.ts" };
+		});
+		const { record } = write({ profile: pinned, toolSource: "/ext/pi-enclave.ts" });
+		expect(check(record, pinned).ok).toBe(true);
+	});
+
+	it("refuses when a new source pin does not match the recorded implementation", () => {
+		const { record } = write({ toolSource: "/ext/pi-enclave.ts" });
+		const pinned = profile((p) => {
+			p.tools.allow.bash = { ...(p.tools.allow.bash ?? {}), source: "/ext/replacement.ts" };
+		});
+		const result = check(record, pinned);
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.detail?.join("\n")).toContain("/ext/replacement.ts");
+	});
+
+	it("fails a legacy source-less record closed when the current grant is pinned", () => {
+		const { record } = write();
+		const pinned = profile((p) => {
+			p.tools.allow.bash = { ...(p.tools.allow.bash ?? {}), source: "/ext/pi-enclave.ts" };
+		});
+		expect(check(record, pinned).ok).toBe(false);
 	});
 
 	// The recorded hash is what the approver saw described; re-deriving it is
@@ -307,6 +447,40 @@ describe("resuming", () => {
 		expect(result.ok).toBe(false);
 		if (result.ok) return;
 		expect(result.reason).toContain("host execution");
+	});
+
+	it("refuses after the current profile disables a recorded capability", () => {
+		const original = profile();
+		const requested = canonicalize({
+			tool: "bash",
+			input: { command: "touch /srv/x", allow_write: "/srv/x" },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+		});
+		const { record } = write({ action: requested, profile: original });
+		const result = check(
+			record,
+			profile((p) => {
+				p.sandbox.capabilities = "none";
+			}),
+		);
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.reason).toContain("disabled capability");
+	});
+
+	it("refuses after the current profile removes the tool grant", () => {
+		const { record } = write();
+		const result = check(
+			record,
+			profile((p) => {
+				delete p.tools.allow.bash;
+			}),
+		);
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.reason).toContain("no longer authorizes this tool");
 	});
 
 	// A narrowing is not an error, but it changes what will happen, so it is

@@ -22,26 +22,34 @@
  *    missed line degrades reporting and never enforcement.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { lstatSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { closeSync, lstatSync, mkdirSync, openSync } from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getDefaultWritePaths, SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { buildChildEnv } from "../env/child-env.ts";
 import { HelperFsClient } from "../fs/client.ts";
 import type { BackendName } from "../probe.ts";
-import { whichSync } from "../probe-host.ts";
-import { canonical } from "./paths.ts";
-import type { CompiledProfile, FsClient, Profile, RunRequest, RunResult, SandboxBackend, Violation } from "./types.ts";
+import { hostRuntimeSafety, whichSync } from "../probe-host.ts";
+import { shellWriteCapabilityIssue, validateWriteCapability } from "./capability.ts";
+import { canonical, isUnder } from "./paths.ts";
+import {
+	type CompiledProfile,
+	type FsClient,
+	type Profile,
+	type RunRequest,
+	type RunResult,
+	SANDBOX_TMPDIR,
+	type SandboxBackend,
+	type Violation,
+} from "./types.ts";
 import { dedupeViolations, parseViolations } from "./violations.ts";
 
 /**
  * Absolute paths for the search tools, for the helper to use instead of a PATH
  * lookup it may not be able to satisfy.
  */
-function resolveSearchTools(): Record<string, string> {
+function resolveSearchTools(rg?: string, fd?: string): Record<string, string> {
 	const env: Record<string, string> = {};
-	const rg = whichSync("rg");
-	const fd = whichSync("fd");
 	if (rg) env.PI_ENCLAVE_RG = rg;
 	if (fd) env.PI_ENCLAVE_FD = fd;
 	return env;
@@ -89,16 +97,19 @@ function withResolvedTargets(readDeny: readonly string[], platform: NodeJS.Platf
  * identity (inode and mtime), so a retarget or a replacement changes it.
  */
 function denySnapshot(profile: Profile): string {
-	return profile.readDeny
-		.map((path) => {
+	return [
+		...profile.readDeny.map((path) => ({ kind: "r", path })),
+		...(profile.writeDeny ?? []).map((path) => ({ kind: "w", path })),
+	]
+		.map(({ kind, path }) => {
 			let link = "";
 			try {
 				const own = lstatSync(path);
 				if (own.isSymbolicLink()) link = `@${own.ino}:${own.mtimeMs}`;
 			} catch {
-				return `0${path}`;
+				return `${kind}:0${path}`;
 			}
-			return `1${path}>${canonical(path)}${link}`;
+			return `${kind}:1${path}>${canonical(path)}${link}`;
 		})
 		.join("\n");
 }
@@ -116,8 +127,8 @@ const HELPER_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "fs", "h
  * leave the status line describing a narrower sandbox than the one in force.
  * Mirrors SRT's own resolution, including its two environment overrides.
  */
-export function srtTmpDir(): string {
-	return process.env.CLAUDE_CODE_TMPDIR || process.env.CLAUDE_TMPDIR || "/tmp/claude";
+export function srtTmpDir(env: NodeJS.ProcessEnv = process.env): string {
+	return env.CLAUDE_CODE_TMPDIR || env.CLAUDE_TMPDIR || SANDBOX_TMPDIR;
 }
 
 /**
@@ -130,6 +141,41 @@ function samePath(a: string, b: string, platform: NodeJS.Platform = process.plat
 	if (platform !== "darwin") return a === b;
 	const strip = (p: string) => p.replace(/^\/private(?=\/)/, "");
 	return strip(a) === strip(b);
+}
+
+/**
+ * Writable bind mounts that pin every movable ancestor of a Linux write deny.
+ *
+ * A read-only bind on `workspace/.git/hooks` protects the directory's inode,
+ * but Linux still permits renaming its writable `.git` parent and creating a
+ * replacement tree at the old pathname. Making each ancestor below the nearest
+ * writable root a mount point makes those renames fail with `EBUSY`, while the
+ * ancestors themselves remain writable for ordinary Git metadata updates.
+ *
+ * The roots are already mount points. Returning pins shallow-first is
+ * load-bearing: a later bind of an ancestor would otherwise cover an earlier
+ * nested mount and remove the pin.
+ */
+export function linuxWriteMountPins(
+	writableRoots: readonly string[],
+	writeDeny: readonly string[],
+	platform: NodeJS.Platform = process.platform,
+): string[] {
+	if (platform !== "linux") return [];
+	const roots = [...new Set(writableRoots.map(canonical))].sort((a, b) => b.length - a.length);
+	const pins = new Set<string>();
+	for (const denied of writeDeny) {
+		const target = canonical(denied);
+		const root = roots.find((candidate) => isUnder(target, candidate));
+		if (!root) continue;
+		for (let parent = dirname(target); parent !== root && isUnder(parent, root); parent = dirname(parent)) {
+			pins.add(parent);
+		}
+	}
+	return [...pins].sort((a, b) => {
+		const depth = a.split("/").length - b.split("/").length;
+		return depth || a.localeCompare(b);
+	});
 }
 
 /**
@@ -167,9 +213,24 @@ export function partitionSrtDefaults(
  * The profile as it is actually in force under sandbox-runtime: the caller's
  * roots plus the SRT temp directory the child is pointed at.
  */
-export function effectiveProfile(profile: Profile, platform: NodeJS.Platform = process.platform): Profile {
-	const tmp = srtTmpDir();
-	const roots = profile.writableRoots.some((root) => samePath(root, tmp, platform))
+export function effectiveProfile(
+	profile: Profile,
+	platform: NodeJS.Platform = process.platform,
+	env: NodeJS.ProcessEnv = process.env,
+): Profile {
+	const tmp = srtTmpDir(env);
+	const hasAmbientOverride = Boolean(env.CLAUDE_CODE_TMPDIR || env.CLAUDE_TMPDIR);
+	const tmpContained =
+		isAbsolute(tmp) && profile.writableRoots.some((root) => isUnder(canonical(tmp), canonical(root)));
+	if (hasAmbientOverride && tmp !== SANDBOX_TMPDIR && !tmpContained) {
+		throw new Error(
+			`pi-enclave: refusing ambient sandbox TMPDIR ${tmp}; ` +
+				"CLAUDE_CODE_TMPDIR/CLAUDE_TMPDIR may only select a path already inside a configured writable root",
+		);
+	}
+	const roots = profile.writableRoots.some(
+		(root) => samePath(root, tmp, platform) || isUnder(canonical(tmp), canonical(root)),
+	)
 		? profile.writableRoots
 		: [...profile.writableRoots, tmp];
 	// sandbox-runtime's allowPty is macOS-only: bubblewrap never restricts
@@ -177,7 +238,70 @@ export function effectiveProfile(profile: Profile, platform: NodeJS.Platform = p
 	// it says PTYs are allowed whatever was asked -- a status line reading "pty
 	// off" there would be describing a restriction that does not exist.
 	const allowPty = platform === "linux" ? true : profile.allowPty;
-	return { ...profile, writableRoots: roots, allowPty };
+	return { ...profile, writableRoots: roots, tmpDir: tmp, allowPty };
+}
+
+/**
+ * Materialize trusted deny mount points before bwrap compiles its bind mounts.
+ * Read-deny credential paths are deliberately never created as a side effect.
+ */
+export function materializeWriteDenyAnchors(profile: Profile): void {
+	const writableRoots = profile.writableRoots.map(canonical);
+	const assertContained = (path: string) => {
+		const resolved = canonical(path);
+		if (!writableRoots.some((root) => isUnder(resolved, root))) {
+			throw new Error(
+				`pi-enclave: refusing to materialize write-deny anchor outside writable roots: ${path} -> ${resolved}`,
+			);
+		}
+	};
+	for (const path of profile.materializeWriteDeny ?? []) {
+		assertContained(path);
+		try {
+			const stat = lstatSync(path);
+			if (!stat.isDirectory() || stat.isSymbolicLink()) {
+				throw new Error(`pi-enclave: protected write-deny anchor is not a real directory: ${path}`);
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			try {
+				const parent = lstatSync(dirname(path));
+				if (!parent.isDirectory() || parent.isSymbolicLink()) {
+					throw new Error(`pi-enclave: protected write-deny parent is not a real directory: ${dirname(path)}`);
+				}
+			} catch (parentError) {
+				if ((parentError as NodeJS.ErrnoException).code === "ENOENT") {
+					throw new Error(`pi-enclave: protected write-deny parent does not exist: ${dirname(path)}`);
+				}
+				throw parentError;
+			}
+			mkdirSync(path, { recursive: false, mode: 0o700 });
+		}
+	}
+	for (const path of profile.materializeWriteDenyFiles ?? []) {
+		assertContained(path);
+		try {
+			const stat = lstatSync(path);
+			if (!stat.isFile() || stat.isSymbolicLink()) {
+				throw new Error(`pi-enclave: protected write-deny anchor is not a real file: ${path}`);
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			try {
+				const parent = lstatSync(dirname(path));
+				if (!parent.isDirectory() || parent.isSymbolicLink()) {
+					throw new Error(`pi-enclave: protected write-deny parent is not a real directory: ${dirname(path)}`);
+				}
+			} catch (parentError) {
+				if ((parentError as NodeJS.ErrnoException).code === "ENOENT") {
+					throw new Error(`pi-enclave: protected write-deny parent does not exist: ${dirname(path)}`);
+				}
+				throw parentError;
+			}
+			const fd = openSync(path, "wx", 0o600);
+			closeSync(fd);
+		}
+	}
 }
 
 /** How long to keep draining violations after a command exits. */
@@ -198,6 +322,16 @@ interface SrtConfig {
 	filesystem: SrtFilesystemConfig;
 	allowPty?: boolean;
 	enableWeakerNestedSandbox?: boolean;
+	ripgrep?: { command: string };
+	bwrapPath?: string;
+	socatPath?: string;
+}
+
+interface HostToolPaths {
+	rg?: string;
+	fd?: string;
+	bwrap?: string;
+	socat?: string;
 }
 
 /**
@@ -210,18 +344,31 @@ export function toSrtConfig(
 	profile: Profile,
 	weakerNested = false,
 	platform: NodeJS.Platform = process.platform,
+	hostTools: HostToolPaths = {},
 ): SrtConfig {
 	const { denied } = partitionSrtDefaults(profile.writableRoots, platform);
+	const denyWrite = [...new Set([...denied, ...withResolvedTargets(profile.writeDeny ?? [], platform)])];
+	const mountPins = linuxWriteMountPins(profile.writableRoots, denyWrite, platform);
+	const allowWrite =
+		platform === "linux"
+			? [...new Set([...profile.writableRoots, ...mountPins])]
+					.map((path, index) => ({ path, index }))
+					.sort((a, b) => a.path.split("/").length - b.path.split("/").length || a.index - b.index)
+					.map(({ path }) => path)
+			: [...profile.writableRoots];
 	return {
 		...(weakerNested ? { enableWeakerNestedSandbox: true } : {}),
+		...(hostTools.rg ? { ripgrep: { command: hostTools.rg } } : {}),
+		...(platform === "linux" && hostTools.bwrap ? { bwrapPath: hostTools.bwrap } : {}),
+		...(platform === "linux" && hostTools.socat ? { socatPath: hostTools.socat } : {}),
 		// "off" means no host is allowlisted. SRT still runs an egress proxy the
 		// child can reach; it denies every request. Raw sockets and DNS are denied
 		// by the kernel.
 		network: { allowedDomains: [], deniedDomains: [] },
 		filesystem: {
 			denyRead: withResolvedTargets(profile.readDeny, platform),
-			allowWrite: [...profile.writableRoots],
-			denyWrite: denied,
+			allowWrite,
+			denyWrite,
 		},
 		allowPty: profile.allowPty,
 	};
@@ -283,6 +430,7 @@ export class SrtBackend implements SandboxBackend {
 	/** Prepared during compile, because HelperSpawner must be synchronous. */
 	private helperArgv: string[] | undefined;
 	private helperDenySnapshot = "";
+	private hostTools: HostToolPaths = {};
 	/** Set by the extension so helper denials reach the same audit trail as shell ones. */
 	onFsViolation: ((violation: Violation) => void) | undefined;
 
@@ -293,14 +441,29 @@ export class SrtBackend implements SandboxBackend {
 
 	async compile(requested: Profile): Promise<CompiledProfile> {
 		const profile = effectiveProfile(requested);
-		const config = toSrtConfig(profile, this.weakened);
+		const pathSafety = hostRuntimeSafety(profile.writableRoots);
+		if (!pathSafety.ok) {
+			throw new Error(`pi-enclave: refusing unsafe host executable lookup. ${pathSafety.detail}`);
+		}
+		const rg = whichSync("rg");
+		const fd = whichSync("fd");
+		const bwrap = process.platform === "linux" ? whichSync("bwrap") : null;
+		const socat = process.platform === "linux" ? whichSync("socat") : null;
+		this.hostTools = {
+			...(rg ? { rg } : {}),
+			...(fd ? { fd } : {}),
+			...(bwrap ? { bwrap } : {}),
+			...(socat ? { socat } : {}),
+		};
+		materializeWriteDenyAnchors(profile);
+		const config = toSrtConfig(profile, this.weakened, process.platform, this.hostTools);
 
 		// SRT points the child's TMPDIR here but never creates it. On macOS a
 		// child can mkdir it itself (the profile allows the path); on Linux bwrap
 		// skips an absent bind, leaving TMPDIR pointing nowhere and `mktemp`
 		// failing. Creating it makes both platforms behave the same.
 		try {
-			mkdirSync(srtTmpDir(), { recursive: true, mode: 0o700 });
+			mkdirSync(profile.tmpDir ?? SANDBOX_TMPDIR, { recursive: true, mode: 0o700 });
 		} catch {
 			// A temp directory that cannot be created is the child's problem to
 			// report, not a reason to refuse to compile.
@@ -319,7 +482,7 @@ export class SrtBackend implements SandboxBackend {
 
 		// Render the backend-native form once, for `/enclave backend` and for the
 		// conformance suite to assert on.
-		const { argv } = await SandboxManager.wrapWithSandboxArgv(":", undefined, undefined, undefined, process.cwd(), {
+		const { argv } = await SandboxManager.wrapWithSandboxArgv(":", "/bin/bash", undefined, undefined, process.cwd(), {
 			commandId: "enclave-describe",
 		});
 		// Prepared here because the helper spawner must be synchronous, and because
@@ -346,7 +509,7 @@ export class SrtBackend implements SandboxBackend {
 		// under a directory with a space would otherwise split into arguments.
 		const helper = await SandboxManager.wrapWithSandboxArgv(
 			`exec ${shellQuote(process.execPath)} ${shellQuote(HELPER_PATH)}`,
-			undefined,
+			"/bin/bash",
 			undefined,
 			undefined,
 			profile.writableRoots[0] ?? process.cwd(),
@@ -364,25 +527,45 @@ export class SrtBackend implements SandboxBackend {
 	 */
 	private async refreshHelperIfStale(compiled: CompiledProfile): Promise<void> {
 		if (denySnapshot(compiled.profile) === this.helperDenySnapshot) return;
+		materializeWriteDenyAnchors(compiled.profile);
 		// Re-apply the configuration before re-wrapping: the manager resolves
 		// deny targets when it takes the configuration, not per wrap, so a wrap
 		// alone would mask the same stale target again.
-		SandboxManager.updateConfig(toSrtConfig(compiled.profile, this.weakened) as never);
+		SandboxManager.updateConfig(
+			toSrtConfig(compiled.profile, this.weakened, process.platform, this.hostTools) as never,
+		);
 		await this.wrapHelper(compiled.profile);
 		this.fsClient?.retire();
 	}
 
 	async run(compiled: CompiledProfile, request: RunRequest): Promise<RunResult> {
 		this.assertCurrent(compiled);
+		if (request.writeCapability) {
+			const lifetimeIssue = shellWriteCapabilityIssue();
+			if (lifetimeIssue) throw new Error(lifetimeIssue);
+		}
 		// Shell commands are wrapped per call, but the manager resolves deny
 		// targets when it takes the configuration, so a retargeted deny link
 		// needs the configuration re-applied here too.
 		await this.refreshHelperIfStale(compiled);
 
+		const capabilityTarget = request.writeCapability
+			? validateWriteCapability(compiled.profile, request.cwd, request.writeCapability)
+			: undefined;
+		const customProfile = capabilityTarget
+			? effectiveProfile({
+					...compiled.profile,
+					writableRoots: [...compiled.profile.writableRoots, capabilityTarget],
+				})
+			: undefined;
+		const customConfig = customProfile
+			? toSrtConfig(customProfile, this.weakened, process.platform, this.hostTools)
+			: undefined;
+
 		const { argv } = await SandboxManager.wrapWithSandboxArgv(
 			request.command,
-			undefined,
-			undefined,
+			"/bin/bash",
+			customConfig as never,
 			request.signal,
 			request.cwd,
 			{ commandId: request.commandId, commandText: request.command },
@@ -460,9 +643,17 @@ export class SrtBackend implements SandboxBackend {
 			};
 
 			child.on("error", (error) => {
+				killTree();
 				cleanup();
 				reject(error);
 			});
+
+			// `close` waits for stdio. A background descendant that inherited a pipe
+			// can keep it from firing, so reap the process group as soon as its leader
+			// exits. On macOS this is the lifecycle boundary Seatbelt itself does not
+			// provide; on Linux it is harmless defense in depth around bwrap's PID
+			// namespace and --die-with-parent behavior.
+			child.on("exit", killTree);
 
 			child.on("close", (code) => {
 				cleanup();
@@ -571,6 +762,8 @@ export class SrtBackend implements SandboxBackend {
 			env: {
 				...buildChildEnv(process.env, {
 					readDeny: compiled.profile.readDeny,
+					writableRoots: compiled.profile.writableRoots,
+					...(compiled.profile.tmpDir ? { tmpdir: compiled.profile.tmpDir } : {}),
 					// The helper reads files on the agent's behalf, so it must honour
 					// the same configured passthrough/envDeny the shell does; without
 					// these a user's custom envDeny protected bash but not the file
@@ -578,7 +771,7 @@ export class SrtBackend implements SandboxBackend {
 					...(compiled.profile.envPassthrough ? { passthrough: compiled.profile.envPassthrough } : {}),
 					...(compiled.profile.envDeny ? { envDeny: compiled.profile.envDeny } : {}),
 				}),
-				...resolveSearchTools(),
+				...resolveSearchTools(this.hostTools.rg, this.hostTools.fd),
 			},
 			stdio: ["pipe", "pipe", "pipe"],
 		}) as ChildProcessWithoutNullStreams;

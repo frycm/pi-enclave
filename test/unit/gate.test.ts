@@ -35,7 +35,7 @@ async function gate(toolName: string, input: Record<string, unknown>, overrides 
 
 describe("the gate", () => {
 	it("permits an ordinary command", async () => {
-		const decision = await gate("bash", { command: "npm test" });
+		const decision = await gate("bash", { command: "git status --short" });
 		expect(decision.block).toBe(false);
 		expect(decision.outcome).toBe("allow");
 	});
@@ -46,6 +46,20 @@ describe("the gate", () => {
 		expect(decision.outcome).toBe("deny");
 		expect(decision.reason).toContain("bash(sudo *)");
 		expect(decision.adverse).toBe(true);
+	});
+
+	it.each([
+		"git init --separate-git-dir .actualgit .",
+		"git clone --config core.hooksPath=hooks ../source nested",
+		"git -C nested worktree add ../branch-worktree",
+		"git submodule add ../source dependency",
+		"git submodule update --init dependency",
+		"git submodule --quiet update --init dependency",
+		"git submodule absorbgitdirs dependency",
+	])("denies agent-driven Git metadata creation: %s", async (command) => {
+		const decision = await gate("bash", { command });
+		expect(decision.outcome).toBe("deny");
+		expect(decision.reason).toContain("bash(git ");
 	});
 
 	it("steers away from the outcome rather than the command", async () => {
@@ -74,6 +88,104 @@ describe("the gate", () => {
 			expect(decision.outcome).toBe("ask-approved");
 		});
 
+		it("refuses a write capability intersecting read-denied credentials before asking", async () => {
+			let asked = false;
+			const decision = await gate(
+				"bash",
+				{ command: "cat /home/u/.ssh/id_ed25519", allow_write: "/home/u/.ssh/out" },
+				{
+					escalator: {
+						confirm: async () => {
+							asked = true;
+							return true;
+						},
+					},
+				},
+			);
+			expect(decision.outcome).toBe("deny");
+			expect(decision.reason).toContain("immutable read-deny");
+			expect(asked).toBe(false);
+		});
+
+		it("refuses a backend-immutable write target before asking", async () => {
+			let asked = false;
+			const decision = await gate(
+				"bash",
+				{ command: "true", allow_write: "/work/.pi/extensions" },
+				{
+					writeCapabilityIssue: () => "pi-enclave: target intersects immutable write-deny /work/.pi",
+					escalator: {
+						confirm: async () => {
+							asked = true;
+							return true;
+						},
+					},
+				},
+			);
+			expect(decision.outcome).toBe("deny");
+			expect(decision.reason).toContain("not grantable");
+			expect(asked).toBe(false);
+		});
+
+		it.each(["allow_read", "allow_host"])("refuses unsupported %s capabilities before asking", async (key) => {
+			let asked = false;
+			const decision = await gate(
+				"bash",
+				{ command: "echo x", [key]: "/outside" },
+				{
+					escalator: {
+						confirm: async () => {
+							asked = true;
+							return true;
+						},
+					},
+				},
+			);
+			expect(decision.outcome).toBe("deny");
+			expect(asked).toBe(false);
+		});
+
+		it("does not escalate a capability disabled by current policy", async () => {
+			let asked = false;
+			const decision = await gate(
+				"bash",
+				{ command: "echo x", allow_write: "/etc/hosts" },
+				{
+					profile: profile((p) => {
+						p.sandbox.capabilities = "none";
+					}),
+					escalator: {
+						confirm: async () => {
+							asked = true;
+							return true;
+						},
+					},
+				},
+			);
+			expect(decision.outcome).toBe("deny");
+			expect(asked).toBe(false);
+		});
+
+		it("asks rather than allowing a parameter-expanded sensitive subcommand", async () => {
+			const decision = await gate("bash", { command: "x=reset; git $x --hard" });
+			expect(decision.outcome).toBe("ask-denied");
+			expect(decision.reason).toContain("param-expansion");
+		});
+
+		it("asks rather than allowing a pathname-expanded sensitive subcommand", async () => {
+			const decision = await gate("bash", { command: "touch reset; git r?set --hard" });
+			expect(decision.outcome).toBe("ask-denied");
+			expect(decision.reason).toContain("pathname-expansion");
+		});
+
+		it("does not confidently allow a multi-cd protected-path write", async () => {
+			const decision = await gate("bash", {
+				command: "mkdir .pi; cd .pi; mkdir extensions; cd extensions; printf x > evil.ts",
+			});
+			expect(decision.outcome).toBe("ask-denied");
+			expect(decision.reason).toContain("cwd-change");
+		});
+
 		// The rules were matched against a guess, so a deny rule may not have
 		// fired. Asking is the only honest answer to "I do not know what this is".
 		it("asks when the tokenizer could not parse the command", async () => {
@@ -86,6 +198,13 @@ describe("the gate", () => {
 			"! git push origin main",
 			'TARGET=.github/workflows/ci.yml; echo pwn > "$TARGET"',
 			'tee "$TARGET"',
+			". /tmp/agent-script",
+			"nodejs /tmp/agent-script.js",
+			"npm run agent-controlled-script",
+			"find . -exec git reset --hard ';'",
+			"sed -n 'e git reset --hard' /dev/null",
+			"busybox sh -c 'git reset --hard'",
+			"fish -c 'git reset --hard'",
 		])("fails closed for unsupported shell semantics in %s", async (command) => {
 			const decision = await gate("bash", { command });
 			expect(decision.outcome).toBe("ask-denied");
@@ -153,6 +272,36 @@ describe("the gate", () => {
 				},
 			);
 			expect(decision.block).toBe(false);
+		});
+
+		it("withholds an otherwise allowed tool at the final unsandboxed boundary", async () => {
+			const decision = await gate(
+				"deploy",
+				{ env: "prod" },
+				{
+					profile: profile((p) => {
+						p.tools.allow.deploy = {};
+					}),
+					withholdBeforeExecution: () => "earlier owned sibling could trip the breaker",
+				},
+			);
+			expect(decision.outcome).toBe("batch-withheld");
+			expect(decision.block).toBe(true);
+		});
+
+		it("applies a deny before the final unsandboxed-boundary check", async () => {
+			const decision = await gate(
+				"deploy",
+				{},
+				{
+					profile: profile((p) => {
+						p.tools.allow.deploy = {};
+						p.rules.deny.push("deploy");
+					}),
+					withholdBeforeExecution: () => "batch risk",
+				},
+			);
+			expect(decision.outcome).toBe("deny");
 		});
 
 		it("sends a reviewed tool to a human", async () => {
@@ -309,9 +458,16 @@ describe("the lock", () => {
 		// under one tool call and must all be allowed.
 		it("permits repeated operations within one tool call", () => {
 			const lock = new ActionLock();
-			lock.register(action, "c1");
-			lock.beginExecution("bash:ls");
-			expect(() => lock.beginExecution("bash:ls")).not.toThrow();
+			const edit = canonicalize({
+				tool: "edit",
+				input: { path: "/work/file", oldText: "a", newText: "b" },
+				cwd: "/work",
+				home: "/home/u",
+				profileName: "dev",
+			});
+			lock.register(edit, "c1");
+			lock.beginExecution("edit:/work/file");
+			expect(() => lock.beginExecution("edit:/work/file")).not.toThrow();
 		});
 
 		it("refuses after the tool call is consumed", () => {
@@ -319,7 +475,7 @@ describe("the lock", () => {
 			lock.register(action, "c1");
 			lock.beginExecution("bash:ls");
 			lock.consume("c1");
-			expect(() => lock.beginExecution("bash:ls")).toThrow(/already run once/);
+			expect(() => lock.beginExecution("bash:ls")).toThrow(/has run once/);
 		});
 
 		// Two identical commands in one batch canonicalize to the same key; a
@@ -330,13 +486,30 @@ describe("the lock", () => {
 			lock.register(action, "c1");
 			lock.register(action, "c2");
 			const first = lock.beginExecution("bash:ls");
-			lock.consume("c1");
 			const second = lock.beginExecution("bash:ls");
 			expect(first.toolCallId).toBe("c1");
 			expect(second.toolCallId).toBe("c2");
+			lock.consume("c1");
 			lock.consume("c2");
 			// Both spent now; a third finds nothing available.
-			expect(() => lock.beginExecution("bash:ls")).toThrow(/already run once/);
+			expect(() => lock.beginExecution("bash:ls")).toThrow(/has run once/);
+		});
+
+		it("refuses indistinguishable concurrent bash calls with different capabilities", () => {
+			const lock = new ActionLock();
+			const widened = canonicalize({
+				tool: "bash",
+				input: { command: "ls", allow_write: "/srv/result" },
+				cwd: "/work",
+				home: "/home/u",
+				profileName: "dev",
+			});
+			lock.register(widened, "capability-call");
+			lock.register(action, "ordinary-call");
+
+			expect(() => lock.beginExecution("bash:ls")).toThrow(/different authority/);
+			lock.consume("ordinary-call");
+			expect(lock.beginExecution("bash:ls").toolCallId).toBe("capability-call");
 		});
 
 		// The window pi's prepare-all-then-execute batching opens: this call was
@@ -433,6 +606,27 @@ describe("checkTool", () => {
 			owned: OWNED_TOOLS,
 		});
 		expect(disposition.allowed && disposition.reviewed).toBe(true);
+	});
+
+	it("fails a configured source pin closed when the runtime source is absent", () => {
+		const disposition = checkTool({
+			tool: "deploy",
+			tools: { allow: { deploy: { source: "/ext/deploy.ts" } } },
+			owned: OWNED_TOOLS,
+		});
+		expect(disposition.allowed).toBe(false);
+		if (disposition.allowed) return;
+		expect(disposition.reason).toContain("unknown source");
+	});
+
+	it("accepts a matching source pin for an owned tool", () => {
+		const disposition = checkTool({
+			tool: "bash",
+			tools: { allow: { bash: { source: "/ext/pi-enclave.ts" } } },
+			owned: OWNED_TOOLS,
+			source: "/ext/pi-enclave.ts",
+		});
+		expect(disposition.allowed).toBe(true);
 	});
 
 	// A tool named after an Object.prototype member must not inherit a grant.

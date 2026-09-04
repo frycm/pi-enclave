@@ -3,7 +3,9 @@ import {
 	BREAKER_ENTRY_TYPE,
 	CircuitBreaker,
 	isBreakerState,
+	recordRuntimeViolation,
 	resetAndPersistBreaker,
+	shouldWithholdNonOwnedSibling,
 	steerMessage,
 } from "../../src/gate/breaker.ts";
 import { ActionLock } from "../../src/gate/lock.ts";
@@ -28,6 +30,20 @@ describe("the circuit breaker", () => {
 		breaker.record(2, true);
 		expect(breaker.finishTurn(2)).toBe(true);
 		expect(breaker.open).toBe(true);
+	});
+
+	it("turns a provisional allow into an adverse runtime sandbox outcome", () => {
+		const breaker = new CircuitBreaker(CONFIG);
+		breaker.record(0, false);
+		recordRuntimeViolation(breaker, 0, 1, true);
+		breaker.finishTurn(0);
+		expect(breaker.state.consecutive).toBe(1);
+	});
+
+	it("does not count a direct-human runtime violation", () => {
+		const breaker = new CircuitBreaker(CONFIG);
+		recordRuntimeViolation(breaker, 0, 1, false);
+		expect(breaker.hasOutcome(0)).toBe(false);
 	});
 
 	it("reports the trip exactly once", () => {
@@ -136,6 +152,39 @@ describe("the circuit breaker", () => {
 			expect(breaker.pendingOpen(3)).toBe(false);
 			expect(breaker.finishTurn(3)).toBe(false);
 			expect(breaker.state.recent).toEqual([false, false, true]);
+		});
+
+		it("blocks an already-locked action on the threshold turn", () => {
+			const breaker = new CircuitBreaker({ consecutive: 3, window: [10, 50] });
+			breaker.restore({ consecutive: 2, recent: [true, true] });
+			const lock = new ActionLock({ breakerOpen: () => breaker.open || breaker.pendingOpen(2) });
+			const action = canonicalize({
+				tool: "bash",
+				input: { command: "echo queued" },
+				cwd: "/work",
+				home: "/home/u",
+				profileName: "dev",
+			});
+			lock.register(action, "c1");
+			breaker.record(2, true);
+
+			expect(breaker.open).toBe(false);
+			expect(() => lock.beginExecution("bash:echo queued")).toThrow(/circuit breaker/);
+		});
+
+		it("withholds only a non-owned sibling when one runtime denial would open", () => {
+			const breaker = new CircuitBreaker({ consecutive: 3, window: [10, 50] });
+			breaker.restore({ consecutive: 2, recent: [true, true] });
+
+			expect(shouldWithholdNonOwnedSibling(breaker, true, false)).toBe(true);
+			expect(shouldWithholdNonOwnedSibling(breaker, false, false)).toBe(false);
+			expect(shouldWithholdNonOwnedSibling(breaker, true, true)).toBe(false);
+		});
+
+		it("allows a non-owned sibling below the one-strike threshold", () => {
+			const breaker = new CircuitBreaker({ consecutive: 3, window: [10, 50] });
+			breaker.restore({ consecutive: 1, recent: [true] });
+			expect(shouldWithholdNonOwnedSibling(breaker, true, false)).toBe(false);
 		});
 	});
 

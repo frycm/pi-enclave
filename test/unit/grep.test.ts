@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { FsClient, Violation } from "../../src/backend/types.ts";
 import { SandboxDenied } from "../../src/backend/types.ts";
-import { parseRipgrepJson, runSandboxedGrep } from "../../src/tools/grep.ts";
+import { GrepExecutionQueue, parseRipgrepJson, runSandboxedGrep } from "../../src/tools/grep.ts";
 
 const rgMatch = (path: string, line: number) =>
 	JSON.stringify({ type: "match", data: { path: { text: path }, line_number: line } });
+
+const rgMatchWithText = (path: string, line: number, text: string) =>
+	JSON.stringify({ type: "match", data: { path: { text: path }, line_number: line, lines: { text: `${text}\n` } } });
 
 /** A helper stub that records what it was asked and answers from a fake tree. */
 function fakeFs(files: Record<string, string>, stdout: string, options: { grepThrows?: Error } = {}) {
@@ -57,6 +60,31 @@ describe("parseRipgrepJson", () => {
 });
 
 describe("runSandboxedGrep", () => {
+	it("serializes the complete parent-side grep lifetime", async () => {
+		const queue = new GrepExecutionQueue();
+		let active = 0;
+		let peak = 0;
+		let releaseFirst!: () => void;
+		const firstBlocked = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const run = (blocked = false) =>
+			queue.run(async () => {
+				active++;
+				peak = Math.max(peak, active);
+				if (blocked) await firstBlocked;
+				active--;
+			});
+
+		const first = run(true);
+		const second = run();
+		await Promise.resolve();
+		expect(active).toBe(1);
+		releaseFirst();
+		await Promise.all([first, second]);
+		expect(peak).toBe(1);
+	});
+
 	it("runs the search through the helper, never in the pi process", async () => {
 		// The whole point of this module: pi's grep spawns rg itself, which would
 		// read a credential directory with the user's full privileges.
@@ -85,6 +113,13 @@ describe("runSandboxedGrep", () => {
 		const { fs, calls } = fakeFs({ "/w/a.txt": "one\ntwo\nthree\n" }, rgMatch("/w/a.txt", 2));
 		await runSandboxedGrep({ fs, cwd: "/w" }, { pattern: "two", context: 1 });
 		expect(calls.reads).toEqual(["/w/a.txt"]);
+	});
+
+	it("uses rg's sandboxed line payload without reading the complete file when context is zero", async () => {
+		const { fs, calls } = fakeFs({}, rgMatchWithText("/w/a.txt", 2, "two"));
+		const result = await runSandboxedGrep({ fs, cwd: "/w" }, { pattern: "two" });
+		expect(result.content[0].text).toBe("a.txt:2: two");
+		expect(calls.reads).toEqual([]);
 	});
 
 	it("reads each file once however many times it matches", async () => {
@@ -121,6 +156,18 @@ describe("runSandboxedGrep", () => {
 		const result = await runSandboxedGrep({ fs, cwd: "/w" }, { pattern: "z" });
 		expect(result.content[0].text).toContain("[truncated]");
 		expect(result.details?.linesTruncated).toBe(true);
+	});
+
+	it("stops context reads when the aggregate output budget is reached", async () => {
+		const files = Object.fromEntries(
+			Array.from({ length: 100 }, (_, index) => [`/w/${index}.txt`, `${"x".repeat(4_000)}\n`]),
+		);
+		const stdout = Array.from({ length: 100 }, (_, index) => rgMatch(`/w/${index}.txt`, 1)).join("\n");
+		const { fs, calls } = fakeFs(files, stdout);
+		const result = await runSandboxedGrep({ fs, cwd: "/w" }, { pattern: "x", context: 1, limit: 100 });
+		expect(calls.reads.length).toBeLessThan(100);
+		expect(result.details?.truncation).toBeDefined();
+		expect(Buffer.byteLength(result.content[0].text)).toBeLessThan(60 * 1024);
 	});
 
 	it("reports a file it cannot read inline instead of failing the search", async () => {

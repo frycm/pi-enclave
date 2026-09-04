@@ -11,9 +11,10 @@
  * else is either a sandbox boundary or a judgement call for the prose rulebook
  * a reviewer reads.
  */
-import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { SANDBOX_TMPDIR } from "../backend/types.ts";
 import type {
 	AttendedSettings,
 	AuditSettings,
@@ -32,36 +33,50 @@ import type {
  * an agent has no business reading, including pi's own, so a task cannot
  * exfiltrate the key that is running it.
  */
-export function defaultReadDeny(home = homedir(), agentDir = getAgentDir()): string[] {
+export function defaultReadDeny(
+	home = homedir(),
+	agentDir = getAgentDir(),
+	env: Readonly<Record<string, string | undefined>> = process.env,
+): string[] {
+	const xdgConfig = env.XDG_CONFIG_HOME;
+	const configRoots = [join(home, ".config")];
+	// XDG base-directory values are paths only when absolute. Never resolve a
+	// relative value against the repository: that would turn untrusted cwd into
+	// authorization data. Keep the conventional root as well, because stale
+	// credentials there remain sensitive after a migration.
+	if (xdgConfig && isAbsolute(xdgConfig)) configRoots.push(xdgConfig);
+
 	return [
-		// pi's *live* credential storage. pi resolves its agent directory from
-		// PI_CODING_AGENT_DIR, so the default path below is only where auth.json
-		// usually is; this entry is where it actually is. The child never sees the
-		// variable, but the file is on disk regardless, and an agent that can read
-		// it can spend the account running it.
-		join(agentDir, "auth.json"),
-		// pi-enclave's own state: pending approval records, the audit log, and the
-		// attendance secret. The pending records are the one place "what a human
-		// approved" is persisted, and the secret is the whole of the RPC
-		// attendance proof -- an agent that can read either can forge the other
-		// side of an escalation. `merge.ts` additionally refuses any profile that
-		// makes this directory writable.
-		enclaveStateDir(agentDir),
-		join(home, ".ssh"),
-		join(home, ".aws"),
-		join(home, ".gnupg"),
-		join(home, ".kube"),
-		join(home, ".docker"),
-		join(home, ".config", "gh"),
-		join(home, ".netrc"),
-		join(home, ".npmrc"),
-		// The default agent directory, kept even when the live one is elsewhere:
-		// a stale auth.json at the default path is still a credential.
-		join(home, ".pi", "agent", "auth.json"),
-		join(home, ".pi", "auth.json"),
-		// Sibling agents' stored credentials, for the same reason.
-		join(home, ".claude", ".credentials.json"),
-		join(home, ".config", "claude"),
+		...new Set([
+			// pi's *live* credential storage. pi resolves its agent directory from
+			// PI_CODING_AGENT_DIR, so the default path below is only where auth.json
+			// usually is; this entry is where it actually is. The child never sees the
+			// variable, but the file is on disk regardless, and an agent that can read
+			// it can spend the account running it.
+			join(agentDir, "auth.json"),
+			// pi-enclave's own state: pending approval records, the audit log, and the
+			// attendance secret. The pending records are the one place "what a human
+			// approved" is persisted, and the secret is the whole of the RPC
+			// attendance proof -- an agent that can read either can forge the other
+			// side of an escalation. `merge.ts` additionally refuses any profile that
+			// makes this directory writable.
+			enclaveStateDir(agentDir),
+			join(home, ".ssh"),
+			join(home, ".aws"),
+			join(home, ".gnupg"),
+			join(home, ".kube"),
+			join(home, ".docker"),
+			...configRoots.map((root) => join(root, "gh")),
+			join(home, ".netrc"),
+			join(home, ".npmrc"),
+			// The default agent directory, kept even when the live one is elsewhere:
+			// a stale auth.json at the default path is still a credential.
+			join(home, ".pi", "agent", "auth.json"),
+			join(home, ".pi", "auth.json"),
+			// Sibling agents' stored credentials, for the same reason.
+			join(home, ".claude", ".credentials.json"),
+			...configRoots.map((root) => join(root, "claude")),
+		]),
 	];
 }
 
@@ -106,6 +121,18 @@ export const DEFAULT_ENV_DENY: readonly string[] = [
  * someone thought of.
  */
 export const DEFAULT_RULES_DENY: readonly string[] = [
+	// Creating or relocating Git metadata establishes a privileged hook consumer
+	// that is absent from the profile compiled for this session. A person can do
+	// this deliberately through direct `!` input; the next agent call then starts
+	// under a newly compiled profile that protects the resulting metadata.
+	"bash(git init*)",
+	"bash(git clone*)",
+	"bash(git worktree add*)",
+	"bash(git worktree move*)",
+	"bash(git worktree repair*)",
+	"bash(git submodule add*)",
+	"bash(git submodule update*--init*)",
+	"bash(git submodule absorbgitdirs*)",
 	// Privilege escalation. The sandbox denies these too, but a pattern denial
 	// names the outcome to the agent instead of surfacing a bare EPERM it will
 	// try to work around.
@@ -158,7 +185,9 @@ export const DEFAULT_RULES_ASK: readonly string[] = [
 
 /** Path denials, matched against every resolved write target. */
 export const DEFAULT_PROTECTED_DENY: readonly string[] = [
+	"**/.git",
 	"**/.git/hooks/**",
+	"**/.git/config",
 	"**/.pi/extensions/**",
 	"**/.ssh/**",
 	"**/authorized_keys",
@@ -167,7 +196,6 @@ export const DEFAULT_PROTECTED_DENY: readonly string[] = [
 /** Path escalations, matched against every resolved write target. */
 export const DEFAULT_PROTECTED_ASK: readonly string[] = [
 	"**/.github/workflows/**",
-	"**/.git/config",
 	"**/Dockerfile",
 	"**/docker-compose*.y*ml",
 ];
@@ -212,6 +240,8 @@ export interface DefaultProfileOptions {
 	home?: string;
 	tmp?: string;
 	agentDir?: string;
+	/** Parent environment used to derive effective credential locations. */
+	env?: Readonly<Record<string, string | undefined>>;
 }
 
 /**
@@ -224,14 +254,14 @@ export interface DefaultProfileOptions {
  * whose default answer resolves to "approved".
  */
 export function defaultProfile(options: DefaultProfileOptions): EffectiveProfile {
-	const { cwd, home = homedir(), tmp = tmpdir(), agentDir = getAgentDir() } = options;
+	const { cwd, home = homedir(), tmp = SANDBOX_TMPDIR, agentDir = getAgentDir(), env = process.env } = options;
 	return {
 		name: "dev",
 		auto: true,
 		sandbox: {
 			mode: "workspace-write",
 			writableRoots: [cwd, tmp],
-			readDeny: defaultReadDeny(home, agentDir),
+			readDeny: defaultReadDeny(home, agentDir, env),
 			network: { mode: "off", allowHosts: [] },
 			capabilities: "reviewed",
 			hostExec: "never",

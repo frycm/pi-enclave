@@ -32,12 +32,27 @@ done
 describe("helper search bounds", () => {
 	let dir: string;
 	let flood: string;
+	let serialized: string;
 
 	beforeAll(() => {
 		dir = mkdtempSync(join(tmpdir(), "enclave-flood-"));
 		flood = join(dir, "flood.sh");
 		writeFileSync(flood, FLOOD);
 		chmodSync(flood, 0o755);
+		serialized = join(dir, "serialized.sh");
+		writeFileSync(
+			serialized,
+			`#!/bin/sh
+if ! mkdir "$SEARCH_LOCK" 2>/dev/null; then
+  echo "overlapping search" >&2
+  exit 9
+fi
+trap 'rmdir "$SEARCH_LOCK"' EXIT
+sleep 0.2
+exit 1
+`,
+		);
+		chmodSync(serialized, 0o755);
 	});
 
 	afterAll(() => {
@@ -92,4 +107,33 @@ describe("helper search bounds", () => {
 			await fs.dispose();
 		}
 	}, 60_000);
+
+	it("serializes concurrent search requests to keep the aggregate memory bound", async () => {
+		const profile = {
+			mode: "workspace-write" as const,
+			writableRoots: [dir],
+			readDeny: [],
+			network: "off" as const,
+			allowPty: false,
+		};
+		const fs = new HelperFsClient({
+			compiled: { backend: "seatbelt", profile, describe: () => "unsandboxed test helper" },
+			spawnHelper: () =>
+				spawn(process.execPath, [HELPER], {
+					env: {
+						...process.env,
+						PI_ENCLAVE_RG: serialized,
+						PI_ENCLAVE_FD: serialized,
+						SEARCH_LOCK: join(dir, "search.lock"),
+					},
+					stdio: ["pipe", "pipe", "pipe"],
+				}) as never,
+			callTimeoutMs: 10_000,
+		});
+		try {
+			await Promise.all([fs.grep(["--json", "x", dir], { path: dir }), fs.grep(["--json", "y", dir], { path: dir })]);
+		} finally {
+			await fs.dispose();
+		}
+	}, 15_000);
 });

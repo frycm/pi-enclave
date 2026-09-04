@@ -16,15 +16,14 @@
  * module is new rather than ported.
  *
  * **What the hash covers, and why each part is in it.** The tool, the resolved
- * paths, the parsed command, the working directory, the requested capability,
- * and the profile name. Not the raw argument object -- key order and
- * whitespace would change the hash without changing the action, and an
- * approval that expires because the model re-serialized its JSON differently is
- * an approval nobody will trust. Not the session id either: that is checked
- * separately, so a mismatch can say "approved in a different session" instead
- * of "not the action you approved".
+ * paths, parsed command, working directory, requested capability, profile name,
+ * and the complete tool input in its executor-observable property order. Semantic projections aid
+ * policy and display; they never replace the executor-consumed input in the
+ * identity. The session id is checked separately so a mismatch can retain a
+ * useful diagnosis.
  */
 import { createHash } from "node:crypto";
+import { redact } from "../state/redact.ts";
 import { normalizeInputPath, pathCandidatesInToken, resolveForPolicy } from "./paths.ts";
 import { type ParsedShell, parseShell } from "./shell.ts";
 
@@ -165,7 +164,10 @@ export function canonicalize(options: CanonicalizeOptions): CanonicalAction {
 			}
 		}
 	} else {
-		const keys = PATH_KEYS[tool] ?? ["path"];
+		// Unknown tools execute in another extension's privileged code. A `path`
+		// field is not evidence that the operation is a read; only owned tools with
+		// a known schema receive semantic path classification.
+		const keys = PATH_KEYS[tool] ?? [];
 		for (const key of keys) {
 			const value = input[key];
 			if (typeof value === "string") addPath(value, WRITING_TOOLS.has(tool));
@@ -244,15 +246,17 @@ const READ_ONLY_COMMANDS = new Set([
  * `allow_write=/Users/m/.ssh/authorized_keys`.
  */
 function readCapability(input: Record<string, unknown>): Capability | undefined {
+	const found: Capability[] = [];
 	for (const [key, kind] of [
 		["allow_write", "write"],
 		["allow_read", "read"],
 		["allow_host", "host"],
 	] as const) {
 		const value = input[key];
-		if (typeof value === "string" && value.trim() !== "") return { kind, value: value.trim() };
+		if (typeof value === "string" && value.trim() !== "") found.push({ kind, value: value.trim() });
 	}
-	return undefined;
+	if (found.length > 1) throw new Error("an action may request exactly one capability");
+	return found[0];
 }
 
 /**
@@ -276,8 +280,8 @@ export function canonicalForm(action: Omit<CanonicalAction, "hash">): string {
 		// distinction while still ignoring harmless whitespace runs.
 		syntax: command.syntax,
 	}));
-	return JSON.stringify({
-		v: 2,
+	return stableSerialize({
+		v: 4,
 		tool: action.tool,
 		cwd: action.cwd,
 		profile: action.profileName,
@@ -294,9 +298,12 @@ export function canonicalForm(action: Omit<CanonicalAction, "hash">): string {
 		// command string and path are excluded (they are captured, normalised,
 		// above); only body-bearing keys are bound here.
 		body: bodyFields(action.input),
-		// For a tool with no shell, no path and no body, the input itself is the
-		// action, so it is included with keys sorted.
-		input: commands || action.paths.length > 0 ? null : stableInput(action.input),
+		// Always bind the complete executor-consumed input. The normalized fields
+		// above are additional policy projections, never a lossy replacement.
+		// Preserve the executor-observable property order inside a string. The
+		// surrounding canonical object remains key-sorted, but two custom tools
+		// that iterate differently ordered inputs must never share an approval.
+		input: executionSerialize(action.input),
 		capability: action.capability ?? null,
 	});
 }
@@ -337,12 +344,76 @@ function stableInput(input: unknown): unknown {
 	return sort(input);
 }
 
+/**
+ * Stable, injective serialization for the JSON-like values accepted by the
+ * action lock. Native JSON.stringify collapses the distinct JavaScript values
+ * `-0` and `0`, even though a tool can distinguish them with Object.is.
+ */
+export function stableSerialize(value: unknown): string {
+	if (value === null) return "null";
+	if (typeof value === "string") return JSON.stringify(value);
+	if (typeof value === "boolean") return value ? "true" : "false";
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) throw new TypeError("cannot serialize a non-finite number");
+		return Object.is(value, -0) ? "-0" : String(value);
+	}
+	if (Array.isArray(value)) return `[${value.map(stableSerialize).join(",")}]`;
+	if (value && typeof value === "object") {
+		return `{${Object.entries(value as Record<string, unknown>)
+			.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+			.map(([key, entry]) => `${JSON.stringify(key)}:${stableSerialize(entry)}`)
+			.join(",")}}`;
+	}
+	throw new TypeError(`cannot serialize ${typeof value}`);
+}
+
+/**
+ * Injective serialization that preserves JavaScript's observable property order.
+ *
+ * This is used wherever a value will be reviewed, hashed as executor input, or
+ * persisted for later execution. Sorting object keys there changes semantics for
+ * tools that iterate their input, so only structural/profile data uses the stable
+ * key-sorted serializer above.
+ */
+export function executionSerialize(value: unknown): string {
+	if (value === null) return "null";
+	if (typeof value === "string") return JSON.stringify(value);
+	if (typeof value === "boolean") return value ? "true" : "false";
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) throw new TypeError("cannot serialize a non-finite number");
+		return Object.is(value, -0) ? "-0" : String(value);
+	}
+	if (Array.isArray(value)) return `[${value.map(executionSerialize).join(",")}]`;
+	if (value && typeof value === "object") {
+		return `{${Object.entries(value as Record<string, unknown>)
+			.map(([key, entry]) => `${JSON.stringify(key)}:${executionSerialize(entry)}`)
+			.join(",")}}`;
+	}
+	throw new TypeError(`cannot serialize ${typeof value}`);
+}
+
+/**
+ * The exact stable value in an ASCII-only form suitable for an authorization UI.
+ *
+ * JSON escaping already distinguishes a literal `\\u202e` from U+202E. Escaping
+ * every remaining non-ASCII code point keeps bidi, zero-width and terminal-
+ * dependent formatting characters inert without changing the value that is
+ * hashed or executed.
+ */
+export function approvalSerialize(value: unknown): string {
+	return executionSerialize(value).replace(/[^\x20-\x7e]/gu, (character) => {
+		const point = character.codePointAt(0);
+		if (point === undefined) throw new TypeError("cannot render an empty code point");
+		return point <= 0xffff ? `\\u${point.toString(16).padStart(4, "0")}` : `\\u{${point.toString(16)}}`;
+	});
+}
+
 export function hashAction(action: Omit<CanonicalAction, "hash">): string {
 	return `sha256:${createHash("sha256").update(canonicalForm(action)).digest("hex")}`;
 }
 
 /**
- * A one-line rendering for a confirm dialog and for the audit log.
+ * A bounded rendering for agent-facing diagnostics and audit-adjacent output.
  *
  * The canonical form, never the raw string: a command with an embedded newline
  * would otherwise be able to hide a second command below the fold of a dialog
@@ -361,22 +432,116 @@ export function describeAction(action: CanonicalAction): string {
 		if (!action.confident) head.push(`    (parse is not confident: ${action.shell.markers.join(", ")})`);
 	} else {
 		for (const path of action.paths) head.push(`    ${path.writes ? "writes" : "reads"} ${path.resolved}`);
-		// The body of a write/edit is part of what is being approved. Rendered as
-		// a bounded preview with its length, never silently omitted.
-		for (const [label, value] of bodyPreviews(action.input)) head.push(`    ${label}: ${value}`);
+		// Body semantics remain visible without disclosing an unlimited value to
+		// agent-facing diagnostics. Direct approval uses the exact renderer below.
+		if (WRITING_TOOLS.has(action.tool)) {
+			for (const [label, value] of bodyPreviews(action.input)) head.push(`    ${label}: ${value}`);
+		}
 	}
+	for (const [label, value] of additionalInputPreviews(action)) head.push(`    input.${label}: ${value}`);
 
 	if (action.capability) head.push(`    requests ${action.capability.kind} access to ${action.capability.value}`);
 	return head.join("\n");
 }
 
-/** Bounded previews of write/edit body fields, for the approval dialog. */
+/**
+ * Full-fidelity evidence for the direct human authorization boundary.
+ *
+ * This is intentionally separate from {@link describeAction}: denial messages
+ * and audit-adjacent diagnostics may redact or bound untrusted values, while a
+ * person deciding whether the original input may execute must see all of it.
+ */
+export function describeActionForApproval(action: CanonicalAction): string {
+	const lines = [
+		`tool: ${approvalSerialize(action.tool)}`,
+		`cwd: ${approvalSerialize(action.cwd)}`,
+		`profile: ${approvalSerialize(action.profileName)}`,
+		`input: ${approvalSerialize(action.input)}`,
+	];
+	for (const path of action.paths) {
+		lines.push(`${path.writes ? "writes" : "reads"}: ${approvalSerialize(path.resolved)}`);
+	}
+	if (action.capability) {
+		lines.push(`capability: ${approvalSerialize({ kind: action.capability.kind, value: action.capability.value })}`);
+	}
+	lines.push(`hash: ${action.hash}`);
+	return lines.join("\n");
+}
+
+/**
+ * Every input field not already represented by the semantic rendering.
+ *
+ * Top-level names are never truncated, so a privileged third-party `mode` or
+ * `force` flag cannot disappear from a confirmation. Values are redacted and
+ * bounded, with the full stable value bound by a digest.
+ */
+function additionalInputPreviews(action: CanonicalAction): [string, string][] {
+	const represented = new Set<string>();
+	if (WRITING_TOOLS.has(action.tool)) for (const key of BODY_KEYS) represented.add(key);
+	if (action.shell) represented.add("command");
+	else for (const key of PATH_KEYS[action.tool] ?? []) represented.add(key);
+	if (action.capability) represented.add(`allow_${action.capability.kind}`);
+	return inputFieldPreviews(action.input, represented);
+}
+
+/** Render every leaf field; nesting must not hide a privileged mode/force flag. */
+export function inputFieldPreviews(
+	input: Record<string, unknown>,
+	represented: ReadonlySet<string> = new Set(),
+): [string, string][] {
+	const out: [string, string][] = [];
+	const render = (label: string, leafKey: string, value: unknown) => {
+		if (Array.isArray(value)) {
+			if (value.length === 0) push(label, leafKey, value);
+			else {
+				value.forEach((entry, index) => {
+					render(`${label}[${index}]`, leafKey, entry);
+				});
+			}
+			return;
+		}
+		if (value && typeof value === "object") {
+			const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+			if (entries.length === 0) push(label, leafKey, value);
+			else {
+				for (const [key, entry] of entries) {
+					const displayed = displayInputKey(key);
+					const child = displayed.startsWith('"') ? `${label}[${displayed}]` : `${label}.${displayed}`;
+					render(child, key, entry);
+				}
+			}
+			return;
+		}
+		push(label, leafKey, value);
+	};
+	const push = (label: string, leafKey: string, value: unknown) => {
+		const stable = stableInput(value);
+		const serialized = stableSerialize(stable);
+		const visible = approvalSerialize(redact(value, {}, leafKey));
+		const preview = visible.length > 240 ? `${visible.slice(0, 120)}…${visible.slice(-120)}` : visible;
+		const digest = createHash("sha256").update(serialized).digest("hex");
+		out.push([label, `${preview} (${serialized.length} serialized chars, sha256:${digest})`]);
+	};
+
+	for (const key of Object.keys(input).sort()) {
+		if (!represented.has(key)) render(displayInputKey(key), key, input[key]);
+	}
+	return out;
+}
+
+/** Keep ordinary field names readable while escaping attacker-chosen controls. */
+export function displayInputKey(key: string): string {
+	return /^[A-Za-z_][A-Za-z0-9_-]*$/.test(key) ? key : approvalSerialize(key);
+}
+
+/** Bounded previews of write/edit body fields for non-authoritative diagnostics. */
 function bodyPreviews(input: Record<string, unknown>): [string, string][] {
 	const out: [string, string][] = [];
 	for (const key of BODY_KEYS) {
 		if (!Object.hasOwn(input, key)) continue;
-		const serialized = JSON.stringify(stableInput(input[key])) ?? "undefined";
-		const preview = serialized.length > 200 ? `${serialized.slice(0, 100)}…${serialized.slice(-100)}` : serialized;
+		const serialized = stableSerialize(stableInput(input[key]));
+		const visible = approvalSerialize(redact(input[key], {}, key));
+		const preview = visible.length > 200 ? `${visible.slice(0, 100)}…${visible.slice(-100)}` : visible;
 		const digest = createHash("sha256").update(serialized).digest("hex");
 		out.push([key, `${preview} (${serialized.length} serialized chars, sha256:${digest})`]);
 	}

@@ -10,6 +10,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatProbeReport } from "../src/probe.ts";
 import { probeHost } from "../src/probe-host.ts";
+import { sanitizeVerificationPath } from "./test-path.ts";
+
+sanitizeVerificationPath();
 
 /**
  * Read pi's version from its package.json rather than importing the package:

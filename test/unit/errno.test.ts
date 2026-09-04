@@ -6,6 +6,7 @@ import type { BackendName, Profile } from "../../src/backend/types.ts";
 const PROFILE: Profile = {
 	mode: "workspace-write",
 	writableRoots: ["/work", "/tmp/box"],
+	writeDeny: ["/work/.pi"],
 	readDeny: ["/home/u/.ssh", "/home/u/.aws"],
 	network: "off",
 	allowPty: true,
@@ -79,6 +80,13 @@ describe("classifyErrno: permission errnos, resolved against the profile", () =>
 		expect(classify("EPERM", "writeFile", "/etc/hosts")?.kind).toBe("write");
 		expect(classify("EACCES", "mkdir", "/usr/local/x")?.kind).toBe("write");
 		expect(classify("EPERM", "access:write", "/etc")?.kind).toBe("write");
+	});
+
+	it("classifies a write-deny carve-out inside a writable root", () => {
+		expect(classify("EROFS", "writeFile", "/work/.pi/enclave.json", "bwrap")).toMatchObject({
+			kind: "write",
+			path: "/work/.pi/enclave.json",
+		});
 	});
 
 	it("classifies EROFS as a WRITE denial (the Linux shape)", () => {

@@ -105,6 +105,22 @@ describe("evaluateRules", () => {
 		expect(evaluateRules(bash("/usr/bin/git push origin"), rules({ ask: ["bash(git push *)"] })).verdict).toBe("ask");
 	});
 
+	it.each([
+		["git -C nested init", "deny"],
+		["git -c advice.detachedHead=false reset --hard", "ask"],
+		["git -C . push origin main", "ask"],
+		["git submodule --quiet update --init dependency", "deny"],
+	])("normalizes Git global options before matching %s", (command, verdict) => {
+		const result = evaluateRules(
+			bash(command),
+			rules({
+				deny: ["bash(git init*)", "bash(git submodule update*--init*)"],
+				ask: ["bash(git reset --hard*)", "bash(git push *)"],
+			}),
+		);
+		expect(result.verdict).toBe(verdict);
+	});
+
 	it("still matches a pattern written against a whole pipeline", () => {
 		expect(evaluateRules(bash("cat x | grep y"), rules({ ask: ["bash(cat x | grep y)"] })).verdict).toBe("ask");
 	});

@@ -15,6 +15,7 @@
  * which is the standard way past a command allowlist and not a subtle one.
  */
 import type { CanonicalAction } from "./canonical.ts";
+import type { SimpleCommand } from "./shell.ts";
 import { commandLine } from "./shell.ts";
 
 /** Beyond these, matching is refused rather than attempted. */
@@ -118,6 +119,8 @@ export function matchTargets(action: CanonicalAction): string[] {
 				const bare = commandLine({ ...command, name: command.name.slice(command.name.lastIndexOf("/") + 1) });
 				if (bare !== "" && bare !== line) lines.push(bare);
 			}
+			const git = normalizedGitTarget(command);
+			if (git) lines.push(git);
 		}
 		// The whole line is included as well, so a pattern someone wrote against
 		// a pipeline as a unit still fires.
@@ -132,6 +135,66 @@ export function matchTargets(action: CanonicalAction): string[] {
 		return [...new Set(action.paths.flatMap((path) => [path.typed, path.resolved, path.relative ?? path.typed]))];
 	}
 	return [safeStringify(action.input)];
+}
+
+/**
+ * Git accepts process-wide options before its real subcommand. Policy rules are
+ * written against that subcommand, so retain the raw target above and add one
+ * option-stripped projection for the documented global option grammar.
+ */
+function normalizedGitTarget(command: SimpleCommand): string | undefined {
+	const name = command.name.slice(command.name.lastIndexOf("/") + 1);
+	if (name !== "git") return undefined;
+	const takesValue = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"]);
+	const valuePrefix = /^(?:-C|-c).+|^--(?:exec-path|git-dir|work-tree|namespace|config-env)=/;
+	const flags = new Set([
+		"-v",
+		"--version",
+		"-h",
+		"--help",
+		"-p",
+		"--paginate",
+		"-P",
+		"--no-pager",
+		"--no-replace-objects",
+		"--bare",
+		"--literal-pathspecs",
+		"--glob-pathspecs",
+		"--noglob-pathspecs",
+		"--icase-pathspecs",
+	]);
+	let index = 0;
+	while (index < command.args.length) {
+		const arg = command.args[index];
+		if (arg === undefined) return undefined;
+		if (arg === "--") {
+			index++;
+			break;
+		}
+		if (takesValue.has(arg)) {
+			if (command.args[index + 1] === undefined) return undefined;
+			index += 2;
+			continue;
+		}
+		if (valuePrefix.test(arg) || flags.has(arg) || arg === "--exec-path") {
+			index++;
+			continue;
+		}
+		if (arg.startsWith("-")) return undefined;
+		break;
+	}
+	let remaining = command.args.slice(index);
+	// `git submodule` has its own options before the nested verb. Preserve the
+	// raw target above, and add a projection whose command word is in the stable
+	// position expected by rules such as `git submodule update*--init*`.
+	if (remaining[0] === "submodule") {
+		let nested = 1;
+		while (["-q", "--quiet", "--cached"].includes(remaining[nested] ?? "")) nested++;
+		if (nested > 1 && remaining[nested] !== undefined) {
+			remaining = ["submodule", ...remaining.slice(nested)];
+		}
+	}
+	return remaining.length > 0 ? `git ${remaining.join(" ")}` : undefined;
 }
 
 function safeStringify(input: unknown): string {

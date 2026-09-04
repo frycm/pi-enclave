@@ -29,6 +29,7 @@ import { canonical, isUnder } from "../backend/paths.ts";
 /** Keys whose values are file contents rather than arguments. */
 const BODY_KEYS = new Set([
 	"content",
+	"edits",
 	"newContent",
 	"new_string",
 	"newString",
@@ -109,18 +110,19 @@ export function redact(value: unknown, options: RedactOptions = {}, key?: string
 	// comparing against both spellings keeps the same symlink-awareness with no
 	// per-token realpath.
 	const denyRoots = resolveDenyRoots(options.readDeny);
-	const walk = (input: unknown, k?: string): unknown => {
+	const walk = (input: unknown, k?: string, inheritedBody = false): unknown => {
+		const body = inheritedBody || (k !== undefined && BODY_KEYS.has(k));
 		if (typeof input === "string") {
-			if (k !== undefined && BODY_KEYS.has(k)) {
+			if (body) {
 				// The length is kept because it is the one thing about a file body
 				// that is useful in an audit record and cannot leak anything.
 				return `${redactedMarker(input)} (${input.length} chars)`;
 			}
 			return redactString(redactDenyPaths(input, denyRoots));
 		}
-		if (Array.isArray(input)) return input.map((entry) => walk(entry, k));
+		if (Array.isArray(input)) return input.map((entry) => walk(entry, k, body));
 		if (input && typeof input === "object") {
-			return Object.fromEntries(Object.entries(input).map(([kk, v]) => [kk, walk(v, kk)]));
+			return Object.fromEntries(Object.entries(input).map(([kk, v]) => [kk, walk(v, kk, body)]));
 		}
 		return input;
 	};
