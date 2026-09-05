@@ -306,7 +306,7 @@ export class HelperFsClient implements FsClient {
 	 * comparison here never permits anything.
 	 */
 	private refuseMaskedSuccess(request: FsCall, resolvedPath: string | undefined): void {
-		if (this.options.compiled.backend !== "bwrap") return;
+		if (!["bwrap", "docker"].includes(this.options.compiled.backend)) return;
 		// A write-access check passing under a deny root is not a masked read --
 		// the deny list governs reads, and writes are decided by the roots.
 		if (request.op === "access" && request.mode === "write") return;
@@ -317,7 +317,7 @@ export class HelperFsClient implements FsClient {
 			kind: "read",
 			op: request.op,
 			path,
-			backend: "bwrap",
+			backend: this.options.compiled.backend,
 			raw: "masked (deny-read tmpfs)",
 		};
 		this.options.onViolation?.(violation);

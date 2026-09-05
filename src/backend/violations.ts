@@ -51,6 +51,7 @@ export const NOISE_PATTERNS: Record<BackendName, RegExp[]> = {
 		/\/dev\/shm\/sem\./,
 		/__pycache__/,
 	],
+	docker: [],
 };
 
 export function isNoise(line: string, backend: BackendName): boolean {
