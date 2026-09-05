@@ -333,7 +333,9 @@ export class ContainerBackend implements SandboxBackend {
 	private remove(owned: OwnedContainer): Promise<void> {
 		owned.removal ??= (async () => {
 			try {
-				await this.control(["rm", "--force", "--volumes", owned.name]);
+				// Podman's --force alone still honors its stop grace period. An
+				// aborted invocation must not retain authority during those seconds.
+				await this.control(["rm", "--force", ...(this.podman ? ["--time", "0"] : []), "--volumes", owned.name]);
 			} catch (error) {
 				// A failed create may never have allocated the container. Verify absence;
 				// a dead daemon or any other removal error is a session-stopping failure.
