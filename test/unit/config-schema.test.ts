@@ -70,11 +70,22 @@ describe("parseDocument", () => {
 	});
 
 	describe("phase gating", () => {
-		it("refuses a named reviewer model rather than silently running deterministic", () => {
+		it("accepts an explicit named reviewer model", () => {
 			const result = parse({ reviewer: { model: "ollama/qwen3:32b" } });
-			expect(errorKeys(result)).toEqual(["reviewer.model"]);
-			if (result.ok) throw new Error("expected failure");
-			expect(result.errors[0]?.message).toContain("Phase 3");
+			expect(result.ok).toBe(true);
+		});
+
+		it.each([
+			"qwen3:32b",
+			"/model",
+			"provider/",
+			"provider/model id",
+		])("refuses malformed reviewer model %s", (model) => {
+			expect(errorKeys(parse({ reviewer: { model } }))).toEqual(["reviewer.model"]);
+		});
+
+		it("accepts an explicit named fallback", () => {
+			expect(parse({ reviewer: { model: "ollama/primary", fallback: "ollama/fallback" } }).ok).toBe(true);
 		});
 
 		it('accepts reviewer.model "none"', () => {
@@ -93,6 +104,12 @@ describe("parseDocument", () => {
 	});
 
 	describe("values", () => {
+		it("accepts a user-global grantable read-deny list", () => {
+			const result = parse({ sandbox: { grantableReadDeny: ["/work/private"] } });
+			if (!result.ok) throw new Error("expected success");
+			expect(result.document.patch?.sandbox?.grantableReadDeny).toEqual(["/work/private"]);
+		});
+
 		it("rejects a zero confirm timeout", () => {
 			expect(errorKeys(parse({ attended: { confirmTimeoutMs: 0 } }))).toEqual(["attended.confirmTimeoutMs"]);
 		});
@@ -118,6 +135,7 @@ describe("parseDocument", () => {
 		const project = (raw: unknown) => parse(raw, "project_shared");
 
 		it.each([
+			["sandbox.grantableReadDeny", { sandbox: { grantableReadDeny: [] } }],
 			["rules.skipReview", { rules: { skipReview: [] } }],
 			["review.environment", { review: { environment: ["x"] } }],
 			["review.hard_deny", { review: { hard_deny: ["x"] } }],
@@ -153,7 +171,7 @@ describe("parseDocument", () => {
 			const result = parse({
 				rules: { skipReview: ["bash(npm test*)"] },
 				review: { soft_deny: ["no migrations outside the CLI"] },
-				sandbox: { env: { passthrough: ["FOO"] } },
+				sandbox: { grantableReadDeny: ["/work/private"], env: { passthrough: ["FOO"] } },
 			});
 			expect(errorKeys(result)).toEqual([]);
 		});
@@ -195,6 +213,11 @@ describe("parseEnvironment", () => {
 		expect(result.ok).toBe(false);
 		if (result.ok) return;
 		expect(result.errors[0]?.key).toBe("PI_ENCLAVE_MODEL");
+	});
+
+	it("does not treat the conformance harness weaker-mode switch as production config", () => {
+		const result = parseEnvironment({ PI_ENCLAVE_WEAKER_NESTED: "1" });
+		expect(result.ok).toBe(false);
 	});
 
 	it("ignores unrelated variables", () => {

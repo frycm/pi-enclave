@@ -21,6 +21,20 @@ import { formatViolations } from "../backend/violations.ts";
 import { buildChildEnv } from "../env/child-env.ts";
 import type { CanonicalAction } from "../policy/canonical.ts";
 
+/** Same seconds/range contract as pi's default BashOperations. */
+export function validateBashTimeout(timeout: unknown): number | undefined {
+	if (timeout === undefined) return undefined;
+	if (
+		typeof timeout !== "number" ||
+		!Number.isFinite(timeout) ||
+		timeout <= 0 ||
+		timeout > Math.floor(2_147_483_647 / 1000)
+	) {
+		throw new Error("Invalid timeout: must be positive finite seconds, at most 2147483");
+	}
+	return timeout;
+}
+
 function pathMayBeReached(action: CanonicalAction, raw: string): boolean {
 	if (!action.shell) return true;
 	let mentioned = false;
@@ -130,6 +144,7 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 
 	return {
 		async exec(command, cwd, execOptions) {
+			validateBashTimeout(execOptions.timeout);
 			const action = options.guard?.(command);
 			const compiled = getCompiled();
 			// The compiled profile's env settings are the configured ones and win;
@@ -152,6 +167,7 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 				env,
 				commandId: nextCommandId(),
 				...(action?.capability?.kind === "write" ? { writeCapability: action.capability.value } : {}),
+				...(action?.capability?.kind === "read" ? { readCapability: action.capability.value } : {}),
 				onData: execOptions.onData,
 				...(execOptions.signal ? { signal: execOptions.signal } : {}),
 				...(execOptions.timeout !== undefined ? { timeout: execOptions.timeout } : {}),
@@ -208,6 +224,9 @@ export const BASH_PROMPT_GUIDELINES: string[] = [
 	"- Writes elsewhere, reads of credential stores, and all network access are refused by the kernel.",
 	"- A refusal is not something you can retry your way past, and sudo is not available.",
 	"- When a refusal is detected it is reported after the command output as 'sandbox denied:'.",
+	"- If a required write is denied, retry the exact command with allow_write set to that exact path and explain why.",
+	"- If a configured, grantable read denial blocks the command, retry with allow_read set to that exact denied root.",
+	"  Capability requests are reviewed, apply to one action only, and may still be refused.",
 	"- On some platforms a denied read is reported as a missing file. If a path you expect to exist",
 	"  appears absent and it looks like a credential location, treat it as denied rather than missing.",
 ];

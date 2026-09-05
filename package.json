@@ -14,7 +14,7 @@
 		]
 	},
 	"engines": {
-		"node": ">=20.11.0"
+		"node": ">=22.19.0"
 	},
 	"scripts": {
 		"check": "tsc --noEmit && biome check src test bin scripts",
@@ -30,15 +30,17 @@
 		"enclave": "node bin/pi-enclave.mjs"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": ">=0.84.2 <0.85.0"
+		"@earendil-works/pi-coding-agent": ">=0.85.0 <0.86.0"
 	},
 	"dependencies": {
 		"@anthropic-ai/sandbox-runtime": "0.0.73",
+		"@earendil-works/pi-ai": "0.85.0",
+		"@earendil-works/pi-server": "0.85.0",
 		"tsx": "4.19.2"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.3.11",
-		"@earendil-works/pi-coding-agent": "0.84.2",
+		"@earendil-works/pi-coding-agent": "0.85.0",
 		"@types/node": "22.10.2",
 		"fast-check": "^3.23.2",
 		"typescript": "5.7.2",

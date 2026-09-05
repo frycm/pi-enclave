@@ -141,12 +141,13 @@ export interface RunRequest {
 	cwd: string;
 	env: ChildEnv;
 	/**
-	 * Phase-2's only invocation-scoped widening: one human-approved write
-	 * target, already bound into the canonical action hash. The backend derives
-	 * the custom profile from the compiled base so callers cannot replace any
-	 * other security field.
+	 * One reviewed write target, already bound into the canonical action hash.
+	 * The backend derives the custom profile from the compiled base so callers
+	 * cannot replace any other security field.
 	 */
 	writeCapability?: string;
+	/** One reviewed read-deny entry lifted for this invocation only. */
+	readCapability?: string;
 	/**
 	 * Correlation key for violations from this invocation. Use the tool-use id,
 	 * never the command text: sandbox-runtime compares only the first 100
@@ -174,6 +175,12 @@ export interface SandboxBackend {
 	/** Start (or reuse) the sandboxed filesystem helper for this profile. */
 	fs(compiled: CompiledProfile): FsClient;
 	/** Release any long-lived resources: the helper, a container, a log monitor. */
+	dispose(): Promise<void>;
+}
+
+/** A filesystem helper whose widened profile must be destroyed after one tool call. */
+export interface FsClientLease {
+	client: FsClient;
 	dispose(): Promise<void>;
 }
 

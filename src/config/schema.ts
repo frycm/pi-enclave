@@ -20,6 +20,7 @@
  */
 import type { DefaultProfileOptions } from "./defaults.ts";
 import { defaultListFor } from "./defaults.ts";
+import { isReviewerModelSetting } from "./reviewer-model.ts";
 import type {
 	AttendedMode,
 	CapabilityMode,
@@ -49,6 +50,7 @@ export type ParseResult = { ok: true; document: ConfigDocument } | { ok: false; 
  * one. `skipReview` is an allow verdict, and `reviewer` decides who judges.
  */
 const PROJECT_FORBIDDEN: Record<string, string> = {
+	"sandbox.grantableReadDeny": "grantableReadDeny authorizes one-shot read widening and is therefore user-global only.",
 	"rules.skipReview": "skipReview is an allow verdict: it bypasses review entirely. User-global only.",
 	"review.environment": "prose rulebook entries are user-global only; a repository must not reach the reviewer prompt.",
 	"review.hard_deny": "prose rulebook entries are user-global only; a repository must not reach the reviewer prompt.",
@@ -68,6 +70,7 @@ const SANDBOX_KEYS = [
 	"mode",
 	"writableRoots",
 	"readDeny",
+	"grantableReadDeny",
 	"network",
 	"capabilities",
 	"hostExec",
@@ -135,15 +138,15 @@ export function parseDocument(
  *
  * Exactly three exist, and any other `PI_ENCLAVE_*` is an error rather than a
  * warning: whoever controls the process environment of an ops runner would
- * otherwise get to probe for variables that do something. `PI_ENCLAVE_WEAKER_NESTED`
- * is exempt because it is a Phase-1 backend diagnostic, is already surfaced in
- * the status line, and cannot widen the profile.
+ * otherwise get to probe for variables that do something. Test and benchmark
+ * harnesses may read their own variables directly; they are not production
+ * configuration.
  */
 export function parseEnvironment(env: Record<string, string | undefined>): ParseResult {
 	const errors: Diagnostic[] = [];
 	const document: ConfigDocument = { source: "env" };
 
-	const known = new Set(["PI_ENCLAVE_ATTENDED", "PI_ENCLAVE_PROFILE", "PI_ENCLAVE_AUTO", "PI_ENCLAVE_WEAKER_NESTED"]);
+	const known = new Set(["PI_ENCLAVE_ATTENDED", "PI_ENCLAVE_PROFILE", "PI_ENCLAVE_AUTO"]);
 	for (const name of Object.keys(env)) {
 		if (name.startsWith("PI_ENCLAVE_") && !known.has(name)) {
 			errors.push({
@@ -374,6 +377,10 @@ class ParseContext {
 			const deny = this.list(join(prefix, "readDeny"), body.readDeny, "sandbox.readDeny");
 			if (deny) out.readDeny = deny;
 		}
+		if ("grantableReadDeny" in body) {
+			const deny = this.list(join(prefix, "grantableReadDeny"), body.grantableReadDeny, "sandbox.grantableReadDeny");
+			if (deny) out.grantableReadDeny = deny;
+		}
 		if ("network" in body) {
 			const network = this.object(join(prefix, "network"), body.network);
 			if (network) {
@@ -537,14 +544,8 @@ class ParseContext {
 		if ("model" in body) {
 			const model = this.string(join(prefix, "model"), body.model);
 			if (model !== undefined) {
-				if (model !== "none") {
-					// Refusing rather than ignoring: a user who named a model and got
-					// deterministic mode anyway would believe every action was being
-					// judged. Phase 3 is where this value starts meaning something.
-					this.error(
-						join(prefix, "model"),
-						`reviewer support arrives in Phase 3; deterministic mode is the only mode, so reviewer.model must be "none" (got "${model}")`,
-					);
+				if (!isReviewerModelSetting(model)) {
+					this.error(join(prefix, "model"), 'must be "none" or an explicit "provider/model-id"');
 				} else {
 					out.model = model;
 				}
@@ -557,8 +558,8 @@ class ParseContext {
 		if ("fallback" in body) {
 			const fallback = this.string(join(prefix, "fallback"), body.fallback);
 			if (fallback !== undefined) {
-				if (fallback !== "none") {
-					this.error(join(prefix, "fallback"), `reviewer support arrives in Phase 3; fallback must be "none"`);
+				if (!isReviewerModelSetting(fallback)) {
+					this.error(join(prefix, "fallback"), 'must be "none" or an explicit "provider/model-id"');
 				} else {
 					out.fallback = fallback;
 				}

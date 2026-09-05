@@ -20,8 +20,15 @@
  * refused with that explanation and left pending, so the user re-runs the task
  * with the rule relaxed instead.
  */
-import { isAbsolute, resolve } from "node:path";
-import { shellWriteCapabilityIssue, validateWriteCapability } from "../backend/capability.ts";
+import { dirname } from "node:path";
+import {
+	resolveCapabilityTarget,
+	shellCapabilityIssue,
+	shellWriteCapabilityIssue,
+	validateReadCapability,
+	validateWriteCapability,
+} from "../backend/capability.ts";
+import { canonical, isUnder } from "../backend/paths.ts";
 import { SrtBackend } from "../backend/srt.ts";
 import type { SandboxBackend } from "../backend/types.ts";
 import { formatViolations } from "../backend/violations.ts";
@@ -30,6 +37,7 @@ import type { EffectiveProfile } from "../config/types.ts";
 import { buildChildEnv } from "../env/child-env.ts";
 import { describeRecordForApproval, type PendingRecord, transition } from "../escalate/pending.ts";
 import { checkResume, describeNarrowing, formatResumeFailure } from "../escalate/resume.ts";
+import { validateBashTimeout } from "../tools/bash.ts";
 
 export interface ApproveIO {
 	out: (text: string) => void;
@@ -88,6 +96,14 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 
 	const { action } = check;
 	const tool = action.tool;
+	let timeout: number | undefined;
+	if (tool === "bash") {
+		try {
+			timeout = validateBashTimeout(action.input.timeout);
+		} catch (error) {
+			return { outcome: "refused", reason: (error as Error).message };
+		}
+	}
 	if (tool !== "bash" && tool !== "write") {
 		const reason =
 			`only bash and write actions can be resumed from the command line; this is a "${tool}".\n` +
@@ -97,18 +113,46 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 		return { outcome: "unsupported", reason };
 	}
 	const capability = action.capability;
-	if (capability && capability.kind !== "write") {
-		const reason = `${capability.kind} capabilities are Phase 3/4; only a one-shot write can be approved in this version.`;
+	if (capability?.kind === "host") {
+		const reason = "host capabilities require the Phase 4 authenticated egress proxy and cannot be approved yet.";
 		io.err(`\npi-enclave: ${reason}`);
 		return { outcome: "unsupported", reason };
 	}
 	const backendProfile = toBackendProfile(current, action.cwd);
-	let capabilityTarget: string | undefined;
-	if (capability) {
+	let writeCapabilityTarget: string | undefined;
+	let readCapabilityTarget: string | undefined;
+	if (capability?.kind === "write") {
 		try {
 			const lifetimeIssue = tool === "bash" ? shellWriteCapabilityIssue(options.platform) : undefined;
 			if (lifetimeIssue) throw new Error(lifetimeIssue);
-			capabilityTarget = validateWriteCapability(backendProfile, action.cwd, capability.value);
+			const target = validateWriteCapability(backendProfile, action.cwd, capability.value);
+			writeCapabilityTarget = target;
+			if (!action.paths.some((path) => path.writes && isUnder(path.resolved, target))) {
+				throw new Error(
+					`pi-enclave: write capability ${writeCapabilityTarget} does not cover a concrete write in this action`,
+				);
+			}
+		} catch (error) {
+			const reason = (error as Error).message;
+			io.err(`\n${reason}`);
+			io.err("  The record is left pending.");
+			return { outcome: "refused", reason };
+		}
+	}
+	if (capability?.kind === "read") {
+		try {
+			const lifetimeIssue = tool === "bash" ? shellCapabilityIssue("read", options.platform) : undefined;
+			if (lifetimeIssue) throw new Error(lifetimeIssue);
+			readCapabilityTarget = validateReadCapability(backendProfile, action.cwd, capability.value);
+			if (!current.sandbox.grantableReadDeny.some((entry) => canonical(entry) === readCapabilityTarget)) {
+				throw new Error(
+					`pi-enclave: read capability ${readCapabilityTarget} is not an exact user-global grantableReadDeny entry`,
+				);
+			}
+			const target = resolveCapabilityTarget(action.cwd, capability.value);
+			if (!action.paths.some((path) => !path.writes && isUnder(path.resolved, target))) {
+				throw new Error(`pi-enclave: read capability ${target} does not cover a concrete read in this action`);
+			}
 		} catch (error) {
 			const reason = (error as Error).message;
 			io.err(`\n${reason}`);
@@ -145,8 +189,8 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 		// capability is folded into a one-shot profile here. It is bound to the
 		// action hash (which includes the capability), and checkResume above
 		// re-derived that hash, so the extension can only be the one approved.
-		if (capabilityTarget) {
-			backendProfile.writableRoots = [...backendProfile.writableRoots, capabilityTarget];
+		if (writeCapabilityTarget) {
+			backendProfile.writableRoots = [...backendProfile.writableRoots, writeCapabilityTarget];
 		}
 		const compiled = await backend.compile(backendProfile);
 		// Compilation can take long enough to cross the TTL too. An approved/
@@ -161,6 +205,7 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 			if (typeof command !== "string") return { outcome: "refused", reason: "the record has no command" };
 			const result = await backend.run(compiled, {
 				command,
+				...(timeout !== undefined ? { timeout } : {}),
 				cwd: action.cwd,
 				env: buildChildEnv(process.env, {
 					passthrough: current.sandbox.env.passthrough,
@@ -169,6 +214,7 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 					writableRoots: compiled.profile.writableRoots,
 				}),
 				commandId: `enclave-approve-${record.nonce}`,
+				...(readCapabilityTarget ? { readCapability: readCapabilityTarget } : {}),
 				onData: (chunk) => io.out(chunk.toString("utf8")),
 			});
 			if (result.violations.length > 0) io.err(formatViolations(result.violations));
@@ -187,8 +233,10 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 		// resolves a relative path against its own working directory, so a record
 		// of `notes.txt` from /project would otherwise be written wherever the
 		// approver happened to run the command -- the approver read "/project/notes.txt".
-		const path = isAbsolute(rawPath) ? rawPath : resolve(action.cwd, rawPath);
+		const path = action.paths.find((entry) => entry.raw === rawPath)?.typed;
+		if (!path) return { outcome: "refused", reason: "the write path has no canonical target" };
 		const fs = backend.fs(compiled);
+		await fs.mkdir(dirname(path));
 		await fs.writeFile(path, content);
 		io.out(`wrote ${path}`);
 		transition(options.stateRoot, record.sessionId, record.nonce, "approved", "consumed");

@@ -62,6 +62,15 @@ describe("narrowerOrEqual", () => {
 			narrower.sandbox.readDeny = ["/home/u/.aws"];
 			expect(narrowerOrEqual(narrower, wider)).toEqual([]);
 		});
+
+		it("treats grantable denials as authority that may only shrink", () => {
+			const wide = base();
+			wide.sandbox.grantableReadDeny = ["/work/private"];
+			const narrow = structuredClone(wide);
+			narrow.sandbox.grantableReadDeny = [];
+			expect(narrowerOrEqual(narrow, wide)).toEqual([]);
+			expect(fields(narrowerOrEqual(wide, narrow))).toEqual(["sandbox.grantableReadDeny"]);
+		});
 	});
 
 	describe("scalars that rank", () => {
@@ -262,6 +271,38 @@ describe("fold", () => {
 		});
 	});
 
+	describe("named reviewer mode", () => {
+		it("defaults review.trigger to mutating", () => {
+			const result = fold(
+				[{ source: "builtin" }, doc("user_global", { reviewer: { model: "ollama/reviewer" } })],
+				OPTIONS,
+			);
+			if (!result.ok) throw new Error(JSON.stringify(result.errors));
+			expect(result.profile.review.trigger).toBe("mutating");
+		});
+
+		it("preserves an explicit boundary trigger", () => {
+			const result = fold(
+				[
+					{ source: "builtin" },
+					doc("user_global", { reviewer: { model: "ollama/reviewer" }, review: { trigger: "boundary" } }),
+				],
+				OPTIONS,
+			);
+			if (!result.ok) throw new Error(JSON.stringify(result.errors));
+			expect(result.profile.review.trigger).toBe("boundary");
+		});
+
+		it("rejects a named fallback without a named primary", () => {
+			const result = fold(
+				[{ source: "builtin" }, doc("user_global", { reviewer: { fallback: "ollama/fallback" } })],
+				OPTIONS,
+			);
+			expect(result.ok).toBe(false);
+			if (!result.ok) expect(result.errors.some((error) => error.field === "reviewer.fallback")).toBe(true);
+		});
+	});
+
 	it("measures a project file against the user-global ceiling, not the defaults", () => {
 		const documents: ConfigDocument[] = [
 			{ source: "builtin" },
@@ -388,6 +429,46 @@ describe("fold", () => {
 		);
 		if (result.ok) throw new Error("expected rejection");
 		expect(result.errors[0]?.message).toContain("state directory");
+	});
+
+	describe("grantable read denials", () => {
+		it("accepts an exact user-added denial", () => {
+			const result = fold(
+				[
+					{ source: "builtin" },
+					doc("user_global", {
+						sandbox: { readDeny: ["/work/private"], grantableReadDeny: ["/work/private"] },
+					}),
+				],
+				OPTIONS,
+			);
+			if (!result.ok) throw new Error(JSON.stringify(result.errors));
+			expect(result.profile.sandbox.grantableReadDeny).toEqual(["/work/private"]);
+		});
+
+		it("rejects a path that is not an exact read denial", () => {
+			const result = fold(
+				[
+					{ source: "builtin" },
+					doc("user_global", {
+						sandbox: { readDeny: ["/work/private"], grantableReadDeny: ["/work/private/child"] },
+					}),
+				],
+				OPTIONS,
+			);
+			expect(result.ok).toBe(false);
+			if (!result.ok) expect(result.errors.some((error) => /not an exact/.test(error.message))).toBe(true);
+		});
+
+		it("never makes a built-in credential denial grantable", () => {
+			const result = fold(
+				[{ source: "builtin" }, doc("user_global", { sandbox: { grantableReadDeny: ["/home/u/.ssh"] } })],
+				OPTIONS,
+			);
+			expect(result.ok).toBe(false);
+			if (!result.ok)
+				expect(result.errors.some((error) => /immutable credential or state/.test(error.message))).toBe(true);
+		});
 	});
 });
 

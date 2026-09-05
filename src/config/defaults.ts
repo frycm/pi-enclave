@@ -208,8 +208,7 @@ export const OWNED_TOOLS: readonly string[] = ["bash", "read", "edit", "write", 
  *
  * Anything else executes in the pi process with the user's privileges, so the
  * default is to deny it and make the user name it. `readOnly` here is a
- * statement about what the tool does, used by Phase 3's trigger; in Phase 2 it
- * changes nothing, because there is no reviewer to skip.
+ * statement about what the tool does, used by the reviewer's trigger.
  */
 export function defaultTools(): ToolsSettings {
 	return {
@@ -262,6 +261,7 @@ export function defaultProfile(options: DefaultProfileOptions): EffectiveProfile
 			mode: "workspace-write",
 			writableRoots: [cwd, tmp],
 			readDeny: defaultReadDeny(home, agentDir, env),
+			grantableReadDeny: [],
 			network: { mode: "off", allowHosts: [] },
 			capabilities: "reviewed",
 			hostExec: "never",

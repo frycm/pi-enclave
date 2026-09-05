@@ -1,7 +1,7 @@
 /**
  * The gate: one `tool_call` handler, one path through it.
  *
- * Canonicalize → L1 → allowlist → escalate → lock. Every tool call takes the
+ * Validate and freeze → canonicalize → L1 → allowlist → review/escalate → lock. Every tool call takes the
  * same route, and there is no second entry point, because a policy layer with
  * two paths is a policy layer with one bypass.
  *
@@ -17,10 +17,13 @@
  */
 
 import { capabilityIntersects, resolveCapabilityTarget } from "../backend/capability.ts";
+import { canonical as canonicalPath, isUnder } from "../backend/paths.ts";
 import type { EffectiveProfile } from "../config/types.ts";
 import { type CanonicalAction, canonicalize, describeAction } from "../policy/canonical.ts";
 import { type Evaluation, evaluateRules, type RuleMatch } from "../policy/match.ts";
 import { matchesPathPattern } from "../policy/paths.ts";
+import { reviewerTrigger } from "../reviewer/classifier.ts";
+import type { ActionReviewer, EffectiveReview, ReviewerResult, ReviewerTrigger } from "../reviewer/types.ts";
 import { ActionLock, freezeToolInput } from "./lock.ts";
 import { checkTool } from "./tools.ts";
 
@@ -42,6 +45,10 @@ export type GateOutcome =
 	| "ask-approved"
 	/** Matched `skipReview` and nothing above it. */
 	| "skip-review"
+	/** L3 permitted the action after deterministic risk enforcement. */
+	| "review-allow"
+	/** L3 denied the action, or returned invalid output. */
+	| "review-deny"
 	/** The breaker was already open. */
 	| "breaker-open"
 	/** A non-owned call was withheld because an earlier sibling could open it at runtime. */
@@ -80,12 +87,16 @@ export interface GateDeps {
 	lock: ActionLock;
 	owned: readonly string[];
 	escalator?: Escalator;
+	/** Present only for a configured, qualified named reviewer. */
+	reviewer?: ActionReviewer;
 	/** True when the breaker is already open. Checked before anything else. */
 	breakerOpen?: () => boolean;
 	/** Where a tool came from, for grant pinning. */
 	toolSource?: (tool: string) => string | undefined;
 	/** Backend-aware last check that a write capability is structurally grantable. */
 	writeCapabilityIssue?: (value: string, cwd: string, tool: string) => string | undefined;
+	/** Backend-aware last check that a read capability can be isolated. */
+	readCapabilityIssue?: (value: string, cwd: string, tool: string) => string | undefined;
 	/** Last admission check for boundaries that have no execute-time guard. */
 	withholdBeforeExecution?: (action: CanonicalAction) => string | undefined;
 	onDecision?: (decision: GateDecision) => void;
@@ -122,6 +133,11 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 		return finish(action, event, deps, { outcome: "allow", block: false, matches: [], adverse: false });
 	}
 
+	// Freeze before every in-gate short circuit, including an already-open
+	// breaker. This preserves the invariant that another handler never sees a
+	// mutable input after pi-enclave has made a policy decision about the call.
+	const action = canonical(event, deps);
+
 	if (deps.breakerOpen?.()) {
 		return {
 			outcome: "breaker-open",
@@ -136,8 +152,6 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 			adverse: false,
 		};
 	}
-
-	const action = canonical(event, deps);
 
 	// L1 first, and before the allowlist: a `deny` on a tool that is not even
 	// allowed should still be recorded as the denial it is, and the audit record
@@ -168,11 +182,9 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 		};
 	}
 
-	// Phase 2 implements the one-shot write extension. Read-deny lifting needs
-	// the immutable/grantable split and host access needs the authenticated proxy;
-	// both arrive in later phases and must be refused rather than approved under
-	// the unchanged base profile.
-	if (action.capability && action.capability.kind !== "write") {
+	// Host access needs Phase 4's authenticated egress proxy. It must be refused
+	// rather than approved under the unchanged base profile.
+	if (action.capability?.kind === "host") {
 		return {
 			outcome: "deny",
 			block: true,
@@ -183,7 +195,64 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 		};
 	}
 
+	if (action.capability?.kind === "read") {
+		const target = resolveCapabilityTarget(action.cwd, action.capability.value);
+		const grantable = profile.sandbox.grantableReadDeny.some((entry) => canonicalPath(entry) === target);
+		if (!grantable) {
+			return {
+				outcome: "deny",
+				block: true,
+				reason:
+					`pi-enclave: read capability ${target} is not an exact user-global grantableReadDeny entry.\n` +
+					"  Built-in credential and enclave-state denials are immutable.",
+				matches: evaluation.matches,
+				adverse: true,
+				action,
+			};
+		}
+		const covered = action.paths.some((path) => !path.writes && isUnder(path.resolved, target));
+		if (!covered) {
+			return {
+				outcome: "deny",
+				block: true,
+				reason:
+					`pi-enclave: read capability ${target} does not cover a concrete read in this action.\n` +
+					"  Capabilities cannot be requested speculatively or carried by an unrelated operation.",
+				matches: evaluation.matches,
+				adverse: true,
+				action,
+			};
+		}
+		const issue = deps.readCapabilityIssue?.(action.capability.value, action.cwd, action.tool);
+		if (issue) {
+			return {
+				outcome: "deny",
+				block: true,
+				reason: `${issue}\n  This boundary is not grantable by approval.`,
+				matches: evaluation.matches,
+				adverse: true,
+				action,
+			};
+		}
+	}
+
 	if (action.capability?.kind === "write") {
+		// Write widening is implemented by one child process whose custom profile
+		// dies with that process. File tools use the long-lived helper, so accepting
+		// a forged allow_write field on one of them would approve authority the
+		// executor cannot safely express.
+		if (action.tool !== "bash") {
+			return {
+				outcome: "deny",
+				block: true,
+				reason:
+					"pi-enclave: one-shot write capabilities are supported only by the sandboxed bash tool.\n" +
+					"  File-tool write widening has no isolated invocation lifetime and is refused.",
+				matches: evaluation.matches,
+				adverse: true,
+				action,
+			};
+		}
 		const target = resolveCapabilityTarget(action.cwd, action.capability.value);
 		const denied = capabilityIntersects(target, profile.sandbox.readDeny);
 		if (denied) {
@@ -204,6 +273,19 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 				outcome: "deny",
 				block: true,
 				reason: `${issue}\n  This boundary is not grantable by approval.`,
+				matches: evaluation.matches,
+				adverse: true,
+				action,
+			};
+		}
+		const covered = action.paths.some((path) => path.writes && isUnder(path.resolved, target));
+		if (!covered) {
+			return {
+				outcome: "deny",
+				block: true,
+				reason:
+					`pi-enclave: write capability ${target} does not cover a concrete write in this action.\n` +
+					"  Capabilities cannot be requested speculatively or carried by an unrelated operation.",
 				matches: evaluation.matches,
 				adverse: true,
 				action,
@@ -244,29 +326,40 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 		};
 	}
 
-	// What needs a human. In deterministic mode this is the only escalation
-	// there is: `reviewer.model` is "none", `review.trigger` is "boundary", and
-	// every boundary crossing is an ask.
-	const askReason = needsHuman(action, evaluation, disposition.reviewed);
-	if (askReason) {
-		const approved = await (deps.escalator ?? DENY_ESCALATOR).confirm(action, askReason, toolSource);
-		if (!approved) {
-			return {
-				outcome: "ask-denied",
-				block: true,
-				terminate: true,
-				reason: `pi-enclave: this needs a person, and the answer was no.\n  ${askReason}\n${describeAction(action)}`,
-				matches: evaluation.matches,
-				adverse: true,
-				action,
-			};
-		}
+	// L1 ask is always L4. It cannot be cleared by the reviewer or by
+	// skipReview, because its meaning is precisely "a person decides".
+	const deterministicAsk = deterministicAskReason(evaluation);
+	if (deterministicAsk) return escalate(action, event, deps, evaluation, toolSource, deterministicAsk);
+
+	// skipReview is an explicit user-global allow verdict for ordinary calls. A
+	// capability still crosses L2 and therefore never takes this route.
+	if (evaluation.verdict === "skipReview" && !action.capability) {
 		return finish(action, event, deps, {
-			outcome: "ask-approved",
+			outcome: "skip-review",
 			block: false,
 			matches: evaluation.matches,
 			adverse: false,
 		});
+	}
+
+	if (deps.reviewer) {
+		const trigger = triggerForReviewer(profile.review.trigger, action, disposition.reviewed, disposition);
+		if (trigger) {
+			const result = await deps.reviewer.review({
+				action,
+				trigger,
+				...(toolSource !== undefined ? { toolSource } : {}),
+			});
+			return handleReview(result, action, event, deps, evaluation, toolSource, !deps.owned.includes(action.tool));
+		}
+	}
+
+	// In deterministic mode this is the only escalation there is. If a named
+	// reviewer is configured but its trigger excludes an uncertain parse, the
+	// uncertainty still goes to a person; it never becomes a fast path.
+	const askReason = needsHumanWithoutReview(action, disposition.reviewed, deps.reviewer !== undefined);
+	if (askReason) {
+		return escalate(action, event, deps, evaluation, toolSource, askReason);
 	}
 
 	return finish(action, event, deps, {
@@ -277,23 +370,142 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 	});
 }
 
-/** Lock the input and register the action. Only reached on a permit. */
+function triggerForReviewer(
+	configured: EffectiveProfile["review"]["trigger"],
+	action: CanonicalAction,
+	reviewed: boolean,
+	disposition: ReturnType<typeof checkTool>,
+): ReviewerTrigger | undefined {
+	if (action.capability) return "capability";
+	if (reviewed) return "mutating";
+	return reviewerTrigger(configured, action, disposition);
+}
+
+async function handleReview(
+	result: ReviewerResult,
+	action: CanonicalAction,
+	event: GateEvent,
+	deps: GateDeps,
+	evaluation: Evaluation,
+	toolSource: string | undefined,
+	outsideSandbox: boolean,
+): Promise<GateDecision> {
+	if (!result.ok) {
+		if (result.kind === "invalid-output") {
+			return {
+				outcome: "review-deny",
+				block: true,
+				terminate: true,
+				reason: `pi-enclave: reviewer output was invalid, so this action is denied.\n  ${result.reason}`,
+				matches: evaluation.matches,
+				adverse: true,
+				action,
+			};
+		}
+		return escalate(
+			action,
+			event,
+			deps,
+			evaluation,
+			toolSource,
+			`the reviewer is unavailable after bounded retries: ${result.reason}`,
+		);
+	}
+
+	return reviewDecision(result.review, action, event, deps, evaluation, toolSource, outsideSandbox);
+}
+
+async function reviewDecision(
+	review: EffectiveReview,
+	action: CanonicalAction,
+	event: GateEvent,
+	deps: GateDeps,
+	evaluation: Evaluation,
+	toolSource: string | undefined,
+	outsideSandbox: boolean,
+): Promise<GateDecision> {
+	const explanation = `reviewer: ${review.reason} (risk ${review.risk}, minimum ${review.minimumRisk})`;
+	if (review.decision === "deny") {
+		return {
+			outcome: "review-deny",
+			block: true,
+			reason: `pi-enclave: denied by the isolated reviewer.\n  ${explanation}\n${describeAction(action)}`,
+			matches: evaluation.matches,
+			adverse: true,
+			action,
+		};
+	}
+	if (review.decision === "ask") {
+		return escalate(action, event, deps, evaluation, toolSource, explanation);
+	}
+	// A reviewed third-party tool executes in pi's privileged process, outside
+	// L2. The model may veto it or recommend it, but cannot be the authority that
+	// admits unsandboxed execution; an allow therefore remains an L4 decision.
+	if (outsideSandbox) {
+		return escalate(
+			action,
+			event,
+			deps,
+			evaluation,
+			toolSource,
+			`${explanation}; "${action.tool}" runs outside the sandbox and requires human approval`,
+		);
+	}
+	return finish(action, event, deps, {
+		outcome: "review-allow",
+		block: false,
+		reason: explanation,
+		matches: evaluation.matches,
+		adverse: false,
+	});
+}
+
+async function escalate(
+	action: CanonicalAction,
+	event: GateEvent,
+	deps: GateDeps,
+	evaluation: Evaluation,
+	toolSource: string | undefined,
+	reason: string,
+): Promise<GateDecision> {
+	const approved = await (deps.escalator ?? DENY_ESCALATOR).confirm(action, reason, toolSource);
+	if (!approved) {
+		return {
+			outcome: "ask-denied",
+			block: true,
+			terminate: true,
+			reason: `pi-enclave: this needs a person, and the answer was no.\n  ${reason}\n${describeAction(action)}`,
+			matches: evaluation.matches,
+			adverse: true,
+			action,
+		};
+	}
+	return finish(action, event, deps, {
+		outcome: "ask-approved",
+		block: false,
+		matches: evaluation.matches,
+		adverse: false,
+	});
+}
+
+/** Register the already-frozen action. Only reached on a permit. */
 function finish(
 	action: CanonicalAction,
 	event: GateEvent,
 	deps: GateDeps,
 	partial: Omit<GateDecision, "action">,
 ): GateDecision {
-	// The freeze can fail -- an input carrying a getter or a cycle is not
-	// lockable -- and guardian's choice is the right one: a failed lock turns
-	// the allow into a denial rather than handing out a guarantee that is not
-	// there.
-	freezeToolInput(event);
 	deps.lock.register(action, event.toolCallId);
 	return { ...partial, action };
 }
 
 function canonical(event: GateEvent, deps: GateDeps): CanonicalAction {
+	// Validate and freeze before reading a single action field. Besides making
+	// the reviewer's evidence a true snapshot, this rejects getters before
+	// canonicalization can invoke attacker-controlled accessors. A denial does
+	// not enter the lock table, but freezing it is harmless because pi
+	// short-circuits later handlers after a block.
+	freezeToolInput(event);
 	return canonicalize({
 		tool: event.toolName,
 		input: event.input,
@@ -335,15 +547,23 @@ function evaluate(action: CanonicalAction, deps: GateDeps): Evaluation {
  *   against a guess, so a `deny` may not have fired; asking is the only honest
  *   response to "I do not know what this command does".
  */
-function needsHuman(action: CanonicalAction, evaluation: Evaluation, reviewed: boolean): string | undefined {
+function deterministicAskReason(evaluation: Evaluation): string | undefined {
 	if (evaluation.verdict === "ask") {
 		return evaluation.decisive.map((match) => `matches ${match.list} rule ${match.pattern}`).join("; ");
 	}
+	return undefined;
+}
+
+function needsHumanWithoutReview(action: CanonicalAction, reviewed: boolean, hasReviewer: boolean): string | undefined {
 	if (action.capability) {
-		return `requests ${action.capability.kind} access to ${action.capability.value}, which widens the sandbox for this one action`;
+		return hasReviewer
+			? undefined
+			: `requests ${action.capability.kind} access to ${action.capability.value}, which widens the sandbox for this one action`;
 	}
 	if (reviewed) {
-		return `"${action.tool}" is marked reviewed, and there is no reviewer in deterministic mode`;
+		return hasReviewer
+			? undefined
+			: `"${action.tool}" is marked reviewed, and there is no reviewer in deterministic mode`;
 	}
 	if (action.shell && !action.confident) {
 		return `the command could not be parsed with confidence (${action.shell.markers.join(", ")}), so the pattern rules were matched against a guess`;

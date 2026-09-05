@@ -120,6 +120,11 @@ export function narrowerOrEqual(a: EffectiveProfile, b: EffectiveProfile): Order
 			fail("sandbox.readDeny", `"${denied}" is no longer denied for reading`);
 		}
 	}
+	// A grantable denial is authority rather than a restriction: a less-trusted
+	// source could only narrow it by removing entries. Project files are forbidden
+	// from mentioning the field at all; this also keeps the partial order complete
+	// for programmatically constructed profiles and persisted snapshots.
+	subsetOf("sandbox.grantableReadDeny", a.sandbox.grantableReadDeny ?? [], b.sandbox.grantableReadDeny ?? [], fail);
 
 	if (a.sandbox.network.mode !== b.sandbox.network.mode) {
 		fail("sandbox.network.mode", `cannot change the network mode from "${b.sandbox.network.mode}"`);
@@ -308,6 +313,11 @@ export function applyPatch(base: EffectiveProfile, patch: ProfilePatch, options:
 			track("sandbox.readDeny", expanded);
 			next.sandbox.readDeny = mergeList("union", next.sandbox.readDeny, expanded);
 		}
+		if (sandbox.grantableReadDeny) {
+			const expanded = sandbox.grantableReadDeny.map(expand);
+			track("sandbox.grantableReadDeny", expanded);
+			next.sandbox.grantableReadDeny = mergeList("replace", next.sandbox.grantableReadDeny ?? [], expanded);
+		}
 		if (sandbox.network) {
 			if (sandbox.network.mode !== undefined) next.sandbox.network.mode = sandbox.network.mode;
 			if (sandbox.network.allowHosts) {
@@ -438,6 +448,7 @@ export function fold(documents: readonly ConfigDocument[], options: DefaultProfi
 	/** Profiles the user-global file defined, available for later selection. */
 	let defined: Record<string, ProfilePatch> = {};
 	let seenUserGlobal = false;
+	let reviewTriggerConfigured = false;
 
 	for (const document of documents) {
 		const { source } = document;
@@ -484,6 +495,7 @@ export function fold(documents: readonly ConfigDocument[], options: DefaultProfi
 			if (!definition) {
 				fail("profile", `no profile named "${selection}" is defined in the user-global file`);
 			} else {
+				reviewTriggerConfigured = definition.review?.trigger !== undefined;
 				const selected = applyPatch(builtin, definition, { ...options, source: "user_global", provenance });
 				selected.name = selection;
 				selected.auto = current.auto;
@@ -492,6 +504,7 @@ export function fold(documents: readonly ConfigDocument[], options: DefaultProfi
 		}
 
 		if (document.patch) {
+			if (document.patch.review?.trigger !== undefined) reviewTriggerConfigured = true;
 			current = applyPatch(current, document.patch, { ...options, source, provenance });
 		}
 
@@ -526,6 +539,36 @@ export function fold(documents: readonly ConfigDocument[], options: DefaultProfi
 		}
 	}
 
+	// Read capabilities are opt-in twice: the path must remain denied in the
+	// effective profile and the user must name that exact denial as grantable.
+	// Built-in credential and enclave-state denials are immutable even for a
+	// reviewer or an attended human.
+	for (const grantable of current.sandbox.grantableReadDeny ?? []) {
+		const target = canonical(grantable);
+		const denied = current.sandbox.readDeny.some((entry) => canonical(entry) === target);
+		if (!denied) {
+			errors.push({
+				source: "user_global",
+				field: "sandbox.grantableReadDeny",
+				message: `"${grantable}" is not an exact sandbox.readDeny entry.`,
+			});
+		}
+		const immutable = builtin.sandbox.readDeny.find((entry) => {
+			const root = canonical(entry);
+			return isUnder(target, root) || isUnder(root, target);
+		});
+		if (target === "/" || immutable) {
+			errors.push({
+				source: "user_global",
+				field: "sandbox.grantableReadDeny",
+				message:
+					target === "/"
+						? '"/" can never be a read capability.'
+						: `"${grantable}" intersects immutable credential or state denial ${immutable}.`,
+			});
+		}
+	}
+
 	// Deterministic mode (`reviewer.model: "none"`, the only value in this
 	// phase) has no runtime consumer for the prose rulebook or a raised trigger.
 	// Leaving them set would make the effective config claim protections that do
@@ -533,6 +576,13 @@ export function fold(documents: readonly ConfigDocument[], options: DefaultProfi
 	// `boundary`, which is what the plan specifies -- reviewing nothing is the
 	// honest state when there is no reviewer.
 	if (current.reviewer.model === "none") {
+		if (current.reviewer.fallback !== "none") {
+			errors.push({
+				source: "user_global",
+				field: "reviewer.fallback",
+				message: 'fallback requires a named primary reviewer; set reviewer.model or use fallback "none".',
+			});
+		}
 		for (const list of ["environment", "hard_deny", "soft_deny", "allow"] as const) {
 			if (current.review[list].length > 0) {
 				errors.push({
@@ -540,13 +590,18 @@ export function fold(documents: readonly ConfigDocument[], options: DefaultProfi
 					field: `review.${list}`,
 					message:
 						`a prose rulebook is set but reviewer.model is "none", so nothing reads it. ` +
-						`Set a reviewer (Phase 3) or remove review.${list}.`,
+						`Set a named reviewer or remove review.${list}.`,
 				});
 			}
 		}
 		if (current.review.trigger !== "boundary") {
 			current = { ...current, review: { ...current.review, trigger: "boundary" } };
 		}
+	} else if (!reviewTriggerConfigured) {
+		// The built-in profile starts in deterministic mode and therefore carries
+		// boundary. Selecting a named reviewer changes the default to the Phase-3
+		// fast path unless the user explicitly selected a trigger.
+		current = { ...current, review: { ...current.review, trigger: "mutating" } };
 	}
 
 	if (errors.length > 0) return { ok: false, errors };
@@ -556,6 +611,7 @@ export function fold(documents: readonly ConfigDocument[], options: DefaultProfi
 function recordBuiltinProvenance(provenance: Provenance, profile: EffectiveProfile) {
 	recordProvenance(provenance, "sandbox.writableRoots", profile.sandbox.writableRoots, "builtin");
 	recordProvenance(provenance, "sandbox.readDeny", profile.sandbox.readDeny, "builtin");
+	recordProvenance(provenance, "sandbox.grantableReadDeny", profile.sandbox.grantableReadDeny, "builtin");
 	recordProvenance(provenance, "sandbox.network.allowHosts", profile.sandbox.network.allowHosts, "builtin");
 	recordProvenance(provenance, "sandbox.env.passthrough", profile.sandbox.env.passthrough, "builtin");
 	recordProvenance(provenance, "sandbox.env.envDeny", profile.sandbox.env.envDeny, "builtin");

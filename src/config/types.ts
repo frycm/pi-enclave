@@ -72,6 +72,8 @@ export interface SandboxSettings {
 	writableRoots: string[];
 	/** Absolute paths that may not be read, even though reads are otherwise open. */
 	readDeny: string[];
+	/** User-global read-deny entries that a reviewed action may lift once. */
+	grantableReadDeny: string[];
 	network: NetworkSettings;
 	/** May the agent request a one-shot capability (which goes to L3, or to L4 without one)? */
 	capabilities: CapabilityMode;
@@ -97,10 +99,9 @@ export interface RulesSettings {
 }
 
 /**
- * The prose rulebook. Phase 2 never reads the four lists -- it only enforces
- * that nothing below user-global can supply them, which is the property Phase 3
- * depends on and which is far cheaper to get right before anything renders them
- * into a prompt.
+ * The prose rulebook rendered into the isolated reviewer's prompt. Nothing
+ * below user-global can supply it, so a repository cannot rewrite the policy
+ * that judges its own actions.
  */
 export interface ReviewSettings {
 	trigger: ReviewTrigger;
@@ -117,6 +118,8 @@ export interface ReviewSettings {
  * `sourceInfo.path` pi reports. Without it, any extension registering a tool of
  * the same name inherits the grant -- and since load order decides which
  * registration wins, that is a grant to whoever loads first.
+ * `reviewed` always leaves the final permit to L4 because this tool runs outside
+ * the sandbox; a named reviewer may veto or recommend, but cannot authorize it.
  */
 export interface ToolGrant {
 	readOnly?: boolean;
@@ -129,7 +132,7 @@ export interface ToolsSettings {
 }
 
 export interface ReviewerSettings {
-	/** `"none"` is deterministic mode. Phase 2 accepts nothing else. */
+	/** `"none"` is deterministic mode; otherwise an explicit `provider/model-id`. */
 	model: string;
 	timeoutMs: number;
 	fallback: string;

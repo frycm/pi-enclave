@@ -29,6 +29,7 @@ afterEach(() => {
 class RecordingBackend implements SandboxBackend {
 	readonly name = "seatbelt" as const;
 	readonly commands: RunRequest[] = [];
+	readonly directories: string[] = [];
 	readonly writes: { path: string; content: string }[] = [];
 	compiledProfile?: Profile;
 	disposed = false;
@@ -52,6 +53,9 @@ class RecordingBackend implements SandboxBackend {
 
 	fs(): FsClient {
 		return {
+			mkdir: async (path: string) => {
+				this.directories.push(path);
+			},
 			writeFile: async (path: string, content: string) => {
 				this.writes.push({ path, content });
 			},
@@ -387,6 +391,24 @@ describe("approving a record", () => {
 		expect(backend.compiledProfile?.writableRoots).toContain(canonical("/etc/x"));
 	});
 
+	it("refuses a write capability unrelated to the recorded action before asking", async () => {
+		const backend = new RecordingBackend();
+		const channel = io();
+		const result = await approve({
+			record: record("bash", { command: "touch /work/output", allow_write: "/srv/unrelated" }),
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: channel.make(true),
+			backend,
+			platform: "linux",
+		});
+		expect(result.outcome).toBe("refused");
+		expect(channel.asked).toHaveLength(0);
+		expect(channel.err.join("\n")).toContain("does not cover a concrete write");
+		expect(backend.compiledProfile).toBeUndefined();
+	});
+
 	it("leaves a credential-overlapping write capability pending without asking", async () => {
 		const backend = new RecordingBackend();
 		const channel = io();
@@ -427,20 +449,72 @@ describe("approving a record", () => {
 		expect(backend.compiledProfile).toBeUndefined();
 	});
 
-	it("refuses an unsupported capability before asking or consuming the record", async () => {
+	it("applies an approved user-grantable Bash read capability to one invocation", async () => {
+		const backend = new RecordingBackend();
+		const p = profile((current) => {
+			current.sandbox.readDeny.push("/work/private");
+			current.sandbox.grantableReadDeny.push("/work/private");
+		});
+		const rec = writePending({
+			stateRoot,
+			sessionId: SESSION,
+			action: canonicalize({
+				tool: "bash",
+				input: { command: "cat /work/private/report", allow_read: "/work/private" },
+				cwd: "/work",
+				home: "/home/u",
+				profileName: "dev",
+			}),
+			profile: p,
+			configHash: configHash(p),
+			reason: "read capability",
+			nonce: NONCE,
+		}).record;
+		const result = await approve({
+			record: rec,
+			stateRoot,
+			current: p,
+			home: "/home/u",
+			io: io().make(true),
+			backend,
+			platform: "linux",
+		});
+		expect(result.outcome).toBe("executed");
+		expect(backend.commands[0]?.readCapability).toBe(canonical("/work/private"));
+		expect(backend.compiledProfile?.readDeny).toContain("/work/private");
+	});
+
+	it("refuses a read capability that is not user-grantable before asking", async () => {
 		const backend = new RecordingBackend();
 		const channel = io();
-		const result = await approve({
-			record: record("bash", { command: "cat /etc/x", allow_read: "/etc/x" }),
+		const p = profile((current) => current.sandbox.readDeny.push("/work/private"));
+		const rec = writePending({
 			stateRoot,
-			current: profile(),
+			sessionId: SESSION,
+			action: canonicalize({
+				tool: "bash",
+				input: { command: "cat /work/private/report", allow_read: "/work/private" },
+				cwd: "/work",
+				home: "/home/u",
+				profileName: "dev",
+			}),
+			profile: p,
+			configHash: configHash(p),
+			reason: "read capability",
+			nonce: NONCE,
+		}).record;
+		const result = await approve({
+			record: rec,
+			stateRoot,
+			current: p,
 			home: "/home/u",
 			io: channel.make(true),
 			backend,
+			platform: "linux",
 		});
-		expect(result.outcome).toBe("unsupported");
+		expect(result.outcome).toBe("refused");
 		expect(channel.asked).toHaveLength(0);
-		expect(channel.err.join("\n")).toContain("Phase 3/4");
+		expect(channel.err.join("\n")).toContain("grantableReadDeny");
 		expect(readdirSync(pendingDirs(stateRoot, SESSION).pending)).toEqual([`${NONCE}.json`]);
 		expect(backend.compiledProfile).toBeUndefined();
 	});
@@ -482,5 +556,70 @@ describe("approving a record", () => {
 		expect(text).toContain("/tmp");
 		expect(text.indexOf("narrowed")).toBeLessThan(text.length);
 		expect(channel.asked).toHaveLength(1);
+	});
+});
+
+describe("approval execution parity", () => {
+	it.each([undefined, 0.05, 1, 2147483])("preserves a valid approved timeout: %s", async (timeout) => {
+		const backend = new RecordingBackend();
+		const result = await approve({
+			record: record("bash", { command: "sleep 60", ...(timeout === undefined ? {} : { timeout }) }),
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: io().make(true),
+			backend,
+		});
+		expect(result.outcome).toBe("executed");
+		expect(backend.commands[0]?.timeout).toBe(timeout);
+	});
+	it.each([0, -1, "1", 2147484])("refuses an invalid approved timeout before transition: %s", async (timeout) => {
+		const backend = new RecordingBackend();
+		const result = await approve({
+			record: record("bash", { command: "sleep 60", timeout }),
+			stateRoot,
+			current: profile(),
+			home: "/home/u",
+			io: io().make(true),
+			backend,
+		});
+		expect(result).toMatchObject({ outcome: "refused", reason: expect.stringContaining("timeout") });
+		expect(backend.commands).toHaveLength(0);
+		expect(backend.compiledProfile).toBeUndefined();
+	});
+	it.each([
+		["new/notes", "/work/new/notes", "/work/new"],
+		["~/notes", "/home/u/notes", "/home/u"],
+		["file:///work/new/notes", "/work/new/notes", "/work/new"],
+	])("creates the approved parent and resolves %s", async (path, expected, parent) => {
+		const backend = new RecordingBackend();
+		const current = profile((p) => {
+			p.sandbox.writableRoots.push("/home/u");
+		});
+		const result = await approve({
+			record: writePending({
+				stateRoot,
+				sessionId: SESSION,
+				action: canonicalize({
+					tool: "write",
+					input: { path, content: "hello" },
+					cwd: "/work",
+					home: "/home/u",
+					profileName: "dev",
+				}),
+				profile: current,
+				configHash: configHash(current),
+				reason: "parity fixture",
+				nonce: NONCE,
+			}).record,
+			stateRoot,
+			current,
+			home: "/home/u",
+			io: io().make(true),
+			backend,
+		});
+		expect(result.outcome).toBe("executed");
+		expect(backend.directories).toEqual([parent]);
+		expect(backend.writes).toEqual([{ path: expected, content: "hello" }]);
 	});
 });

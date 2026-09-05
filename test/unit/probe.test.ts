@@ -30,7 +30,7 @@ afterEach(() => {
 function healthyEnv(overrides: Partial<ProbeEnv> = {}): ProbeEnv {
 	return {
 		platform: "darwin",
-		nodeVersion: "22.10.0",
+		nodeVersion: "22.19.0",
 		piVersion: PI_RANGE_MIN,
 		which: () => "/usr/bin/stub",
 		readText: () => null,
@@ -72,22 +72,23 @@ describe("version parsing", () => {
 
 describe("range checks", () => {
 	it("includes the lower bound and excludes the upper", () => {
-		expect(isVersionInRange("0.84.2", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
-		expect(isVersionInRange("0.84.99", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
-		expect(isVersionInRange("0.84.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
-		expect(isVersionInRange("0.85.0", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
+		expect(isVersionInRange("0.85.0", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
+		expect(isVersionInRange("0.85.99", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
+		expect(isVersionInRange("0.84.4", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
+		expect(isVersionInRange("0.86.0", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
 	});
 
 	it("refuses a prerelease of the next minor", () => {
-		// Semver puts 0.85.0-rc.1 below 0.85.0, but the bound exists because an
+		// Semver puts 0.86.0-rc.1 below 0.86.0, but the bound exists because an
 		// unseen minor may change hook semantics, and an rc is exactly that.
+		expect(isVersionInRange("0.86.0-rc.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
+		expect(isVersionInRange("0.86.0-0", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
 		expect(isVersionInRange("0.85.0-rc.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
-		expect(isVersionInRange("0.85.0-0", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
 	});
 
 	it("still admits a prerelease inside the range", () => {
 		// Prereleases of a patch we already support carry no unseen minor.
-		expect(isVersionInRange("0.84.3-rc.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
+		expect(isVersionInRange("0.85.1-rc.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
 	});
 
 	it("never admits an unparseable version", () => {
@@ -111,7 +112,7 @@ describe("probe: pi version gate", () => {
 	it("fails closed on a NEWER pi, not just an older one", () => {
 		// The whole point of a two-sided bound: an unseen minor may change hook
 		// semantics, and "probably fine" is not a sandbox guarantee.
-		expect(byId(healthyEnv({ piVersion: "0.85.0" }), "pi-version")?.status).toBe("fail");
+		expect(byId(healthyEnv({ piVersion: "0.86.0" }), "pi-version")?.status).toBe("fail");
 		expect(byId(healthyEnv({ piVersion: "1.0.0" }), "pi-version")?.status).toBe("fail");
 	});
 
@@ -241,7 +242,7 @@ describe("probe: Linux user namespaces", () => {
 });
 
 describe("probe: Node version", () => {
-	it("rejects Node below the sandbox-runtime minimum", () => {
+	it("rejects Node below the pinned pi minimum", () => {
 		const report = probe(healthyEnv({ nodeVersion: "18.20.0" }));
 		expect(report.ok).toBe(false);
 		expect(byId(healthyEnv({ nodeVersion: "18.20.0" }), "node-version")?.status).toBe("fail");
