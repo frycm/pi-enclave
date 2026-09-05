@@ -20,7 +20,7 @@
  * refused with that explanation and left pending, so the user re-runs the task
  * with the rule relaxed instead.
  */
-import { isAbsolute, resolve } from "node:path";
+import { dirname } from "node:path";
 import {
 	resolveCapabilityTarget,
 	shellCapabilityIssue,
@@ -37,6 +37,7 @@ import type { EffectiveProfile } from "../config/types.ts";
 import { buildChildEnv } from "../env/child-env.ts";
 import { describeRecordForApproval, type PendingRecord, transition } from "../escalate/pending.ts";
 import { checkResume, describeNarrowing, formatResumeFailure } from "../escalate/resume.ts";
+import { validateBashTimeout } from "../tools/bash.ts";
 
 export interface ApproveIO {
 	out: (text: string) => void;
@@ -95,6 +96,14 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 
 	const { action } = check;
 	const tool = action.tool;
+	let timeout: number | undefined;
+	if (tool === "bash") {
+		try {
+			timeout = validateBashTimeout(action.input.timeout);
+		} catch (error) {
+			return { outcome: "refused", reason: (error as Error).message };
+		}
+	}
 	if (tool !== "bash" && tool !== "write") {
 		const reason =
 			`only bash and write actions can be resumed from the command line; this is a "${tool}".\n` +
@@ -196,6 +205,7 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 			if (typeof command !== "string") return { outcome: "refused", reason: "the record has no command" };
 			const result = await backend.run(compiled, {
 				command,
+				...(timeout !== undefined ? { timeout } : {}),
 				cwd: action.cwd,
 				env: buildChildEnv(process.env, {
 					passthrough: current.sandbox.env.passthrough,
@@ -223,8 +233,10 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 		// resolves a relative path against its own working directory, so a record
 		// of `notes.txt` from /project would otherwise be written wherever the
 		// approver happened to run the command -- the approver read "/project/notes.txt".
-		const path = isAbsolute(rawPath) ? rawPath : resolve(action.cwd, rawPath);
+		const path = action.paths.find((entry) => entry.raw === rawPath)?.typed;
+		if (!path) return { outcome: "refused", reason: "the write path has no canonical target" };
 		const fs = backend.fs(compiled);
+		await fs.mkdir(dirname(path));
 		await fs.writeFile(path, content);
 		io.out(`wrote ${path}`);
 		transition(options.stateRoot, record.sessionId, record.nonce, "approved", "consumed");

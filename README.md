@@ -41,14 +41,26 @@ Every integration claim below is made against a specific pi:
 |---|---|
 | Repository | [`earendil-works/pi`](https://github.com/earendil-works/pi) (formerly `badlogic/pi-mono`; not the unrelated `badlogic/pi` GPU-pod CLI) |
 | Package | `@earendil-works/pi-coding-agent` |
-| Supported range | **`>=0.84.2 <0.85.0`** — bounded on both sides |
-| Reference commit | [`c49906e`](https://github.com/earendil-works/pi/tree/c49906ec77788625aacbdc53ebca6fbe65bd20f5) — all file and doc links in this README are pinned to it |
+| Supported range | **`>=0.85.0 <0.86.0`** — bounded on both sides; development dependency pinned to **`0.85.0`** |
+| Reference commit | [`107d79f`](https://github.com/earendil-works/pi/tree/107d79f11072bbc8a3a757ed7fd69596bee7d68c) — upstream **v0.85.0**, released September 4, 2026 |
+| Node | **`>=22.19.0`**, matching the pinned pi release |
 | Fork for core changes | [`frycm/pi`](https://github.com/frycm/pi) — always rebased onto the **latest stable upstream release**; carries only the patches listed under [core changes](#core-changes-to-propose-to-pi) |
 
 pi-enclave declares the range as a `peerDependency` and `probe()` **fails closed outside
 it** — on an older pi *and* on a newer one. A newer minor may change hook semantics (handler
 ordering, `tool_call` result shape, tool operation interfaces) in ways the conformance suite
 has not seen, and "probably fine" is not a sandbox guarantee.
+
+The v0.85.0 package imports `@earendil-works/pi-server` through its root export without
+declaring that dependency. pi-enclave explicitly pins `@earendil-works/pi-server@0.85.0`
+to keep SDK imports and the standalone CLI working. Remove this workaround only after an
+upstream release fixes the package dependency and a clean-install import check passes.
+Policy initialization uses `ctx.cwd`, matching v0.85.0's tool execution in SDK sessions.
+
+The September 5 baseline update has local type, unit and policy validation; the native
+Linux/macOS matrix must be rerun on this update before merge. The existing green matrix
+was run with pi v0.84.2. See the [whole-project review](docs/project-review-2026-09-05.md)
+for Phase 3 blockers and the proposed release gates.
 
 Moving the baseline is one PR that does all of the following together, or none of it:
 
@@ -365,7 +377,7 @@ kernel denies it, the helper reports a `Violation` exactly as a shell command wo
 
 This also handles a concrete gap in pi's current `grep` tool: its operations object only
 abstracts the filesystem walk, while the tool itself still
-[spawns `rg` directly](https://github.com/earendil-works/pi/blob/c49906ec77788625aacbdc53ebca6fbe65bd20f5/packages/coding-agent/src/core/tools/grep.ts#L175-L226)
+[spawns `rg` directly](https://github.com/earendil-works/pi/blob/107d79f11072bbc8a3a757ed7fd69596bee7d68c/packages/coding-agent/src/core/tools/grep.ts#L139-L190)
 from the pi process. pi-enclave therefore re-registers `grep` with its own implementation
 that runs `rg` inside the helper, rather than reusing its unsandboxed execution path.
 
@@ -488,7 +500,7 @@ are reached by **pi itself**, not from inside the sandbox.
 
 Everything below uses APIs that exist in pi at the [baseline](#api-baseline). pi already
 ships an
-[SRT-based sandbox extension example](https://github.com/earendil-works/pi/blob/c49906ec77788625aacbdc53ebca6fbe65bd20f5/packages/coding-agent/examples/extensions/sandbox/index.ts)
+[SRT-based sandbox extension example](https://github.com/earendil-works/pi/blob/107d79f11072bbc8a3a757ed7fd69596bee7d68c/packages/coding-agent/examples/extensions/sandbox/index.ts)
 that overrides `bash`; pi-enclave's contribution is not another Seatbelt/bwrap wrapper but
 complete tool coverage, monotonic policy, exact approval binding, auditability and reviewer
 evaluation on top of one.
@@ -516,7 +528,7 @@ evaluation on top of one.
 > extension loads first inherits the grant. This is the honest answer until pi core offers
 > a sandbox hook for tool execution — see [core changes](#core-changes-to-propose-to-pi).
 >
-> **pi 0.84.2 has no MCP support at all** — no dependency, no setting, no tool namespace.
+> **pi 0.85.0 has no built-in MCP support** — third-party extensions can supply it.
 > Earlier drafts of this document said "MCP and custom tools"; there is only the second
 > kind. An MCP bridge, when one exists, will be an extension registering ordinary tools,
 > and the allowlist covers it unchanged.
@@ -768,12 +780,14 @@ mutating, so that predicate is a policy contract, not an implementation detail:
   built-ins `read`, `grep`, `find`, `ls` are; `bash`, `edit`, `write` are not.
 - **Shell.** A canonical command is read-only only when **every** simple command in it
   satisfies a built-in predicate table keyed on `command`, `subcommand` and **forbidden
-  flags**, e.g. `git (status|log|diff|show|branch --list|remote -v)`, `gh (pr|issue|repo)
+  flags**, e.g. `git (branch --list|remote -v)`, `gh (pr|issue|repo)
   (view|list|status)` with `-X`/`--method` forbidden, `ls`, `cat`, `head`, `tail`, `grep`,
   `rg`, `find` with its executing/file-output actions forbidden, `wc`, `jq`, `basename`,
   `dirname`, `pwd`, `readlink`, and `realpath`. A listed command with an unlisted subcommand
   or a forbidden flag is mutating; `git reset --hard`, `gh pr view --web`,
-  `find -fprint0 output`, `file --compile`, and `rg --pre command` therefore never fast-path.
+  `find -fprint0 output`, `file -Cm`, and `rg --pre command` therefore never fast-path.
+  `file` accepts only positively enumerated safe option forms. Git status/log/diff/show
+  receive review because repository configuration can invoke fsmonitor or diff/textconv programs.
 - **Structural rules, any one of which makes the whole command mutating:** any
   redirection (`>`, `>>`, `<>`, `tee`), any command substitution or process substitution
   (`$(…)`, backticks, `<(…)`), `eval`, `xargs`, `sh -c` / `bash -c`, a heredoc, an
@@ -794,7 +808,7 @@ mutating, so that predicate is a policy contract, not an implementation detail:
 
 ### Inspecting and critiquing the rulebook
 
-`pi enclave …` **is not possible**: pi 0.84.2's subcommand set is closed (`install`,
+`pi enclave …` **is not possible**: pi 0.85.0's subcommand set is closed (`install`,
 `remove`, `update`, `list`, `config`, `auth`) and any other bare word on its command line
 becomes a prompt for the model, so `pi enclave approve` would ask the agent to do something
 called "enclave approve". Out-of-session commands ship as their own `pi-enclave` binary.
@@ -907,10 +921,23 @@ quantization keeps its badge forever. A qualification is a record bound to:
 
 | Bound to | Why |
 |---|---|
-| **Model identity** — the exact weights digest reported by Ollama, or a descriptor digest over provider, model ID, API and base URL for a remote model | An Ollama re-pull or quantization change invalidates qualification. A remote provider cannot expose a weights digest, so deployments must choose an immutable versioned model ID; moving aliases remain a stated residual risk |
+| **Model identity** — Ollama manifest digest and runtime version from the effective inference endpoint, plus model/routing configuration; remote models use a descriptor digest over the effective registry/auth configuration | A model/configuration, endpoint or adapter change invalidates qualification. A remote provider cannot expose a weights digest, so deployments must choose an immutable versioned model ID; moving aliases remain a stated residual risk |
 | **Prompt version** — hash of the reviewer system prompt, the evidence schema, and the effective `review.*` rulebook as printed by `/enclave rules config` | Any prompt edit *or rulebook edit* invalidates every prior result. Custom prose is exactly as untested as a new prompt; a re-run on an unchanged model is cheap and cached per hash |
 | **Corpus version** — hash of the eval corpus | Adding cases must force re-qualification |
-| **Sampling parameters** — `temperature`, `seed`, `num_ctx`, max tokens | Reproducibility |
+| **Sampling parameters** — `temperature`, `seed`, max tokens, and enforced Ollama `num_ctx` (remote context is recorded as provider-managed) | Reproducibility without claiming unsupported request settings |
+
+Ollama uses the native `/api/chat` endpoint with explicit sampling options and checks
+`/api/ps` for the loaded manifest and context length. Identity is checked before and after
+every review stage. Non-Ollama loopback services and adapters without the required seed
+support are refused. Qualification record version 2 invalidates the earlier records;
+run `/enclave eval-reviewer` again after this update.
+
+High-risk authorization uses the complete action and the newest complete direct instruction,
+separately from bounded model evidence. Commands and paths retain their case. Conditional,
+revoked or ambiguous instructions require human escalation. A Bash capability request needs
+explicit approval of its complete action hash; permission to read a directory alone does
+not authorize other shell effects. Direct input and active-branch changes invalidate queued
+actions, and reviewer responses based on superseded instructions are refused.
 
 The eval itself runs **each case N times** (default `N = 5`, fixed temperature zero,
 different deterministic seeds) and qualifies only if:
@@ -995,7 +1022,7 @@ turns a performance feature into an authorization replay surface.
 ### Attendance is a setting, not an inference
 
 An earlier draft inferred "a human is present" from `ctx.hasUI`. That is wrong on current pi:
-[`ctx.hasUI` is `true` in both TUI and RPC modes](https://github.com/earendil-works/pi/blob/c49906ec77788625aacbdc53ebca6fbe65bd20f5/packages/coding-agent/docs/extensions.md#L950-L956),
+[`ctx.hasUI` is `true` in both TUI and RPC modes](https://github.com/earendil-works/pi/blob/107d79f11072bbc8a3a757ed7fd69596bee7d68c/packages/coding-agent/docs/extensions.md#L972-L974),
 and an RPC client may be a headless orchestrator with nobody behind it — the worst possible
 place to show a confirm dialog whose default resolves to "approved". Attendance is therefore
 an **explicit contract**:
@@ -1013,8 +1040,8 @@ attended: {
 | `"rpc"` | A person is behind an RPC client that has opted in | The client must complete the **approval-channel handshake** below, built only from `ctx.ui.input` / `ctx.ui.confirm`. No handshake → treated as `"off"` for this session, and the status line says so. |
 | `"off"` | Nobody is there (CI, ops runner, print mode) | Every `ask` is a deny; no dialog is ever attempted |
 
-**The RPC handshake, on pinned pi.** pi 0.84.2 gives an extension exactly the fixed
-[`extension_ui_request` methods](https://github.com/earendil-works/pi/blob/c49906ec77788625aacbdc53ebca6fbe65bd20f5/packages/coding-agent/src/modes/rpc/rpc-types.ts#L238-L283)
+**The RPC handshake, on pinned pi.** pi 0.85.0 gives an extension exactly the fixed
+[`extension_ui_request` methods](https://github.com/earendil-works/pi/blob/107d79f11072bbc8a3a757ed7fd69596bee7d68c/packages/coding-agent/src/modes/rpc/rpc-types.ts#L246-L281)
 — `select`, `confirm`, `input`, `editor`, plus fire-and-forget — and nothing custom. So the
 handshake is a defined use of `ctx.ui.input`, not a new message type:
 
@@ -1698,7 +1725,7 @@ human-only decisions remain authoritative.
 
 ## Core changes to propose to pi
 
-All of the above works as an extension, but three small core changes would make any
+All of the above works as an extension, but four core changes would make any
 reviewer or sandbox extension *robust* rather than merely careful:
 
 1. **Ordered or final `tool_call` handlers.** Today handlers run in extension load order,
@@ -1713,8 +1740,9 @@ reviewer or sandbox extension *robust* rather than merely careful:
    `confirm` request and a matching `proof` on the response — so each approval, not just
    the channel, can be bound to a secret the client holds.
 
-These are prototyped in [`frycm/pi`](https://github.com/frycm/pi) and upstreamed with
-pi-enclave as the motivating use case. The fork's policy is fixed: it is **always rebased
+These are proposals for [`frycm/pi`](https://github.com/frycm/pi), with pi-enclave as the
+motivating use case. As of September 5, 2026, the fork is exactly upstream v0.85.0 and
+contains no prototype patches. The fork's policy is fixed: it is **always rebased
 onto the latest stable upstream release** and carries *only* the patches above as discrete
 commits on top — no divergent features, no long-lived branch. pi-enclave itself targets
 upstream pi at the [baseline](#api-baseline); the fork exists to prove the patches, and

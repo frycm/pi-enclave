@@ -21,6 +21,20 @@ import { formatViolations } from "../backend/violations.ts";
 import { buildChildEnv } from "../env/child-env.ts";
 import type { CanonicalAction } from "../policy/canonical.ts";
 
+/** Same seconds/range contract as pi's default BashOperations. */
+export function validateBashTimeout(timeout: unknown): number | undefined {
+	if (timeout === undefined) return undefined;
+	if (
+		typeof timeout !== "number" ||
+		!Number.isFinite(timeout) ||
+		timeout <= 0 ||
+		timeout > Math.floor(2_147_483_647 / 1000)
+	) {
+		throw new Error("Invalid timeout: must be positive finite seconds, at most 2147483");
+	}
+	return timeout;
+}
+
 function pathMayBeReached(action: CanonicalAction, raw: string): boolean {
 	if (!action.shell) return true;
 	let mentioned = false;
@@ -130,6 +144,7 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 
 	return {
 		async exec(command, cwd, execOptions) {
+			validateBashTimeout(execOptions.timeout);
 			const action = options.guard?.(command);
 			const compiled = getCompiled();
 			// The compiled profile's env settings are the configured ones and win;

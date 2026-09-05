@@ -2,7 +2,7 @@ import { resolveCapabilityTarget } from "../backend/capability.ts";
 import { canonical, isUnderAny, normalizePath } from "../backend/paths.ts";
 import type { EffectiveProfile } from "../config/types.ts";
 import type { CanonicalAction } from "../policy/canonical.ts";
-import type { EffectiveReview, ModelReview, ReviewEvidence, ReviewRisk } from "./types.ts";
+import type { EffectiveReview, ModelReview, ReviewAuthorization, ReviewEvidence, ReviewRisk } from "./types.ts";
 
 const RISK_RANK: Record<ReviewRisk, number> = { low: 0, medium: 1, high: 2, critical: 3 };
 
@@ -60,63 +60,43 @@ export function minimumRisk(action: CanonicalAction, profile: EffectiveProfile):
 	return "low";
 }
 
-const NEGATED_AUTHORIZATION =
-	/\b(?:do\s+not|don't|dont|did\s+not|didn't|didnt|never|must\s+not|mustn't|should\s+not|shouldn't|without|avoid|forbid|forbidden|deny|denied|refuse|refused|stop)\b/u;
-
-function startsWithRequest(text: string, verb: string, object: string): boolean {
-	const requests = [
-		`${verb} ${object}`,
-		`please ${verb} ${object}`,
-		`could you ${verb} ${object}`,
-		`can you ${verb} ${object}`,
-		`would you ${verb} ${object}`,
-		`go ahead and ${verb} ${object}`,
-		`you may ${verb} ${object}`,
-		`i authorize you to ${verb} ${object}`,
-		`i approve ${verb} ${object}`,
-	];
-	return requests.some((request) => text === request || text.startsWith(`${request} `));
+// Request grammar is case-insensitive; executable data is byte-exact. A suffix
+// may qualify or revoke a request, so it cannot be ignored as display prose.
+function exactRequest(text: string, verbs: readonly string[], object: string): boolean {
+	const prefix =
+		/^(?:(?:please|could you|can you|would you|go ahead and|you may|i authorize you to|i approve) )?([a-z]+) /i.exec(
+			text,
+		);
+	return !!prefix && verbs.includes((prefix[1] ?? "").toLowerCase()) && text.slice(prefix[0].length) === object;
 }
 
-function explicitHashAuthorization(text: string, hash: string): boolean {
-	return [`approve ${hash}`, `authorize ${hash}`, `allow ${hash}`, `i approve ${hash}`, `i authorize ${hash}`].some(
-		(request) => text === request || text.startsWith(`${request} `),
-	);
-}
-
-function explicitCapabilityAuthorization(text: string, kind: "read" | "write" | "host", target: string): boolean {
-	const verbs = kind === "read" ? ["read", "inspect", "view"] : kind === "write" ? ["write", "modify", "create"] : [];
-	if (verbs.some((verb) => startsWithRequest(text, verb, target))) return true;
-	const spelling = `allow_${kind}`;
-	const assignments = [`${spelling}=${target}`, `${spelling}="${target}"`, `${spelling}='${target}'`];
-	return assignments.some((assignment) =>
-		["use", "request", "retry with", "approve", "authorize"].some((verb) => startsWithRequest(text, verb, assignment)),
-	);
-}
-
-/**
- * Deliberately narrow deterministic coverage for an effective-high allow.
- * Natural-language ambiguity becomes an ask; it never becomes model authority.
- */
-export function directAuthorizationCovers(evidence: ReviewEvidence): boolean {
-	const action = evidence.action;
-	for (const entry of evidence.authorization) {
-		const text = entry.text.trim().toLowerCase();
-		if (NEGATED_AUTHORIZATION.test(text)) continue;
-		if (explicitHashAuthorization(text, action.hash.toLowerCase())) return true;
-		if (evidence.requestedCapability) {
-			const target = evidence.requestedCapability.value.toLowerCase();
-			if (explicitCapabilityAuthorization(text, evidence.requestedCapability.kind, target)) return true;
-		}
-		const command = action.input.command;
-		if (typeof command === "string") {
-			const exact = command.trim().toLowerCase();
-			if (text === exact || startsWithRequest(text, "run", exact) || startsWithRequest(text, "execute", exact)) {
-				return true;
-			}
-		}
+/** Only the newest complete direct instruction may establish high-risk coverage. */
+export function directAuthorizationCovers(
+	action: CanonicalAction,
+	authorization: readonly ReviewAuthorization[],
+): boolean {
+	const entry = authorization.at(-1);
+	if (!entry || entry.provenance !== "direct") return false;
+	const text = entry.text.trim();
+	if (
+		exactRequest(text, ["approve", "authorize", "allow"], action.hash) ||
+		exactRequest(text.replace(/^i /i, ""), ["approve", "authorize", "allow"], action.hash)
+	)
+		return true;
+	if (action.capability) {
+		// A grant alone never authorizes extra shell effects or write contents.
+		// Such actions require the full action hash, covering command AND grant.
+		if (!["read", "ls", "find", "grep"].includes(action.tool) || action.capability.kind !== "read") return false;
+		const target = action.capability.value;
+		if (exactRequest(text, ["read", "inspect", "view"], target)) return true;
+		return [`allow_read=${target}`, `allow_read="${target}"`, `allow_read='${target}'`].some(
+			(assignment) =>
+				exactRequest(text, ["use", "request", "approve", "authorize"], assignment) ||
+				exactRequest(text.replace(/^retry with /i, "request "), ["request"], assignment),
+		);
 	}
-	return false;
+	const command = action.input.command;
+	return typeof command === "string" && (text === command || exactRequest(text, ["run", "execute"], command));
 }
 
 export function enforceReview(
@@ -124,10 +104,11 @@ export function enforceReview(
 	action: CanonicalAction,
 	profile: EffectiveProfile,
 	evidence: ReviewEvidence,
+	authorization: readonly ReviewAuthorization[] = [],
 ): EffectiveReview {
 	const floor = maxRisk(minimumRisk(action, profile), evidence.action.truncated ? "high" : "low");
 	const risk = maxRisk(model.risk, floor);
-	const authorizationCovers = directAuthorizationCovers(evidence);
+	const authorizationCovers = directAuthorizationCovers(action, authorization);
 	let decision = model.decision;
 	let reason = model.reason;
 	if (risk === "critical" && decision !== "deny") {

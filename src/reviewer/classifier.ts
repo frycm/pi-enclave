@@ -46,14 +46,53 @@ function baseName(value: string): string {
 }
 
 function hasFlag(args: readonly string[], flags: readonly string[]): boolean {
-	return args.some((arg) => flags.some((flag) => arg === flag || arg.startsWith(`${flag}=`)));
+	return args.some((arg) =>
+		flags.some(
+			(flag) =>
+				arg === flag ||
+				arg.startsWith(`${flag}=`) ||
+				(flag.length === 2 && /^-[^-]/.test(arg) && arg.slice(1).includes(flag[1] as string)),
+		),
+	);
+}
+
+function fileReadOnly(args: readonly string[]): boolean {
+	// Positive syntax only. Unknown options/abbreviations and short clusters
+	// containing -C must not turn a magic database compilation into a read.
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i] as string;
+		if (arg === "--") return true;
+		if (!arg.startsWith("-") || arg === "-") continue;
+		if (
+			[
+				"--brief",
+				"--mime",
+				"--mime-type",
+				"--mime-encoding",
+				"--dereference",
+				"--no-dereference",
+				"--version",
+				"--help",
+			].includes(arg)
+		)
+			continue;
+		if (arg === "-m" || arg === "--magic-file") {
+			if (!args[++i]) return false;
+			continue;
+		}
+		if (/^-[bikLNnprszh0]+$/.test(arg)) continue;
+		return false;
+	}
+	return true;
 }
 
 function gitReadOnly(command: SimpleCommand): boolean {
 	if (hasFlag(command.args, GIT_EFFECT_FLAGS)) return false;
 	const [subcommand, ...rest] = command.args;
 	if (!subcommand || subcommand.startsWith("-")) return false;
-	if (["status", "log", "diff", "show"].includes(subcommand)) return true;
+	// These may execute configured fsmonitor/diff/textconv programs. The
+	// sandbox bounds them, but their subcommand name cannot bypass review.
+	if (["status", "log", "diff", "show"].includes(subcommand)) return false;
 	if (subcommand === "branch") return rest[0] === "--list" && rest.slice(1).every((arg) => !arg.startsWith("-"));
 	if (subcommand === "remote") return rest.length === 1 && rest[0] === "-v";
 	return false;
@@ -73,7 +112,7 @@ function simpleCommandReadOnly(command: SimpleCommand): boolean {
 	// regardless of its basename.
 	if (command.name.includes("/")) return false;
 	const name = baseName(command.name);
-	if (name === "file") return !hasFlag(command.args, FILE_EFFECT_FLAGS);
+	if (name === "file") return fileReadOnly(command.args);
 	if (name === "rg") return !hasFlag(command.args, RG_EFFECT_FLAGS);
 	if (SIMPLE_READERS.has(name)) return true;
 	if (name === "git") return gitReadOnly(command);
@@ -115,7 +154,8 @@ export function reviewerTrigger(
 
 export const READ_ONLY_CLASSIFIER = {
 	simple: [...SIMPLE_READERS],
-	git: ["status", "log", "diff", "show", "branch --list", "remote -v"],
+	git: ["branch --list", "remote -v"],
+	gitConfiguredPrograms: ["status", "log", "diff", "show"],
 	gitForbidden: GIT_EFFECT_FLAGS,
 	gh: ["pr view|list|status", "issue view|list|status", "repo view|list|status"],
 	ghForbidden: GH_EFFECT_FLAGS,

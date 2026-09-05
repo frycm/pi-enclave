@@ -120,7 +120,11 @@ export function createEditOperations(fs: FsClientRef, guard?: ToolGuard) {
 	};
 }
 
-export function createWriteOperations(fs: FsClientRef, guard?: ToolGuard) {
+export function createWriteOperations(
+	fs: FsClientRef,
+	guard?: ToolGuard,
+	guardParent?: (path: string) => CanonicalAction | undefined,
+) {
 	return {
 		writeFile: (path: string, content: string) => {
 			const action = guarded(guard, "write", path);
@@ -129,18 +133,25 @@ export function createWriteOperations(fs: FsClientRef, guard?: ToolGuard) {
 		// `mkdir` is guarded against the *file* path the action named: pi creates
 		// the parent directory of a write target, so the directory itself never
 		// appears in the tool input and would never be in the table.
-		mkdir: (path: string) => protect(() => withFs(fs, undefined, (client) => client.mkdir(path))),
+		mkdir: (path: string) => {
+			const action = guardParent?.(path);
+			return protect(() => withFs(fs, action, (client) => client.mkdir(path)));
+		},
 	};
 }
 
-export function createLsOperations(fs: FsClientRef, guard?: ToolGuard) {
+export function createLsOperations(
+	fs: FsClientRef,
+	guard?: ToolGuard,
+	guardStat?: (path: string) => CanonicalAction | undefined,
+) {
 	return {
 		exists: (path: string) => {
 			const action = guarded(guard, "ls", path);
 			return protect(() => withFs(fs, action, (client) => client.exists(path)));
 		},
 		stat: (path: string) => {
-			const action = guarded(guard, "ls", path);
+			const action = guardStat ? guardStat(path) : guarded(guard, "ls", path);
 			return protect(() => withFs(fs, action, (client) => client.stat(path)));
 		},
 		readdir: (path: string) => {

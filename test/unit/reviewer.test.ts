@@ -115,3 +115,25 @@ describe("isolated reviewer", () => {
 		expect(result).toMatchObject({ ok: false, kind: "unavailable" });
 	});
 });
+
+it("rejects authorization revoked while the model is in flight", async () => {
+	const authorization = [
+		{ provenance: "direct" as const, channel: "interactive" as const, text: "Please run rm -rf build" },
+	];
+	const primary: ReviewerCompletion = {
+		name: "fixture",
+		async complete(request) {
+			if (request.maxTokens === 1) return "1";
+			authorization.push({ provenance: "direct", channel: "interactive", text: "Do not run rm -rf build" });
+			return '{"decision":"allow","risk":"low","reason":"stale authorization"}';
+		},
+	};
+	const result = await new IsolatedReviewer({
+		profile: PROFILE,
+		prompt: PROMPT,
+		primary,
+		timeoutMs: 1000,
+		evidence: () => ({ attended: "off", authorization }),
+	}).review({ action: action("rm -rf build"), trigger: "mutating" });
+	expect(result).toMatchObject({ ok: false, reason: expect.stringContaining("authorization changed") });
+});

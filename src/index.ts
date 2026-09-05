@@ -15,7 +15,7 @@
  */
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	createBashTool,
 	createEditTool,
@@ -84,6 +84,7 @@ import {
 	createWriteOperations,
 } from "./tools/file-ops.ts";
 import { GrepExecutionQueue, runSandboxedGrep } from "./tools/grep.ts";
+import { bindOwnedTool } from "./tools/locked.ts";
 
 /**
  * A fallback spelling of this module's path.
@@ -162,7 +163,7 @@ type ConfirmFn = (
 
 export default function (pi: ExtensionAPI): void {
 	const report = probeHost(PI_VERSION ?? null);
-	const cwd = process.cwd();
+	let cwd = process.cwd();
 	const backend = new SrtBackend();
 
 	// The zero-configuration profile until the fold runs at session start. It is
@@ -274,6 +275,7 @@ export default function (pi: ExtensionAPI): void {
 	let actionReviewer: ActionReviewer | undefined;
 	let reviewerSetup: Awaited<ReturnType<typeof prepareQualifiedReviewer>>;
 	const reviewAuthorization: ReviewAuthorization[] = [];
+	let authorizationGeneration = 0;
 	const reviewContext: ReviewContextEntry[] = [];
 
 	/**
@@ -300,6 +302,11 @@ export default function (pi: ExtensionAPI): void {
 		if (lockNotApplicable()) return undefined;
 		return lock.beginPathExecution(tool, path).action;
 	};
+
+	const registerOwnedTool = (tool: Parameters<typeof pi.registerTool>[0]) => {
+		pi.registerTool(bindOwnedTool(tool, lock, lockNotApplicable));
+	};
+	const guardParent = (path: string) => (lockNotApplicable() ? undefined : lock.beginParentExecution(path).action);
 
 	/** A snapshot for rendering. Rebuilt per call so it never goes stale. */
 	const state = (): EnclaveState => ({
@@ -436,7 +443,7 @@ export default function (pi: ExtensionAPI): void {
 			allow_write: "One exact filesystem path to make writable for this action only, subject to review",
 			allow_read: "One exact configured read-deny root to lift for this action only, subject to review",
 		});
-		pi.registerTool({ ...base, label: "bash (sandboxed)", promptGuidelines: BASH_PROMPT_GUIDELINES });
+		registerOwnedTool({ ...base, label: "bash (sandboxed)", promptGuidelines: BASH_PROMPT_GUIDELINES });
 
 		// `!` and `!!` run through the sandbox by construction, but not through the
 		// policy gate: they arrive on their own event with no `tool_call`, so they
@@ -460,19 +467,26 @@ export default function (pi: ExtensionAPI): void {
 		// Each closes over fsClient() rather than a captured client, so a
 		// recompiled profile retires the old helper without leaving a tool bound
 		// to it.
-		pi.registerTool(
+		registerOwnedTool(
 			addCapabilityParameters(createReadTool(cwd, { operations: createReadOperations(fsClient, guardPath) }), {
 				allow_read: "One exact configured read-deny root to lift for this action only, subject to review",
 			}),
 		);
-		pi.registerTool(createEditTool(cwd, { operations: createEditOperations(fsClient, guardPath) }));
-		pi.registerTool(createWriteTool(cwd, { operations: createWriteOperations(fsClient, guardPath) }));
-		pi.registerTool(
-			addCapabilityParameters(createLsTool(cwd, { operations: createLsOperations(fsClient, guardPath) }), {
-				allow_read: "One exact configured read-deny root to lift for this action only, subject to review",
-			}),
+		registerOwnedTool(createEditTool(cwd, { operations: createEditOperations(fsClient, guardPath) }));
+		registerOwnedTool(createWriteTool(cwd, { operations: createWriteOperations(fsClient, guardPath, guardParent) }));
+		registerOwnedTool(
+			addCapabilityParameters(
+				createLsTool(cwd, {
+					operations: createLsOperations(fsClient, guardPath, (path) =>
+						lockNotApplicable() ? undefined : lock.beginDirectoryEntryExecution(path).action,
+					),
+				}),
+				{
+					allow_read: "One exact configured read-deny root to lift for this action only, subject to review",
+				},
+			),
 		);
-		pi.registerTool(
+		registerOwnedTool(
 			addCapabilityParameters(createFindTool(cwd, { operations: createFindOperations(fsClient, guardPath) }), {
 				allow_read: "One exact configured read-deny root to lift for this action only, subject to review",
 			}),
@@ -486,7 +500,7 @@ export default function (pi: ExtensionAPI): void {
 		const grepBase = addCapabilityParameters(createGrepTool(cwd), {
 			allow_read: "One exact configured read-deny root to lift for this action only, subject to review",
 		});
-		pi.registerTool({
+		registerOwnedTool({
 			...grepBase,
 			label: "grep (sandboxed)",
 			execute: async (_id: string, params: unknown, signal?: AbortSignal) => {
@@ -534,6 +548,7 @@ export default function (pi: ExtensionAPI): void {
 			hasTty: process.stdin.isTTY === true,
 		});
 
+		const decisionGeneration = authorizationGeneration;
 		const decision: GateDecision = await decide(
 			{ toolName: event.toolName, toolCallId: event.toolCallId, input: event.input as Record<string, unknown> },
 			{
@@ -601,6 +616,14 @@ export default function (pi: ExtensionAPI): void {
 				},
 			},
 		);
+		if (decisionGeneration !== authorizationGeneration) {
+			lock.consume(event.toolCallId);
+			return {
+				block: true,
+				reason:
+					"pi-enclave: direct instructions or active session branch changed during review; retry for a fresh decision",
+			};
+		}
 		if (decision.action) {
 			reviewContext.push({
 				provenance: "assistant_tool_call",
@@ -668,6 +691,8 @@ export default function (pi: ExtensionAPI): void {
 		const text = messageText(event.message);
 		const record = directInput.recordForMessage(text, Date.now());
 		if (!record) return;
+		authorizationGeneration++;
+		lock.reset();
 		pi.appendEntry(PROVENANCE_ENTRY_TYPE, record);
 		reviewAuthorization.push({
 			provenance: "direct",
@@ -691,7 +716,20 @@ export default function (pi: ExtensionAPI): void {
 		lock.consume(event.toolCallId);
 	});
 
+	const restoreBranch = (ctx: ExtensionContext) => {
+		authorizationGeneration++;
+		directInput.reset();
+		lock.reset();
+		const restored = restoreReviewHistory(ctx.sessionManager.getBranch());
+		reviewAuthorization.splice(0, reviewAuthorization.length, ...restored.authorization);
+		reviewContext.splice(0, reviewContext.length, ...restored.context);
+	};
+	pi.on("session_tree", (_event, ctx) => restoreBranch(ctx));
+
 	pi.on("session_start", async (_event, ctx) => {
+		// Pi 0.85 executes built-in operations relative to ctx.cwd. SDK sessions
+		// can differ from process.cwd(), so policy, hashes and grep must agree.
+		cwd = ctx.cwd;
 		actionReviewer = undefined;
 		reviewerSetup = undefined;
 		directInput.reset();
@@ -721,9 +759,7 @@ export default function (pi: ExtensionAPI): void {
 		effective = loaded.profile;
 		provenance = loaded.provenance;
 		profile = toBackendProfile(loaded.profile, cwd);
-		const restored = restoreReviewHistory(ctx.sessionManager.getBranch());
-		reviewAuthorization.push(...restored.authorization);
-		reviewContext.push(...restored.context);
+		restoreBranch(ctx);
 
 		// Ownership is checked after the configuration, because the diagnosis is
 		// only actionable once we know auto mode was going to start at all.

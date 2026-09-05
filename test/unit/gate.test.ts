@@ -352,7 +352,7 @@ describe("the gate", () => {
 
 		it("keeps a classified read on the fast path", async () => {
 			const reviewer = allow();
-			const decision = await gate("bash", { command: "git status --short" }, { profile: reviewProfile(), reviewer });
+			const decision = await gate("bash", { command: "cat README.md" }, { profile: reviewProfile(), reviewer });
 			expect(decision.outcome).toBe("allow");
 			expect(reviewer.calls).toBe(0);
 		});

@@ -25,8 +25,10 @@
  * un-prepare it. Every operations object pi-enclave owns therefore asks the
  * table again, at the moment it is about to act.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
+import { dirname } from "node:path";
 import { canonical, normalizePath } from "../backend/paths.ts";
-import type { CanonicalAction } from "../policy/canonical.ts";
+import { type CanonicalAction, executionSerialize, hashAction } from "../policy/canonical.ts";
 
 export type LockState = "locked" | "executing" | "consumed";
 
@@ -88,6 +90,7 @@ export class ActionLock {
 	// still available.
 	private readonly byKey = new Map<string, LockEntry[]>();
 	private readonly byToolCall = new Map<string, LockEntry>();
+	private readonly invocation = new AsyncLocalStorage<{ entry: LockEntry; signal?: AbortSignal }>();
 	private readonly options: LockOptions;
 
 	constructor(options: LockOptions = {}) {
@@ -96,6 +99,7 @@ export class ActionLock {
 
 	/** Record an action as permitted to execute. */
 	register(action: CanonicalAction, toolCallId: string, approved = false): LockEntry {
+		if (this.byToolCall.has(toolCallId)) throw new LockViolation("ambiguous", "pi-enclave: duplicate tool-call ID");
 		const entry: LockEntry = { action, toolCallId, state: "locked", executions: 0, ...(approved ? { approved } : {}) };
 		for (const key of executionKeys(action)) {
 			const list = this.byKey.get(key);
@@ -110,6 +114,87 @@ export class ActionLock {
 		return this.byKey.get(key)?.[0];
 	}
 
+	/** Bind the complete executor invocation before any operation (including mkdir). */
+	async runInvocation<T>(
+		toolCallId: string,
+		tool: string,
+		input: unknown,
+		cwd: string,
+		run: () => Promise<T>,
+		signal?: AbortSignal,
+	): Promise<T> {
+		const entry = this.byToolCall.get(toolCallId);
+		if (!entry) throw new LockViolation("not-locked", "pi-enclave: this tool-call ID did not pass the policy gate");
+		assertJsonLike(input);
+		if (
+			entry.action.tool !== tool ||
+			entry.action.cwd !== cwd ||
+			executionSerialize(entry.action.input) !== executionSerialize(input) ||
+			hashAction(entry.action) !== entry.action.hash
+		) {
+			throw new LockViolation("ambiguous", "pi-enclave: execution differs from the complete gated action");
+		}
+		if (entry.state !== "locked")
+			throw new LockViolation("already-consumed", "pi-enclave: this invocation already started");
+		return this.invocation.run({ entry, ...(signal ? { signal } : {}) }, async () => {
+			try {
+				this.checkEntry(entry);
+				entry.state = "executing";
+				return await run();
+			} finally {
+				entry.state = "consumed";
+			}
+		});
+	}
+
+	private checkEntry(entry: LockEntry): void {
+		this.invocation.getStore()?.signal?.throwIfAborted();
+		if (this.byToolCall.get(entry.toolCallId) !== entry || entry.state === "consumed") {
+			throw new LockViolation("already-consumed", "pi-enclave: this invocation is finished or its session was reset");
+		}
+		if (this.options.breakerOpen?.()) {
+			throw new LockViolation(
+				"breaker-open",
+				"pi-enclave: the denial circuit breaker opened while this call was queued",
+			);
+		}
+	}
+
+	/** A write's mkdir may touch only the parent of that invocation's target. */
+	beginParentExecution(path: string): LockEntry {
+		const entry = this.invocation.getStore()?.entry;
+		if (
+			!entry ||
+			entry.action.tool !== "write" ||
+			!entry.action.paths.some((target) => normalizePath(dirname(target.typed)) === normalizePath(path))
+		) {
+			throw new LockViolation("not-locked", "pi-enclave: mkdir has no matching write invocation");
+		}
+		this.checkEntry(entry);
+		entry.executions++;
+		return entry;
+	}
+
+	/** ls stats the directory and each immediate entry returned by readdir. */
+	beginDirectoryEntryExecution(path: string): LockEntry {
+		const entry = this.invocation.getStore()?.entry;
+		const normalized = normalizePath(path);
+		if (
+			!entry ||
+			entry.action.tool !== "ls" ||
+			!entry.action.paths.some((target) =>
+				[target.typed, target.resolved].some(
+					(directory) => directory === normalized || directory === dirname(normalized),
+				),
+			)
+		) {
+			throw new LockViolation("not-locked", "pi-enclave: stat is not an immediate entry of this ls invocation");
+		}
+		this.checkEntry(entry);
+		entry.executions++;
+		return entry;
+	}
+
 	/**
 	 * May an operations object act under this key, right now?
 	 *
@@ -120,6 +205,14 @@ export class ActionLock {
 	 */
 	beginExecution(key: string): LockEntry {
 		const list = this.byKey.get(key);
+		const scoped = this.invocation.getStore()?.entry;
+		if (scoped) {
+			this.checkEntry(scoped);
+			if (!list?.includes(scoped))
+				throw new LockViolation("not-locked", "pi-enclave: operation does not match this invocation");
+			scoped.executions++;
+			return scoped;
+		}
 		if (!list || list.length === 0) {
 			throw new LockViolation(
 				"not-locked",
@@ -133,10 +226,10 @@ export class ActionLock {
 		// identities (most importantly, one has allow_write and one does not), no
 		// observation at execute time can tell which one pi started first. Refuse
 		// while both are live instead of lending either call the other's grant.
-		if (isBash && new Set(live.map((candidate) => candidate.action.hash)).size > 1) {
+		if (new Set(live.map((candidate) => candidate.action.hash)).size > 1) {
 			throw new LockViolation(
 				"ambiguous",
-				"pi-enclave: concurrent bash calls with the same command request different authority; they cannot be safely correlated and will not run together.",
+				"pi-enclave: concurrent calls request different authority; an invocation binding is required.",
 			);
 		}
 		// A bash operations object acts once, so an entry already executing belongs

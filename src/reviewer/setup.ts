@@ -1,7 +1,7 @@
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { EffectiveProfile, Provenance } from "../config/types.ts";
 import { qualificationBinding } from "./eval.ts";
-import { resolveReviewerModel, reviewerModelDigest } from "./model.ts";
+import { bindReviewerCompletion, resolveReviewerModel, reviewerModelDigest } from "./model.ts";
 import { buildReviewerPrompt, reviewerRulebook } from "./prompt.ts";
 import { readQualification } from "./qualification.ts";
 import type { IsolatedReviewerOptions, ReviewerCompletion } from "./reviewer.ts";
@@ -22,13 +22,13 @@ async function qualifiedCompletion(
 	qualifiedDir: string,
 ): Promise<ReviewerCompletion> {
 	const resolved = resolveReviewerModel(registry, reference);
-	const modelDigest = await reviewerModelDigest(resolved.model);
+	const modelDigest = await reviewerModelDigest(resolved.model, registry);
 	const binding = qualificationBinding({
 		model: reference,
 		modelDigest,
 		profile,
 		prompt,
-		completion: resolved.completion,
+		completion: bindReviewerCompletion(resolved, modelDigest),
 		timeoutMs: profile.reviewer.timeoutMs,
 	});
 	const qualification = readQualification(qualifiedDir, binding);
@@ -38,7 +38,7 @@ async function qualifiedCompletion(
 				`  Run /enclave eval-reviewer in pi.`,
 		);
 	}
-	return resolved.completion;
+	return bindReviewerCompletion(resolved, modelDigest);
 }
 
 export async function prepareQualifiedReviewer(
@@ -58,7 +58,7 @@ export async function prepareQualifiedReviewer(
 }
 
 export function reviewerSamplingSummary(): string {
-	return `temperature=${REVIEWER_TEMPERATURE}, seed=${REVIEWER_SEED}, num_ctx=${REVIEWER_NUM_CTX}, maxTokens=${REVIEWER_MAX_TOKENS}`;
+	return `temperature=${REVIEWER_TEMPERATURE}, seed=${REVIEWER_SEED}, Ollama num_ctx=${REVIEWER_NUM_CTX} (verified); remote context=provider-managed, maxTokens=${REVIEWER_MAX_TOKENS}`;
 }
 
 export type ReviewerEvidenceSource = IsolatedReviewerOptions["evidence"];

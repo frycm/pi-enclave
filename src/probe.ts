@@ -11,12 +11,12 @@
  */
 
 /** Inclusive lower bound of the supported pi range. */
-export const PI_RANGE_MIN = "0.84.2";
+export const PI_RANGE_MIN = "0.85.0";
 /** Exclusive upper bound. A new minor may change hook semantics the conformance suite has not seen. */
-export const PI_RANGE_MAX = "0.85.0";
+export const PI_RANGE_MAX = "0.86.0";
 
-/** Minimum Node for `@anthropic-ai/sandbox-runtime`. */
-export const NODE_RANGE_MIN = "20.11.0";
+/** Minimum Node for the pinned pi release (also satisfies sandbox-runtime). */
+export const NODE_RANGE_MIN = "22.19.0";
 
 export type CheckStatus = "ok" | "warn" | "fail";
 
@@ -78,9 +78,9 @@ export interface ProbeEnv {
 //
 // A dependency-free comparator for the `x.y.z[-prerelease]` versions we care
 // about. Semver orders a prerelease before its release, which puts
-// `0.85.0-rc.1` *inside* a `< 0.85.0` bound -- the opposite of what the bound
+// `0.86.0-rc.1` *inside* a `< 0.86.0` bound -- the opposite of what the bound
 // means here. The upper bound exists because an unseen minor may change hook
-// semantics, and an 0.85 release candidate contains exactly those unseen
+// semantics, and an 0.86 release candidate contains exactly those unseen
 // changes. So the range check compares the exclusive upper bound on the core
 // version alone, ignoring prerelease ordering in that direction.
 // ---------------------------------------------------------------------------
@@ -252,7 +252,7 @@ function checkNodeVersion(env: ProbeEnv): ProbeCheck {
 		id: "node-version",
 		title: "Node version",
 		status: "fail",
-		detail: `${env.nodeVersion} is below the sandbox-runtime minimum ${NODE_RANGE_MIN}`,
+		detail: `${env.nodeVersion} is below the pinned pi minimum ${NODE_RANGE_MIN}`,
 		remediation: `Upgrade Node to ${NODE_RANGE_MIN} or newer.`,
 	};
 }

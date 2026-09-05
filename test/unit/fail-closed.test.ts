@@ -22,7 +22,7 @@ const FAILED: ProbeReport = {
 			id: "pi-version",
 			title: "pi version",
 			status: "fail",
-			detail: "pi 0.99.0 is outside >=0.84.2 <0.85.0",
+			detail: "pi 0.99.0 is outside >=0.85.0 <0.86.0",
 			remediation: "pin pi",
 		},
 	],

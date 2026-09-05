@@ -1,7 +1,7 @@
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { EffectiveProfile, Provenance } from "../config/types.ts";
 import { evalReviewer } from "./eval.ts";
-import { resolveReviewerModel, reviewerModelDigest } from "./model.ts";
+import { bindReviewerCompletion, resolveReviewerModel, reviewerModelDigest } from "./model.ts";
 import { buildReviewerPrompt, reviewerRulebook } from "./prompt.ts";
 import { type QualificationRecord, writeQualification } from "./qualification.ts";
 
@@ -33,13 +33,13 @@ export async function qualifyConfiguredReviewers(options: {
 	const runs: QualificationRun[] = [];
 	for (const reference of references) {
 		const resolved = resolveReviewerModel(options.registry, reference);
-		const modelDigest = await reviewerModelDigest(resolved.model);
+		const modelDigest = await reviewerModelDigest(resolved.model, options.registry);
 		const record = await evalReviewer({
 			model: reference,
 			modelDigest,
 			profile: options.profile,
 			prompt,
-			completion: resolved.completion,
+			completion: bindReviewerCompletion(resolved, modelDigest),
 			timeoutMs: options.profile.reviewer.timeoutMs,
 			...(options.onProgress
 				? { onProgress: (completed: number, total: number) => options.onProgress?.(reference, completed, total) }

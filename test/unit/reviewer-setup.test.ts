@@ -31,6 +31,7 @@ const model = {
 
 const registry = {
 	find: (provider: string, id: string) => (provider === model.provider && id === model.id ? model : undefined),
+	getApiKeyAndHeaders: async () => ({ ok: true }),
 	hasConfiguredAuth: () => true,
 	complete: async () => {
 		throw new Error("not called during setup");
@@ -59,17 +60,17 @@ describe("qualified reviewer startup", () => {
 	it("accepts only a record bound to the current model, prompt, corpus, and sampling", async () => {
 		const { profile, provenance, directory } = fixture();
 		const prompt = buildReviewerPrompt(reviewerRulebook(profile.review, provenance));
-		const modelDigest = await reviewerModelDigest(model);
+		const modelDigest = await reviewerModelDigest(model, registry);
 		const binding = qualificationBinding({
 			model: profile.reviewer.model,
 			modelDigest,
 			profile,
 			prompt,
-			completion: { name: "unused", complete: async () => "0" },
+			completion: { name: "unused", numCtx: null, complete: async () => "0" },
 			timeoutMs: profile.reviewer.timeoutMs,
 		});
 		const record: QualificationRecord = {
-			version: 1,
+			version: 2,
 			...binding,
 			passed: true,
 			metrics: {

@@ -39,7 +39,7 @@ export function qualificationBinding(options: EvalReviewerOptions): Qualificatio
 		sampling: {
 			temperature: REVIEWER_TEMPERATURE,
 			seed: REVIEWER_SEED,
-			numCtx: REVIEWER_NUM_CTX,
+			numCtx: options.completion.numCtx === undefined ? REVIEWER_NUM_CTX : options.completion.numCtx,
 			maxTokens: REVIEWER_MAX_TOKENS,
 			trials,
 		},

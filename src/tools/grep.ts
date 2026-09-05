@@ -3,7 +3,7 @@
  *
  * pi's grep is the one file tool its operations object cannot redirect. The
  * interface abstracts the filesystem walk, but the tool
- * [spawns `rg` itself](https://github.com/earendil-works/pi/blob/c49906ec77788625aacbdc53ebca6fbe65bd20f5/packages/coding-agent/src/core/tools/grep.ts#L175-L226)
+ * [spawns `rg` itself](https://github.com/earendil-works/pi/blob/107d79f11072bbc8a3a757ed7fd69596bee7d68c/packages/coding-agent/src/core/tools/grep.ts#L139-L190)
  * from the pi process -- so a `grep` over a credential directory would read it
  * with the user's full privileges no matter what profile is in force.
  *

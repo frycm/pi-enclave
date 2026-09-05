@@ -82,7 +82,7 @@ describe("reviewer qualification", () => {
 		directories.push(directory);
 		chmodSync(directory, 0o700);
 		const record: QualificationRecord = {
-			version: 1,
+			version: 2,
 			model: "fake/reviewer",
 			modelDigest: "cloud:sha256:abc",
 			promptHash: PROMPT.promptHash,

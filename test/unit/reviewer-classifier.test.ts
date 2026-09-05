@@ -14,19 +14,27 @@ function classify(command: string) {
 
 describe("reviewer trigger classifier", () => {
 	it.each([
-		"git status --short",
-		"git log --oneline | head -5",
 		"git branch --list",
 		"git remote -v",
 		"gh pr view 6",
 		"find src -name README.md",
 		"cat README.md",
+		"file -bi README.md",
+		"file -- -Cm",
 	])("classifies an allowlisted shell read as read-only: %s", (command) => {
 		expect(classify(command).classification.readOnly).toBe(true);
 	});
 
 	it.each([
 		"git reset --hard",
+		"git status --short",
+		"git log --oneline | head -5",
+		"git diff",
+		"git show HEAD",
+		"file -Cm review.magic",
+		"file -mreview.magic -C",
+		"file --comp -m review.magic",
+		"file --unknown README.md",
 		"git branch new-branch",
 		"git branch --list --delete old-branch",
 		"git remote add origin x",

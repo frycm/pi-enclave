@@ -14,7 +14,7 @@ const OK_REPORT: ProbeReport = {
 	ok: true,
 	platform: "darwin",
 	backend: "seatbelt",
-	piVersion: "0.84.2",
+	piVersion: "0.85.0",
 	checks: [{ id: "platform", title: "Platform", status: "ok", detail: "darwin -> seatbelt backend" }],
 };
 

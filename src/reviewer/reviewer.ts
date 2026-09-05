@@ -30,6 +30,8 @@ export interface CompletionRequest {
 /** A model-specific transport. It returns only assistant text and carries no tools or session context. */
 export interface ReviewerCompletion {
 	readonly name: string;
+	/** null means provider-managed context; a number is enforced by the transport. */
+	readonly numCtx?: number | null;
 	complete(request: CompletionRequest): Promise<string>;
 }
 
@@ -86,6 +88,8 @@ export class IsolatedReviewer implements ActionReviewer {
 	async review(request: ReviewerRequest): Promise<ReviewerResult> {
 		const suppliedEvidence =
 			typeof this.options.evidence === "function" ? this.options.evidence(request) : this.options.evidence;
+		// Keep trusted full records separate from the bounded model representation.
+		const authorization = structuredClone(suppliedEvidence.authorization ?? []);
 		const evidence = buildReviewEvidence({
 			...suppliedEvidence,
 			...request,
@@ -135,9 +139,14 @@ export class IsolatedReviewer implements ActionReviewer {
 					if (error instanceof ReviewerOutputError) return invalidOutput(error.message, evidence);
 					throw error;
 				}
+				const currentEvidence =
+					typeof this.options.evidence === "function" ? this.options.evidence(request) : this.options.evidence;
+				if (JSON.stringify(currentEvidence.authorization ?? []) !== JSON.stringify(authorization)) {
+					return invalidOutput("direct authorization changed during review; a fresh decision is required", evidence);
+				}
 				return {
 					ok: true,
-					review: enforceReview(model, request.action, this.options.profile, evidence),
+					review: enforceReview(model, request.action, this.options.profile, evidence, authorization),
 					modelReview: model,
 					evidence,
 				};

@@ -3,13 +3,13 @@ import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { checkSecureFile } from "../state/dir.ts";
 
-export const QUALIFICATION_VERSION = 1;
+export const QUALIFICATION_VERSION = 2;
 export const DEFAULT_QUALIFICATION_TRIALS = 5;
 
 export interface ReviewerSampling {
 	temperature: number;
 	seed: number;
-	numCtx: number;
+	numCtx: number | null;
 	maxTokens: number;
 	trials: number;
 }
@@ -68,7 +68,7 @@ export function isQualificationRecord(value: unknown): value is QualificationRec
 		!!sampling &&
 		isFiniteNumber(sampling.temperature) &&
 		isFiniteNumber(sampling.seed) &&
-		isFiniteNumber(sampling.numCtx) &&
+		(sampling.numCtx === null || isFiniteNumber(sampling.numCtx)) &&
 		isFiniteNumber(sampling.maxTokens) &&
 		isFiniteNumber(sampling.trials) &&
 		!!metrics &&
