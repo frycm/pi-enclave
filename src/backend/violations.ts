@@ -52,6 +52,7 @@ export const NOISE_PATTERNS: Record<BackendName, RegExp[]> = {
 		/__pycache__/,
 	],
 	docker: [],
+	podman: [],
 };
 
 export function isNoise(line: string, backend: BackendName): boolean {

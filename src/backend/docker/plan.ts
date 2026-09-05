@@ -169,7 +169,7 @@ export function compileDockerPlan(
 	});
 }
 
-export function mountArguments(plan: DockerPlan, privateDir: string): string[] {
+export function mountArguments(plan: DockerPlan, privateDir: string, engine: "docker" | "podman" = "docker"): string[] {
 	return plan.mounts.flatMap((mount) => {
 		const source =
 			mount.kind === "bind"
@@ -177,7 +177,7 @@ export function mountArguments(plan: DockerPlan, privateDir: string): string[] {
 				: `${privateDir}/${mount.kind === "mask-directory" ? "empty-dir" : "empty-file"}`;
 		return [
 			"--mount",
-			`type=bind,source=${source},target=${mount.target},bind-recursive=disabled${mount.readonly ? ",readonly" : ""}`,
+			`type=bind,source=${source},target=${mount.target},${engine === "podman" ? "bind-nonrecursive" : "bind-recursive=disabled"}${mount.readonly ? ",readonly" : ""}`,
 		];
 	});
 }

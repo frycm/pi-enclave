@@ -25,6 +25,28 @@ jobs:
           docker version
       - run: npm run test:docker
 
+  podman:
+    name: Offline rootless Podman boundary (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install rootless Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs
+          podman info
+      - run: npm ci
+      - name: Build trusted conformance image and record immutable ID
+        run: |
+          podman build -f docker/Dockerfile.conformance --iidfile /tmp/pi-enclave-podman-image-id docker
+          echo "PI_ENCLAVE_PODMAN_IMAGE=$(cat /tmp/pi-enclave-podman-image-id)" >> "$GITHUB_ENV"
+          podman version
+      - run: npm run test:podman
+
   check:
     name: Typecheck and lint
     runs-on: ubuntu-latest

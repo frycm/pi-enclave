@@ -24,6 +24,7 @@
 		"test:conformance": "vitest --run --passWithNoTests test/conformance",
 		"test:policy": "vitest --run test/policy",
 		"test:docker": "vitest --run test/docker",
+		"test:podman": "vitest --run test/podman",
 		"probe": "node --import tsx scripts/probe.ts",
 		"conformance:report": "node --import tsx scripts/conformance-report.ts",
 		"policy:report": "node --import tsx scripts/policy-report.ts",
