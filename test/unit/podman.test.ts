@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -74,7 +74,6 @@ describe("Podman admission", () => {
 	it("round-trips literal arguments through the machine SSH shell without expansion", () => {
 		vi.stubGlobal("process", { ...process, platform: "darwin" });
 		const driver = new PodmanDriver({ binary: "/trusted/podman", machine: "enclave" });
-		driver.configure = () => {};
 		const words = ["create", "space ' quote", "$(printf INJECTED)", "`printf INJECTED`", "line\nbreak", "semi;colon"];
 		const args = driver.args(words);
 		expect(args.slice(0, 3)).toEqual(["machine", "ssh", "enclave"]);
@@ -88,5 +87,36 @@ describe("Podman admission", () => {
 		vi.stubGlobal("process", { ...process, platform: "darwin" });
 		for (const machine of ["--rootful", "a;b", "a b", "$(id)"])
 			expect(() => new PodmanDriver({ machine })).toThrow(/machine name/);
+	});
+
+	it("keeps symlinked and retargeted engine storage outside exposed roots", () => {
+		vi.stubGlobal("process", { ...process, platform: "linux" });
+		const driver = new PodmanDriver({});
+		const state = mkdtempSync(join(realpathSync(tmpdir()), "enclave-podman-storage-"));
+		try {
+			const link = join(state, "store");
+			const first = join(state, "first");
+			const second = join(state, "second");
+			mkdirSync(first);
+			mkdirSync(second);
+			symlinkSync(first, link);
+			driver.checkInfo({
+				...supported,
+				store: { graphRoot: link, runRoot: "/run/user/1234", volumePath: `${link}/volumes` },
+			});
+			const check = (root: string) =>
+				driver.checkRoots({
+					profile: { mode: "workspace-write", writableRoots: [root], readDeny: [], network: "off", allowPty: true },
+					mounts: [],
+					observedPaths: [],
+					snapshot: "",
+				});
+			expect(() => check(first)).toThrow(/configuration\/storage/);
+			rmSync(link);
+			symlinkSync(second, link);
+			expect(() => check(second)).toThrow(/configuration\/storage/);
+		} finally {
+			rmSync(state, { recursive: true, force: true });
+		}
 	});
 });

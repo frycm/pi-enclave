@@ -1,5 +1,5 @@
 /**
- * Experimental Phase 4a runner. Explicitly invoked by the Docker test harness;
+ * Experimental Phase 4a runner. Explicitly invoked by the Docker/Podman test harnesses;
  * production selection remains native until the remaining roadmap gates pass.
  */
 import { type ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";

@@ -154,16 +154,17 @@ export class PodmanDriver {
 		if (!this.machine) {
 			for (const path of [info.store?.graphRoot, info.store?.runRoot, info.store?.volumePath]) {
 				if (!path) throw new Error("pi-enclave: Podman did not report its storage paths");
-				this.protectedPaths.push(canonical(dockerPath(path)));
+				this.protectedPaths.push(dockerPath(path));
 			}
 		}
 	}
 
 	checkRoots(plan: DockerPlan): void {
+		const protectedPaths = this.protectedPaths.flatMap((path) => [path, canonical(path)]);
 		for (const root of [...plan.profile.writableRoots, ...(plan.profile.readableRoots ?? [])]) {
 			if (this.machine && !isUnder(root, this.hostHome))
 				throw new Error("pi-enclave: macOS Podman roots must be canonical paths inside the shared home directory");
-			if (this.protectedPaths.some((path) => isUnder(path, root) || isUnder(root, path)))
+			if (protectedPaths.some((path) => isUnder(path, root) || isUnder(root, path)))
 				throw new Error(`pi-enclave: Podman host root overlaps engine configuration/storage: ${root}`);
 		}
 	}

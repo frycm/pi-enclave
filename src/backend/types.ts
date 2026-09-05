@@ -37,7 +37,7 @@ export interface Profile {
 	mode: "workspace-write";
 	/** Absolute paths that may be written. Everything else is read-only. */
 	writableRoots: readonly string[];
-	/** Docker-only host read mounts; native backends already expose other host reads. */
+	/** Container-only host read mounts; native backends already expose other host reads. */
 	readableRoots?: readonly string[];
 	/** Paths kept read-only even when they sit below a writable root. */
 	writeDeny?: readonly string[];

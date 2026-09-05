@@ -1,8 +1,10 @@
-# Phase 4a: offline Docker
+# Phase 4a: offline Docker and Podman
 
 Status: first implementation slice, experimental test entry point. Production
 extension and standalone approval still select the native backend. This is not
-Phase 4 sign-off and does not enable network access or Docker fallback.
+Phase 4 sign-off and does not enable network access or container fallback.
+
+For Ubuntu/macOS prerequisites and test commands, see [local testing with Podman](local-testing.md).
 
 Phase 3's seven findings were repaired and PR #7 merged after native Linux and
 macOS CI passed; see [remediation evidence](phase-3-remediation.md).
@@ -51,10 +53,36 @@ The Docker contracts follow the official [run reference](https://docs.docker.com
 [seccomp documentation](https://docs.docker.com/engine/security/seccomp/).
 The vendored Moby policy records its exact provenance and license alongside it.
 
+## Podman adapter
+
+`PodmanBackend` shares the mount compiler, syscall policy, container lifecycle and
+filesystem helper with `DockerBackend`. Linux uses the native rootless CLI with
+`--remote=false`, explicit keep-id UID/GID mapping, and delegated cgroup v2
+CPU/memory/PID controllers. It requires seccomp and refuses rootful engines.
+
+The adapter replaces ambient containers.conf, default mounts and hooks, clears
+connection-selection variables and keeps engine configuration/storage outside
+all exposed host roots. Podman bind mounts use `bind-nonrecursive`. Extra writable
+`/run` and `/var/tmp` mounts are disabled with `--read-only-tmpfs=false`; only the
+reported `/tmp` and `/dev/shm` remain writable temporary directories. Cancellation
+uses `rm --force --time 0`: Podman's ordinary force-remove grace period allowed a
+detached child to keep running in the initial real-engine test.
+
+macOS uses an explicitly named, running rootless Podman machine through its SSH
+command transport. Paths must be canonical and inside the shared home. Fresh
+host/VM canaries and file hashes check every bind source before launch; a missing
+or different share refuses execution. Its private configuration/helper lives
+under the shared home, outside the exposed roots. Machine names and shell
+arguments are validated/quoted. This path remains pending real Mac qualification.
+
+See Podman's [run reference](https://docs.podman.io/en/stable/markdown/podman-run.1.html),
+[removal semantics](https://docs.podman.io/en/stable/markdown/podman-rm.1.html), and
+[machine SSH transport](https://docs.podman.io/en/stable/markdown/podman-machine-ssh.1.html).
+
 ## Validation
 
 `npm run test:unit` includes mount authority, immutability, retargeting, unsupported
-topology and seccomp regressions. The Docker-specific daemon tests exercise normal
+topology and seccomp regressions. The shared Docker/Podman engine tests exercise normal
 workspace operations, nested masks, protected metadata and ancestor renames,
 symlinks, recursive search, a live mounted Unix socket with an unsandboxed positive
 control, TCP/DNS, image and host environment isolation, UID ownership, zero
@@ -75,6 +103,13 @@ unsupported daemon settings fail the tests. CI builds and runs the fixture on
 Linux. The development host currently has no Docker CLI/daemon, so local daemon
 results must not be inferred from unit-test success.
 
+The rootless Linux run on 2026-09-05 used Podman 4.9.3: all 12 shared
+boundary tests passed, including immediate timeout/abort cleanup and observed
+cgroup limits. Docker passed the same 12 tests. The unit suite passed 1,000 tests
+and the policy suite passed 25. See [CI evidence](https://github.com/frycm/pi-enclave/actions/runs/33958997857).
+These results do not qualify Podman 5.7 on the development host or a macOS VM;
+both still need their own local run after installation.
+
 ## Remaining Phase 4a gates
 
 1. Integrate trusted user-global backend/image selection, probe/status reporting,
@@ -87,13 +122,14 @@ results must not be inferred from unit-test success.
    suite covers supported topology separately; it does not claim that F10/F13/F14
    (missing or retargeted nested deny paths) execute successfully. Those layouts
    refuse compilation instead of receiving a weaker boundary.
-4. Qualify rootless/userns UID mapping, Docker Desktop and Windows path semantics.
-   This first runner explicitly refuses non-Linux hosts and remapped daemons.
+4. Qualify macOS Podman machine execution, Docker Desktop and Windows path semantics.
+   Docker still refuses non-Linux hosts and remapped daemons. Podman has a separate
+   rootless adapter and Linux CI entry point; its Mac machine path is not yet qualified.
 5. Measure helper startup, large-output/cancellation behavior and crash recovery
    when the parent itself is killed. `--rm`/a reaper or another durable ownership
    mechanism is required before unattended production use; normal disposal is
    not evidence for abrupt parent-death cleanup.
 
-Only after these gates should native → Docker → refuse become the selection
-order. Phase 4b then introduces authenticated, invocation-bound egress with
+Only after these gates should a trusted user-selected Docker/Podman fallback
+become part of backend selection. Phase 4b then introduces authenticated, invocation-bound egress with
 connection-time validation, DNS/redirect defenses and revocation of live tunnels.

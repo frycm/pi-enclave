@@ -27,8 +27,8 @@ Designed to be trustworthy **offline, with open-weight models**.
 > grants are implemented. A named reviewer still fails closed until that exact model,
 > prompt, corpus and sampling configuration passes the local qualification command.
 >
-> **Next phase:** [Phase 4a's experimental offline Docker runner](docs/phase-4a-docker.md)
-> has a separate test entry point; production still uses native backends. Docker
+> **Next phase:** [Phase 4a's experimental offline Docker/Podman runners](docs/phase-4a-docker.md)
+> have separate test entry points; production still uses native backends. Container
 > fallback/capabilities/platform qualification, the Phase 4b egress proxy, and the
 > Phase 5 ops broker remain ahead.
 > Sections describing them are design commitments, not descriptions of working software.
@@ -266,7 +266,7 @@ unsandboxed fallback.
 
 ```ts
 interface SandboxBackend {
-  readonly name: "seatbelt" | "bwrap" | "docker";
+  readonly name: "seatbelt" | "bwrap" | "docker" | "podman";
   compile(profile: SandboxProfile): Promise<CompiledProfile>;
   run(compiled: CompiledProfile, request: RunRequest)
     : Promise<{ exitCode: number | null; violations: Violation[] }>;
@@ -421,13 +421,15 @@ when proxying.
   On hosts without userns (Docker-in-Docker), fall through to the Docker backend rather
   than offering a "weaker nested" mode.
 
-### Docker — fallback and Windows
+### Docker / Podman — container backends
 
 The [experimental Phase 4a runner](docs/phase-4a-docker.md) uses one container per
 Bash invocation and a persistent helper container, each with
 `--network none --cap-drop ALL --security-opt no-new-privileges --read-only --pids-limit …`.
 Per-invocation containers let cancellation reap detached descendants. Production
-fallback, capabilities and Windows qualification remain gated.
+fallback, capabilities and Windows qualification remain gated. Podman adds a
+rootless Linux adapter and an experimental macOS machine path using the same
+boundary suite. See [Podman installation and local tests](docs/local-testing.md).
 
 - **Filesystem** — only explicit roots are bind-mounted; everything else comes from the
   image. A nested `readDeny` is masked and a nested `writeDeny` is remounted read-only after
@@ -1382,13 +1384,14 @@ after passing the eval.*
 
 **v1 ships here.**
 
-### Phase 4a — Offline Docker backend
+### Phase 4a — Offline Docker / Podman backends
 
 *Outcome: a qualified offline fallback for locked-down Linux hosts and Windows.*
 
 - [First implementation slice](docs/phase-4a-docker.md): explicit immutable local images,
   nested deny mounts, UID execution, environment isolation, socket denial and container
-  lifecycle through a separate Linux test entry point.
+  lifecycle through separate Docker and rootless Podman test entry points. macOS
+  Podman machine execution is implemented and awaiting real-machine qualification.
 - Remaining: trusted configuration/probe integration, invocation-bound capabilities,
   parent-crash recovery, the full shared conformance contract, and Linux/Windows platform
   evidence before enabling native → Docker → refuse selection. No automatic builds of

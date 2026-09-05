@@ -1,4 +1,4 @@
-/** Opt-in real Docker tests. Providing an image makes missing prerequisites fail, never skip. */
+/** Opt-in real container tests. Providing an image makes missing prerequisites fail, never skip. */
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import {
@@ -28,7 +28,10 @@ export function offlineBoundary(engine: "docker" | "podman") {
 	const image = process.env[`PI_ENCLAVE_${engine.toUpperCase()}_IMAGE`];
 	const binary =
 		process.env[`PI_ENCLAVE_${engine.toUpperCase()}_BINARY`] ??
-		(process.platform === "darwin" ? "/opt/homebrew/bin/podman" : `/usr/bin/${engine}`);
+		(process.platform === "darwin" && engine === "podman"
+			? (["/opt/homebrew/bin/podman", "/usr/local/bin/podman", "/opt/podman/bin/podman"].find(existsSync) ??
+				"/opt/homebrew/bin/podman")
+			: `/usr/bin/${engine}`);
 	const machine = process.env.PI_ENCLAVE_PODMAN_MACHINE ?? "podman-machine-default";
 	const cliArgs = (args: string[]) =>
 		engine === "podman" && process.platform === "darwin"
@@ -178,13 +181,15 @@ export function offlineBoundary(engine: "docker" | "podman") {
 for family,target in [(socket.AF_INET,('1.1.1.1',80)),(socket.AF_UNIX,${JSON.stringify(socket)})]:
  try:
   s=socket.socket(family);s.settimeout(2);s.connect(target);print('LEAK')
- except OSError: print('DENIED')
+ except OSError as e: print('DENIED', e.errno)
 try: socket.getaddrinfo('example.com',443);print('DNS_LEAK')
 except OSError: print('DNS_DENIED')`)}`,
 				);
 				expect(result.exitCode, result.output).toBe(0);
 				expect(result.output).not.toContain("LEAK");
 				expect(result.output.match(/DENIED/g)).toHaveLength(3);
+				// socket() itself must be EPERM, including across a Mac VM boundary.
+				expect(result.output.match(/DENIED 1\n/g)).toHaveLength(2);
 				expect(connections).toBe(1);
 			} finally {
 				server.close();
