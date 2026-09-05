@@ -74,6 +74,12 @@ export class PodmanDriver {
 
 	configure(privateDir: string): void {
 		this.privateDir = privateDir;
+		if (this.machine) {
+			// Podman machine ssh delegates to exec.LookPath("ssh"). Its command
+			// line selects the identity/port, but otherwise OpenSSH reads ambient
+			// Include/ProxyCommand/LocalCommand settings. Suppress all SSH config.
+			writeFileSync(join(privateDir, "ssh"), '#!/bin/sh\nexec /usr/bin/ssh -F /dev/null "$@"\n', { mode: 0o500 });
+		}
 		writeFileSync(join(privateDir, "mounts.conf"), "", { mode: 0o600 });
 		// Replace ambient containers.conf, including default mounts, hooks and env.
 		// Keep the normal image store; XDG_CONFIG_HOME excludes user config/modules.
@@ -101,7 +107,7 @@ export class PodmanDriver {
 		// machine ssh needs the user's existing VM configuration, but no agent,
 		// remote context or environment-selected connections are inherited.
 		return this.machine
-			? { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", HOME: this.hostHome, LANG: "C.UTF-8" }
+			? { PATH: `${this.privateDir}:/usr/bin:/bin:/usr/sbin:/sbin`, HOME: this.hostHome, LANG: "C.UTF-8" }
 			: this.engineEnv();
 	}
 

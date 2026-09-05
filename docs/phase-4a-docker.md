@@ -73,7 +73,9 @@ command transport. Paths must be canonical and inside the shared home. Fresh
 host/VM canaries and file hashes check every bind source before launch; a missing
 or different share refuses execution. Its private configuration/helper lives
 under the shared home, outside the exposed roots. Machine names and shell
-arguments are validated/quoted. This path remains pending real Mac qualification.
+arguments are validated/quoted. A private SSH launcher suppresses user/system SSH
+configuration, including Include/ProxyCommand/LocalCommand side effects. This path
+remains pending real Mac qualification.
 
 See Podman's [run reference](https://docs.podman.io/en/stable/markdown/podman-run.1.html),
 [removal semantics](https://docs.podman.io/en/stable/markdown/podman-rm.1.html), and

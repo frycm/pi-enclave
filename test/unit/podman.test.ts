@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -81,6 +81,30 @@ describe("Podman admission", () => {
 		const script = (args[3] ?? "").replace("'/usr/bin/podman'", "'/usr/bin/printf' '%s\\0'");
 		const output = execFileSync("/bin/sh", ["-c", script]).toString();
 		expect(output.split("\0")).toEqual(["--remote=false", ...words, ""]);
+	});
+
+	it("starts machine SSH without user or system SSH configuration", () => {
+		vi.stubGlobal("process", { ...process, platform: "darwin" });
+		const driver = new PodmanDriver({ machine: "enclave" });
+		const state = mkdtempSync(join(realpathSync(tmpdir()), "enclave-podman-ssh-"));
+		try {
+			driver.configure(state);
+			// OpenSSH -G resolves configuration locally without opening a connection.
+			// -F is reported as the effective config source, proving the PATH shim
+			// executes the real client with an empty config.
+			const result = spawnSync("/bin/sh", ["-c", "ssh -G -v example.invalid"], {
+				env: driver.env(),
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			expect(result.status, result.stderr).toBe(0);
+			expect(result.stdout).toMatch(/hostname example\.invalid/);
+			expect(result.stdout).toMatch(/permitlocalcommand no/);
+			expect(result.stderr).toContain("Reading configuration data /dev/null");
+			expect(result.stderr).not.toMatch(/Reading configuration data .*\/ssh(?:_config|\/config)/);
+		} finally {
+			rmSync(state, { recursive: true, force: true });
+		}
 	});
 
 	it("rejects machine names that could become CLI flags or shell fragments", () => {

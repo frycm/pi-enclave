@@ -147,7 +147,7 @@ exposes everything required: built-in tool overrides with pluggable operations, 
   or Claude Code auto mode.
 - Work **fully offline**: a local reviewer model, no cloud dependency anywhere in the
   control path.
-- Native sandboxing on macOS and Linux; Docker as the portable fallback and the Windows answer.
+- Native sandboxing on macOS and Linux; Podman/Docker as planned container fallbacks.
 - Cover *every* execution path pi has: built-in tools, `!` user bash, and — by policy —
   custom and MCP tools.
 - Two first-class profiles: **dev** (workspace-write) and **ops** (offline server management).
@@ -260,8 +260,9 @@ particular command.
 
 The backend is a small interface. The profile — what is readable, writable and reachable —
 is backend-independent and compiled per backend at session start. The target selection order
-after Phase 4 is native for the host OS → Docker → **refuse to enter auto mode**. Today it is
-native → refuse; the experimental Docker runner is not yet enabled as a fallback. There is never a silent
+after Phase 4 is native for the host OS → a trusted user-selected Podman/Docker backend →
+**refuse to enter auto mode**. Today it is native → refuse; the experimental container
+runners are not yet enabled as fallbacks. There is never a silent
 unsandboxed fallback.
 
 ```ts
@@ -1394,7 +1395,7 @@ after passing the eval.*
   Podman machine execution is implemented and awaiting real-machine qualification.
 - Remaining: trusted configuration/probe integration, invocation-bound capabilities,
   parent-crash recovery, the full shared conformance contract, and Linux/Windows platform
-  evidence before enabling native → Docker → refuse selection. No automatic builds of
+  evidence before enabling a user-selected Podman/Docker fallback. No automatic builds of
   untrusted project Dockerfiles.
 
 ### Phase 4b — Authenticated egress proxy
