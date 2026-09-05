@@ -150,7 +150,7 @@ export function compileDockerPlan(
 				(parent) =>
 					parent !== mount &&
 					isUnder(mount.target, parent.target) &&
-					(parent.kind !== "bind" || (parent.readonly && writeDeny.includes(parent.target))),
+					(parent.kind !== "bind" || (parent.readonly && writeDeny.includes(parent.target) && mount.kind === "bind")),
 			),
 	);
 	profile.writableRoots = Object.freeze(writes);

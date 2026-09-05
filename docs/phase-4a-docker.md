@@ -24,6 +24,11 @@ macOS CI passed; see [remediation evidence](phase-3-remediation.md).
   overlaps, and ambiguous Docker mount syntax. No credential paths are created.
   Mount inode identities are checked before launch and helper calls; a changed
   topology stops execution and requires recompilation.
+  Masks are empty and read-only, as on bwrap, so ordinary recursive searches can
+  cross protected children without treating them as I/O failures. Direct helper
+  access to a masked file/directory reports `SandboxDenied`; a shell read of a
+  masked file can return empty bytes. Read masks remain effective inside a
+  write-protected directory, and denied image paths are masked too.
 - `--network none`, all capabilities dropped, no new privileges, read-only image,
   separate IPC/PID namespaces, and bounded memory/CPU/PIDs. A pinned Moby allowlist
   additionally denies `socket`, `socketcall`, and io_uring. Network isolation alone

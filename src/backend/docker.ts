@@ -84,8 +84,11 @@ export class DockerBackend implements SandboxBackend {
 		this.privateDir = mkdtempSync(join(tmpdir(), "pi-enclave-docker-"));
 		chmodSync(this.privateDir, 0o700);
 		try {
-			mkdirSync(join(this.privateDir, "empty-dir"), 0o000);
-			writeFileSync(join(this.privateDir, "empty-file"), "", { mode: 0o000 });
+			// Empty read-only masks match bwrap: recursive searches can cross them
+			// without EACCES, while HelperFsClient classifies direct masked success
+			// as SandboxDenied. No host secret bytes are present in these mounts.
+			mkdirSync(join(this.privateDir, "empty-dir"), 0o755);
+			writeFileSync(join(this.privateDir, "empty-file"), "", { mode: 0o444 });
 			writeFileSync(join(this.privateDir, "config.json"), "{}", { mode: 0o600 });
 			writeFileSync(join(this.privateDir, "seccomp.json"), offlineSeccomp(), { mode: 0o600 });
 			copyFileSync(new URL("../fs/helper.mjs", import.meta.url), join(this.privateDir, "helper.mjs"));

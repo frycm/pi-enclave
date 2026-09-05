@@ -78,6 +78,17 @@ describe("Docker mount authority", () => {
 		expect(compile).toThrow(/nested beneath/);
 	});
 
+	it("preserves a read mask inside an already write-protected directory", () => {
+		profile.writeDeny = [join(workspace, ".git")];
+		profile.readDeny = [join(workspace, ".git", "config")];
+		const plan = compile();
+		expect(plan.mounts.find((m) => m.target.endsWith("/.git"))).toMatchObject({ readonly: true, kind: "bind" });
+		expect(plan.mounts.find((m) => m.target.endsWith("/.git/config"))).toMatchObject({
+			readonly: true,
+			kind: "mask-file",
+		});
+	});
+
 	it("refuses missing nested deny paths without creating them", () => {
 		profile.readDeny = [join(workspace, "not-yet-created")];
 		expect(compile).toThrow(/ENOENT/);

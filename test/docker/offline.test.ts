@@ -116,11 +116,28 @@ describe.skipIf(!image)("offline Docker boundary", () => {
 	it("denies secrets to shell reads, symlinks and recursive search", async () => {
 		for (const command of ["cat secrets/token", "cat private-file", "cat secret-link"]) {
 			const result = await sh(command);
-			expect(result.exitCode).not.toBe(0);
+			// A denied file is an empty read-only mount, as on bwrap. Directory
+			// contents are absent; neither representation can disclose host bytes.
+			if (command !== "cat private-file") expect(result.exitCode).not.toBe(0);
+			else expect(result.output).toBe("");
 			expect(result.output).not.toContain("DOCKER-CONFORMANCE-SECRET");
 		}
 		const result = await sh("rg --hidden --no-ignore --follow DOCKER-CONFORMANCE-SECRET .");
 		expect(result.output).not.toContain("DOCKER-CONFORMANCE-SECRET");
+	});
+
+	it("keeps read masks effective inside write-protected roots and in the image", async () => {
+		profile.writeDeny = [join(workspace, ".git")];
+		profile.readDeny = [...profile.readDeny, join(workspace, ".git", "config"), "/etc/hostname"];
+		compiled = await backend.compile(profile);
+		for (const command of ["cat .git/config", "cat /etc/hostname"]) {
+			const result = await sh(command);
+			expect(result.output).toBe("");
+		}
+		await expect(backend.fs(compiled).readFile(join(workspace, ".git", "config"))).rejects.toBeInstanceOf(
+			SandboxDenied,
+		);
+		await expect(backend.fs(compiled).readFile("/etc/hostname")).rejects.toBeInstanceOf(SandboxDenied);
 	});
 
 	it("denies TCP, DNS and a live Unix socket exposed inside the workspace", async () => {
