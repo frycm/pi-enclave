@@ -15,10 +15,10 @@ This change repairs R1–R7 from the [September 5 project review](project-review
 ## Validation
 
 - Syntax/types/imports: `npm run check` passes.
-- Full local suites: 967 unit tests and 25 policy tests pass on the final candidate. Native CI evidence will be recorded before merge.
+- Full local suites: 967 unit tests and 25 policy tests pass on the final candidate.
 - Focused regression suites exercise the original triggers and legitimate controls listed above. The original exploits no longer produce an allow or borrowed grant in those paths.
 - Local conformance: 11 passed, 47 native cases skipped because `fd` is missing and AppArmor denies capability-bearing user namespaces. The host policy was not weakened.
-- Linux/macOS CI on the final commit is a required merge gate.
+- Linux/macOS CI passed on candidate `5cb03468b6e258b636c061229a38338616cbc97e`: [run 33952802405](https://github.com/frycm/pi-enclave/actions/runs/33952802405), including typecheck/lint and both native test/conformance jobs. PR #7 was then squash-merged as `a1f431b72216e441b1f82c0f053bbc6a6154f04a`.
 
 ## Remaining release evidence
 

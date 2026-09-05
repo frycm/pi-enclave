@@ -27,7 +27,10 @@ Designed to be trustworthy **offline, with open-weight models**.
 > grants are implemented. A named reviewer still fails closed until that exact model,
 > prompt, corpus and sampling configuration passes the local qualification command.
 >
-> **Not built:** the Phase 4 egress proxy and Docker backend, and the Phase 5 ops broker.
+> **Next phase:** [Phase 4a's experimental offline Docker/Podman runners](docs/phase-4a-docker.md)
+> have separate test entry points; production still uses native backends. Container
+> fallback/capabilities/platform qualification, the Phase 4b egress proxy, and the
+> Phase 5 ops broker remain ahead.
 > Sections describing them are design commitments, not descriptions of working software.
 >
 > **Known gaps in what *is* built** are listed under [Phase 1 status](#phase-1-status),
@@ -144,7 +147,7 @@ exposes everything required: built-in tool overrides with pluggable operations, 
   or Claude Code auto mode.
 - Work **fully offline**: a local reviewer model, no cloud dependency anywhere in the
   control path.
-- Native sandboxing on macOS and Linux; Docker as the portable fallback and the Windows answer.
+- Native sandboxing on macOS and Linux; Podman/Docker as planned container fallbacks.
 - Cover *every* execution path pi has: built-in tools, `!` user bash, and — by policy —
   custom and MCP tools.
 - Two first-class profiles: **dev** (workspace-write) and **ops** (offline server management).
@@ -257,13 +260,14 @@ particular command.
 
 The backend is a small interface. The profile — what is readable, writable and reachable —
 is backend-independent and compiled per backend at session start. The target selection order
-after Phase 4 is native for the host OS → Docker → **refuse to enter auto mode**. Today it is
-native → refuse because the Docker backend is not implemented. There is never a silent
+after Phase 4 is native for the host OS → a trusted user-selected Podman/Docker backend →
+**refuse to enter auto mode**. Today it is native → refuse; the experimental container
+runners are not yet enabled as fallbacks. There is never a silent
 unsandboxed fallback.
 
 ```ts
 interface SandboxBackend {
-  readonly name: "seatbelt" | "bwrap" | "docker";
+  readonly name: "seatbelt" | "bwrap" | "docker" | "podman";
   compile(profile: SandboxProfile): Promise<CompiledProfile>;
   run(compiled: CompiledProfile, request: RunRequest)
     : Promise<{ exitCode: number | null; violations: Violation[] }>;
@@ -354,7 +358,7 @@ const CHILD_ENV_BASE = [
   Phase-4 credential broker all run in pi's process; nothing inside the sandbox needs a
   credential to do the task. Compatible clients may receive scoped substitution through a
   TLS-terminating proxy; opaque CONNECT/SOCKS and certificate-pinned clients cannot.
-- The Docker backend builds the same `ChildEnv` into `docker exec -e`; it does not rely on
+- The Docker backend passes the same `ChildEnv` through an `env -i` launcher; it does not rely on
   the container having a clean environment by accident.
 
 **Conformance case.** For every backend: set `ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`,
@@ -418,11 +422,15 @@ when proxying.
   On hosts without userns (Docker-in-Docker), fall through to the Docker backend rather
   than offering a "weaker nested" mode.
 
-### Docker — fallback and Windows
+### Docker / Podman — container backends
 
-A long-lived per-session container:
-`docker run --rm -d --network none --cap-drop ALL --security-opt no-new-privileges --read-only --pids-limit …`
-with the workspace bind-mounted; each action is a `docker exec`.
+The [experimental Phase 4a runner](docs/phase-4a-docker.md) uses one container per
+Bash invocation and a persistent helper container, each with
+`--network none --cap-drop ALL --security-opt no-new-privileges --read-only --pids-limit …`.
+Per-invocation containers let cancellation reap detached descendants. Production
+fallback, capabilities and Windows qualification remain gated. Podman adds a
+rootless Linux adapter and an experimental macOS machine path using the same
+boundary suite. See [Podman installation and local tests](docs/local-testing.md).
 
 - **Filesystem** — only explicit roots are bind-mounted; everything else comes from the
   image. A nested `readDeny` is masked and a nested `writeDeny` is remounted read-only after
@@ -436,10 +444,10 @@ with the workspace bind-mounted; each action is a `docker exec`.
   separately approved build uses a no-network, no-secret isolated builder, a minimal
   allowlisted context, no SSH/socket mounts, no host Docker socket and no privileged
   BuildKit entitlements; the resulting digest is what the session profile records. UID
-  mapping is needed for file ownership. Every `docker exec` enters through a fixed `env -i`
+  mapping is needed for file ownership. Every child enters through a fixed `env -i`
   launcher so image `ENV` entries cannot silently supplement the constructed `ChildEnv`;
-  trusted images must not contain secrets on disk either. Startup is slower, amortized by
-  the session-long container. On macOS, Docker Desktop is a VM — actually *stronger*
+  trusted images must not contain secrets on disk either. Helper startup is amortized;
+  Bash currently pays per-container startup. On macOS, Docker Desktop is a VM — actually *stronger*
   isolation than Seatbelt, with slower I/O.
 
 ### Later — microVM
@@ -1377,20 +1385,31 @@ after passing the eval.*
 
 **v1 ships here.**
 
-### Phase 4 — Egress proxy and Docker backend
+### Phase 4a — Offline Docker / Podman backends
 
-*Outcome: allowlisted network for online use; Windows and locked-down Linux hosts.*
+*Outcome: a qualified offline fallback for locked-down Linux hosts and Windows.*
+
+- [First implementation slice](docs/phase-4a-docker.md): explicit immutable local images,
+  nested deny mounts, UID execution, environment isolation, socket denial and container
+  lifecycle through separate Docker and rootless Podman test entry points. macOS
+  Podman machine execution is implemented and awaiting real-machine qualification.
+- Remaining: trusted configuration/probe integration, invocation-bound capabilities,
+  parent-crash recovery, the full shared conformance contract, and Linux/Windows platform
+  evidence before enabling a user-selected Podman/Docker fallback. No automatic builds of
+  untrusted project Dockerfiles.
+
+### Phase 4b — Authenticated egress proxy
+
+*Outcome: allowlisted network with revocable authority bound to each invocation.*
 
 - Per-invocation authenticated proxy grants; canonical DNS/address checks and rebinding-safe
   connects; explicit TLS termination for scoped HTTPS credential substitution; destination-
   only CONNECT/SOCKS5; `allow_host` capability with canonical host and port. Redirects repeat
   destination validation; opaque tunnels never receive credential substitution.
-- Session container lifecycle, trusted digest-pinned images, separately approved offline
-  untrusted-Dockerfile builds, UID mapping; Docker passes the conformance suite.
 - Acceptance gates: no raw child socket can bypass the proxy; every proxy credential is
   action-bound, single-use and expired on process exit; DNS rebinding/redirect/private-IP
-  cases pass adversarial tests; Docker proves nested deny mounts and `env -i` behavior on
-  Linux and Windows before it becomes a fallback.
+  cases pass adversarial tests. Test retries, sibling isolation and revocation of already
+  open tunnels. Credential substitution is a separately tested milestone.
 
 ### Phase 5 — Ops profile
 
