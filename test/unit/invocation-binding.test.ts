@@ -3,7 +3,7 @@ import {
 	createLsTool,
 	createReadTool,
 	createWriteTool,
-	type ExtensionContext,
+	type ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import type { FsClient } from "../../src/backend/types.ts";
@@ -21,7 +21,7 @@ import { bindOwnedTool } from "../../src/tools/locked.ts";
 
 const cwd = "/work";
 const home = "/home/u";
-const ctx = { cwd } as ExtensionContext;
+const ctx = { cwd } as ExtensionToolContext;
 const canonical = (tool: string, input: Record<string, unknown>) =>
 	canonicalize({ tool, input, cwd, home, profileName: "dev" });
 
@@ -103,7 +103,7 @@ describe("complete owned tool invocation binding", () => {
 		await expect(tool.execute("other", input, undefined, undefined, ctx)).rejects.toThrow("ID");
 		await expect(tool.execute("read", { ...input, offset: 2 }, undefined, undefined, ctx)).rejects.toThrow("differs");
 		await expect(
-			tool.execute("read", input, undefined, undefined, { cwd: "/elsewhere" } as ExtensionContext),
+			tool.execute("read", input, undefined, undefined, { cwd: "/elsewhere" } as ExtensionToolContext),
 		).rejects.toThrow("differs");
 		expect(access).not.toHaveBeenCalled();
 		await tool.execute("read", input, undefined, undefined, ctx);

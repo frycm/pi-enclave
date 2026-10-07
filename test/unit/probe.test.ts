@@ -47,7 +47,7 @@ describe("version parsing", () => {
 	});
 
 	it("captures prerelease and ignores build metadata", () => {
-		expect(parseVersion("0.85.0-rc.1")?.prerelease).toBe("rc.1");
+		expect(parseVersion("1.1.0-rc.1")?.prerelease).toBe("rc.1");
 		expect(parseVersion("1.2.3+build.5")?.prerelease).toBeNull();
 	});
 
@@ -64,7 +64,7 @@ describe("version parsing", () => {
 			return parsed;
 		};
 		expect(compareVersions(v("0.84.2"), v("0.84.10"))).toBeLessThan(0);
-		expect(compareVersions(v("0.85.0"), v("0.84.99"))).toBeGreaterThan(0);
+		expect(compareVersions(v("1.1.0"), v("0.84.99"))).toBeGreaterThan(0);
 		expect(compareVersions(v("1.0.0-rc.1"), v("1.0.0"))).toBeLessThan(0);
 		expect(compareVersions(v("0.84.2"), v("0.84.2"))).toBe(0);
 	});
@@ -72,23 +72,23 @@ describe("version parsing", () => {
 
 describe("range checks", () => {
 	it("includes the lower bound and excludes the upper", () => {
-		expect(isVersionInRange("0.85.0", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
-		expect(isVersionInRange("0.85.99", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
+		expect(isVersionInRange("1.1.0", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
+		expect(isVersionInRange("1.1.99", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
 		expect(isVersionInRange("0.84.4", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
-		expect(isVersionInRange("0.86.0", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
+		expect(isVersionInRange("1.2.0", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
 	});
 
 	it("refuses a prerelease of the next minor", () => {
-		// Semver puts 0.86.0-rc.1 below 0.86.0, but the bound exists because an
+		// Semver puts 1.2.0-rc.1 below 1.2.0, but the bound exists because an
 		// unseen minor may change hook semantics, and an rc is exactly that.
-		expect(isVersionInRange("0.86.0-rc.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
-		expect(isVersionInRange("0.86.0-0", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
-		expect(isVersionInRange("0.85.0-rc.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
+		expect(isVersionInRange("1.2.0-rc.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
+		expect(isVersionInRange("1.2.0-0", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
+		expect(isVersionInRange("1.1.0-rc.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(false);
 	});
 
 	it("still admits a prerelease inside the range", () => {
 		// Prereleases of a patch we already support carry no unseen minor.
-		expect(isVersionInRange("0.85.1-rc.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
+		expect(isVersionInRange("1.1.1-rc.1", PI_RANGE_MIN, PI_RANGE_MAX)).toBe(true);
 	});
 
 	it("never admits an unparseable version", () => {
@@ -112,7 +112,7 @@ describe("probe: pi version gate", () => {
 	it("fails closed on a NEWER pi, not just an older one", () => {
 		// The whole point of a two-sided bound: an unseen minor may change hook
 		// semantics, and "probably fine" is not a sandbox guarantee.
-		expect(byId(healthyEnv({ piVersion: "0.86.0" }), "pi-version")?.status).toBe("fail");
+		expect(byId(healthyEnv({ piVersion: "1.2.0" }), "pi-version")?.status).toBe("fail");
 		expect(byId(healthyEnv({ piVersion: "1.0.0" }), "pi-version")?.status).toBe("fail");
 	});
 

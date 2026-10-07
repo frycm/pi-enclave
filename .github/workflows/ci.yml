@@ -19,6 +19,15 @@ jobs:
       - run: npx tsc --noEmit
       - run: npx biome ci src test
 
+      - name: Clean packaged install
+        run: |
+          fixture=$(mktemp -d)
+          npm pack --pack-destination "$fixture"
+          npm install --prefix "$fixture/consumer" "$fixture/pi-enclave-0.1.0.tgz" @earendil-works/pi-coding-agent@1.1.0
+          node "$fixture/consumer/node_modules/pi-enclave/bin/pi-enclave.mjs" --help
+          cd "$fixture/consumer"
+          node --import tsx --input-type=module -e 'await import("pi-enclave")'
+
   test:
     name: Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

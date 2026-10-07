@@ -2,15 +2,9 @@
  * The tool allowlist.
  *
  * Tools pi-enclave does not own execute in the pi process with the user's full
- * privileges and never touch the sandbox. There is no hook in pi 0.84.2 that
- * would let an extension wrap another extension's tool execution, so the honest
- * answer is to deny by default and make the user name what they want.
- *
- * A note on vocabulary the README gets wrong: it calls these "MCP and custom
- * tools", but pi 0.84.2 has no MCP support at all -- no dependency, no setting,
- * no tool namespace. Every non-built-in tool arrives as a plain
- * `CustomToolCallEvent` with whatever flat name the registering extension
- * chose. An MCP bridge, when one exists, will be one of those.
+ * privileges and never touch the sandbox. Pi 1.1's nested execution hooks apply
+ * the same gate to codemode child calls and deferred MCP tools, but do not turn
+ * those executors into OS-sandboxed tools. Deny them by default.
  *
  * That is also why grants may pin a `source`. Names are not identities here:
  * two extensions can register `deploy`, and the one whose registration pi keeps

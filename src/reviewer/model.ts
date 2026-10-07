@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { stream as streamOpenAI } from "@earendil-works/pi-ai/api/openai-completions";
+import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { parseReviewerModelReference } from "../config/reviewer-model.ts";
 import { stableSerialize } from "../policy/canonical.ts";
@@ -108,7 +109,7 @@ async function manifest(target: Endpoint, signal: AbortSignal): Promise<string> 
 /** Identity includes inference routing and model configuration, never the CLI's server. */
 async function endpointDigest(target: Endpoint, signal: AbortSignal): Promise<string> {
 	const model = target.model;
-	const descriptor = { model: target.model, headers: target.headers, auth: target.authIdentity, transport: 2 };
+	const descriptor = { model: target.model, headers: target.headers, auth: target.authIdentity, transport: 3 };
 	if (model.provider === "ollama") {
 		const modelManifest = await manifest(target, signal);
 		const version = await ollamaJson(target, "version", signal);
@@ -171,10 +172,12 @@ async function completeSnapshot(target: Endpoint, request: CompletionRequest): P
 	// ModelRegistry.complete would resolve auth (including baseUrl) again.
 	const response = await streamOpenAI(
 		{ ...target.model, api: "openai-completions", samplingParams: {} },
-		{
-			systemPrompt: request.system,
-			messages: [{ role: "user", content: [{ type: "text", text: request.user }], timestamp: Date.now() }],
-		},
+		normalizeContext({
+			messages: [
+				{ role: "system", content: [{ type: "text", text: request.system }], timestamp: Date.now() },
+				{ role: "user", content: [{ type: "text", text: request.user }], timestamp: Date.now() },
+			],
+		}),
 		{
 			headers: target.headers,
 			signal: request.signal,

@@ -4,7 +4,7 @@ import { loadConfig } from "../../src/config/sources.ts";
 import register from "../../src/index.ts";
 
 vi.mock("../../src/probe-host.ts", () => ({
-	probeHost: () => ({ ok: true, platform: "linux", backend: "bwrap", piVersion: "0.85.0", checks: [] }),
+	probeHost: () => ({ ok: true, platform: "linux", backend: "bwrap", piVersion: "1.1.0", checks: [] }),
 }));
 vi.mock("../../src/config/sources.ts", () => ({
 	loadConfig: vi.fn(() => ({ ok: false, message: "fixture stops before backend startup", sources: [] })),

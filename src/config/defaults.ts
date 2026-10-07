@@ -54,6 +54,10 @@ export function defaultReadDeny(
 			// variable, but the file is on disk regardless, and an agent that can read
 			// it can spend the account running it.
 			join(agentDir, "auth.json"),
+			// Pi 1.1 stores MCP OAuth tokens separately; server configuration may
+			// also contain literal authorization headers or environment secrets.
+			join(agentDir, "mcp-auth.json"),
+			join(agentDir, "mcp.json"),
 			// pi-enclave's own state: pending approval records, the audit log, and the
 			// attendance secret. The pending records are the one place "what a human
 			// approved" is persisted, and the secret is the whole of the RPC
@@ -72,6 +76,8 @@ export function defaultReadDeny(
 			// The default agent directory, kept even when the live one is elsewhere:
 			// a stale auth.json at the default path is still a credential.
 			join(home, ".pi", "agent", "auth.json"),
+			join(home, ".pi", "agent", "mcp-auth.json"),
+			join(home, ".pi", "agent", "mcp.json"),
 			join(home, ".pi", "auth.json"),
 			// Sibling agents' stored credentials, for the same reason.
 			join(home, ".claude", ".credentials.json"),
@@ -260,7 +266,7 @@ export function defaultProfile(options: DefaultProfileOptions): EffectiveProfile
 		sandbox: {
 			mode: "workspace-write",
 			writableRoots: [cwd, tmp],
-			readDeny: defaultReadDeny(home, agentDir, env),
+			readDeny: [...defaultReadDeny(home, agentDir, env), join(cwd, ".pi", "mcp.json")],
 			grantableReadDeny: [],
 			network: { mode: "off", allowHosts: [] },
 			capabilities: "reviewed",

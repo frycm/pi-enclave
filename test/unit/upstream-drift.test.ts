@@ -42,9 +42,9 @@ const GREP_ARTIFACT = join(findPiRoot(), "dist", "core", "tools", "grep.js");
 const MIME_ARTIFACT = join(findPiRoot(), "dist", "utils", "mime.js");
 
 /** The pi build these hashes were taken from. Bump all together, never one. */
-const PINNED_PI_VERSION = "0.85.0";
+const PINNED_PI_VERSION = "1.1.0";
 const PINNED_GREP_SHA256 = "641ae520a88c7eb86406d9a18880f31412cb41cdc15a7ee3e1da5de62979ca7c";
-const PINNED_MIME_SHA256 = "e865d8bb69bc7462da3769a9add3f417f6f55ee3f8803cca4603123f8fbed438";
+const PINNED_MIME_SHA256 = "36bdb72fc40d809ab5f69e80ecd54651d4131661e92cf7dcec7b719f139badcf";
 
 /** Duplicated in src/tools/grep.ts because pi does not export it. */
 const DUPLICATED_DEFAULT_LIMIT = 100;

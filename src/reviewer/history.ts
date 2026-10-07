@@ -46,6 +46,22 @@ export function restoreReviewHistory(entries: readonly unknown[]): RestoredRevie
 						input: structuredClone(input as Record<string, unknown>),
 					});
 				}
+			} else if (message.role === "toolResult" && message.nestedCalls && typeof message.nestedCalls === "object") {
+				// Pi 1.1 persists child invocation metadata on the parent's result.
+				// These inputs are untrusted context, never direct authorization.
+				const nested = message.nestedCalls as { calls?: unknown };
+				if (Array.isArray(nested.calls)) {
+					for (const call of nested.calls) {
+						if (!call || typeof call !== "object") continue;
+						const { name, arguments: input } = call as Record<string, unknown>;
+						if (typeof name !== "string" || !input || typeof input !== "object" || Array.isArray(input)) continue;
+						context.push({
+							provenance: "assistant_tool_call",
+							tool: name,
+							input: structuredClone(input as Record<string, unknown>),
+						});
+					}
+				}
 			}
 			continue;
 		}
