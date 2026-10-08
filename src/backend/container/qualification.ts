@@ -6,6 +6,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	readlinkSync,
 	renameSync,
 	rmSync,
 	symlinkSync,
@@ -127,14 +128,17 @@ export async function qualifyContainer(
 		compiled = await backend.compile(profile);
 		await row("workspace-and-uid", async () => {
 			const result = await sh(
-				"echo written > written.txt; id -u; grep CapEff /proc/self/status; test $(cat /sys/fs/cgroup/pids.max) = 256; test $(cat /sys/fs/cgroup/memory.max) = 536870912",
+				'echo written > written.txt; id -u; id -g; grep CapEff /proc/self/status; readlink /proc/self/ns/pid; test $(cat /sys/fs/cgroup/pids.max) = 256 && test $(cat /sys/fs/cgroup/memory.max) = 536870912 && read quota period < /sys/fs/cgroup/cpu.max && test "$quota" != max && test "$quota" -eq "$((period * 2))"',
 			);
 			assert(
 				result.exitCode === 0 &&
 					readFileSync(join(workspace, "written.txt"), "utf8") === "written\n" &&
 					/CapEff:\s+0+/.test(result.output) &&
-					result.output.split("\n").includes(String(process.getuid?.())),
-				"normal workspace writes, resource limits and zero capabilities",
+					result.output.split("\n")[0] === String(process.getuid?.()) &&
+					result.output.split("\n")[1] === String(process.getgid?.()) &&
+					result.output.includes("pid:[") &&
+					!result.output.includes(readlinkSync("/proc/self/ns/pid")),
+				"normal workspace writes, UID/GID, private PID namespace, resource limits and zero capabilities",
 			);
 		});
 		await row("outside-write-and-symlinks", async () => {
