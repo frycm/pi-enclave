@@ -31,7 +31,7 @@ export interface ProbeCheck {
 	remediation?: string;
 }
 
-export type BackendName = "seatbelt" | "bwrap";
+export type BackendName = "seatbelt" | "bwrap" | "docker" | "podman";
 
 export interface ProbeReport {
 	/** False if any check failed. Auto mode must refuse to start. */
@@ -153,6 +153,8 @@ export function isVersionAtLeast(raw: string, min: string): boolean {
  * advisory.
  */
 const BACKEND_BINARIES: Record<BackendName, { required: string[]; optional: string[] }> = {
+	docker: { required: ["docker"], optional: [] },
+	podman: { required: ["podman"], optional: [] },
 	seatbelt: { required: ["/usr/bin/sandbox-exec"], optional: ["rg", "fd"] },
 	bwrap: { required: ["bwrap", "socat"], optional: ["rg", "fd"] },
 };

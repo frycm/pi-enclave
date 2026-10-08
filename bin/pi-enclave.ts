@@ -14,12 +14,18 @@
  */
 import { readdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
+import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
+import { ContainerBackend } from "../src/backend/container/backend.ts";
+import { qualifyContainer } from "../src/backend/container/qualification.ts";
+import { selectBackend } from "../src/backend/select.ts";
 import { approve } from "../src/cli/approve.ts";
 import { renderConfig, renderDefaults } from "../src/config/render.ts";
 import { loadConfig } from "../src/config/sources.ts";
 import { provisionSecret } from "../src/escalate/handshake.ts";
 import { describeRecord, listPending, listSessions, readPending } from "../src/escalate/pending.ts";
+import { formatProbeReport } from "../src/probe.ts";
 import { formatVerifyResult, verifyLog } from "../src/state/audit.ts";
 import { ensureStateDirs, stateDirs } from "../src/state/dir.ts";
 
@@ -32,6 +38,8 @@ const USAGE = `pi-enclave <command>
   approve <nonce>               show an action, ask, and run it once
   audit [verify] [--session id] read or re-chain the audit log
   attend-secret                 provision the RPC attendance secret
+  qualify-backend                qualify the explicitly configured local container engine
+  probe                         probe the configured backend and qualification
 
 Read-only status, rules, pending, and audit inspection are also available inside pi as
 /enclave <command>. Approval and secret provisioning are CLI-only.`;
@@ -62,6 +70,30 @@ async function main(argv: string[]): Promise<number> {
 
 		case "attend-secret":
 			return attendSecret();
+		case "qualify-backend": {
+			const loaded = currentConfig(cwd);
+			if (!loaded) return 1;
+			const settings = loaded.profile.sandbox.backend;
+			if (settings.kind === "native")
+				throw new Error("select a trusted Docker/Podman image in user-global sandbox.backend first");
+			const dirs = ensureStateDirs();
+			const backend = new ContainerBackend(settings, join(dirs.root, "containers"));
+			const record = await qualifyContainer(backend, dirs.qualified);
+			for (const row of record.rows) process.stdout.write(`PASS ${row.name} (${Math.round(row.ms)} ms)\n`);
+			process.stdout.write(`Qualified ${backend.name} on this host: ${record.identity}\n`);
+			return 0;
+		}
+		case "probe": {
+			const loaded = currentConfig(cwd);
+			if (!loaded) return 1;
+			const selected = await selectBackend(loaded.profile.sandbox.backend, PI_VERSION);
+			try {
+				process.stdout.write(`${formatProbeReport(selected.report)}\n`);
+				return selected.report.ok ? 0 : 1;
+			} finally {
+				await selected.backend.dispose();
+			}
+		}
 
 		default:
 			process.stderr.write(`pi-enclave: unknown command "${command}"\n\n${USAGE}\n`);

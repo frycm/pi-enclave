@@ -8,6 +8,8 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { selectBackend } from "../src/backend/select.ts";
+import { loadConfig } from "../src/config/sources.ts";
 import { formatProbeReport } from "../src/probe.ts";
 import { probeHost } from "../src/probe-host.ts";
 import { sanitizeVerificationPath } from "./test-path.ts";
@@ -43,6 +45,25 @@ function resolvePiVersion(): string | null {
 	}
 }
 
-const report = probeHost(resolvePiVersion());
-console.log(formatProbeReport(report));
-process.exit(report.ok ? 0 : 1);
+const loaded = loadConfig({ cwd: process.cwd(), projectTrusted: true });
+if (!loaded.ok) {
+	console.error(loaded.message);
+	process.exitCode = 1;
+} else if (loaded.profile.sandbox.backend.kind === "native") {
+	const report = probeHost(resolvePiVersion());
+	console.log(formatProbeReport(report));
+	process.exitCode = report.ok ? 0 : 1;
+} else {
+	try {
+		const selected = await selectBackend(loaded.profile.sandbox.backend, resolvePiVersion());
+		try {
+			console.log(formatProbeReport(selected.report));
+			process.exitCode = selected.report.ok ? 0 : 1;
+		} finally {
+			await selected.backend.dispose();
+		}
+	} catch (error) {
+		console.error((error as Error).message);
+		process.exitCode = 1;
+	}
+}

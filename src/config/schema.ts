@@ -50,6 +50,7 @@ export type ParseResult = { ok: true; document: ConfigDocument } | { ok: false; 
  * one. `skipReview` is an allow verdict, and `reviewer` decides who judges.
  */
 const PROJECT_FORBIDDEN: Record<string, string> = {
+	"sandbox.backend": "container images, engines and host mounts are user-global only.",
 	"sandbox.grantableReadDeny": "grantableReadDeny authorizes one-shot read widening and is therefore user-global only.",
 	"rules.skipReview": "skipReview is an allow verdict: it bypasses review entirely. User-global only.",
 	"review.environment": "prose rulebook entries are user-global only; a repository must not reach the reviewer prompt.",
@@ -67,6 +68,7 @@ const PROFILE_KEYS = ["sandbox", "rules", "review", "tools", "reviewer", "breake
 const DOCUMENT_KEYS = ["profile", "profiles", ...PROFILE_KEYS] as const;
 
 const SANDBOX_KEYS = [
+	"backend",
 	"mode",
 	"writableRoots",
 	"readDeny",
@@ -364,6 +366,33 @@ class ParseContext {
 		this.rejectForbidden(prefix, body);
 
 		const out: NonNullable<ProfilePatch["sandbox"]> = {};
+		if ("backend" in body) {
+			if (this.source !== "user_global") this.error(join(prefix, "backend"), "backend selection is user-global only");
+			const key = join(prefix, "backend");
+			const backend = this.object(key, body.backend);
+			if (backend) {
+				this.rejectUnknown(key, backend, ["kind", "fallback", "image", "binary", "socket", "readableRoots"]);
+				const kind = this.enum(join(key, "kind"), backend.kind, ["native", "docker", "podman", "auto"] as const);
+				const fallback =
+					"fallback" in backend
+						? this.enum(join(key, "fallback"), backend.fallback, ["docker", "podman"] as const)
+						: "podman";
+				const image = "image" in backend ? this.string(join(key, "image"), backend.image) : "";
+				const binary = "binary" in backend ? this.string(join(key, "binary"), backend.binary) : "";
+				const socket = "socket" in backend ? this.string(join(key, "socket"), backend.socket) : "";
+				const readableRoots =
+					"readableRoots" in backend
+						? this.list(join(key, "readableRoots"), backend.readableRoots, "sandbox.backend.readableRoots")
+						: [];
+				if (kind && fallback && image !== undefined && binary !== undefined && socket !== undefined && readableRoots) {
+					if (kind !== "native" && !/^(sha256:[a-f0-9]{64}|[^\s@]+@sha256:[a-f0-9]{64})$/.test(image))
+						this.error(join(key, "image"), "an immutable local image ID or repository digest is required");
+					if (kind !== "native" && !binary.startsWith("/"))
+						this.error(join(key, "binary"), "an absolute engine executable is required");
+					out.backend = { kind, fallback, image, binary, socket, readableRoots };
+				}
+			}
+		}
 
 		if ("mode" in body) {
 			const mode = this.enum(join(prefix, "mode"), body.mode, ["workspace-write"] as const);

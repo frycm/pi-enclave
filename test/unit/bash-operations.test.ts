@@ -175,6 +175,31 @@ describe("createEnclaveBashOperations", () => {
 		expect(await ops.exec("false", "/work", { onData: () => {} })).toEqual({ exitCode: 3 });
 	});
 
+	it("does not count an approved read as a denial, while sibling denials still count", async () => {
+		const compiled = { ...COMPILED, profile: { ...PROFILE, readDeny: ["/srv/private", "/srv/sibling"] } };
+		const { backend } = recordingBackend({ exitCode: 1 });
+		const onDeniedReadAttempt = vi.fn();
+		const onViolations = vi.fn();
+		const action = canonicalize({
+			tool: "bash",
+			input: { command: "cat /srv/private/report /srv/sibling/key", allow_read: "/srv/private" },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+			writableRoots: ["/work"],
+		});
+		const ops = createEnclaveBashOperations({
+			backend,
+			getCompiled: () => compiled,
+			guard: () => action,
+			onDeniedReadAttempt,
+			onViolations,
+		});
+		await ops.exec(String(action.input.command), "/work", { onData: () => {} });
+		expect(onDeniedReadAttempt).toHaveBeenCalledWith(["/srv/sibling/key"]);
+		expect(onViolations).toHaveBeenCalledWith([expect.objectContaining({ path: "/srv/sibling/key" })]);
+	});
+
 	it("appends violations to the output so the agent can change approach", async () => {
 		// The operations interface can only return an exit code. An agent that
 		// sees a bare failure retries it, often with sudo.
