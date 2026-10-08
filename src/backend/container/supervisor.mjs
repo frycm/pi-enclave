@@ -14,6 +14,7 @@ let attachment;
 let cleaning;
 const cli = (args) =>
 	exec(plan.binary, [...plan.prefix, ...args], { env: plan.engineEnv, timeout: 30_000, maxBuffer: 1024 * 1024 });
+const absent = (error) => /no such (container|object)/i.test(error.stderr ?? "");
 
 async function remove() {
 	if (creating) return;
@@ -22,7 +23,19 @@ async function remove() {
 		try {
 			await cli(["rm", "--force", ...(plan.engine === "podman" ? ["--time", "0"] : []), plan.name]);
 		} catch (error) {
-			if (!/no such container|does not exist|not found/i.test(`${error.stderr ?? ""}`)) throw error;
+			if (!absent(error) && !/removal.*already in progress/i.test(error.stderr ?? "")) throw error;
+		}
+		// Docker --rm may already be deleting it. An in-progress response is not proof of removal.
+		const deadline = Date.now() + 30_000;
+		while (true) {
+			try {
+				await cli(["container", "inspect", plan.name]);
+			} catch (error) {
+				if (absent(error)) return;
+				throw error;
+			}
+			if (Date.now() >= deadline) throw new Error(`container ${plan.name} still exists after cleanup`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
 	})();
 	return cleaning;
