@@ -287,6 +287,74 @@ describe("createEnclaveBashOperations", () => {
 		expect(onDeniedReadAttempt).toHaveBeenCalledWith([DENIED_SSH_CONFIG]);
 	});
 
+	it.each(["echo /home/u/.ssh/config", "printf '%s\\n' /home/u/.ssh/config", "echo hi > /home/u/.ssh/config"])(
+		"does not count a literal or write-only path as a denied read: %s",
+		async (command) => {
+			const action = canonicalize({
+				tool: "bash",
+				input: { command },
+				cwd: "/work",
+				home: "/home/u",
+				profileName: "dev",
+			});
+			const { backend } = recordingBackend({ exitCode: 0, violations: [] });
+			const onDeniedReadAttempt = vi.fn();
+			const ops = createEnclaveBashOperations({
+				backend,
+				getCompiled: () => COMPILED,
+				guard: () => action,
+				onDeniedReadAttempt,
+			});
+
+			await ops.exec(command, "/work", { onData: () => {} });
+			expect(onDeniedReadAttempt).not.toHaveBeenCalled();
+		},
+	);
+
+	it("keeps conservative accounting when a shell substitution makes echo uncertain", async () => {
+		const command = 'echo /home/u/.ssh/config "$(true)"';
+		const action = canonicalize({
+			tool: "bash",
+			input: { command },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+		});
+		const { backend } = recordingBackend({ exitCode: 0, violations: [] });
+		const onDeniedReadAttempt = vi.fn();
+		const ops = createEnclaveBashOperations({
+			backend,
+			getCompiled: () => COMPILED,
+			guard: () => action,
+			onDeniedReadAttempt,
+		});
+
+		await ops.exec(command, "/work", { onData: () => {} });
+		expect(onDeniedReadAttempt).toHaveBeenCalledWith([DENIED_SSH_CONFIG]);
+	});
+
+	it("does not treat a project executable named echo as the shell builtin", async () => {
+		const command = "./echo /home/u/.ssh/config";
+		const action = canonicalize({
+			tool: "bash",
+			input: { command },
+			cwd: "/work",
+			home: "/home/u",
+			profileName: "dev",
+		});
+		const { backend } = recordingBackend({ exitCode: 0, violations: [] });
+		const onDeniedReadAttempt = vi.fn();
+		const ops = createEnclaveBashOperations({
+			backend,
+			getCompiled: () => COMPILED,
+			guard: () => action,
+			onDeniedReadAttempt,
+		});
+
+		await ops.exec(command, "/work", { onData: () => {} });
+		expect(onDeniedReadAttempt).toHaveBeenCalledWith([DENIED_SSH_CONFIG]);
+	});
+
 	it("accounts for a denied copy source even when the command also writes", async () => {
 		const action = canonicalize({
 			tool: "bash",

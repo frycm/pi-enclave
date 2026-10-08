@@ -8,8 +8,8 @@ mutations and boundary crossings — never for the decisions that must be determ
 Designed to be trustworthy **offline, with open-weight models**.
 
 > [!IMPORTANT]
-> **Status: Phases 1–3 are merged. Phase 4a has experimental offline Docker and
-> Podman backends in draft PR #8; production uses the native sandbox. Egress and
+> **Status: Phases 1–3 are merged. Phase 4a's experimental offline Docker and
+> Podman work remains unmerged; production uses the native sandbox. Egress and
 > the Phase 5 ops broker remain design.**
 >
 > **Built and tested:** the OS-enforced sandbox (L2), the deterministic policy layer (L1),
@@ -1098,6 +1098,7 @@ in the workspace, which the sandboxed agent can write to.
 | Session binding | `sessionId`, the pi session file path, and the configuration hash recorded as audit evidence. The record is found only within its named session state directory; its action hash and nonce cannot be replayed as another action. |
 | Nonce | 128-bit random, in the filename and the body. The resume command must present it. |
 | Expiry | `expiresAt`, default 24 h from creation. Expired records are refused and deleted; freshness is checked again after an interactive prompt and after sandbox compilation, immediately before execution. |
+| Policy freshness | The effective configuration is reloaded after the prompt and after sandbox compilation. If it changed or cannot be loaded, nothing executes and the record remains pending for a fresh review. |
 | Single use | On resume the record is atomically renamed to `approved/` before execution, then to `consumed/` after. A second resume with the same nonce is a no-op with an audit entry. |
 | Approval | `pi-enclave approve <nonce>` displays the canonical action and asks for confirmation *in that terminal*. `/enclave pending` is deliberately read-only, and no RPC approval method exists yet. There is no way to approve by editing the file. |
 
@@ -1376,22 +1377,37 @@ after passing the eval.*
 - Eval corpus, `/enclave eval-reviewer` command and qualification records. Published model
   results remain follow-up evidence and never replace qualification on the user's hardware.
 
-**v1 ships here.**
+**v1 release gate:** expand the reviewer corpus beyond repeated templates, qualify a real
+local model on target hardware with measured denial, approval and latency rates, and run
+the end-to-end approval, cancellation, resume and parallel-call flows against the packaged
+pi 1.1.0 integration. Publish the supported host and model limits with those results.
 
-### Phase 4 — Egress proxy and Docker backend
+### Phase 4a — Offline container backend
 
-*Outcome: allowlisted network for online use; Windows and locked-down Linux hosts.*
+*Outcome: a qualified fallback for hosts where the native sandbox cannot run, with
+`network.mode: "off"` throughout.*
 
-- Per-invocation authenticated proxy grants; canonical DNS/address checks and rebinding-safe
-  connects; explicit TLS termination for scoped HTTPS credential substitution; destination-
-  only CONNECT/SOCKS5; `allow_host` capability with canonical host and port. Redirects repeat
-  destination validation; opaque tunnels never receive credential substitution.
 - Session container lifecycle, trusted digest-pinned images, separately approved offline
-  untrusted-Dockerfile builds, UID mapping; Docker passes the conformance suite.
-- Acceptance gates: no raw child socket can bypass the proxy; every proxy credential is
-  action-bound, single-use and expired on process exit; DNS rebinding/redirect/private-IP
-  cases pass adversarial tests; Docker proves nested deny mounts and `env -i` behavior on
-  Linux and Windows before it becomes a fallback.
+  untrusted-Dockerfile builds, UID mapping and no child access to the container engine socket.
+- Integrate backend selection through trusted configuration, probing and session startup;
+  retain invocation-bound read and write capabilities and refuse when no qualified backend
+  is available.
+- Prove nested deny mounts, credential and environment isolation, cancellation, descendant
+  cleanup and parent-crash recovery with the shared conformance suite. Qualify each supported
+  Linux, macOS and Windows engine configuration before enabling it as a fallback.
+
+### Phase 4b — Authenticated egress
+
+*Outcome: allowlisted network access for online tasks without raw child egress.*
+
+- Per-invocation authenticated proxy grants; canonical host, port, DNS and address checks;
+  connection-time rebinding defenses; redirects repeat validation. Define grant lifetime for
+  retries, parallel connections and already-open tunnels before adding `allow_host`.
+- Start with destination-only egress. Scoped HTTPS credential substitution requires a
+  separately tested TLS-terminating path; opaque CONNECT/SOCKS5 tunnels never receive it.
+- Acceptance gates: no raw child socket bypasses the proxy; credentials are action-bound,
+  single-use and expired on process exit; DNS rebinding, redirects, private IPs, sibling
+  isolation and revocation pass adversarial tests.
 
 ### Phase 5 — Ops profile
 
@@ -1476,7 +1492,7 @@ sandbox's, so a green row on a restricted host is not read as stronger evidence 
 | Bash read capability and an ordinary sibling overlap | Linux grant reaches only the capability process; macOS refuses Bash widening because it cannot guarantee lifetime | 3 | native SRT conformance |
 | Pending record edited on disk, or mode changed to `0644`, or nonce reused, or a nonce containing a path | Refused with an audit entry | 2 | P10 |
 | **Environment leak**: provider keys set in the pi process; `env`, `$VAR` expansion, `os.environ`, `/proc/self/environ` inside the sandbox | None of the values appear; a `passthrough` entry matching `envDeny` is rejected at config load | 1 | C9 |
-| **Stale resume**: pending record written, user then removes a writable root/tool grant, disables capabilities, re-adds a `readDeny`, or loosens config; `pi-enclave approve` | Safe narrowing executes under current policy; a revoked tool/capability or wider config is refused and remains pending | 2 | P11 |
+| **Stale resume**: pending record written, user then removes a writable root/tool grant, disables capabilities, re-adds a `readDeny`, or loosens config; `pi-enclave approve` | Safe narrowing before the prompt executes under current policy; a revoked tool/capability or wider config is refused. Any effective policy change during the prompt or compilation leaves the record pending | 2 | P11 + approval freshness unit tests |
 
 ---
 

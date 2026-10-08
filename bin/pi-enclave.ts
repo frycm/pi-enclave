@@ -172,6 +172,7 @@ async function runApprove(argv: string[]): Promise<number> {
 			record: read.record,
 			stateRoot: dirs.state,
 			current: loaded.profile,
+			reloadCurrent: () => currentConfig(read.record.action.cwd)?.profile,
 			home: homedir(),
 			io: {
 				out: (text) => process.stdout.write(text.endsWith("\n") ? text : `${text}\n`),
