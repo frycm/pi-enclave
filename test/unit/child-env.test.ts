@@ -56,6 +56,11 @@ describe("globToRegExp", () => {
 });
 
 describe("isCredentialName", () => {
+	it("refuses host Java options even through explicit passthrough", () => {
+		const parent = { JAVA_TOOL_OPTIONS: "-Dhost.token=secret" };
+		expect(buildChildEnv(parent, { passthrough: ["JAVA_TOOL_OPTIONS"] })).not.toHaveProperty("JAVA_TOOL_OPTIONS");
+		expect(validatePassthrough(["JAVA_TOOL_OPTIONS"]).rejected).toHaveLength(1);
+	});
 	it("matches every documented credential pattern", () => {
 		for (const name of [
 			"ANTHROPIC_API_KEY",

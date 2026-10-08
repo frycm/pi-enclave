@@ -76,7 +76,7 @@ export function directAuthorizationCovers(
 	authorization: readonly ReviewAuthorization[],
 ): boolean {
 	const entry = authorization.at(-1);
-	if (!entry || entry.provenance !== "direct") return false;
+	if (entry?.provenance !== "direct") return false;
 	const text = entry.text.trim();
 	if (
 		exactRequest(text, ["approve", "authorize", "allow"], action.hash) ||

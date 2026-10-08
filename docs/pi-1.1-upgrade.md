@@ -5,6 +5,9 @@ commit `abe508e1b89912adde45528136c3221eb69acdd7`. The previous baseline was v0.
 `107d79f11072bbc8a3a757ed7fd69596bee7d68c`; upstream reports 545 intervening commits.
 This is a focused compatibility and trust-boundary review, not an exhaustive audit of pi.
 
+The subsequent [dependency upgrade](dependency-upgrade.md) records the refreshed
+sandbox runtime and toolchain, additional Java environment protection, and updated validation.
+
 ## Changes and resulting behavior
 
 | Area | Upstream change / verified behavior | Enclave response |

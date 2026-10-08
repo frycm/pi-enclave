@@ -43,6 +43,10 @@ function expectWriteAllowed(profile: Profile, path: string): void {
 }
 
 describe("sandbox profile authority", () => {
+	it("withholds inherited Java options from SRT's argv composition", () => {
+		const config = toSrtConfig(profile(["/work"]));
+		expect(config.credentials.envVars).toContainEqual({ name: "JAVA_TOOL_OPTIONS", mode: "deny" });
+	});
 	it("fails closed for shell write grants whose process lifetime cannot be contained on macOS", () => {
 		expect(shellWriteCapabilityIssue("darwin")).toContain("could outlive the invocation");
 		expect(shellWriteCapabilityIssue("linux")).toBeUndefined();

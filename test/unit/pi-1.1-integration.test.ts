@@ -156,19 +156,18 @@ describe("pi 1.1 nested execution", () => {
 			expect(seen).toEqual(["parent:parent/1:write", "parent:parent/2:write"]);
 		});
 	});
-	it.each([
-		"codemode",
-		"powershell",
-		"mcp__fixture__send",
-	])("denies deferred %s even when it is callable", async (name) => {
-		await withSession(async ({ nested, foreign, seen }) => {
-			const result = await nested(name, { path: "x", content: "secret" });
-			expect(result.isError).toBe(true);
-			expect(JSON.stringify(result.result)).toContain("not in tools.allow");
-			expect(foreign).not.toHaveBeenCalled();
-			expect(seen).toContain(`parent:parent/1:${name}`);
-		});
-	});
+	it.each(["codemode", "powershell", "mcp__fixture__send"])(
+		"denies deferred %s even when it is callable",
+		async (name) => {
+			await withSession(async ({ nested, foreign, seen }) => {
+				const result = await nested(name, { path: "x", content: "secret" });
+				expect(result.isError).toBe(true);
+				expect(JSON.stringify(result.result)).toContain("not in tools.allow");
+				expect(foreign).not.toHaveBeenCalled();
+				expect(seen).toContain(`parent:parent/1:${name}`);
+			});
+		},
+	);
 	it("refuses a child when the breaker is open", async () => {
 		await withSession(async ({ nested, write, openBreaker }) => {
 			openBreaker();

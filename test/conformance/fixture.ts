@@ -20,6 +20,7 @@ export const SECRET_ENV = {
 	ANTHROPIC_API_KEY: "sk-ant-CONFORMANCE-LEAK",
 	AWS_SECRET_ACCESS_KEY: "aws-CONFORMANCE-LEAK",
 	GITHUB_TOKEN: "ghp-CONFORMANCE-LEAK",
+	JAVA_TOOL_OPTIONS: "-Dhost.token=JAVA-CONFORMANCE-LEAK",
 } as const;
 
 /** Written into the read-denied directory. Must never appear in any output. */

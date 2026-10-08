@@ -321,6 +321,7 @@ interface SrtFilesystemConfig {
 interface SrtConfig {
 	network: { allowedDomains: string[]; deniedDomains: string[] };
 	filesystem: SrtFilesystemConfig;
+	credentials: { envVars: { name: string; mode: "deny" }[] };
 	allowPty?: boolean;
 	enableWeakerNestedSandbox?: boolean;
 	ripgrep?: { command: string };
@@ -366,6 +367,9 @@ export function toSrtConfig(
 		// child can reach; it denies every request. Raw sockets and DNS are denied
 		// by the kernel.
 		network: { allowedDomains: [], deniedDomains: [] },
+		// SRT 0.0.79 composes Java proxy options with the parent's value inside
+		// argv. Deny the inherited value there as well as in buildChildEnv.
+		credentials: { envVars: [{ name: "JAVA_TOOL_OPTIONS", mode: "deny" }] },
 		filesystem: {
 			denyRead: withResolvedTargets(profile.readDeny, platform),
 			allowWrite,

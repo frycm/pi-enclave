@@ -164,8 +164,7 @@ export class ActionLock {
 	beginParentExecution(path: string): LockEntry {
 		const entry = this.invocation.getStore()?.entry;
 		if (
-			!entry ||
-			entry.action.tool !== "write" ||
+			entry?.action.tool !== "write" ||
 			!entry.action.paths.some((target) => normalizePath(dirname(target.typed)) === normalizePath(path))
 		) {
 			throw new LockViolation("not-locked", "pi-enclave: mkdir has no matching write invocation");
@@ -180,8 +179,7 @@ export class ActionLock {
 		const entry = this.invocation.getStore()?.entry;
 		const normalized = normalizePath(path);
 		if (
-			!entry ||
-			entry.action.tool !== "ls" ||
+			entry?.action.tool !== "ls" ||
 			!entry.action.paths.some((target) =>
 				[target.typed, target.resolved].some(
 					(directory) => directory === normalized || directory === dirname(normalized),

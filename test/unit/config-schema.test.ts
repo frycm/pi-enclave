@@ -75,14 +75,12 @@ describe("parseDocument", () => {
 			expect(result.ok).toBe(true);
 		});
 
-		it.each([
-			"qwen3:32b",
-			"/model",
-			"provider/",
-			"provider/model id",
-		])("refuses malformed reviewer model %s", (model) => {
-			expect(errorKeys(parse({ reviewer: { model } }))).toEqual(["reviewer.model"]);
-		});
+		it.each(["qwen3:32b", "/model", "provider/", "provider/model id"])(
+			"refuses malformed reviewer model %s",
+			(model) => {
+				expect(errorKeys(parse({ reviewer: { model } }))).toEqual(["reviewer.model"]);
+			},
+		);
 
 		it("accepts an explicit named fallback", () => {
 			expect(parse({ reviewer: { model: "ollama/primary", fallback: "ollama/fallback" } }).ok).toBe(true);

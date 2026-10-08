@@ -36,55 +36,55 @@ function memoryFs(): FsClient {
 }
 
 describe("complete owned tool invocation binding", () => {
-	it.each([
-		false,
-		true,
-	])("keeps concurrent same-path read grants separate through gate and real pi tools (reverse=%s)", async (reverse) => {
-		const profile = defaultProfile({ cwd, home, agentDir: `${home}/.pi/agent` });
-		profile.sandbox.readDeny.push("/work/private");
-		profile.sandbox.grantableReadDeny.push("/work/private");
-		const lock = new ActionLock();
-		const inputs = [
-			{ path: "/work/private/notes", limit: 1, allow_read: "/work/private" },
-			{ path: "/work/private/notes", offset: 2, limit: 1 },
-		];
-		const deps = { profile, cwd, home, owned: OWNED_TOOLS, lock, escalator: { confirm: async () => true } };
-		for (const [i, input] of inputs.entries())
-			expect((await decide({ toolName: "read", toolCallId: String(i), input }, deps)).block).toBe(false);
-		const selected: Array<{ hash: string; granted: boolean }> = [];
-		let accessCount = 0;
-		let release!: () => void;
-		const both = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		const operations = createReadOperations(
-			(action) => {
-				const granted = action?.capability?.kind === "read";
-				selected.push({ hash: action?.hash ?? "missing", granted });
-				return {
-					...memoryFs(),
-					access: async () => {
-						if (++accessCount === 2) release();
-						await both;
-						if (!granted) throw new Error("base profile denied");
-					},
-				};
-			},
-			(tool, path) => lock.beginPathExecution(tool, path).action,
-		);
-		const tool = bindOwnedTool(createReadTool(cwd, { operations }), lock);
-		const order = reverse ? [1, 0] : [0, 1];
-		const results = await Promise.allSettled(
-			order.map((i) => tool.execute(String(i), inputs[i], undefined, undefined, ctx)),
-		);
-		expect(results[order.indexOf(0)]?.status).toBe("fulfilled");
-		expect(results[order.indexOf(1)]).toMatchObject({
-			status: "rejected",
-			reason: expect.objectContaining({ message: expect.stringContaining("base profile denied") }),
-		});
-		expect(new Set(selected.map((entry) => entry.hash)).size).toBe(2);
-		expect(lock.entries().every((entry) => entry.state === "consumed")).toBe(true);
-	});
+	it.each([false, true])(
+		"keeps concurrent same-path read grants separate through gate and real pi tools (reverse=%s)",
+		async (reverse) => {
+			const profile = defaultProfile({ cwd, home, agentDir: `${home}/.pi/agent` });
+			profile.sandbox.readDeny.push("/work/private");
+			profile.sandbox.grantableReadDeny.push("/work/private");
+			const lock = new ActionLock();
+			const inputs = [
+				{ path: "/work/private/notes", limit: 1, allow_read: "/work/private" },
+				{ path: "/work/private/notes", offset: 2, limit: 1 },
+			];
+			const deps = { profile, cwd, home, owned: OWNED_TOOLS, lock, escalator: { confirm: async () => true } };
+			for (const [i, input] of inputs.entries())
+				expect((await decide({ toolName: "read", toolCallId: String(i), input }, deps)).block).toBe(false);
+			const selected: Array<{ hash: string; granted: boolean }> = [];
+			let accessCount = 0;
+			let release!: () => void;
+			const both = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const operations = createReadOperations(
+				(action) => {
+					const granted = action?.capability?.kind === "read";
+					selected.push({ hash: action?.hash ?? "missing", granted });
+					return {
+						...memoryFs(),
+						access: async () => {
+							if (++accessCount === 2) release();
+							await both;
+							if (!granted) throw new Error("base profile denied");
+						},
+					};
+				},
+				(tool, path) => lock.beginPathExecution(tool, path).action,
+			);
+			const tool = bindOwnedTool(createReadTool(cwd, { operations }), lock);
+			const order = reverse ? [1, 0] : [0, 1];
+			const results = await Promise.allSettled(
+				order.map((i) => tool.execute(String(i), inputs[i], undefined, undefined, ctx)),
+			);
+			expect(results[order.indexOf(0)]?.status).toBe("fulfilled");
+			expect(results[order.indexOf(1)]).toMatchObject({
+				status: "rejected",
+				reason: expect.objectContaining({ message: expect.stringContaining("base profile denied") }),
+			});
+			expect(new Set(selected.map((entry) => entry.hash)).size).toBe(2);
+			expect(lock.entries().every((entry) => entry.state === "consumed")).toBe(true);
+		},
+	);
 
 	it("refuses changed input, cwd, IDs and replay before touching the helper", async () => {
 		const lock = new ActionLock();
