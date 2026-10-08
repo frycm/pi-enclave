@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { assertMounts, compileMounts } from "../../src/backend/container/mounts.ts";
+import { assertMounts, assertUnexposed, compileMounts } from "../../src/backend/container/mounts.ts";
 import { CONTAINER_SECCOMP } from "../../src/backend/container/seccomp.ts";
 import type { Profile } from "../../src/backend/types.ts";
 
@@ -81,5 +81,13 @@ describe("container mount authority", () => {
 		symlinkSync(join(f.workspace, "nested", "secrets"), alias);
 		f.profile.readDeny = [alias];
 		expect(f.compile).toThrow(/unsafe nested denial alias/);
+	});
+	it("refuses engine storage descendants and socket paths through aliased ancestors", () => {
+		const f = fixture();
+		const alias = join(f.root, "engine-alias");
+		symlinkSync(f.workspace, alias);
+		expect(() => assertUnexposed([f.workspace], [join(alias, "engine.sock")])).toThrow(/cannot be exposed/);
+		expect(() => assertUnexposed([join(f.workspace, "nested")], [f.workspace])).toThrow(/cannot be exposed/);
+		expect(() => assertUnexposed([f.workspace], [join(f.root, "separate-store")])).not.toThrow();
 	});
 });

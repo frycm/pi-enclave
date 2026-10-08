@@ -35,7 +35,7 @@ import type {
 	SandboxBackend,
 	Violation,
 } from "../types.ts";
-import { assertMounts, compileMounts, containerPath, type MountPlan } from "./mounts.ts";
+import { assertMounts, assertUnexposed, compileMounts, containerPath, type MountPlan } from "./mounts.ts";
 import { CONTAINER_SECCOMP } from "./seccomp.ts";
 
 const exec = promisify(execFile);
@@ -213,8 +213,6 @@ export class ContainerBackend implements SandboxBackend {
 		const roots = [...profile.writableRoots, ...profile.readableRoots];
 		const safety = hostExecutableSafety(profile.writableRoots, [this.settings.binary, process.execPath]);
 		if (!safety.ok) throw new Error(safety.detail);
-		if (roots.some((root) => isUnder(this.root as string, root) || isUnder(root, this.root as string)))
-			throw new Error("pi-enclave: container control state must be outside exposed roots");
 		const engine = this.engineIdentity as {
 			store?: string;
 			runRoot?: string;
@@ -222,12 +220,14 @@ export class ContainerBackend implements SandboxBackend {
 			runtime?: { path?: string };
 			conmon?: { path?: string };
 		};
-		if (
-			[engine.store, engine.runRoot, engine.root, this.settings.socket]
-				.filter(Boolean)
-				.some((path) => roots.some((root) => isUnder(path as string, root)))
-		)
-			throw new Error("pi-enclave: engine storage and sockets cannot be exposed to the child");
+		assertUnexposed(roots, [
+			this.root as string,
+			this.controlRoot,
+			engine.store ?? "",
+			engine.runRoot ?? "",
+			engine.root ?? "",
+			this.settings.socket,
+		]);
 		const runtimeSafety = hostExecutableSafety(
 			profile.writableRoots,
 			[engine.runtime?.path, engine.conmon?.path].filter((p): p is string => !!p),
@@ -371,11 +371,17 @@ export class ContainerBackend implements SandboxBackend {
 		// HelperFsClient's protocol/ready failures request SIGKILL. The supervisor must first reap the container.
 		const kill = child.kill.bind(child);
 		child.kill = (signal) => kill(signal === "SIGKILL" ? "SIGTERM" : signal);
+		let diagnostic = "";
+		child.stderr.on("data", (chunk: Buffer) => {
+			diagnostic = (diagnostic + chunk.toString()).slice(-8192);
+		});
 		const completion = new Promise<number | null>((resolve, reject) => {
 			child.once("error", reject);
 			child.once("close", (code) => {
 				if (code === 125)
-					this.failure = new Error("pi-enclave: container supervisor failed; refusing further execution");
+					this.failure = new Error(
+						`pi-enclave: container supervisor failed; refusing further execution.\n${diagnostic.trim()}`,
+					);
 				resolve(code);
 			});
 		});

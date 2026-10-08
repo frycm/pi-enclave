@@ -44,6 +44,15 @@ export function assertMounts(plan: MountPlan): void {
 	}
 }
 
+/** Exclude both ancestors and descendants, including aliases such as /var/run -> /run. */
+export function assertUnexposed(roots: readonly string[], protectedPaths: readonly string[]): void {
+	for (const protectedPath of protectedPaths.filter(Boolean)) {
+		const target = canonical(protectedPath);
+		if (roots.some((root) => isUnder(target, canonical(root)) || isUnder(canonical(root), target)))
+			throw new Error(`pi-enclave: engine/control path cannot be exposed: ${protectedPath}`);
+	}
+}
+
 /** Pin every ancestor of a nested denial as a mount, so renaming it cannot uncover the source. */
 export function compileMounts(profile: Profile, emptyDir: string, emptyFile: string): MountPlan {
 	const identities = new Map<string, string>();
