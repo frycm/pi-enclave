@@ -314,7 +314,7 @@ export class ContainerBackend implements SandboxBackend {
 			`--security-opt=seccomp=${join(this.root as string, "seccomp.json")}`,
 			"--read-only",
 			"--ipc=private",
-			"--pid=private",
+			this.name === "docker" ? "--pid=" : "--pid=private",
 			"--cgroupns=private",
 			"--pids-limit=256",
 			"--memory=512m",

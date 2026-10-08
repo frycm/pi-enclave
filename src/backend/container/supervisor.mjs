@@ -66,7 +66,7 @@ try {
 	}
 } catch (error) {
 	creating = false;
-	process.stderr.write(`pi-enclave: container supervisor: ${error.message}\n`);
+	process.stderr.write(`pi-enclave: container supervisor: ${error.stderr?.trim() || error.message}\n`);
 	try {
 		await remove();
 	} catch (cleanupError) {

@@ -61,10 +61,26 @@ export function compileMounts(profile: Profile, emptyDir: string, emptyFile: str
 		...(profile.readableRoots ?? []).map((path) => ({ path, readonly: true })),
 		...profile.writableRoots.map((path) => ({ path, readonly: false })),
 	].filter(({ path }) => path !== "/tmp/claude");
-	const reserved = ["/", "/proc", "/sys", "/dev", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/enclave"];
+	const reserved = [
+		"/",
+		"/tmp",
+		"/proc",
+		"/sys",
+		"/dev",
+		"/usr",
+		"/bin",
+		"/sbin",
+		"/lib",
+		"/lib64",
+		"/etc",
+		"/enclave",
+	];
 	for (const { path, readonly } of roots.sort((a, b) => a.path.length - b.path.length)) {
 		containerPath(path);
-		if (reserved.some((root) => root === path || (root !== "/" && isUnder(path, root))))
+		if (
+			reserved.some((root) => root === path || (!["/", "/tmp"].includes(root) && isUnder(path, root))) ||
+			isUnder(path, "/tmp/claude")
+		)
 			throw new Error(`pi-enclave: container runtime path cannot be a host mount: ${path}`);
 		if (realpathSync(path) !== path) throw new Error(`pi-enclave: host mount must be canonical: ${path}`);
 		const stat = lstatSync(path);

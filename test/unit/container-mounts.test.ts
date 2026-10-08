@@ -48,6 +48,8 @@ describe("container mount authority", () => {
 		expect(f.compile).toThrow(/under a read denial/);
 		f.profile.readableRoots = ["/usr"];
 		expect(f.compile).toThrow(/runtime path/);
+		f.profile.readableRoots = ["/tmp"];
+		expect(f.compile).toThrow(/runtime path/);
 	});
 	it("refuses missing and symlinked nested deny topology", () => {
 		const f = fixture();
