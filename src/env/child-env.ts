@@ -88,6 +88,8 @@ export const CREDENTIAL_DENY_PATTERNS = [
 	"KUBECONFIG",
 	"DOCKER_HOST",
 	"PI_*",
+	// SRT composes this into its launch argv; it must not carry host JVM options.
+	"JAVA_TOOL_OPTIONS",
 ] as const;
 
 /**

@@ -41,7 +41,7 @@ afterAll(() => {
 	else process.env.PATH = ambientPath;
 });
 
-const report = probeHost("0.85.0");
+const report = probeHost("1.1.0");
 
 /**
  * Inside a container, capability-bearing user namespaces are unavailable and

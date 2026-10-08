@@ -1,5 +1,5 @@
 /**
- * A fake pi, built to the semantics verified in 0.84.2 rather than to what is
+ * A fake pi, built to the semantics verified in 1.1.0 rather than to what is
  * convenient.
  *
  * Three of those semantics are the whole reason this harness exists, and a
@@ -12,13 +12,14 @@
  * 2. **A handler that throws is not caught**, and the tool does not run. So a
  *    frozen input mutated by a later handler fails the call closed. The harness
  *    lets the throw escape and records the call as errored.
- * 3. **A batch's `tool_call` events all complete before any tool executes.**
+ * 3. **A parallel batch's `tool_call` events complete before any tool executes.**
  *    This is the window the execute-time re-check exists for: blocking a call
  *    cannot un-prepare a sibling that was already prepared.
  *
- * Sources: `runner.ts:932-953` (handler loop, no clone, no catch),
- * `agent-loop.ts:489-554` (prepare-all-then-execute), `agent-session.ts:491`
- * (`input` is the object `execute` receives).
+ * Sources on v1.1.0: extensions/runner.ts (emitToolCall), agent-loop.ts
+ * (prepareToolCall and executeToolCallsParallel), agent-session.ts (_beforeToolCall).
+ * The installed session's nested path is exercised separately in
+ * test/unit/pi-1.1-integration.test.ts. Sequential tools prepare per call.
  */
 
 export interface FakeToolCallEvent {

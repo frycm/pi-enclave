@@ -58,8 +58,10 @@ describe("reviewer model transport", () => {
 
 		const [, context, options] = fake.complete.mock.calls[0] ?? [];
 		expect(context).toMatchObject({
-			systemPrompt: "reviewer system",
-			messages: [{ role: "user", content: [{ type: "text", text: '{"action":"evidence"}' }] }],
+			messages: [
+				{ role: "system", content: [{ type: "text", text: "reviewer system" }] },
+				{ role: "user", content: [{ type: "text", text: '{"action":"evidence"}' }] },
+			],
 		});
 		expect(context).not.toHaveProperty("tools");
 		expect(options).toMatchObject({

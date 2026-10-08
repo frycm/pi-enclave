@@ -727,7 +727,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_tree", (_event, ctx) => restoreBranch(ctx));
 
 	pi.on("session_start", async (_event, ctx) => {
-		// Pi 0.85 executes built-in operations relative to ctx.cwd. SDK sessions
+		// Pi 1.1 executes built-in operations relative to ctx.cwd. SDK sessions
 		// can differ from process.cwd(), so policy, hashes and grep must agree.
 		cwd = ctx.cwd;
 		actionReviewer = undefined;

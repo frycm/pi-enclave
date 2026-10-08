@@ -8,8 +8,9 @@ mutations and boundary crossings — never for the decisions that must be determ
 Designed to be trustworthy **offline, with open-weight models**.
 
 > [!IMPORTANT]
-> **Status: Phases 1 and 2 are merged. Phase 3 is implemented on the current development
-> branch and is being validated; Phases 4 and 5 remain design.**
+> **Status: Phases 1–3 are merged. Phase 4a has experimental offline Docker and
+> Podman backends in draft PR #8; production uses the native sandbox. Egress and
+> the Phase 5 ops broker remain design.**
 >
 > **Built and tested:** the OS-enforced sandbox (L2), the deterministic policy layer (L1),
 > human escalation (L4), the action lock, the circuit breaker, the audit log, and the
@@ -21,13 +22,14 @@ Designed to be trustworthy **offline, with open-weight models**.
 > [Phase 1 plan](docs/phase-1-plan.md), the [Phase 2 plan](docs/phase-2-plan.md) and the
 > [sandbox-runtime findings](docs/step-0-srt-findings.md).
 >
-> **Phase 3 branch:** isolated named-model review, strict structured output, provenance-
+> **Phase 3:** isolated named-model review, strict structured output, provenance-
 > labelled evidence, deterministic risk floors, qualification records and corpus,
 > conservative read-only classification, rulebook critique, and reviewed one-shot read
 > grants are implemented. A named reviewer still fails closed until that exact model,
 > prompt, corpus and sampling configuration passes the local qualification command.
 >
-> **Not built:** the Phase 4 egress proxy and Docker backend, and the Phase 5 ops broker.
+> **Not integrated:** the Phase 4 container backends. **Not built:** the egress proxy
+> and the Phase 5 ops broker.
 > Sections describing them are design commitments, not descriptions of working software.
 >
 > **Known gaps in what *is* built** are listed under [Phase 1 status](#phase-1-status),
@@ -41,8 +43,8 @@ Every integration claim below is made against a specific pi:
 |---|---|
 | Repository | [`earendil-works/pi`](https://github.com/earendil-works/pi) (formerly `badlogic/pi-mono`; not the unrelated `badlogic/pi` GPU-pod CLI) |
 | Package | `@earendil-works/pi-coding-agent` |
-| Supported range | **`>=0.85.0 <0.86.0`** — bounded on both sides; development dependency pinned to **`0.85.0`** |
-| Reference commit | [`107d79f`](https://github.com/earendil-works/pi/tree/107d79f11072bbc8a3a757ed7fd69596bee7d68c) — upstream **v0.85.0**, released September 4, 2026 |
+| Supported range | **`>=1.1.0 <1.2.0`** — bounded on both sides; development dependency pinned to **`1.1.0`** |
+| Reference commit | [`abe508e`](https://github.com/earendil-works/pi/tree/abe508e1b89912adde45528136c3221eb69acdd7) — upstream **v1.1.0**, released October 7, 2026 |
 | Node | **`>=22.19.0`**, matching the pinned pi release |
 | Fork for core changes | [`frycm/pi`](https://github.com/frycm/pi) — always rebased onto the **latest stable upstream release**; carries only the patches listed under [core changes](#core-changes-to-propose-to-pi) |
 
@@ -51,16 +53,11 @@ it** — on an older pi *and* on a newer one. A newer minor may change hook sema
 ordering, `tool_call` result shape, tool operation interfaces) in ways the conformance suite
 has not seen, and "probably fine" is not a sandbox guarantee.
 
-The v0.85.0 package imports `@earendil-works/pi-server` through its root export without
-declaring that dependency. pi-enclave explicitly pins `@earendil-works/pi-server@0.85.0`
-to keep SDK imports and the standalone CLI working. Remove this workaround only after an
-upstream release fixes the package dependency and a clean-install import check passes.
-Policy initialization uses `ctx.cwd`, matching v0.85.0's tool execution in SDK sessions.
-
-The September 5 baseline update has local type, unit and policy validation; the native
-Linux/macOS matrix must be rerun on this update before merge. The existing green matrix
-was run with pi v0.84.2. See the [whole-project review](docs/project-review-2026-09-05.md)
-for Phase 3 blockers and the proposed release gates.
+The pi v1.1.0 root import no longer requires the old `pi-server` packaging workaround;
+that dependency has been removed. Policy initialization continues to use `ctx.cwd`.
+The [pi 1.1 migration review](docs/pi-1.1-upgrade.md) records execution-path changes,
+MCP credential protection, reviewer transport migration and validation evidence. Native
+Linux/macOS conformance on the upgrade commit is required before merge.
 
 Moving the baseline is one PR that does all of the following together, or none of it:
 
@@ -377,7 +374,7 @@ kernel denies it, the helper reports a `Violation` exactly as a shell command wo
 
 This also handles a concrete gap in pi's current `grep` tool: its operations object only
 abstracts the filesystem walk, while the tool itself still
-[spawns `rg` directly](https://github.com/earendil-works/pi/blob/107d79f11072bbc8a3a757ed7fd69596bee7d68c/packages/coding-agent/src/core/tools/grep.ts#L139-L190)
+[spawns `rg` directly](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/src/core/tools/grep.ts#L139-L190)
 from the pi process. pi-enclave therefore re-registers `grep` with its own implementation
 that runs `rg` inside the helper, rather than reusing its unsandboxed execution path.
 
@@ -500,7 +497,7 @@ are reached by **pi itself**, not from inside the sandbox.
 
 Everything below uses APIs that exist in pi at the [baseline](#api-baseline). pi already
 ships an
-[SRT-based sandbox extension example](https://github.com/earendil-works/pi/blob/107d79f11072bbc8a3a757ed7fd69596bee7d68c/packages/coding-agent/examples/extensions/sandbox/index.ts)
+[SRT-based sandbox extension example](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/examples/extensions/sandbox/index.ts)
 that overrides `bash`; pi-enclave's contribution is not another Seatbelt/bwrap wrapper but
 complete tool coverage, monotonic policy, exact approval binding, auditability and reviewer
 evaluation on top of one.
@@ -528,10 +525,16 @@ evaluation on top of one.
 > extension loads first inherits the grant. This is the honest answer until pi core offers
 > a sandbox hook for tool execution — see [core changes](#core-changes-to-propose-to-pi).
 >
-> **pi 0.85.0 has no built-in MCP support** — third-party extensions can supply it.
-> Earlier drafts of this document said "MCP and custom tools"; there is only the second
-> kind. An MCP bridge, when one exists, will be an extension registering ordinary tools,
-> and the allowlist covers it unchanged.
+> **Pi 1.1 includes MCP, codemode and PowerShell.** They are outside enclave's owned
+> tool set and denied by default. Deferred tools and codemode child calls pass through
+> the same gate; being callable does not grant permission. Codemode's credentialed
+> `models.classify()` and `models.generateImages()` calls do not emit child `tool_call`
+> events, so an explicit codemode grant authorizes more than nested filesystem tools.
+> MCP server startup, connection and authentication run in the trusted pi process;
+> denying its tools does not sandbox or stop that activity. MCP `source` pins identify
+> the registering extension, not the server URL or executable. Keep configuration
+> trusted and immutable during the session. MCP OAuth storage and server configuration
+> are included in built-in read denials.
 
 ---
 
@@ -808,10 +811,8 @@ mutating, so that predicate is a policy contract, not an implementation detail:
 
 ### Inspecting and critiquing the rulebook
 
-`pi enclave …` **is not possible**: pi 0.85.0's subcommand set is closed (`install`,
-`remove`, `update`, `list`, `config`, `auth`) and any other bare word on its command line
-becomes a prompt for the model, so `pi enclave approve` would ask the agent to do something
-called "enclave approve". Out-of-session commands ship as their own `pi-enclave` binary.
+`pi enclave …` is not a registered pi v1.1 subcommand. Out-of-session commands ship as
+their own `pi-enclave` binary, preventing an approval request from becoming an agent prompt.
 Read-only inspection is also available through `/enclave …`, but approval intentionally is
 not: the decision must happen outside the session the agent is driving.
 
@@ -1022,7 +1023,7 @@ turns a performance feature into an authorization replay surface.
 ### Attendance is a setting, not an inference
 
 An earlier draft inferred "a human is present" from `ctx.hasUI`. That is wrong on current pi:
-[`ctx.hasUI` is `true` in both TUI and RPC modes](https://github.com/earendil-works/pi/blob/107d79f11072bbc8a3a757ed7fd69596bee7d68c/packages/coding-agent/docs/extensions.md#L972-L974),
+[`ctx.hasUI` is `true` in both TUI and RPC modes](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/docs/extensions.md),
 and an RPC client may be a headless orchestrator with nobody behind it — the worst possible
 place to show a confirm dialog whose default resolves to "approved". Attendance is therefore
 an **explicit contract**:
@@ -1040,8 +1041,8 @@ attended: {
 | `"rpc"` | A person is behind an RPC client that has opted in | The client must complete the **approval-channel handshake** below, built only from `ctx.ui.input` / `ctx.ui.confirm`. No handshake → treated as `"off"` for this session, and the status line says so. |
 | `"off"` | Nobody is there (CI, ops runner, print mode) | Every `ask` is a deny; no dialog is ever attempted |
 
-**The RPC handshake, on pinned pi.** pi 0.85.0 gives an extension exactly the fixed
-[`extension_ui_request` methods](https://github.com/earendil-works/pi/blob/107d79f11072bbc8a3a757ed7fd69596bee7d68c/packages/coding-agent/src/modes/rpc/rpc-types.ts#L246-L281)
+**The RPC handshake, on pinned pi.** pi 1.1.0 gives an extension exactly the fixed
+[`extension_ui_request` methods](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/src/modes/rpc/rpc-types.ts)
 — `select`, `confirm`, `input`, `editor`, plus fire-and-forget — and nothing custom. So the
 handshake is a defined use of `ctx.ui.input`, not a new message type:
 
@@ -1353,7 +1354,7 @@ matrix is green on both backends in CI, on a real Linux host rather than a conta
 See [Phase 2 status](#phase-2-status) for what this cost, what it corrected in this
 document, and what it does not cover.
 
-### Phase 3 — Reviewer 🧪 implemented on this branch
+### Phase 3 — Reviewer ✅ merged; live qualification evidence outstanding
 
 *Outcome: mutations and boundary crossings get a model opinion, and small local models are admitted only
 after passing the eval.*
@@ -1667,7 +1668,7 @@ quietly absorbs its own corrections teaches nobody anything.
 
 ## Phase 3 status
 
-The current branch implements the reviewer milestone without changing the trust boundary:
+The implementation includes the reviewer milestone without changing the trust boundary:
 the model advises on L1-undecided actions, while L1, L2, deterministic minimum risk and
 human-only decisions remain authoritative.
 
@@ -1741,7 +1742,7 @@ reviewer or sandbox extension *robust* rather than merely careful:
    the channel, can be bound to a secret the client holds.
 
 These are proposals for [`frycm/pi`](https://github.com/frycm/pi), with pi-enclave as the
-motivating use case. As of September 5, 2026, the fork is exactly upstream v0.85.0 and
+motivating use case. The pi v1.1 migration advances the fork to the exact stable upstream v1.1.0 tag and
 contains no prototype patches. The fork's policy is fixed: it is **always rebased
 onto the latest stable upstream release** and carries *only* the patches above as discrete
 commits on top — no divergent features, no long-lived branch. pi-enclave itself targets

@@ -174,24 +174,21 @@ describe("parseShell", () => {
 		});
 
 		// Argument expansion can select a sensitive dispatcher verb or path.
-		it.each([
-			"echo $HOME",
-			"npm run $script",
-			"cat $file",
-			'x=reset; git "$x" --hard',
-		])("%s is not confident", (command) => {
-			expect(parseShell(command).confident).toBe(false);
-		});
+		it.each(["echo $HOME", "npm run $script", "cat $file", 'x=reset; git "$x" --hard'])(
+			"%s is not confident",
+			(command) => {
+				expect(parseShell(command).confident).toBe(false);
+			},
+		);
 
-		it.each([
-			'TARGET=.github/workflows/ci.yml; echo pwn > "$TARGET"',
-			'tee "$TARGET"',
-			"dd if=/dev/zero of=$TARGET",
-		])("%s escalates because a write target is expanded", (command) => {
-			const parsed = parseShell(command);
-			expect(parsed.confident).toBe(false);
-			expect(parsed.markers).toContain("param-expansion");
-		});
+		it.each(['TARGET=.github/workflows/ci.yml; echo pwn > "$TARGET"', 'tee "$TARGET"', "dd if=/dev/zero of=$TARGET"])(
+			"%s escalates because a write target is expanded",
+			(command) => {
+				const parsed = parseShell(command);
+				expect(parsed.confident).toBe(false);
+				expect(parsed.markers).toContain("param-expansion");
+			},
+		);
 	});
 
 	describe("hidden filesystem effects", () => {

@@ -11,9 +11,9 @@
  */
 
 /** Inclusive lower bound of the supported pi range. */
-export const PI_RANGE_MIN = "0.85.0";
+export const PI_RANGE_MIN = "1.1.0";
 /** Exclusive upper bound. A new minor may change hook semantics the conformance suite has not seen. */
-export const PI_RANGE_MAX = "0.86.0";
+export const PI_RANGE_MAX = "1.2.0";
 
 /** Minimum Node for the pinned pi release (also satisfies sandbox-runtime). */
 export const NODE_RANGE_MIN = "22.19.0";
@@ -78,9 +78,9 @@ export interface ProbeEnv {
 //
 // A dependency-free comparator for the `x.y.z[-prerelease]` versions we care
 // about. Semver orders a prerelease before its release, which puts
-// `0.86.0-rc.1` *inside* a `< 0.86.0` bound -- the opposite of what the bound
+// `1.2.0-rc.1` *inside* a `< 1.2.0` bound -- the opposite of what the bound
 // means here. The upper bound exists because an unseen minor may change hook
-// semantics, and an 0.86 release candidate contains exactly those unseen
+// semantics, and a 1.2 release candidate contains exactly those unseen
 // changes. So the range check compares the exclusive upper bound on the core
 // version alone, ignoring prerelease ordering in that direction.
 // ---------------------------------------------------------------------------

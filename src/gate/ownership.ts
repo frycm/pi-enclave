@@ -2,12 +2,12 @@
  * Who owns the tools, and what else is loaded.
  *
  * The README described this as a load-order check against an extension that
- * registers `bash` *after* pi-enclave. Verified against pi 0.84.2, the
+ * registers `bash` *after* pi-enclave. Verified against pi 1.1.0, the
  * direction is the other way round, and the difference decides what the check
  * has to be:
  *
  * - Within one extension, the last `registerTool` for a name wins.
- * - **Across extensions, the first in load order wins** (`runner.ts:451-461`):
+ * - **Across extensions, the first in load order wins** (`runner.ts:getAllRegisteredTools`):
  *   a later extension cannot displace an earlier one's tool.
  * - Extension tools always override built-ins.
  *
