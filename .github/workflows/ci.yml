@@ -6,6 +6,35 @@ on:
   pull_request:
 
 jobs:
+  container:
+    name: Offline container boundary (${{ matrix.engine }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [docker, podman]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install rootless Podman
+        if: matrix.engine == 'podman'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs
+          # Qualify the same capability-bearing userns host configuration as bwrap.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Build the reviewed fixture and record its immutable image ID
+        env:
+          ENGINE: ${{ matrix.engine }}
+        run: |
+          "$ENGINE" build -f docker/Dockerfile.conformance --iidfile /tmp/enclave-image-id docker
+          echo "PI_ENCLAVE_TEST_CONTAINER_ENGINE=$ENGINE" >> "$GITHUB_ENV"
+          echo "PI_ENCLAVE_TEST_CONTAINER_IMAGE=$(cat /tmp/enclave-image-id)" >> "$GITHUB_ENV"
+      - run: npm run test:container
   check:
     name: Typecheck and lint
     runs-on: ubuntu-latest

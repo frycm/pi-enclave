@@ -34,8 +34,9 @@ import {
 	validateWriteCapability,
 } from "./backend/capability.ts";
 import { canonical as canonicalPath, isUnder } from "./backend/paths.ts";
+import { selectBackend } from "./backend/select.ts";
 import { SrtBackend } from "./backend/srt.ts";
-import type { CompiledProfile, FsClient, FsClientLease, Violation } from "./backend/types.ts";
+import type { CompiledProfile, FsClient, FsClientLease, SandboxBackend, Violation } from "./backend/types.ts";
 import { type EnclaveState, handleEnclaveCommand, renderStatusLine } from "./commands/enclave.ts";
 import { OWNED_TOOLS } from "./config/defaults.ts";
 import { createDevProfile, toBackendProfile } from "./config/profile.ts";
@@ -162,9 +163,10 @@ type ConfirmFn = (
 ) => Promise<boolean>;
 
 export default function (pi: ExtensionAPI): void {
-	const report = probeHost(PI_VERSION ?? null);
+	const nativeReport = probeHost(PI_VERSION ?? null);
+	let report = nativeReport;
 	let cwd = process.cwd();
-	const backend = new SrtBackend();
+	let backend: SandboxBackend = new SrtBackend();
 
 	// The zero-configuration profile until the fold runs at session start. It is
 	// never what a session executes under -- session_start replaces it -- but a
@@ -312,7 +314,7 @@ export default function (pi: ExtensionAPI): void {
 	const state = (): EnclaveState => ({
 		report,
 		backendName: backend.name,
-		weakened: backend.weakened,
+		weakened: backend.weakened ?? false,
 		profile,
 		compiled,
 		violations,
@@ -365,7 +367,7 @@ export default function (pi: ExtensionAPI): void {
 	// point of step 7 being invisible in the one place a user looks.
 	backend.onFsViolation = (violation) => recordViolations([violation], true);
 
-	if (!report.ok) {
+	if (report.checks.some((check) => ["pi-version", "node-version"].includes(check.id) && check.status === "fail")) {
 		// Refuse loudly, on stderr, at load time. ctx.ui.notify from session_start
 		// fires and returns cleanly in --print mode but never reaches stdout, and
 		// unattended is exactly where a silent fail-closed is most dangerous.
@@ -383,17 +385,19 @@ export default function (pi: ExtensionAPI): void {
 	 * remediation the stderr line gave.
 	 */
 	const requireCompiled = (): CompiledProfile => {
-		if (!report.ok) throw new Error(`pi-enclave: refusing to run unsandboxed.\n${formatProbeReport(report)}`);
 		// A rejected configuration is a refusal, not a fallback to the defaults.
 		// Falling back would run the session under a profile nobody chose, which
 		// is exactly the "half-applied configuration" the loader refuses to build.
 		if (configError) throw new Error(configError);
+		if (!report.ok) throw new Error(`pi-enclave: refusing to run unsandboxed.\n${formatProbeReport(report)}`);
 		if (!compiled) throw new Error("pi-enclave: sandbox is not ready");
 		return compiled;
 	};
 
 	const operations = createEnclaveBashOperations({
-		backend,
+		get backend() {
+			return backend;
+		},
 		getCompiled: requireCompiled,
 		onViolations: (found) => recordViolations(found, true),
 		onDeniedReadAttempt: (paths) => recordRuntimeViolation(breaker, currentTurn, paths.length, true),
@@ -412,7 +416,9 @@ export default function (pi: ExtensionAPI): void {
 	 * still stops it once a turn has been shut down.
 	 */
 	const userBashOperations = createEnclaveBashOperations({
-		backend,
+		get backend() {
+			return backend;
+		},
 		getCompiled: requireCompiled,
 		onViolations: (found) => recordViolations(found, false),
 		guard: () => {
@@ -426,6 +432,8 @@ export default function (pi: ExtensionAPI): void {
 	const fsClient = (action?: import("./policy/canonical.ts").CanonicalAction) => {
 		const compiledProfile = requireCompiled();
 		if (action?.capability?.kind === "read") {
+			if (!backend.fsWithReadCapability)
+				throw new Error("pi-enclave: this backend does not support reviewed read leases");
 			return backend.fsWithReadCapability(compiledProfile, action.capability.value, action.hash, action.cwd);
 		}
 		return backend.fs(compiledProfile);
@@ -533,8 +541,8 @@ export default function (pi: ExtensionAPI): void {
 	 * exists to prevent.
 	 */
 	pi.on("tool_call", async (event) => {
-		if (!report.ok) return { block: true, reason: formatProbeReport(report) };
 		if (configError) return { block: true, reason: configError };
+		if (!report.ok) return { block: true, reason: formatProbeReport(report) };
 		if (ownershipError) return { block: true, reason: ownershipError };
 		if (!effective) return { block: true, reason: "pi-enclave: no policy is loaded yet, so nothing may run." };
 
@@ -727,6 +735,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_tree", (_event, ctx) => restoreBranch(ctx));
 
 	pi.on("session_start", async (_event, ctx) => {
+		compiled = undefined;
 		// Pi 1.1 executes built-in operations relative to ctx.cwd. SDK sessions
 		// can differ from process.cwd(), so policy, hashes and grep must agree.
 		cwd = ctx.cwd;
@@ -735,12 +744,6 @@ export default function (pi: ExtensionAPI): void {
 		directInput.reset();
 		reviewAuthorization.length = 0;
 		reviewContext.length = 0;
-		if (!report.ok) {
-			ctx.ui.notify(formatProbeReport(report), "error");
-			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
-			return;
-		}
-
 		// Configuration is loaded here rather than at extension load because it
 		// depends on `ctx.isProjectTrusted()`, which only exists once there is a
 		// context. Refusals still go to stderr as well as to notify: in --print
@@ -759,6 +762,22 @@ export default function (pi: ExtensionAPI): void {
 		effective = loaded.profile;
 		provenance = loaded.provenance;
 		profile = toBackendProfile(loaded.profile, cwd);
+		try {
+			await backend.dispose();
+			const selected = await selectBackend(effective.sandbox.backend, PI_VERSION ?? null, {
+				nativeReport: nativeReport,
+			});
+			backend = selected.backend;
+			report = selected.report;
+			backend.onFsViolation = (violation) => recordViolations([violation], true);
+			if (!report.ok) throw new Error(formatProbeReport(report));
+		} catch (error) {
+			configError = (error as Error).message;
+			process.stderr.write(`${configError}\n`);
+			ctx.ui.notify(configError, "error");
+			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
+			return;
+		}
 		restoreBranch(ctx);
 
 		// Ownership is checked after the configuration, because the diagnosis is
@@ -935,7 +954,13 @@ export default function (pi: ExtensionAPI): void {
 			if (isBreakerState(entry.data)) breaker.restore(entry.data);
 		}
 
-		compiled = await backend.compile(profile);
+		try {
+			compiled = await backend.compile(profile);
+		} catch (error) {
+			configError = (error as Error).message;
+			ctx.ui.notify(configError, "error");
+			process.stderr.write(`${configError}\n`);
+		}
 		refreshStatusLine = () => ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
 		refreshStatusLine();
 	});

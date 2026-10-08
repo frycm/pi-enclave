@@ -104,6 +104,7 @@ export function renderConfig(profile: EffectiveProfile, provenance: Provenance):
 	);
 	lines.push("");
 	lines.push(`sandbox.mode           ${profile.sandbox.mode}`);
+	lines.push(`sandbox.backend        ${JSON.stringify(profile.sandbox.backend)}`);
 	lines.push(`sandbox.network        ${profile.sandbox.network.mode}`);
 	lines.push(`sandbox.capabilities   ${profile.sandbox.capabilities}`);
 	lines.push(`sandbox.hostExec       ${profile.sandbox.hostExec}`);
