@@ -24,6 +24,10 @@ TypeScript 7 and fast-check 4 required no compiler configuration or property-tes
 changes. Vitest 5 runs the existing isolated suites and their mocks with the
 existing configuration. Biome's schema was updated and four test files were
 reformatted; three equivalent optional-chain guards satisfy its newer lint rules.
+The approval tests now use a real temporary home: resolving their synthetic
+`/home/u` denial roots during PATH filtering hit macOS automounts and exceeded
+Vitest 5's test deadline. The fake-backend tests retain their approval and
+environment assertions, without changing production behavior or increasing timeouts.
 
 The published sandbox-runtime 0.0.73 and 0.0.79 artifacts were compared in the
 manager, configuration, Linux/macOS wrappers, and seccomp discovery. The manager

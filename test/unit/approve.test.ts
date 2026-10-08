@@ -1,7 +1,7 @@
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { canonical } from "../../src/backend/paths.ts";
 import type { CompiledProfile, FsClient, Profile, RunRequest, SandboxBackend } from "../../src/backend/types.ts";
 import { type ApproveIO, approve } from "../../src/cli/approve.ts";
@@ -11,7 +11,11 @@ import { pendingDirs, writePending } from "../../src/escalate/pending.ts";
 import { canonicalize } from "../../src/policy/canonical.ts";
 import { configHash } from "../../src/state/audit.ts";
 
-const OPTIONS = { cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" };
+// Keep host path resolution out of macOS /home automounts, even with a fake backend.
+const TEST_HOME = mkdtempSync(join(tmpdir(), "enclave-approve-home-"));
+afterAll(() => rmSync(TEST_HOME, { recursive: true, force: true }));
+
+const OPTIONS = { cwd: "/work", home: TEST_HOME, tmp: "/tmp", agentDir: join(TEST_HOME, ".pi", "agent") };
 const SESSION = "session-1";
 const NONCE = "0123456789abcdef0123456789abcdef";
 
@@ -97,7 +101,7 @@ function record(tool: string, input: Record<string, unknown>) {
 	return writePending({
 		stateRoot,
 		sessionId: SESSION,
-		action: canonicalize({ tool, input, cwd: "/work", home: "/home/u", profileName: "dev" }),
+		action: canonicalize({ tool, input, cwd: "/work", home: TEST_HOME, profileName: "dev" }),
 		profile: p,
 		configHash: configHash(p),
 		reason: "matches ask rule",
@@ -113,7 +117,7 @@ describe("approving a record", () => {
 			record: record("bash", { command: "git push origin main" }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: channel.make(false),
 			backend,
 		});
@@ -129,7 +133,7 @@ describe("approving a record", () => {
 			record: record("write", { path: "/work/prod", content, note: "safe\u202Eliated" }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: channel.make(false),
 			backend,
 		});
@@ -146,7 +150,7 @@ describe("approving a record", () => {
 			record: record("bash", { command: "git push origin main" }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend,
 		});
@@ -165,7 +169,7 @@ describe("approving a record", () => {
 				record: record("bash", { command: "env" }),
 				stateRoot,
 				current: profile(),
-				home: "/home/u",
+				home: TEST_HOME,
 				io: io().make(true),
 				backend,
 			});
@@ -181,7 +185,7 @@ describe("approving a record", () => {
 			record: record("bash", { command: "git push origin main" }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(false),
 			backend,
 		});
@@ -198,7 +202,7 @@ describe("approving a record", () => {
 			record: rec,
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend,
 			now: () => 2_000,
@@ -222,7 +226,7 @@ describe("approving a record", () => {
 			record: rec,
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend,
 			now: () => now,
@@ -241,7 +245,7 @@ describe("approving a record", () => {
 			record: record("bash", { command: "ls" }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend: new RecordingBackend(),
 		});
@@ -267,7 +271,7 @@ describe("approving a record", () => {
 			record: record("bash", { command: "ls" }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend,
 		});
@@ -282,7 +286,7 @@ describe("approving a record", () => {
 			record: record("write", { path: "/work/notes.md", content: "hello" }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend,
 		});
@@ -298,7 +302,7 @@ describe("approving a record", () => {
 			record: record("write", { path: "notes.md", content: "hi" }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend,
 		});
@@ -312,7 +316,7 @@ describe("approving a record", () => {
 			record: record("write", { file_path: "/work/x", content: "y" }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend,
 		});
@@ -329,7 +333,7 @@ describe("approving a record", () => {
 			record: record("edit", { path: "/work/x", oldString: "a", newString: "b" }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: channel.make(true),
 			backend,
 		});
@@ -348,7 +352,7 @@ describe("approving a record", () => {
 			current: profile((p) => {
 				p.sandbox.writableRoots.push("/etc");
 			}),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: channel.make(true),
 			backend,
 		});
@@ -370,7 +374,7 @@ describe("approving a record", () => {
 				tool: "bash",
 				input: { command: "touch /etc/x", allow_write: "/etc/x" },
 				cwd: "/work",
-				home: "/home/u",
+				home: TEST_HOME,
 				profileName: "dev",
 			}),
 			profile: p,
@@ -382,7 +386,7 @@ describe("approving a record", () => {
 			record: rec,
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend,
 			platform: "linux",
@@ -398,7 +402,7 @@ describe("approving a record", () => {
 			record: record("bash", { command: "touch /work/output", allow_write: "/srv/unrelated" }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: channel.make(true),
 			backend,
 			platform: "linux",
@@ -414,12 +418,12 @@ describe("approving a record", () => {
 		const channel = io();
 		const result = await approve({
 			record: record("bash", {
-				command: "cat /home/u/.ssh/id_ed25519",
-				allow_write: "/home/u/.ssh/out",
+				command: `cat ${join(TEST_HOME, ".ssh", "id_ed25519")}`,
+				allow_write: join(TEST_HOME, ".ssh", "out"),
 			}),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: channel.make(true),
 			backend,
 			platform: "linux",
@@ -438,7 +442,7 @@ describe("approving a record", () => {
 			record: record("bash", { command: "touch /srv/result", allow_write: "/srv/result" }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: channel.make(true),
 			backend,
 			platform: "darwin",
@@ -462,7 +466,7 @@ describe("approving a record", () => {
 				tool: "bash",
 				input: { command: "cat /work/private/report", allow_read: "/work/private" },
 				cwd: "/work",
-				home: "/home/u",
+				home: TEST_HOME,
 				profileName: "dev",
 			}),
 			profile: p,
@@ -474,7 +478,7 @@ describe("approving a record", () => {
 			record: rec,
 			stateRoot,
 			current: p,
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend,
 			platform: "linux",
@@ -495,7 +499,7 @@ describe("approving a record", () => {
 				tool: "bash",
 				input: { command: "cat /work/private/report", allow_read: "/work/private" },
 				cwd: "/work",
-				home: "/home/u",
+				home: TEST_HOME,
 				profileName: "dev",
 			}),
 			profile: p,
@@ -507,7 +511,7 @@ describe("approving a record", () => {
 			record: rec,
 			stateRoot,
 			current: p,
-			home: "/home/u",
+			home: TEST_HOME,
 			io: channel.make(true),
 			backend,
 			platform: "linux",
@@ -527,7 +531,7 @@ describe("approving a record", () => {
 			record: rec,
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend,
 			assumeYes: true,
@@ -547,7 +551,7 @@ describe("approving a record", () => {
 			current: profile((p) => {
 				p.sandbox.writableRoots = ["/work"];
 			}),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: channel.make(false),
 			backend: new RecordingBackend(),
 		});
@@ -566,7 +570,7 @@ describe("approval execution parity", () => {
 			record: record("bash", { command: "sleep 60", ...(timeout === undefined ? {} : { timeout }) }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend,
 		});
@@ -579,7 +583,7 @@ describe("approval execution parity", () => {
 			record: record("bash", { command: "sleep 60", timeout }),
 			stateRoot,
 			current: profile(),
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend,
 		});
@@ -589,12 +593,12 @@ describe("approval execution parity", () => {
 	});
 	it.each([
 		["new/notes", "/work/new/notes", "/work/new"],
-		["~/notes", "/home/u/notes", "/home/u"],
+		["~/notes", join(TEST_HOME, "notes"), TEST_HOME],
 		["file:///work/new/notes", "/work/new/notes", "/work/new"],
 	])("creates the approved parent and resolves %s", async (path, expected, parent) => {
 		const backend = new RecordingBackend();
 		const current = profile((p) => {
-			p.sandbox.writableRoots.push("/home/u");
+			p.sandbox.writableRoots.push(TEST_HOME);
 		});
 		const result = await approve({
 			record: writePending({
@@ -604,7 +608,7 @@ describe("approval execution parity", () => {
 					tool: "write",
 					input: { path, content: "hello" },
 					cwd: "/work",
-					home: "/home/u",
+					home: TEST_HOME,
 					profileName: "dev",
 				}),
 				profile: current,
@@ -614,7 +618,7 @@ describe("approval execution parity", () => {
 			}).record,
 			stateRoot,
 			current,
-			home: "/home/u",
+			home: TEST_HOME,
 			io: io().make(true),
 			backend,
 		});
