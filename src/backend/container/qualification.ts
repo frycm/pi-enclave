@@ -262,11 +262,15 @@ export async function qualifyContainer(
 			assert(refused, "revoked helper lease survived");
 		});
 		await row("timeout-descendant-cleanup", async () => {
-			const result = await sh("setsid sh -c 'sleep 2; echo escaped > detached.txt' >/dev/null 2>&1 & sleep 30", {
-				timeout: 0.8,
-			});
+			const result = await sh(
+				"setsid sh -c 'echo started > detached-started; sleep 4; echo escaped > detached.txt' >/dev/null 2>&1 & sleep 30",
+				{
+					timeout: 2,
+				},
+			);
 			assert(result.exitCode === null, "timeout did not cancel");
-			await new Promise((resolve) => setTimeout(resolve, 2300));
+			assert(existsSync(join(workspace, "detached-started")), "timeout descendant positive control did not start");
+			await new Promise((resolve) => setTimeout(resolve, 4300));
 			let escaped = false;
 			try {
 				readFileSync(join(workspace, "detached.txt"));
@@ -288,7 +292,7 @@ export async function qualifyContainer(
 			const childScript = `import {ContainerBackend} from ${JSON.stringify(source)};
 const backend = new ContainerBackend(${JSON.stringify(backend.settings)}, ${JSON.stringify(join(root, "parent-control"))});
 const compiled = await backend.compile(${JSON.stringify(profile)});
-await backend.run(compiled, {command: "echo started > crash-started; setsid sh -c 'sleep 2; echo escaped > crash-escaped' >/dev/null 2>&1 & sleep 30", cwd:${JSON.stringify(workspace)},env:{},commandId:"parent-death"});`;
+await backend.run(compiled, {command: "setsid sh -c 'echo started > crash-started; sleep 2; echo escaped > crash-escaped' >/dev/null 2>&1 & sleep 30", cwd:${JSON.stringify(workspace)},env:{},commandId:"parent-death"});`;
 			const child = spawn(
 				process.execPath,
 				["--import", fileURLToPath(import.meta.resolve("tsx")), "--input-type=module", "-e", childScript],
