@@ -8,8 +8,8 @@ mutations and boundary crossings — never for the decisions that must be determ
 Designed to be trustworthy **offline, with open-weight models**.
 
 > [!IMPORTANT]
-> **Status: Phases 1–3 are merged. Phase 4a's experimental offline Docker and
-> Podman work remains unmerged; production uses the native sandbox. Egress and
+> **Status: Phases 1–3 are merged. Phase 4a adds locally qualified offline Docker
+> and rootless Podman on Linux/x86-64. Native sandboxing remains the default. Egress and
 > the Phase 5 ops broker remain design.**
 >
 > **Built and tested:** the OS-enforced sandbox (L2), the deterministic policy layer (L1),
@@ -28,9 +28,13 @@ Designed to be trustworthy **offline, with open-weight models**.
 > grants are implemented. A named reviewer still fails closed until that exact model,
 > prompt, corpus and sampling configuration passes the local qualification command.
 >
-> **Not integrated:** the Phase 4 container backends. **Not built:** the egress proxy
-> and the Phase 5 ops broker.
-> Sections describing them are design commitments, not descriptions of working software.
+> **Container support:** trusted user-global selection, immutable local images, per-action
+> containers and isolated file helpers, one-shot capabilities, and cleanup on cancellation
+> or parent death. Each host must pass `pi-enclave qualify-backend` before selection succeeds.
+> See [container setup and supported limits](docs/phase-4a-containers.md).
+>
+> **Not built:** the egress proxy and the Phase 5 ops broker. Sections describing them
+> are design commitments, not descriptions of working software.
 >
 > **Known gaps in what *is* built** are listed under [Phase 1 status](#phase-1-status),
 > [Phase 2 status](#phase-2-status), and [Phase 3 status](#phase-3-status).
@@ -253,14 +257,15 @@ particular command.
 ## Sandbox backends
 
 The backend is a small interface. The profile — what is readable, writable and reachable —
-is backend-independent and compiled per backend at session start. The target selection order
-after Phase 4 is native for the host OS → Docker → **refuse to enter auto mode**. Today it is
-native → refuse because the Docker backend is not implemented. There is never a silent
-unsandboxed fallback.
+is backend-independent and compiled per backend at session start. The default is native
+for the host OS. User-global `sandbox.backend` may select Docker or rootless Podman, or
+`auto` with one configured container fallback. `auto` uses native when its probe passes;
+otherwise the configured container must have an exact local qualification record. Failure
+refuses execution. See [configuration and qualification](docs/phase-4a-containers.md).
 
 ```ts
 interface SandboxBackend {
-  readonly name: "seatbelt" | "bwrap" | "docker";
+  readonly name: "seatbelt" | "bwrap" | "docker" | "podman";
   compile(profile: SandboxProfile): Promise<CompiledProfile>;
   run(compiled: CompiledProfile, request: RunRequest)
     : Promise<{ exitCode: number | null; violations: Violation[] }>;
@@ -351,8 +356,8 @@ const CHILD_ENV_BASE = [
   Phase-4 credential broker all run in pi's process; nothing inside the sandbox needs a
   credential to do the task. Compatible clients may receive scoped substitution through a
   TLS-terminating proxy; opaque CONNECT/SOCKS and certificate-pinned clients cannot.
-- The Docker backend builds the same `ChildEnv` into `docker exec -e`; it does not rely on
-  the container having a clean environment by accident.
+- Container commands and helpers enter through `env -i` with the same constructed
+  `ChildEnv`, clearing image `ENV` entries as well as host credentials.
 
 **Conformance case.** For every backend: set `ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`,
 `GITHUB_TOKEN` and a `passthrough`-listed `FOO_TOKEN` in the pi process, then run `env`,
@@ -415,29 +420,26 @@ when proxying.
   On hosts without userns (Docker-in-Docker), fall through to the Docker backend rather
   than offering a "weaker nested" mode.
 
-### Docker — fallback and Windows
+### Docker and rootless Podman — qualified offline containers
 
-A long-lived per-session container:
-`docker run --rm -d --network none --cap-drop ALL --security-opt no-new-privileges --read-only --pids-limit …`
-with the workspace bind-mounted; each action is a `docker exec`.
+Each shell action gets a fresh container; file operations use a persistent sandboxed
+helper for their compiled profile, with a separate helper lease for an approved read.
+One-shot grants never widen the base helper or sibling actions.
 
-- **Filesystem** — only explicit roots are bind-mounted; everything else comes from the
-  image. A nested `readDeny` is masked and a nested `writeDeny` is remounted read-only after
-  the parent bind. Compilation refuses any topology Docker cannot express without exposing
-  an immutable denial; it never assumes the host home is absent when a user explicitly
-  selected a root that contains it.
-- **Network** — `--network none`, plus an optional sidecar proxy on a user-defined network
-  for `proxy` mode.
-- **Caveats** — the toolchain must exist in a trusted, digest-pinned image. A repository
-  `Dockerfile` is untrusted executable build input and is never built automatically. A
-  separately approved build uses a no-network, no-secret isolated builder, a minimal
-  allowlisted context, no SSH/socket mounts, no host Docker socket and no privileged
-  BuildKit entitlements; the resulting digest is what the session profile records. UID
-  mapping is needed for file ownership. Every `docker exec` enters through a fixed `env -i`
-  launcher so image `ENV` entries cannot silently supplement the constructed `ChildEnv`;
-  trusted images must not contain secrets on disk either. Startup is slower, amortized by
-  the session-long container. On macOS, Docker Desktop is a VM — actually *stronger*
-  isolation than Seatbelt, with slower I/O.
+- **Filesystem** — explicit same-path host binds, read-only image, private temporary
+  storage, nested read masks and read-only write denials. Denial ancestors are pinned
+  to prevent renaming them to reveal protected content. Missing or symlinked nested
+  deny topology refuses compilation. Mount identities are checked before each operation.
+- **Network and privilege** — `--network=none`, a default-deny seccomp policy that
+  blocks socket creation and namespace changes, no capabilities, no-new-privileges,
+  private process namespaces and enforced resource limits. The engine socket is absent.
+- **Images and lifetime** — user-global immutable local image only; no implicit pull
+  or build. Image environment and entrypoint are replaced. A detached host supervisor
+  owns removal, including timeout, abort, helper teardown and parent `SIGKILL`.
+- **Supported limits** — Linux/x86-64 local Docker without UID remapping, or rootless
+  Podman with delegated cgroup v2 CPU/memory/PID controllers. Both require local
+  qualification; macOS, Windows, other architectures and remote engines refuse.
+  [Setup and evidence](docs/phase-4a-containers.md) describe the exact contract.
 
 ### Later — microVM
 
@@ -599,15 +601,15 @@ injection resistance and useful benign approvals against the exact production pr
 ### Configuration sources
 
 This table describes the target schema through Phase 5. The current parser implements the
-fields through Phase 3, keeps `network.mode: "off"`, and has no Docker image or broker
-configuration. Future fields are rejected rather than accepted and ignored.
+fields through Phase 4a, keeps `network.mode: "off"`, and accepts backend and image
+configuration only at user-global scope. Broker and egress fields are rejected.
 
 | Source | Location | May | May not |
 |---|---|---|---|
 | Built-in defaults | package | — | — |
 | User global | `~/.pi/agent/enclave.json` | Everything: profiles, backend, reviewer model, `rules`, the whole `review` rulebook, tool allowlist | — |
 | Project local (untracked) | `.pi/enclave.local.json` | Select a profile, add writable roots *inside* the repo, add `rules.deny` / `rules.ask`, add protected paths, raise `review.trigger` | Touch `rules.skipReview` or **any of the four prose lists** `review.environment` / `hard_deny` / `soft_deny` / `allow`, change the reviewer, disable the sandbox |
-| Project shared (tracked) | `.pi/enclave.json` | Add `rules.deny` / `rules.ask`, add protected paths, raise `review.trigger`, declare the Docker image | Anything that relaxes policy, and any of the four prose lists; ignored entirely if the project is not trusted |
+| Project shared (tracked) | `.pi/enclave.json` | Add `rules.deny` / `rules.ask`, add protected paths, raise `review.trigger` | Change backend or image, relax policy, or set any of the four prose lists; ignored entirely if the project is not trusted |
 | Environment | `PI_ENCLAVE_*` (three variables, listed below) | Force attendance off; select an *already-defined, narrower* profile; disable auto mode | Name a model, backend or any value not already defined in user-global config; relax anything |
 
 ### Monotonic configuration rule
@@ -1382,19 +1384,22 @@ local model on target hardware with measured denial, approval and latency rates,
 the end-to-end approval, cancellation, resume and parallel-call flows against the packaged
 pi 1.1.0 integration. Publish the supported host and model limits with those results.
 
-### Phase 4a — Offline container backend
+### Phase 4a — Offline container backend (Linux implementation; broader host qualification pending)
 
 *Outcome: a qualified fallback for hosts where the native sandbox cannot run, with
 `network.mode: "off"` throughout.*
 
-- Session container lifecycle, trusted digest-pinned images, separately approved offline
-  untrusted-Dockerfile builds, UID mapping and no child access to the container engine socket.
+- Per-action container and session-helper lifecycle, trusted immutable local images,
+  host UID mapping and no child access to the container engine socket. Automatic image
+  pulls and repository Dockerfile builds are refused; an isolated untrusted-image builder
+  remains a separate acceptance gate.
 - Integrate backend selection through trusted configuration, probing and session startup;
   retain invocation-bound read and write capabilities and refuse when no qualified backend
   is available.
 - Prove nested deny mounts, credential and environment isolation, cancellation, descendant
   cleanup and parent-crash recovery with the shared conformance suite. Qualify each supported
-  Linux, macOS and Windows engine configuration before enabling it as a fallback.
+  Linux engine configuration locally before enabling it as a fallback. macOS and Windows
+  container engines remain disabled pending equivalent host-path and lifetime evidence.
 
 ### Phase 4b — Authenticated egress
 

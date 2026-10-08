@@ -264,6 +264,7 @@ export function defaultProfile(options: DefaultProfileOptions): EffectiveProfile
 		name: "dev",
 		auto: true,
 		sandbox: {
+			backend: { kind: "native", fallback: "podman", image: "", binary: "", socket: "", readableRoots: [] },
 			mode: "workspace-write",
 			writableRoots: [cwd, tmp],
 			readDeny: [...defaultReadDeny(home, agentDir, env), join(cwd, ".pi", "mcp.json")],

@@ -21,6 +21,7 @@
  * with the rule relaxed instead.
  */
 import { dirname } from "node:path";
+import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import {
 	resolveCapabilityTarget,
 	shellCapabilityIssue,
@@ -29,7 +30,7 @@ import {
 	validateWriteCapability,
 } from "../backend/capability.ts";
 import { canonical, isUnder } from "../backend/paths.ts";
-import { SrtBackend } from "../backend/srt.ts";
+import { selectBackend } from "../backend/select.ts";
 import type { SandboxBackend } from "../backend/types.ts";
 import { formatViolations } from "../backend/violations.ts";
 import { toBackendProfile } from "../config/profile.ts";
@@ -200,7 +201,18 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 	const changedAfterPrompt = changedConfig();
 	if (changedAfterPrompt) return changedAfterPrompt;
 
-	const backend = options.backend ?? new SrtBackend();
+	let selected: Awaited<ReturnType<typeof selectBackend>> | undefined;
+	try {
+		selected = options.backend ? undefined : await selectBackend(current.sandbox.backend, PI_VERSION);
+	} catch (error) {
+		return { outcome: "refused", reason: (error as Error).message };
+	}
+	if (selected && !selected.report.ok) {
+		await selected.backend.dispose();
+		return { outcome: "refused", reason: "the selected sandbox backend cannot start" };
+	}
+	const backend = options.backend ?? selected?.backend;
+	if (!backend) return { outcome: "refused", reason: "no sandbox backend was selected" };
 	try {
 		// A pending capability request exists because its target is *outside* the
 		// current writable roots -- that is why it was escalated. Compiling the

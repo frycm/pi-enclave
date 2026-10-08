@@ -67,6 +67,8 @@ export interface NetworkSettings {
 }
 
 export interface SandboxSettings {
+	/** Immutable below user-global; images and engine endpoints are trusted inputs. */
+	backend: BackendSettings;
 	mode: "workspace-write";
 	/** Absolute paths that may be written. Everything else is read-only. */
 	writableRoots: string[];
@@ -81,6 +83,18 @@ export interface SandboxSettings {
 	hostExec: HostExecMode;
 	allowPty: boolean;
 	env: EnvSettings;
+}
+
+export interface BackendSettings {
+	kind: "native" | "docker" | "podman" | "auto";
+	/** The explicitly chosen engine when native probing fails in auto mode. */
+	fallback: "docker" | "podman";
+	image: string;
+	/** Absolute local executable and Unix daemon socket (Docker only). */
+	binary: string;
+	socket: string;
+	/** Additional read-only host mounts; other paths come from the trusted image. */
+	readableRoots: string[];
 }
 
 export interface ProtectedPaths {

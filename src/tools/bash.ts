@@ -15,7 +15,8 @@
  *   permitted" with no explanation will usually retry the same thing with
  *   `sudo`. Telling it which boundary it hit is what lets it change approach.
  */
-import { isUnderAny } from "../backend/paths.ts";
+import { resolveCapabilityTarget } from "../backend/capability.ts";
+import { canonical, isUnderAny } from "../backend/paths.ts";
 import type { CompiledProfile, SandboxBackend, Violation } from "../backend/types.ts";
 import { formatViolations } from "../backend/violations.ts";
 import { buildChildEnv } from "../env/child-env.ts";
@@ -148,7 +149,7 @@ export function nextCommandId(): string {
 }
 
 export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOperationsLike {
-	const { backend, getCompiled, passthrough, envDeny, onViolations, onDeniedReadAttempt } = options;
+	const { getCompiled, passthrough, envDeny, onViolations, onDeniedReadAttempt } = options;
 
 	return {
 		async exec(command, cwd, execOptions) {
@@ -169,7 +170,7 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 				...(compiled.profile.tmpDir ? { tmpdir: compiled.profile.tmpDir } : {}),
 			});
 
-			const result = await backend.run(compiled, {
+			const result = await options.backend.run(compiled, {
 				command,
 				cwd,
 				env,
@@ -182,8 +183,11 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 			});
 
 			const violations = [...result.violations];
+			const readGrant =
+				action?.capability?.kind === "read" ? resolveCapabilityTarget(action.cwd, action.capability.value) : undefined;
+			const remainingReadDeny = compiled.profile.readDeny.filter((path) => canonical(path) !== readGrant);
 			const deniedReadPaths = action?.paths
-				.filter((path) => isUnderAny(path.resolved, compiled.profile.readDeny) && pathMayBeReached(action, path.raw))
+				.filter((path) => isUnderAny(path.resolved, remainingReadDeny) && pathMayBeReached(action, path.raw))
 				.map((path) => path.resolved);
 			if (deniedReadPaths && deniedReadPaths.length > 0) onDeniedReadAttempt?.(deniedReadPaths);
 			// bubblewrap reports denied writes through SRT's observer, but a denied

@@ -94,6 +94,9 @@ export function narrowerOrEqual(a: EffectiveProfile, b: EffectiveProfile): Order
 	const violations: OrderViolation[] = [];
 	const fail = (field: string, message: string) => violations.push({ field, message });
 	const contained = containment();
+	if (JSON.stringify(a.sandbox.backend) !== JSON.stringify(b.sandbox.backend)) {
+		fail("sandbox.backend", "backend selection is immutable below user-global");
+	}
 
 	if (a.auto && !b.auto) fail("auto", "auto mode cannot be turned back on");
 
@@ -302,6 +305,11 @@ export function applyPatch(base: EffectiveProfile, patch: ProfilePatch, options:
 
 	const sandbox = patch.sandbox;
 	if (sandbox) {
+		if (sandbox.backend)
+			next.sandbox.backend = {
+				...sandbox.backend,
+				readableRoots: sandbox.backend.readableRoots.map(expand),
+			};
 		if (sandbox.mode !== undefined) next.sandbox.mode = sandbox.mode;
 		if (sandbox.writableRoots) {
 			const expanded = sandbox.writableRoots.map(expand);
