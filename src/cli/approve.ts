@@ -37,6 +37,7 @@ import type { EffectiveProfile } from "../config/types.ts";
 import { buildChildEnv } from "../env/child-env.ts";
 import { describeRecordForApproval, type PendingRecord, transition } from "../escalate/pending.ts";
 import { checkResume, describeNarrowing, formatResumeFailure } from "../escalate/resume.ts";
+import { configHash } from "../state/audit.ts";
 import { validateBashTimeout } from "../tools/bash.ts";
 
 export interface ApproveIO {
@@ -50,6 +51,8 @@ export interface ApproveOptions {
 	record: PendingRecord;
 	stateRoot: string;
 	current: EffectiveProfile;
+	/** Reloads the effective configuration from its sources before execution. */
+	reloadCurrent: () => EffectiveProfile | undefined;
 	home: string;
 	io: ApproveIO;
 	/** Injected by tests. */
@@ -70,11 +73,31 @@ export type ApproveResult =
 
 export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 	const { record, io, current } = options;
+	const initialConfigHash = configHash(current);
 	const expired = () => Date.parse(record.expiresAt) <= (options.now?.() ?? Date.now());
 	const expiredResult = (): ApproveResult => ({
 		outcome: "refused",
 		reason: `the approval record expired at ${record.expiresAt} before execution`,
 	});
+	const changedConfig = (): ApproveResult | undefined => {
+		let fresh: EffectiveProfile | undefined;
+		try {
+			fresh = options.reloadCurrent();
+		} catch (error) {
+			io.err(`\npi-enclave: cannot reload the current configuration: ${(error as Error).message}`);
+		}
+		if (!fresh) {
+			const reason = "the current configuration could not be reloaded; nothing ran";
+			io.err(`\npi-enclave: ${reason}.`);
+			return { outcome: "refused", reason };
+		}
+		if (configHash(fresh) !== initialConfigHash) {
+			const reason = "the configuration changed while approval was in progress; review the action again";
+			io.err(`\npi-enclave: ${reason}; nothing ran.`);
+			return { outcome: "refused", reason };
+		}
+		return undefined;
+	};
 
 	io.out(describeRecordForApproval(record));
 
@@ -174,12 +197,8 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 		io.err(`\npi-enclave: the approval record expired at ${record.expiresAt}; nothing ran.`);
 		return expiredResult();
 	}
-
-	// Renamed *before* execution, so a crash mid-run leaves the record in
-	// approved/ rather than pending/ -- visible evidence that something was
-	// approved and may have run, which is a state a person should be told about
-	// rather than one that resolves itself.
-	transition(options.stateRoot, record.sessionId, record.nonce, "pending", "approved");
+	const changedAfterPrompt = changedConfig();
+	if (changedAfterPrompt) return changedAfterPrompt;
 
 	const backend = options.backend ?? new SrtBackend();
 	try {
@@ -193,12 +212,18 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 			backendProfile.writableRoots = [...backendProfile.writableRoots, writeCapabilityTarget];
 		}
 		const compiled = await backend.compile(backendProfile);
-		// Compilation can take long enough to cross the TTL too. An approved/
-		// record is retained as crash-safe evidence, but no action executes.
+		// Compilation can take long enough to cross the TTL or outlive the
+		// displayed policy. Keep the record pending until both checks pass.
 		if (expired()) {
 			io.err(`\npi-enclave: the approval record expired at ${record.expiresAt} while preparing; nothing ran.`);
 			return expiredResult();
 		}
+		const changedAfterCompile = changedConfig();
+		if (changedAfterCompile) return changedAfterCompile;
+
+		// Rename immediately before execution. A crash mid-run leaves visible
+		// evidence in approved/ that the action may have run.
+		transition(options.stateRoot, record.sessionId, record.nonce, "pending", "approved");
 
 		if (tool === "bash") {
 			const command = action.input.command;

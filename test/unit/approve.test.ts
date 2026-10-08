@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { canonical } from "../../src/backend/paths.ts";
 import type { CompiledProfile, FsClient, Profile, RunRequest, SandboxBackend } from "../../src/backend/types.ts";
-import { type ApproveIO, approve } from "../../src/cli/approve.ts";
+import { type ApproveIO, type ApproveOptions, approve as approvePending } from "../../src/cli/approve.ts";
 import { defaultProfile } from "../../src/config/defaults.ts";
 import type { EffectiveProfile } from "../../src/config/types.ts";
 import { pendingDirs, writePending } from "../../src/escalate/pending.ts";
@@ -94,6 +94,10 @@ function profile(edit: (p: EffectiveProfile) => void = () => {}): EffectiveProfi
 	const p = defaultProfile(OPTIONS);
 	edit(p);
 	return p;
+}
+
+function approve(options: Omit<ApproveOptions, "reloadCurrent"> & { reloadCurrent?: ApproveOptions["reloadCurrent"] }) {
+	return approvePending({ ...options, reloadCurrent: options.reloadCurrent ?? (() => options.current) });
 }
 
 function record(tool: string, input: Record<string, unknown>) {
@@ -234,8 +238,77 @@ describe("approving a record", () => {
 
 		expect(result.outcome).toBe("refused");
 		expect(backend.commands).toHaveLength(0);
-		expect(readdirSync(pendingDirs(stateRoot, SESSION).approved)).toEqual([`${NONCE}.json`]);
+		expect(readdirSync(pendingDirs(stateRoot, SESSION).pending)).toEqual([`${NONCE}.json`]);
 		expect(backend.disposed).toBe(true);
+	});
+
+	it("refuses when the policy changes while the approval prompt is open", async () => {
+		const backend = new RecordingBackend();
+		let live = profile();
+		const channel = io();
+		const result = await approve({
+			record: record("bash", { command: "ls" }),
+			stateRoot,
+			current: live,
+			reloadCurrent: () => live,
+			home: TEST_HOME,
+			io: {
+				...channel.make(true),
+				ask: async () => {
+					live = profile((p) => p.rules.deny.push("bash:ls"));
+					return true;
+				},
+			},
+			backend,
+		});
+
+		expect(result.outcome).toBe("refused");
+		expect(backend.compiledProfile).toBeUndefined();
+		expect(backend.commands).toHaveLength(0);
+		expect(readdirSync(pendingDirs(stateRoot, SESSION).pending)).toEqual([`${NONCE}.json`]);
+	});
+
+	it("refuses when the policy cannot be reloaded after confirmation", async () => {
+		const backend = new RecordingBackend();
+		const channel = io();
+		const result = await approve({
+			record: record("bash", { command: "ls" }),
+			stateRoot,
+			current: profile(),
+			reloadCurrent: () => undefined,
+			home: TEST_HOME,
+			io: channel.make(true),
+			backend,
+		});
+
+		expect(result.outcome).toBe("refused");
+		expect(channel.err.join("\n")).toContain("could not be reloaded");
+		expect(backend.compiledProfile).toBeUndefined();
+		expect(readdirSync(pendingDirs(stateRoot, SESSION).pending)).toEqual([`${NONCE}.json`]);
+	});
+
+	it("refuses when the policy changes during sandbox compilation", async () => {
+		const backend = new RecordingBackend();
+		let live = profile();
+		backend.beforeCompile = () => {
+			live = profile((p) => {
+				p.sandbox.writableRoots = [];
+			});
+		};
+		const result = await approve({
+			record: record("bash", { command: "ls" }),
+			stateRoot,
+			current: live,
+			reloadCurrent: () => live,
+			home: TEST_HOME,
+			io: io().make(true),
+			backend,
+		});
+
+		expect(result.outcome).toBe("refused");
+		expect(backend.commands).toHaveLength(0);
+		expect(backend.disposed).toBe(true);
+		expect(readdirSync(pendingDirs(stateRoot, SESSION).pending)).toEqual([`${NONCE}.json`]);
 	});
 
 	// pending → approved before execution and approved → consumed after, so a

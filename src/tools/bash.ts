@@ -50,16 +50,22 @@ function pathMayBeReached(action: CanonicalAction, raw: string): boolean {
 			(connector === "&&" && possibleStatus.has(true)) ||
 			(connector === "||" && possibleStatus.has(false)) ||
 			(connector !== "&&" && connector !== "||");
+		const commandName = command.name.slice(command.name.lastIndexOf("/") + 1);
+		// Echo and printf treat plain arguments as data. A non-confident parse may
+		// hide a command substitution, so only exclude their arguments when the
+		// parser has ruled that out. Output redirects are writes, not read attempts.
+		const literalArguments =
+			action.confident &&
+			["echo", "printf", "/bin/echo", "/bin/printf", "/usr/bin/echo", "/usr/bin/printf"].includes(command.name);
 		const namesPath =
 			command.name.includes(raw) ||
-			command.args.some((arg) => arg.includes(raw)) ||
-			command.redirects.some((redirect) => redirect.target.includes(raw));
+			(!literalArguments && command.args.some((arg) => arg.includes(raw))) ||
+			command.redirects.some((redirect) => !redirect.writes && redirect.target.includes(raw));
 		if (namesPath) {
 			mentioned = true;
 			if (reachable) return true;
 		}
 
-		const commandName = command.name.slice(command.name.lastIndexOf("/") + 1);
 		const commandStatus =
 			commandName === "true" ? new Set([true]) : commandName === "false" ? new Set([false]) : new Set([true, false]);
 		if (index === 0 || connector === undefined || (connector !== "&&" && connector !== "||")) {
@@ -76,7 +82,9 @@ function pathMayBeReached(action: CanonicalAction, raw: string): boolean {
 			]);
 		}
 	}
-	return !mentioned;
+	// A confident parse accounted for every path-bearing token. An uncertain
+	// parse may have hidden a reachable read, so keep the conservative fallback.
+	return !mentioned && !action.confident;
 }
 
 /**
