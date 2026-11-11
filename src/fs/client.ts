@@ -11,11 +11,19 @@
  * not spawned per operation.
  */
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { classifyErrno } from "../backend/errno.ts";
 import { isUnderAny } from "../backend/paths.ts";
 import type { CompiledProfile, FsClient, Violation } from "../backend/types.ts";
 import { SandboxDenied } from "../backend/types.ts";
-import { encodeFrame, FrameDecoder, type FsCall, type FsResponse, PROTOCOL_VERSION } from "./protocol.ts";
+import {
+	encodeFrame,
+	FrameDecoder,
+	type FsCall,
+	type FsResponse,
+	PROTOCOL_VERSION,
+	READ_CHUNK_BYTES,
+} from "./protocol.ts";
 
 /** How long a single operation may take before it is abandoned. */
 const DEFAULT_CALL_TIMEOUT_MS = 30_000;
@@ -28,6 +36,29 @@ const READY_TIMEOUT_MS = 15_000;
  * retrying forever turns one broken session into a spawn loop.
  */
 const MAX_RESTARTS = 3;
+
+/** Cancellation can finish while helper startup or a profile refresh is still pending. */
+function abortable<T>(task: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return task;
+	return new Promise((resolve, reject) => {
+		const onAbort = () => {
+			signal.removeEventListener("abort", onAbort);
+			reject(new Error("Operation aborted"));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) onAbort();
+		task.then(
+			(value) => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(value);
+			},
+			(error) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			},
+		);
+	});
+}
 
 /** Spawns a helper process under the compiled profile. */
 export type HelperSpawner = () => ChildProcessWithoutNullStreams;
@@ -208,13 +239,26 @@ export class HelperFsClient implements FsClient {
 		child?.stdin.end();
 	}
 
-	private async call(request: FsCall, signal?: AbortSignal): Promise<unknown> {
+	private async prepare(signal?: AbortSignal, expectedChild?: ChildProcessWithoutNullStreams) {
+		signal?.throwIfAborted();
 		if (this.disposed) throw new Error("pi-enclave: the filesystem helper was shut down");
-		await this.options.beforeCall?.();
-		await this.start();
-
+		await abortable(this.options.beforeCall?.() ?? Promise.resolve(), signal);
+		if (this.disposed) throw new Error("pi-enclave: the filesystem helper was shut down");
+		if (expectedChild && this.child !== expectedChild) throw new Error("pi-enclave: read stream helper was retired");
+		await abortable(this.start(), signal);
+		signal?.throwIfAborted();
 		const child = this.child;
+		if (expectedChild && child !== expectedChild) throw new Error("pi-enclave: read stream helper was retired");
 		if (!child) throw new Error("pi-enclave: the filesystem helper is not running");
+		return child;
+	}
+
+	private async call(
+		request: FsCall,
+		signal?: AbortSignal,
+		expectedChild?: ChildProcessWithoutNullStreams,
+	): Promise<unknown> {
+		const child = await this.prepare(signal, expectedChild);
 
 		const id = ++this.sequence;
 		const timeoutMs = this.options.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
@@ -223,7 +267,15 @@ export class HelperFsClient implements FsClient {
 		// otherwise, so abort and timeout both send a cancel for it.
 		const cancel = () => {
 			try {
-				this.send(child, encodeFrame({ op: "cancel", target: id, id: ++this.sequence }));
+				this.send(
+					child,
+					encodeFrame({
+						op: "cancel",
+						target: id,
+						id: ++this.sequence,
+						...("stream" in request ? { stream: request.stream } : {}),
+					}),
+				);
 			} catch {
 				// The helper is gone; there is nothing left to cancel.
 			}
@@ -306,7 +358,7 @@ export class HelperFsClient implements FsClient {
 	 * comparison here never permits anything.
 	 */
 	private refuseMaskedSuccess(request: FsCall, resolvedPath: string | undefined): void {
-		if (this.options.compiled.backend !== "bwrap") return;
+		if (!["bwrap", "docker", "podman"].includes(this.options.compiled.backend)) return;
 		// A write-access check passing under a deny root is not a masked read --
 		// the deny list governs reads, and writes are decided by the roots.
 		if (request.op === "access" && request.mode === "write") return;
@@ -317,7 +369,7 @@ export class HelperFsClient implements FsClient {
 			kind: "read",
 			op: request.op,
 			path,
-			backend: "bwrap",
+			backend: this.options.compiled.backend,
 			raw: "masked (deny-read tmpfs)",
 		};
 		this.options.onViolation?.(violation);
@@ -330,6 +382,50 @@ export class HelperFsClient implements FsClient {
 
 	async readFile(path: string): Promise<Buffer> {
 		return Buffer.from((await this.call({ op: "readFile", path })) as string, "base64");
+	}
+
+	async *createReadStream(path: string, options: { signal?: AbortSignal } = {}): AsyncIterable<Uint8Array> {
+		const { signal } = options;
+		const child = await this.prepare(signal);
+		// A nonce cannot name a descriptor from a replacement helper, even if
+		// another call retires this process while the consumer is between chunks.
+		const stream = randomUUID();
+		const close = () => {
+			try {
+				this.send(child, encodeFrame({ op: "closeRead", stream, id: ++this.sequence }));
+			} catch {
+				// A closed helper has already closed every descriptor it owned.
+			}
+		};
+		signal?.addEventListener("abort", close, { once: true });
+		try {
+			await this.call({ op: "openRead", path, stream }, signal, child);
+			for (;;) {
+				const result = await this.call({ op: "readChunk", path, stream }, signal, child);
+				// The helper is a wire boundary. Reject oversized/malformed chunks
+				// before decoding or yielding bytes into the trusted pi process.
+				if (!result || typeof result !== "object") throw new Error("pi-enclave: invalid read chunk");
+				const { data, done } = result as { data?: unknown; done?: unknown };
+				if (
+					typeof data !== "string" ||
+					data.length > Math.ceil(READ_CHUNK_BYTES / 3) * 4 ||
+					typeof done !== "boolean" ||
+					!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)
+				) {
+					throw new Error("pi-enclave: invalid or oversized read chunk");
+				}
+				const bytes = Buffer.from(data, "base64");
+				if (bytes.length > READ_CHUNK_BYTES || (bytes.length === 0 && !done))
+					throw new Error("pi-enclave: invalid read chunk size");
+				signal?.throwIfAborted();
+				if (bytes.length > 0) yield bytes;
+				signal?.throwIfAborted();
+				if (done) break;
+			}
+		} finally {
+			signal?.removeEventListener("abort", close);
+			close();
+		}
 	}
 
 	async head(path: string, bytes: number): Promise<Buffer> {

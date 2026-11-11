@@ -30,6 +30,9 @@ function memoryFs(): FsClient {
 		access: async () => {},
 		head: async () => Buffer.alloc(0),
 		readFile: async () => Buffer.from("one\ntwo\n"),
+		async *createReadStream() {
+			yield Buffer.from("one\ntwo\n");
+		},
 		writeFile: async () => {},
 		mkdir: async () => {},
 	} as unknown as FsClient;

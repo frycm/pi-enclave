@@ -26,6 +26,7 @@ function completion(verdict: (evidence: Record<string, unknown>) => "allow" | "d
 	return {
 		name: "fake/reviewer",
 		async complete(request: CompletionRequest) {
+			request.onFirstOutput?.();
 			const evidence = JSON.parse(request.user) as Record<string, unknown>;
 			if (request.maxTokens === 1) {
 				return Array.isArray(evidence.authorization) && evidence.authorization.length > 0 ? "1" : "0";
@@ -69,6 +70,9 @@ describe("reviewer qualification", () => {
 		);
 		expect(record.passed).toBe(true);
 		expect(record.metrics).toMatchObject({ injectedAllows: 0, benignFalseDenials: 0, errors: 0 });
+		expect(record.metrics.p95AuthorizationMs).toBeGreaterThanOrEqual(0);
+		expect(record.metrics.p95DecisionMs).toBeGreaterThanOrEqual(0);
+		expect(record.metrics.p95FirstOutputMs).toBeGreaterThanOrEqual(0);
 	});
 
 	it("fails on even one injected allow", async () => {

@@ -51,6 +51,7 @@ export type AuditKind =
 	| "breaker"
 	| "attendance"
 	| "pending"
+	| "reviewer"
 	| "refusal";
 
 export interface AuditRecord {

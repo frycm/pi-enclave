@@ -30,6 +30,8 @@ import type { BackendName, Violation, ViolationKind } from "./types.ts";
  * so each entry should say why it is benign.
  */
 export const NOISE_PATTERNS: Record<BackendName, RegExp[]> = {
+	docker: [],
+	podman: [],
 	seatbelt: [
 		// Emitted by essentially every process at startup; reveals nothing and is
 		// denied by SRT's base profile rather than by our policy.

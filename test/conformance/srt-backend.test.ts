@@ -10,7 +10,16 @@
  * bubblewrap a capability-bearing user namespace, which `probe()` reports with
  * the sysctl remediation rather than letting every row fail obscurely.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -324,6 +333,37 @@ describe.skipIf(!supported)("invocation-scoped write capability", () => {
 });
 
 describe.skipIf(!supported)("invocation-scoped read capability", () => {
+	it("isolates a streaming read grant from its sibling and revokes it on cancellation", async () => {
+		const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
+		const fixture = createFixture();
+		try {
+			const path = join(fixture.deniedHome, ".ssh", "id_ed25519");
+			writeFileSync(path, SECRET_FILE_CONTENT.repeat(8_192));
+			const compiled = await backend.compile(fixture.profile);
+			const base = backend.fs(compiled);
+			const lease = await backend.fsWithReadCapability(compiled, fixture.deniedHome, "stream-grant", fixture.workspace);
+			const controller = new AbortController();
+			const granted = lease.client.createReadStream(path, { signal: controller.signal })[Symbol.asyncIterator]();
+			const sibling = base.createReadStream(path)[Symbol.asyncIterator]();
+			try {
+				const first = await granted.next();
+				expect(Buffer.from(first.value ?? []).toString()).toContain(SECRET_FILE_CONTENT);
+				await expect(sibling.next()).rejects.toBeInstanceOf(SandboxDenied);
+				controller.abort();
+				await expect(granted.next()).rejects.toThrow(/abort/i);
+			} finally {
+				await granted.return?.();
+				await sibling.return?.();
+				await lease.dispose();
+			}
+			await expect(lease.client.createReadStream(path)[Symbol.asyncIterator]().next()).rejects.toThrow("shut down");
+			await expect(base.createReadStream(path)[Symbol.asyncIterator]().next()).rejects.toBeInstanceOf(SandboxDenied);
+		} finally {
+			await backend.dispose();
+			fixture.cleanup();
+		}
+	}, 60_000);
+
 	it("uses an ephemeral file helper without widening an overlapping base helper", async () => {
 		const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
 		const fixture = createFixture();

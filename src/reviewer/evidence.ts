@@ -159,6 +159,7 @@ export function buildReviewEvidence(options: BuildEvidenceOptions): ReviewEviden
 		action.paths.length > MAX_COLLECTION_ENTRIES ||
 		(action.shell?.commands.length ?? 0) > MAX_COLLECTION_ENTRIES;
 	const evidence: ReviewEvidence = {
+		...(options.toolReachability ? { toolReachability: structuredClone(options.toolReachability) } : {}),
 		action: {
 			tool: boundedText(action.tool),
 			input: input.value,

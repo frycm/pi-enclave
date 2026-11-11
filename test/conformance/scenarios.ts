@@ -672,6 +672,12 @@ SCENARIOS.push(
 			const fs = backend.fs(compiled);
 			const attempts: Array<[string, () => Promise<unknown>]> = [
 				["readFile", () => fs.readFile(fixture.deniedFile)],
+				[
+					"stream",
+					async () => {
+						for await (const chunk of fs.createReadStream(fixture.deniedFile)) return Buffer.from(chunk);
+					},
+				],
 				["head", () => fs.head(fixture.deniedFile, 64)],
 				["access", () => fs.access(fixture.deniedFile, "read")],
 			];
@@ -687,7 +693,7 @@ SCENARIOS.push(
 						return { ok: false, detail: `${name} NOT CLASSIFIED: ${String(error).slice(0, 60)}` };
 				}
 			}
-			return { ok: true, detail: "readFile, head and access all classified as denied" };
+			return { ok: true, detail: "readFile, stream, head and access all classified as denied" };
 		},
 	},
 	{

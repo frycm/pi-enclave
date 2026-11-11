@@ -34,6 +34,8 @@ export const SANDBOX_TMPDIR = "/tmp/claude";
  * read the workspace" on either backend.
  */
 export interface Profile {
+	/** Container-only explicit host read mounts. */
+	readableRoots?: readonly string[];
 	mode: "workspace-write";
 	/** Absolute paths that may be written. Everything else is read-only. */
 	writableRoots: readonly string[];
@@ -167,6 +169,14 @@ export interface RunResult {
 }
 
 export interface SandboxBackend {
+	readonly weakened?: boolean;
+	onFsViolation?: ((violation: Violation) => void) | undefined;
+	fsWithReadCapability?(
+		compiled: CompiledProfile,
+		value: string,
+		actionHash: string,
+		cwd: string,
+	): Promise<FsClientLease>;
 	readonly name: BackendName;
 	/** Compile a profile for this backend. Called once per session. */
 	compile(profile: Profile): Promise<CompiledProfile>;
@@ -191,6 +201,8 @@ export interface FsClientLease {
  */
 export interface FsClient {
 	readFile(path: string): Promise<Buffer>;
+	/** Pull bounded chunks from one descriptor opened inside the sandbox. */
+	createReadStream(path: string, options?: { signal?: AbortSignal }): AsyncIterable<Uint8Array>;
 	/** The first `bytes` of a file, for type sniffing without a full read. */
 	head(path: string, bytes: number): Promise<Buffer>;
 	writeFile(path: string, content: string): Promise<void>;

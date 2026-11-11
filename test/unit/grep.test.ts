@@ -13,6 +13,9 @@ const rgMatchWithText = (path: string, line: number, text: string) =>
 function fakeFs(files: Record<string, string>, stdout: string, options: { grepThrows?: Error } = {}) {
 	const calls: { grep: string[][]; reads: string[] } = { grep: [], reads: [] };
 	const fs: FsClient = {
+		async *createReadStream(path) {
+			yield await this.readFile(path);
+		},
 		async grep(args) {
 			calls.grep.push([...args]);
 			if (options.grepThrows) throw options.grepThrows;

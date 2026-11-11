@@ -56,6 +56,34 @@ async function withFs<T>(ref: FsClientRef, action: CanonicalAction | undefined, 
 	}
 }
 
+/** Cancellation must also settle while an invocation-specific helper is being acquired. */
+async function readFs(ref: FsClientRef, action: CanonicalAction | undefined, signal?: AbortSignal) {
+	signal?.throwIfAborted();
+	const pending = Promise.resolve(ref(action));
+	if (!signal) return pending;
+	return new Promise<FsClient | FsClientLease>((resolve, reject) => {
+		let cancelled = false;
+		const abort = () => {
+			cancelled = true;
+			reject(signal.reason);
+		};
+		signal.addEventListener("abort", abort, { once: true });
+		if (signal.aborted) abort();
+		pending.then(
+			(resolved) => {
+				signal.removeEventListener("abort", abort);
+				if (cancelled) {
+					if (isLease(resolved)) void resolved.dispose().catch(() => {});
+				} else resolve(resolved);
+			},
+			(error) => {
+				signal.removeEventListener("abort", abort);
+				reject(error);
+			},
+		);
+	});
+}
+
 /**
  * Translate a denial into a message the agent can act on.
  *
@@ -82,6 +110,34 @@ const protect = async <T>(run: () => Promise<T>): Promise<T> => {
 
 export function createReadOperations(fs: FsClientRef, guard?: ToolGuard) {
 	return {
+		async *createReadStream(path: string, options: { signal?: AbortSignal }): AsyncIterable<Uint8Array> {
+			options.signal?.throwIfAborted();
+			const action = guarded(guard, "read", path);
+			const resolved = await readFs(fs, action, options.signal);
+			const client = isLease(resolved) ? resolved.client : resolved;
+			let disposal: Promise<void> | undefined;
+			const dispose = () => (disposal ??= isLease(resolved) ? resolved.dispose() : Promise.resolve());
+			const onAbort = () => {
+				void dispose().catch(() => {});
+			};
+			options.signal?.addEventListener("abort", onAbort, { once: true });
+			try {
+				options.signal?.throwIfAborted();
+				guarded(guard, "read", path);
+				for await (const chunk of client.createReadStream(path, options)) {
+					guarded(guard, "read", path);
+					options.signal?.throwIfAborted();
+					yield chunk;
+					options.signal?.throwIfAborted();
+					guarded(guard, "read", path);
+				}
+			} catch (error) {
+				describe(error);
+			} finally {
+				options.signal?.removeEventListener("abort", onAbort);
+				await dispose();
+			}
+		},
 		readFile: (path: string) => {
 			const action = guarded(guard, "read", path);
 			return protect(() => withFs(fs, action, (client) => client.readFile(path)));

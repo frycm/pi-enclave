@@ -25,9 +25,16 @@ function registry(options: { authenticated?: boolean } = {}) {
 		stopReason: "stop",
 		timestamp: Date.now(),
 	}));
-	vi.mocked(streamOpenAI).mockImplementation(
-		(...args) => ({ result: () => complete(...args) }) as ReturnType<typeof streamOpenAI>,
-	);
+	vi.mocked(streamOpenAI).mockImplementation((...args) => {
+		const result = complete(...args);
+		return {
+			result: () => result,
+			async *[Symbol.asyncIterator]() {
+				await result;
+				yield { type: "text_delta", delta: "isolated answer" };
+			},
+		} as unknown as ReturnType<typeof streamOpenAI>;
+	});
 	return {
 		complete,
 		value: {
@@ -44,6 +51,7 @@ describe("reviewer model transport", () => {
 		const fake = registry();
 		const resolved = resolveReviewerModel(fake.value, "cloud/reviewer-2026-09-01");
 		const controller = new AbortController();
+		const onFirstOutput = vi.fn();
 		await expect(
 			resolved.completion.complete({
 				system: "reviewer system",
@@ -53,8 +61,10 @@ describe("reviewer model transport", () => {
 				temperature: 0,
 				seed: 31337,
 				numCtx: 4096,
+				onFirstOutput,
 			}),
 		).resolves.toBe("isolated answer");
+		expect(onFirstOutput).toHaveBeenCalledOnce();
 
 		const [, context, options] = fake.complete.mock.calls[0] ?? [];
 		expect(context).toMatchObject({

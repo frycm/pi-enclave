@@ -1,5 +1,6 @@
 import type { Violation } from "../backend/types.ts";
 import type { AttendedMode, ReviewSettings, SourceId } from "../config/types.ts";
+import type { ToolReachability } from "../gate/reachability.ts";
 import type { CanonicalAction, Capability } from "../policy/canonical.ts";
 
 export const REVIEW_DECISIONS = ["allow", "deny", "ask"] as const;
@@ -39,6 +40,7 @@ export interface ReviewActionEvidence {
 
 /** The only user turn sent to the isolated reviewer. */
 export interface ReviewEvidence {
+	toolReachability?: ToolReachability;
 	action: ReviewActionEvidence;
 	violation: Violation | null;
 	requestedCapability: Capability | null;
@@ -96,6 +98,7 @@ export interface ActionReviewer {
 }
 
 export interface BuildEvidenceOptions {
+	toolReachability?: ToolReachability;
 	action: CanonicalAction;
 	trigger: ReviewerTrigger;
 	attended: AttendedMode;
