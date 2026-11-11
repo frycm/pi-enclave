@@ -169,13 +169,28 @@ describe("Git persistence surface (#33)", () => {
 		expect(findGitEntries([root]).find((entry) => entry.path === cache)?.bare).toBe(true);
 	});
 
-	it("leaves alone a directory whose HEAD Git would not accept", () => {
+	it("treats any HEAD content as a repository, as Git accepts more forms than a pattern would", () => {
+		// Git 2.43 accepts both of these as a repository and runs core.fsmonitor
+		// from a subdirectory.
+		for (const head of [
+			"4B825DC642CB6EB9A060E54BF8D69288FBEE4904\n",
+			"4b825dc642cb6eb9a060e54bf8d69288fbee4904 trailing junk\n",
+			"ref: refs/heads/main\n",
+		]) {
+			const root = tempDir("enclave-git-surface-");
+			mkdirSync(join(root, "cache", "objects"), { recursive: true });
+			mkdirSync(join(root, "cache", "refs"));
+			writeFileSync(join(root, "cache", "HEAD"), head);
+			expect(findGitEntries([root]), head).toEqual([{ path: join(root, "cache"), kind: "dir", bare: true }]);
+		}
+	});
+
+	it("does not take a directory with HEAD but no objects, refs or commondir for a repository", () => {
 		const root = tempDir("enclave-git-surface-");
 		mkdirSync(join(root, "cache", "objects"), { recursive: true });
-		mkdirSync(join(root, "cache", "refs"));
-		writeFileSync(join(root, "cache", "HEAD"), "not a ref\n");
-		expect(findGitEntries([root])).toEqual([]);
 		writeFileSync(join(root, "cache", "HEAD"), "ref: refs/heads/main\n");
+		expect(findGitEntries([root])).toEqual([]);
+		writeFileSync(join(root, "cache", "commondir"), "../elsewhere\n");
 		expect(findGitEntries([root])).toEqual([{ path: join(root, "cache"), kind: "dir", bare: true }]);
 	});
 

@@ -734,7 +734,7 @@ layers:
   every Git directory it finds: the workspace's own, each submodule's below `.git/modules`
   (including nested and namespaced names), linked worktrees via `commondir`, and any other
   repository nested in the tree, through its `.git` directory or gitfile. It also protects any
-  directory that is a repository by its contents rather than its name (a valid `HEAD` with
+  directory that is a repository by its contents rather than its name (a `HEAD` entry with
   `objects` and `refs`, or with `commondir`): Git checks every ancestor of the current
   directory for that shape, so with `core.bare = false` and `core.worktree = .` in its config,
   `git status` anywhere below it runs that config. Its hooks are resolved against the worktree

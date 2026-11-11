@@ -11,17 +11,7 @@
  * This module only finds and fingerprints those paths. It never runs Git:
  * the tree it inspects is the agent's.
  */
-import {
-	closeSync,
-	constants,
-	type Dirent,
-	lstatSync,
-	openSync,
-	readdirSync,
-	readlinkSync,
-	readSync,
-	realpathSync,
-} from "node:fs";
+import { closeSync, constants, type Dirent, lstatSync, openSync, readdirSync, readSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type FingerprintBudget, fingerprint, PersistenceScanError, type ScanMatch, scanRoots } from "./scan.ts";
 
@@ -43,37 +33,24 @@ export interface GitScanOptions {
 }
 
 /**
- * Whether `HEAD` in `dir` is one Git accepts: a symlink into `refs/`, a
- * `ref: refs/...` line or an object id. Git ignores a directory whose HEAD is
- * not, so a build cache that happens to hold files with these names is left
- * alone.
+ * Whether a listing has the shape Git accepts as a repository. HEAD's content
+ * is not checked: Git accepts more forms than any simple check would (an
+ * object id in either case, with trailing text), and a false positive only
+ * protects a little more.
  */
-function validHead(dir: string, entry: Dirent): boolean {
-	const path = join(dir, "HEAD");
-	try {
-		if (entry.isSymbolicLink()) return readlinkSync(path).startsWith("refs/");
-		if (!entry.isFile()) return false;
-		const head = readHead(path);
-		return /^ref:\s*refs\//.test(head) || /^[0-9a-f]{40}(?:[0-9a-f]{24})?\s*$/.test(head);
-	} catch {
-		return false;
-	}
-}
-
-function isGitDirListing(dir: string, entries: readonly Dirent[]): boolean {
+function isGitDirListing(entries: readonly Dirent[]): boolean {
 	// Called for every directory walked, so one pass and no allocation.
-	let head: Dirent | undefined;
+	let head = false;
 	let objects = false;
 	let refs = false;
 	let commondir = false;
 	for (const entry of entries) {
-		if (entry.name === "HEAD") head = entry;
+		if (entry.name === "HEAD") head = true;
 		else if (entry.name === "objects") objects = true;
 		else if (entry.name === "refs") refs = true;
 		else if (entry.name === "commondir") commondir = true;
 	}
-	if (!head || !(commondir || (objects && refs))) return false;
-	return validHead(dir, head);
+	return head && (commondir || (objects && refs));
 }
 
 /**
@@ -86,7 +63,7 @@ export function findGitEntries(roots: readonly string[], options: GitScanOptions
 	const matches = scanRoots(roots, {
 		match: (name) => name === ".git",
 		matchListing: (dir, entries) => {
-			if (!isGitDirListing(dir, entries)) return false;
+			if (!isGitDirListing(entries)) return false;
 			bare.add(dir);
 			return true;
 		},
