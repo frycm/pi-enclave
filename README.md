@@ -419,6 +419,12 @@ when proxying.
   empty tmpfs rather than by returning an error.
 - **Network** — the network namespace is removed. In `proxy` mode a Unix domain socket is
   bound into the sandbox and bridged by `socat` to the host proxy (Claude Code's layout).
+- **Unix sockets** — the `AF_UNIX` block comes from sandbox-runtime's vendored
+  `apply-seccomp` helper, which ships for x64 and arm64 only. sandbox-runtime itself runs
+  without the filter when the helper is missing, so `probe()` fails on Linux unless the
+  helper is present, executable and outside every writable root; its path is passed to
+  sandbox-runtime explicitly, and every compile then runs a self-test inside the new
+  sandbox that must see `socket(AF_UNIX)` refused, or the session refuses to start.
 - **Caveats** — requires unprivileged user namespaces (Ubuntu 24.04's AppArmor policy may
   block them; `probe()` detects this and prints the sysctl fix). WSL1 is unsupported.
   On hosts without userns (Docker-in-Docker), fall through to the Docker backend rather
@@ -1542,7 +1548,8 @@ do, which differs from each other more than the design assumed.
   escape that group with `setsid`/`setpgid`, so Bash write capabilities fail closed there;
   Linux contains them with bubblewrap's PID namespace and `--die-with-parent`.
 - **`probe()` fails closed** on an unsupported pi (in *either* direction), a missing
-  backend binary, or a host that cannot give bubblewrap capability-bearing user namespaces.
+  backend binary, a missing or non-executable Linux seccomp helper, or a host that cannot
+  give bubblewrap capability-bearing user namespaces.
   That last check runs the real chain rather than inferring from a sysctl, because inside a
   container the sysctl is absent and plain `bwrap` succeeds while the sandbox does not work
   at all.

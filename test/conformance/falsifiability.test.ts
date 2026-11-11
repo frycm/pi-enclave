@@ -24,6 +24,7 @@
  * pass every row. This file is what makes that meaningful.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { checkUnixSocketBlocking } from "../../src/backend/self-test.ts";
 import {
 	createFixture,
 	hostCapEff,
@@ -35,7 +36,7 @@ import {
 } from "./fixture.ts";
 import { NoopBackend } from "./noop-backend.ts";
 import { type ConformanceRow, formatRows, runConformance } from "./runner.ts";
-import { SCENARIOS } from "./scenarios.ts";
+import { SCENARIOS, scenarioEnv } from "./scenarios.ts";
 
 describe("conformance suite falsifiability", () => {
 	let restoreSecrets: () => void;
@@ -196,4 +197,26 @@ describe("C9 control: the environment scenario fails when credentials are not st
 			expect(process.env[name], name).toBe(value);
 		}
 	});
+});
+
+describe("Unix-socket self-test control (#34)", () => {
+	it("fails without a sandbox, so a passing self-test is evidence of the seccomp filter", async () => {
+		// The Linux backend refuses to compile unless this self-test passes
+		// (srt-backend.test.ts asserts it on the real host). Run unsandboxed, the
+		// same probe must report that a Unix socket could be created; otherwise
+		// it would pass on a host with no filter at all.
+		const backend = new NoopBackend();
+		const fixture = createFixture();
+		try {
+			const compiled = await backend.compile(fixture.profile);
+			const result = await checkUnixSocketBlocking(backend, compiled, {
+				cwd: fixture.workspace,
+				env: scenarioEnv(fixture),
+			});
+			expect(result.ok, result.detail).toBe(false);
+			expect(result.detail).toContain("could create a Unix socket");
+		} finally {
+			fixture.cleanup();
+		}
+	}, 60_000);
 });

@@ -29,9 +29,10 @@ import { getDefaultWritePaths, SandboxManager } from "@anthropic-ai/sandbox-runt
 import { buildChildEnv } from "../env/child-env.ts";
 import { HelperFsClient } from "../fs/client.ts";
 import type { BackendName } from "../probe.ts";
-import { hostRuntimeSafety, whichSync } from "../probe-host.ts";
+import { hostExecutableSafety, hostRuntimeSafety, resolveSeccompHelper, whichSync } from "../probe-host.ts";
 import { shellCapabilityIssue, validateReadCapability, validateWriteCapability } from "./capability.ts";
 import { canonical, isUnder } from "./paths.ts";
+import { checkUnixSocketBlocking } from "./self-test.ts";
 import {
 	type CompiledProfile,
 	type FsClient,
@@ -327,6 +328,7 @@ interface SrtConfig {
 	ripgrep?: { command: string };
 	bwrapPath?: string;
 	socatPath?: string;
+	seccomp?: { applyPath: string };
 }
 
 interface HostToolPaths {
@@ -334,6 +336,8 @@ interface HostToolPaths {
 	fd?: string;
 	bwrap?: string;
 	socat?: string;
+	/** The probed `apply-seccomp`, passed explicitly so SRT never falls back to a global install. */
+	seccompHelper?: string;
 }
 
 /**
@@ -363,6 +367,7 @@ export function toSrtConfig(
 		...(hostTools.rg ? { ripgrep: { command: hostTools.rg } } : {}),
 		...(platform === "linux" && hostTools.bwrap ? { bwrapPath: hostTools.bwrap } : {}),
 		...(platform === "linux" && hostTools.socat ? { socatPath: hostTools.socat } : {}),
+		...(platform === "linux" && hostTools.seccompHelper ? { seccomp: { applyPath: hostTools.seccompHelper } } : {}),
 		// "off" means no host is allowlisted. SRT still runs an egress proxy the
 		// child can reach; it denies every request. Raw sockets and DNS are denied
 		// by the kernel.
@@ -454,11 +459,31 @@ export class SrtBackend implements SandboxBackend {
 		const fd = whichSync("fd");
 		const bwrap = process.platform === "linux" ? whichSync("bwrap") : null;
 		const socat = process.platform === "linux" ? whichSync("socat") : null;
+		// sandbox-runtime runs without its Unix-socket filter when it cannot find
+		// this helper, and says so only on its debug channel (#34). Refuse here,
+		// so a backend constructed without the probe still fails closed.
+		const seccompHelper = process.platform === "linux" ? resolveSeccompHelper() : null;
+		if (process.platform === "linux" && seccompHelper === null) {
+			throw new Error(
+				"pi-enclave: refusing to compile the Linux sandbox without sandbox-runtime's seccomp helper; " +
+					"sandboxed commands could otherwise connect to any Unix socket the user can reach",
+			);
+		}
+		// bwrap executes the helper for every command, so a copy the agent can
+		// write would let it replace the filter it runs under. Checked against
+		// the compiled roots rather than in the probe, which only knows the cwd.
+		if (seccompHelper !== null) {
+			const helperSafety = hostExecutableSafety(profile.writableRoots, [seccompHelper]);
+			if (!helperSafety.ok) {
+				throw new Error(`pi-enclave: refusing an agent-writable seccomp helper. ${helperSafety.detail}`);
+			}
+		}
 		this.hostTools = {
 			...(rg ? { rg } : {}),
 			...(fd ? { fd } : {}),
 			...(bwrap ? { bwrap } : {}),
 			...(socat ? { socat } : {}),
+			...(seccompHelper ? { seccompHelper } : {}),
 		};
 		materializeWriteDenyAnchors(profile);
 		const config = toSrtConfig(profile, this.weakened, process.platform, this.hostTools);
@@ -495,7 +520,35 @@ export class SrtBackend implements SandboxBackend {
 		// assertCurrent exists to prevent.
 		await this.wrapHelper(profile);
 
-		return new SrtCompiledProfile(this.name, profile, ++this.generation, argv.join(" "));
+		const compiled = new SrtCompiledProfile(this.name, profile, ++this.generation, argv.join(" "));
+		if (process.platform === "linux") await this.requireUnixSocketBlocking(compiled);
+		return compiled;
+	}
+
+	/**
+	 * The session-start self-test for the Linux backend (#34).
+	 *
+	 * The probe establishes that the seccomp helper exists; this establishes
+	 * that it is in force, by trying to create an `AF_UNIX` socket inside the
+	 * sandbox just compiled and requiring the refusal. It turns the conformance
+	 * row C8 into a check on the host the session actually runs on, and it
+	 * catches a sandbox-runtime release that stops applying the filter. A
+	 * failure throws, which leaves the session without a compiled profile, so
+	 * every tool refuses.
+	 */
+	private async requireUnixSocketBlocking(compiled: SrtCompiledProfile): Promise<void> {
+		const profile = compiled.profile;
+		const result = await checkUnixSocketBlocking(this, compiled, {
+			cwd: profile.writableRoots[0] ?? process.cwd(),
+			env: buildChildEnv(process.env, {
+				readDeny: profile.readDeny,
+				writableRoots: profile.writableRoots,
+				...(profile.tmpDir ? { tmpdir: profile.tmpDir } : {}),
+			}),
+		});
+		if (!result.ok) {
+			throw new Error(`pi-enclave: refusing to start the Linux sandbox: ${result.detail}`);
+		}
 	}
 
 	/**

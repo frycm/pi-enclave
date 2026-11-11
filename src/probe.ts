@@ -71,6 +71,16 @@ export interface ProbeEnv {
 	 * Returns null when the check could not be run (no bwrap, not Linux).
 	 */
 	canNestNamespaces?: () => { ok: boolean; detail: string } | null;
+	/**
+	 * Linux only: the canonical path of sandbox-runtime's executable seccomp
+	 * helper for this architecture, or null when there is none.
+	 *
+	 * The helper is the only thing that blocks `socket(AF_UNIX, ...)` inside
+	 * the sandbox, and sandbox-runtime runs without it silently. On Linux an
+	 * env that does not provide this function fails the check: an unasked
+	 * question is not a yes.
+	 */
+	seccompHelper?: () => string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +343,36 @@ function checkLinuxUserns(env: ProbeEnv): ProbeCheck | null {
 }
 
 /**
+ * sandbox-runtime's `apply-seccomp` must be present and executable on Linux.
+ *
+ * Without it sandbox-runtime records a warning and runs every command with no
+ * Unix-socket filter. A network namespace does not stop `connect()` to a
+ * socket visible in the filesystem, so the session bus, a container engine
+ * socket or an ssh-agent would all be reachable from inside the sandbox. That
+ * is a different boundary from the one the status line describes, so it fails
+ * rather than warns (#34).
+ */
+function checkSeccompHelper(env: ProbeEnv): ProbeCheck {
+	const helper = env.seccompHelper?.() ?? null;
+	if (helper !== null) {
+		return { id: "linux-seccomp-helper", title: "Seccomp helper", status: "ok", detail: helper };
+	}
+	return {
+		id: "linux-seccomp-helper",
+		title: "Seccomp helper",
+		status: "fail",
+		detail:
+			env.seccompHelper === undefined
+				? "the seccomp helper could not be checked on this host"
+				: "sandbox-runtime's apply-seccomp helper was not found or is not executable for this architecture; " +
+					"without it sandboxed commands could connect to any Unix socket the user can reach",
+		remediation:
+			"Run on x64 or arm64, and reinstall pi-enclave so that " +
+			"node_modules/@anthropic-ai/sandbox-runtime/vendor/seccomp/<arch>/apply-seccomp exists and is executable.",
+	};
+}
+
+/**
  * The functional namespace check.
  *
  * Runs the same chain sandbox-runtime does -- bubblewrap creating a
@@ -380,6 +420,7 @@ export function probe(env: ProbeEnv): ProbeReport {
 		if (env.platform === "linux") {
 			const userns = checkLinuxUserns(env);
 			if (userns) checks.push(userns);
+			checks.push(checkSeccompHelper(env));
 			// Only worth running when the sysctl has not already explained the
 			// failure, and only when the binaries it needs are present.
 			const alreadyFailed = checks.some((check) => check.status === "fail");

@@ -23,13 +23,14 @@ import {
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { checkUnixSocketBlocking } from "../../src/backend/self-test.ts";
 import { effectiveProfile, partitionSrtDefaults, SrtBackend, srtTmpDir, toSrtConfig } from "../../src/backend/srt.ts";
 import { SandboxDenied } from "../../src/backend/types.ts";
 import { formatProbeReport } from "../../src/probe.ts";
 import { probeHost } from "../../src/probe-host.ts";
 import { createFixture, plantSecrets, SECRET_FILE_CONTENT } from "./fixture.ts";
 import { type ConformanceRow, formatRows, runConformance } from "./runner.ts";
-import { SCENARIOS } from "./scenarios.ts";
+import { SCENARIOS, scenarioEnv } from "./scenarios.ts";
 
 // npm prepends this checkout's node_modules/.bin to PATH before starting
 // Vitest. Production correctly refuses that host-code lookup path; the native
@@ -203,6 +204,30 @@ describe.skipIf(!supported)("sandbox-runtime profile translation", () => {
 		});
 		expect(config.network.allowedDomains).toEqual([]);
 	});
+});
+
+describe.skipIf(!supported || process.platform !== "linux")("session-start Unix-socket self-test (#34)", () => {
+	it("refuses socket(AF_UNIX) inside the compiled sandbox on this host", async () => {
+		// compile() already ran this probe and would have thrown on failure; it
+		// is repeated here so the CI row shows the verdict and the errno, and so
+		// a compile() that stopped running it would still leave this assertion.
+		// The unsandboxed control is in falsifiability.test.ts.
+		const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
+		const fixture = createFixture();
+		try {
+			const compiled = await backend.compile(fixture.profile);
+			const result = await checkUnixSocketBlocking(backend, compiled, {
+				cwd: fixture.workspace,
+				env: scenarioEnv(fixture),
+			});
+			console.info(`unix-socket self-test: ${result.detail}`);
+			expect(result.ok, result.detail).toBe(true);
+			expect(result.detail).toMatch(/EPERM|EACCES/);
+		} finally {
+			await backend.dispose();
+			fixture.cleanup();
+		}
+	}, 60_000);
 });
 
 describe.skipIf(!supported)("pty policy", () => {

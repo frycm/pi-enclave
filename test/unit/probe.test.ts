@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -16,7 +16,7 @@ import {
 	probe,
 	USERNS_SYSCTL_PATH,
 } from "../../src/probe.ts";
-import { hostExecutableSafety, hostPathSafety } from "../../src/probe-host.ts";
+import { hostExecutableSafety, hostPathSafety, resolveSeccompHelper, seccompHelperArch } from "../../src/probe-host.ts";
 
 const tempRoots: string[] = [];
 afterEach(() => {
@@ -34,6 +34,8 @@ function healthyEnv(overrides: Partial<ProbeEnv> = {}): ProbeEnv {
 		piVersion: PI_RANGE_MIN,
 		which: () => "/usr/bin/stub",
 		readText: () => null,
+		// Present so the Linux cases below fail only for the reason they are about.
+		seccompHelper: () => "/opt/srt/vendor/seccomp/x64/apply-seccomp",
 		...overrides,
 	};
 }
@@ -238,6 +240,93 @@ describe("probe: Linux user namespaces", () => {
 		const env = healthyEnv({ platform: "darwin", readText: () => "1" });
 		expect(probe(env).checks.map((c) => c.id)).not.toContain("linux-userns");
 		expect(probe(env).ok).toBe(true);
+	});
+});
+
+describe("probe: Linux seccomp helper (#34)", () => {
+	it("fails when the helper is missing, instead of reporting a partial check as OK", () => {
+		const env = healthyEnv({ platform: "linux", seccompHelper: () => null });
+		const report = probe(env);
+		expect(report.ok).toBe(false);
+		const check = byId(env, "linux-seccomp-helper");
+		expect(check?.status).toBe("fail");
+		expect(check?.detail).toContain("Unix socket");
+		expect(check?.remediation).toContain("apply-seccomp");
+	});
+
+	it("fails when the host env cannot answer the question at all", () => {
+		const { seccompHelper: _omitted, ...env } = healthyEnv({ platform: "linux" });
+		expect(probe(env).ok).toBe(false);
+		expect(byId(env, "linux-seccomp-helper")?.status).toBe("fail");
+	});
+
+	it("does not run the namespace chain once the helper is known to be missing", () => {
+		let ran = false;
+		const env = healthyEnv({
+			platform: "linux",
+			seccompHelper: () => null,
+			canNestNamespaces: () => {
+				ran = true;
+				return { ok: true, detail: "would have passed" };
+			},
+		});
+		expect(probe(env).checks.map((c) => c.id)).not.toContain("linux-namespace-nesting");
+		expect(ran).toBe(false);
+	});
+
+	it("passes and names the helper when it is present", () => {
+		const env = healthyEnv({ platform: "linux" });
+		expect(probe(env).ok).toBe(true);
+		expect(byId(env, "linux-seccomp-helper")).toMatchObject({
+			status: "ok",
+			detail: expect.stringContaining("apply-seccomp"),
+		});
+	});
+
+	it("is a Linux check only", () => {
+		const env = healthyEnv({ platform: "darwin", seccompHelper: () => null });
+		expect(probe(env).checks.map((c) => c.id)).not.toContain("linux-seccomp-helper");
+		expect(probe(env).ok).toBe(true);
+	});
+});
+
+describe("resolveSeccompHelper", () => {
+	const packageWithHelper = (name: string, mode: number | null): string => {
+		const root = mkdtempSync(join(tmpdir(), "enclave-srt-"));
+		tempRoots.push(root);
+		if (mode !== null) {
+			mkdirSync(join(root, "vendor", "seccomp", name), { recursive: true });
+			const helper = join(root, "vendor", "seccomp", name, "apply-seccomp");
+			writeFileSync(helper, "#!/bin/sh\n");
+			chmodSync(helper, mode);
+		}
+		return root;
+	};
+
+	it("returns the canonical path of an executable helper", () => {
+		const root = packageWithHelper("x64", 0o755);
+		expect(resolveSeccompHelper(root, "x64")).toBe(realpathSync(join(root, "vendor/seccomp/x64/apply-seccomp")));
+	});
+
+	it("returns null when the helper lost its executable bit", () => {
+		expect(resolveSeccompHelper(packageWithHelper("x64", 0o644), "x64")).toBeNull();
+	});
+
+	it("returns null when the helper is absent", () => {
+		expect(resolveSeccompHelper(packageWithHelper("x64", null), "x64")).toBeNull();
+	});
+
+	it("never substitutes the x64 helper on an architecture SRT does not ship", () => {
+		const root = packageWithHelper("x64", 0o755);
+		for (const architecture of ["riscv64", "ppc64", "s390x", "arm", "ia32"]) {
+			expect(seccompHelperArch(architecture), architecture).toBeNull();
+			expect(resolveSeccompHelper(root, architecture), architecture).toBeNull();
+		}
+	});
+
+	it("finds the helper that ships with the installed sandbox-runtime", () => {
+		// x64 and arm64 are the only CI architectures; both helpers ship in the package.
+		expect(resolveSeccompHelper()).toMatch(/vendor\/seccomp\/(x64|arm64)\/apply-seccomp$/);
 	});
 });
 
