@@ -130,9 +130,9 @@ function releaseLargeResponse() {
  * it returns true, and the output is capped in bytes regardless. Both are
  * reported in the result so the caller can say so.
  */
-function runTool(requestId, bin, args, stopAfterLines) {
+function runTool(requestId, bin, args, stopAfterLines, cwd) {
 	return new Promise((resolve) => {
-		const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(bin, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
 		running.set(requestId, child);
 		let stdout = "";
 		let stderr = "";
@@ -280,13 +280,44 @@ async function handle(request) {
 			// -- on this side of the boundary, so it is the same answer rg got --
 			// and let a refusal travel as the errno it is.
 			accessSync(request.path, constants.R_OK);
-			// Stop rg at the match limit rather than buffering everything it would
-			// ever print; `--json` emits one event per line, so matches can be
-			// counted as they arrive.
+			// Root globs at the search directory, including symlinked roots such
+			// as macOS /tmp. This cwd and the root stat stay inside the sandbox.
+			const directory = statSync(request.path).isDirectory();
+			const args = [...request.args];
+			if (directory) args[args.length - 1] = ".";
+			const context = request.context ?? 0;
+			// Keep the last allowed match's trailing context and wait for one
+			// more match before reporting truncation. The byte cap still applies.
 			let matches = 0;
+			let lastFile;
+			let trailingEnd = 0;
+			let extraMatch = false;
 			const limit = request.limit > 0 ? request.limit : Infinity;
-			const result = await runTool(request.id, TOOL_PATHS.rg, request.args, (line) =>
-				line.includes('"type":"match"') ? ++matches >= limit : false,
+			const result = await runTool(
+				request.id,
+				TOOL_PATHS.rg,
+				args,
+				(line) => {
+					let event;
+					try {
+						event = JSON.parse(line);
+					} catch {
+						return false;
+					}
+					if (event.type !== "match" && event.type !== "context") return false;
+					const file = JSON.stringify(event.data?.path);
+					const number = event.data?.line_number;
+					if (matches < limit) {
+						if (event.type === "match" && ++matches === limit) {
+							lastFile = file;
+							trailingEnd = number + context;
+						}
+						return false;
+					}
+					if (event.type === "match") extraMatch = true;
+					return extraMatch && !(file === lastFile && number < trailingEnd);
+				},
+				directory ? request.path : undefined,
 			);
 			if (result.code === "ENOENT")
 				throw Object.assign(new Error(`rg is not available (looked for ${TOOL_PATHS.rg})`), { code: "ENOENT" });

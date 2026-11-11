@@ -5,7 +5,7 @@
  *
  * **The freeze** is guardian's `tool-input-lock.ts`, ported with attribution
  * (MIT). `event.input` is asserted JSON-like, deep-frozen, and redefined
- * non-writable. It works because of a fact verified in pi 1.1.0: the object
+ * non-writable. It works because of a fact verified in pi 1.5.2: the object
  * the `tool_call` handlers receive *is* the object `execute` receives -- pi
  * clones the arguments once at validation and never again. A later extension's
  * mutation therefore throws a `TypeError`, and `emitToolCall` is the one

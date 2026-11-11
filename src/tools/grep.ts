@@ -1,33 +1,18 @@
 /**
- * `grep`, with the search running inside the sandbox.
- *
- * pi's grep is the one file tool its operations object cannot redirect. The
- * interface abstracts the filesystem walk, but the tool
- * [spawns `rg` itself](https://github.com/earendil-works/pi/blob/107d79f11072bbc8a3a757ed7fd69596bee7d68c/packages/coding-agent/src/core/tools/grep.ts#L139-L190)
- * from the pi process -- so a `grep` over a credential directory would read it
- * with the user's full privileges no matter what profile is in force.
- *
- * Rather than copy pi's four hundred lines, this keeps pi's tool object whole --
- * schema, description, renderers, prompt snippet -- and replaces only `execute`.
- * Less to keep in step on a baseline bump, and the parts users see stay
- * byte-identical to the built-in tool.
- *
- * The observable contract is what the tests pin: `path:line: text` for a match,
- * `path-line- text` for a context line, and pi's own truncation notices.
+ * pi's grep executor, with rg running inside the sandboxed filesystem helper.
+ * The schema and rendering stay upstream; this mirrors the pinned pi 1.5.2
+ * JSON/context protocol without spawning rg or opening matched files in pi.
  */
-import { relative } from "node:path";
+import { basename, relative, resolve } from "node:path";
 import { DEFAULT_MAX_BYTES, formatSize, truncateHead, truncateLine } from "@earendil-works/pi-coding-agent";
 import type { FsClient } from "../backend/types.ts";
 import { SandboxDenied } from "../backend/types.ts";
 
-/**
- * Mirrors pi's private `DEFAULT_LIMIT` (grep.ts:44). Duplicated because it is
- * not exported; `test/unit/upstream-drift.test.ts` fails when pi's value or its
- * grep artifact changes, so the copy cannot drift silently.
- */
+/** Private upstream constant, pinned with its artifact in upstream-drift.test.ts. */
 const DEFAULT_LIMIT = 100;
-/** Keep caller-controlled match metadata bounded even before output formatting. */
+/** Bound caller-controlled metadata even before output formatting. */
 const MAX_MATCH_LIMIT = 10_000;
+const GREP_MAX_LINE_LENGTH = 500;
 
 export interface GrepArgs {
 	pattern: string;
@@ -45,36 +30,62 @@ export interface GrepOutcome {
 	isError?: boolean;
 }
 
-interface RipgrepMatch {
+interface RipgrepLine {
 	filePath: string;
 	lineNumber: number;
-	lineText?: string;
+	lineText: string;
+	isMatch: boolean;
 }
 
-/** Parse ripgrep's `--json` stream, stopping at the match limit. */
-export function parseRipgrepJson(stdout: string, limit: number): { matches: RipgrepMatch[]; limitReached: boolean } {
-	const matches: RipgrepMatch[] = [];
+/** Decode ripgrep's JSON wire values, including non-UTF-8 paths and contents. */
+function decodeRgText(value: { text?: string; bytes?: string } | undefined): string {
+	if (typeof value?.text === "string") return value.text;
+	if (typeof value?.bytes === "string") return Buffer.from(value.bytes, "base64").toString("utf8");
+	return "";
+}
+
+/** Select matches and their context; only an additional match proves truncation. */
+export function parseRipgrepJson(stdout: string, limit: number, context = 0) {
+	const matches: RipgrepLine[] = [];
+	let matchCount = 0;
+	let limitReached = false;
+	let lastFile: string | undefined;
+	let trailingEnd = 0;
 	for (const line of stdout.split("\n")) {
-		if (!line.trim()) continue;
-		if (matches.length >= limit) return { matches, limitReached: true };
 		let event: {
 			type?: string;
-			data?: { path?: { text?: string }; line_number?: number; lines?: { text?: string } };
+			data?: {
+				path?: { text?: string; bytes?: string };
+				line_number?: number;
+				lines?: { text?: string; bytes?: string };
+			};
 		};
 		try {
 			event = JSON.parse(line);
 		} catch {
 			continue;
 		}
-		if (event.type !== "match") continue;
-		const filePath = event.data?.path?.text;
+		if (event.type !== "match" && event.type !== "context") continue;
+		const filePath = decodeRgText(event.data?.path);
 		const lineNumber = event.data?.line_number;
-		if (filePath && typeof lineNumber === "number") {
-			const text = event.data?.lines?.text;
-			matches.push({ filePath, lineNumber, ...(typeof text === "string" ? { lineText: text } : {}) });
+		if (!filePath || typeof lineNumber !== "number") continue;
+		let isMatch = event.type === "match";
+		if (matchCount >= limit) {
+			const inWindow = filePath === lastFile && lineNumber <= trailingEnd;
+			if (isMatch) limitReached = true;
+			if (!inWindow) {
+				if (limitReached) break;
+				continue;
+			}
+			isMatch = false;
+		} else if (isMatch) {
+			matchCount++;
+			lastFile = filePath;
+			trailingEnd = lineNumber + context;
 		}
+		matches.push({ filePath, lineNumber, lineText: decodeRgText(event.data?.lines), isMatch });
 	}
-	return { matches, limitReached: matches.length >= limit };
+	return { matches, matchCount, limitReached };
 }
 
 export interface SandboxedGrepOptions {
@@ -83,11 +94,7 @@ export interface SandboxedGrepOptions {
 	signal?: AbortSignal;
 }
 
-/**
- * Serialize complete grep executions, including parent-side parsing and context
- * reads. Bounding only the helper subprocess still lets completed 16-MiB
- * payloads accumulate in the parent while earlier calls await follow-up reads.
- */
+/** Bound the entire parent-side parsing/formatting lifetime, not only the child. */
 export class GrepExecutionQueue {
 	private tail: Promise<void> = Promise.resolve();
 
@@ -107,35 +114,29 @@ export class GrepExecutionQueue {
 	}
 }
 
-/**
- * Run a search entirely inside the sandbox and format it the way pi does.
- *
- * Context lines are read back through the helper too. Reading them in the pi
- * process would reopen the exact hole this module exists to close: `rg` would be
- * confined while the surrounding lines it reported were fetched with full
- * privileges.
- */
+/** Search and obtain context entirely inside L2, then format the bounded result. */
 export async function runSandboxedGrep(options: SandboxedGrepOptions, args: GrepArgs): Promise<GrepOutcome> {
 	const { fs, cwd, signal } = options;
-	const searchPath = args.path ?? cwd;
+	const searchPath = resolve(cwd, args.path ?? ".");
 	const requestedLimit =
-		args.limit && Number.isFinite(args.limit) && args.limit > 0 ? Math.floor(args.limit) : DEFAULT_LIMIT;
+		args.limit !== undefined && Number.isFinite(args.limit) ? Math.max(1, Math.floor(args.limit)) : DEFAULT_LIMIT;
 	const limit = Math.min(requestedLimit, MAX_MATCH_LIMIT);
-	const context = args.context && args.context > 0 ? args.context : 0;
-
-	const rgArgs = ["--json", "--line-number", "--color=never", "--hidden"];
+	const context = args.context && args.context > 0 ? Math.min(Math.floor(args.context), Number.MAX_SAFE_INTEGER) : 0;
+	const rgArgs = ["--no-config", "--json", "--line-number", "--color=never", "--hidden"];
 	if (args.ignoreCase) rgArgs.push("--ignore-case");
 	if (args.literal) rgArgs.push("--fixed-strings");
-	if (args.glob) rgArgs.push("--glob", args.glob);
+	if (args.glob) rgArgs.push("--glob", args.glob.replace(/^(!?)(?:\.\/)+/, "$1"));
+	if (context > 0) rgArgs.push("--context", String(context));
 	rgArgs.push("--", args.pattern, searchPath);
 
 	let stdout: string;
+	let directory: boolean;
 	let capped = false;
 	try {
-		// The limit travels with the request so rg is stopped at the limit inside
-		// the sandbox, rather than buffering everything it would ever print.
+		directory = (await fs.stat(searchPath)).isDirectory();
 		({ stdout, capped = false } = await fs.grep(rgArgs, {
 			limit,
+			context,
 			path: searchPath,
 			...(signal ? { signal } : {}),
 		}));
@@ -149,81 +150,28 @@ export async function runSandboxedGrep(options: SandboxedGrepOptions, args: Grep
 		throw error;
 	}
 
-	const { matches, limitReached } = parseRipgrepJson(stdout, limit);
-	if (matches.length === 0) return { content: [{ type: "text", text: "No matches found" }] };
-
-	// Ripgrep emits a file's matches together. Retain only that file while its
-	// matches are formatted, then release it before reading the next one. A
-	// cross-file cache let the default 100-match search retain 100 complete
-	// 32-MiB files in the privileged parent before the final output truncation.
-	let cachedPath: string | undefined;
-	let cachedLines: string[] = [];
-	const linesFor = async (path: string): Promise<string[]> => {
-		if (path === cachedPath) return cachedLines;
-		let lines: string[] = [];
-		try {
-			lines = (await fs.readFile(path)).toString("utf8").split("\n");
-		} catch {
-			// A file rg could see but the helper cannot read is reported inline
-			// rather than failing the whole search.
-		}
-		cachedPath = path;
-		cachedLines = lines;
-		return cachedLines;
-	};
-
+	const { matches, matchCount, limitReached } = parseRipgrepJson(stdout, limit, context);
+	if (matchCount === 0) return { content: [{ type: "text", text: "No matches found" }] };
 	let linesTruncated = false;
 	const output: string[] = [];
 	let outputBytes = 0;
-	let outputBudgetReached = false;
-	const append = (line: string): boolean => {
-		outputBytes += Buffer.byteLength(line, "utf8") + (output.length > 0 ? 1 : 0);
-		output.push(line);
-		if (outputBytes > DEFAULT_MAX_BYTES) {
-			outputBudgetReached = true;
-			return false;
-		}
-		return true;
-	};
-
 	for (const match of matches) {
-		const shown = relative(cwd, match.filePath) || match.filePath;
-		// With no context, rg already returned the matching line inside the
-		// sandbox. Avoid a second full-file read entirely. Older/fake rg payloads
-		// without `data.lines.text` retain the compatible helper-read fallback.
-		if (context === 0 && match.lineText !== undefined) {
-			const raw = match.lineText.replace(/\r?\n$/, "").replace(/\r/g, "");
-			const { text, wasTruncated } = truncateLine(raw);
-			if (wasTruncated) linesTruncated = true;
-			if (!append(`${shown}:${match.lineNumber}: ${text}`)) break;
-			continue;
-		}
-
-		const lines = await linesFor(match.filePath);
-		if (lines.length === 0) {
-			if (!append(`${shown}:${match.lineNumber}: (unable to read file)`)) break;
-			continue;
-		}
-		const start = context > 0 ? Math.max(1, match.lineNumber - context) : match.lineNumber;
-		const end = context > 0 ? Math.min(lines.length, match.lineNumber + context) : match.lineNumber;
-		for (let current = start; current <= end; current++) {
-			const raw = (lines[current - 1] ?? "").replace(/\r/g, "");
-			const { text, wasTruncated } = truncateLine(raw);
-			if (wasTruncated) linesTruncated = true;
-			if (!append(current === match.lineNumber ? `${shown}:${current}: ${text}` : `${shown}-${current}- ${text}`)) {
-				break;
-			}
-		}
-		if (outputBudgetReached) break;
+		const path = relative(searchPath, resolve(searchPath, match.filePath));
+		const shown = directory && path && !path.startsWith("..") ? path.replace(/\\/g, "/") : basename(match.filePath);
+		const { text, wasTruncated } = truncateLine(match.lineText.replace(/\r?\n?$/, ""));
+		if (wasTruncated) linesTruncated = true;
+		const line = match.isMatch ? `${shown}:${match.lineNumber}: ${text}` : `${shown}-${match.lineNumber}- ${text}`;
+		if (outputBytes - 1 <= DEFAULT_MAX_BYTES) output.push(line);
+		outputBytes += Buffer.byteLength(line, "utf8") + 1;
 	}
-
-	const truncation = truncateHead(output.join("\n"), { maxBytes: DEFAULT_MAX_BYTES });
+	const truncation = truncateHead(output.join("\n"), { maxLines: Number.MAX_SAFE_INTEGER });
+	truncation.totalLines = matches.length;
+	truncation.totalBytes = outputBytes - 1;
 	let text = truncation.content;
 	const notices: string[] = [];
 	const details: GrepOutcome["details"] = {};
-
 	if (limitReached) {
-		notices.push(`${limit} match limit reached`);
+		notices.push(`${limit} matches limit reached. Use limit=${limit * 2} for more, or refine pattern`);
 		details.matchLimitReached = limit;
 	}
 	if (truncation.truncated) {
@@ -231,11 +179,10 @@ export async function runSandboxedGrep(options: SandboxedGrepOptions, args: Grep
 		details.truncation = truncation;
 	}
 	if (capped) notices.push("search output limit reached inside the sandbox; refine the pattern or path");
-	if (linesTruncated) details.linesTruncated = true;
+	if (linesTruncated) {
+		notices.push(`Some lines truncated to ${GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines`);
+		details.linesTruncated = true;
+	}
 	if (notices.length > 0) text += `\n\n[${notices.join(". ")}]`;
-
-	return {
-		content: [{ type: "text", text }],
-		...(Object.keys(details).length > 0 ? { details } : {}),
-	};
+	return { content: [{ type: "text", text }], ...(Object.keys(details).length > 0 ? { details } : {}) };
 }

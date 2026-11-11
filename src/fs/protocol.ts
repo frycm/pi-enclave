@@ -43,7 +43,7 @@ export type FsCall =
 	| { op: "readdir"; path: string }
 	| { op: "exists"; path: string }
 	| { op: "glob"; pattern: string; cwd: string; ignore: string[]; limit: number }
-	| { op: "grep"; args: string[]; limit: number; path: string }
+	| { op: "grep"; args: string[]; limit: number; path: string; context?: number }
 	| { op: "cancel"; target: number }
 	| { op: "ping" };
 

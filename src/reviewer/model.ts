@@ -109,7 +109,7 @@ async function manifest(target: Endpoint, signal: AbortSignal): Promise<string> 
 /** Identity includes inference routing and model configuration, never the CLI's server. */
 async function endpointDigest(target: Endpoint, signal: AbortSignal): Promise<string> {
 	const model = target.model;
-	const descriptor = { model: target.model, headers: target.headers, auth: target.authIdentity, transport: 3 };
+	const descriptor = { model: target.model, headers: target.headers, auth: target.authIdentity, transport: 4 };
 	if (model.provider === "ollama") {
 		const modelManifest = await manifest(target, signal);
 		const version = await ollamaJson(target, "version", signal);

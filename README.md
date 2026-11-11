@@ -43,8 +43,8 @@ Every integration claim below is made against a specific pi:
 |---|---|
 | Repository | [`earendil-works/pi`](https://github.com/earendil-works/pi) (formerly `badlogic/pi-mono`; not the unrelated `badlogic/pi` GPU-pod CLI) |
 | Package | `@earendil-works/pi-coding-agent` |
-| Supported range | **`>=1.1.0 <1.2.0`** — bounded on both sides; development dependency pinned to **`1.1.0`** |
-| Reference commit | [`abe508e`](https://github.com/earendil-works/pi/tree/abe508e1b89912adde45528136c3221eb69acdd7) — upstream **v1.1.0**, released October 7, 2026 |
+| Supported range | **`>=1.5.2 <1.6.0`** — bounded on both sides; development dependency pinned to **`1.5.2`** |
+| Reference commit | [`b4afddd`](https://github.com/earendil-works/pi/tree/b4afdddf44e059c67ccf5097e5317d913521b470) — upstream **v1.5.2**, released November 10, 2026 |
 | Node | **`>=22.19.0`**, matching the pinned pi release |
 | Fork for core changes | [`frycm/pi`](https://github.com/frycm/pi) — always rebased onto the **latest stable upstream release**; carries only the patches listed under [core changes](#core-changes-to-propose-to-pi) |
 
@@ -53,11 +53,12 @@ it** — on an older pi *and* on a newer one. A newer minor may change hook sema
 ordering, `tool_call` result shape, tool operation interfaces) in ways the conformance suite
 has not seen, and "probably fine" is not a sandbox guarantee.
 
-The pi v1.1.0 root import no longer requires the old `pi-server` packaging workaround;
-that dependency has been removed. Policy initialization continues to use `ctx.cwd`.
-The [pi 1.1 migration review](docs/pi-1.1-upgrade.md) records execution-path changes,
-MCP credential protection, reviewer transport migration and validation evidence. Native
-Linux/macOS conformance on the upgrade commit is required before merge.
+The [pi 1.5 migration and dependency review](docs/pi-1.5-upgrade.md) records the
+startup-event change, sandboxed grep parity, sandbox-runtime update and validation.
+Policy initialization continues to use `ctx.cwd`; the old `pi-server` workaround
+remains unnecessary. Native Linux/macOS conformance on the upgrade commit is
+required before merge. The [pi 1.1 migration review](docs/pi-1.1-upgrade.md) retains
+the previous baseline history.
 
 Moving the baseline is one PR that does all of the following together, or none of it:
 
@@ -374,7 +375,7 @@ kernel denies it, the helper reports a `Violation` exactly as a shell command wo
 
 This also handles a concrete gap in pi's current `grep` tool: its operations object only
 abstracts the filesystem walk, while the tool itself still
-[spawns `rg` directly](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/src/core/tools/grep.ts#L139-L190)
+[spawns `rg` directly](https://github.com/earendil-works/pi/blob/b4afdddf44e059c67ccf5097e5317d913521b470/packages/coding-agent/src/core/tools/grep.ts#L155-L180)
 from the pi process. pi-enclave therefore re-registers `grep` with its own implementation
 that runs `rg` inside the helper, rather than reusing its unsandboxed execution path.
 
@@ -497,7 +498,7 @@ are reached by **pi itself**, not from inside the sandbox.
 
 Everything below uses APIs that exist in pi at the [baseline](#api-baseline). pi already
 ships an
-[SRT-based sandbox extension example](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/examples/extensions/sandbox/index.ts)
+[SRT-based sandbox extension example](https://github.com/earendil-works/pi/blob/b4afdddf44e059c67ccf5097e5317d913521b470/packages/coding-agent/examples/extensions/sandbox/index.ts)
 that overrides `bash`; pi-enclave's contribution is not another Seatbelt/bwrap wrapper but
 complete tool coverage, monotonic policy, exact approval binding, auditability and reviewer
 evaluation on top of one.
@@ -1023,7 +1024,7 @@ turns a performance feature into an authorization replay surface.
 ### Attendance is a setting, not an inference
 
 An earlier draft inferred "a human is present" from `ctx.hasUI`. That is wrong on current pi:
-[`ctx.hasUI` is `true` in both TUI and RPC modes](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/docs/extensions.md),
+[`ctx.hasUI` is `true` in both TUI and RPC modes](https://github.com/earendil-works/pi/blob/b4afdddf44e059c67ccf5097e5317d913521b470/packages/coding-agent/docs/extensions.md),
 and an RPC client may be a headless orchestrator with nobody behind it — the worst possible
 place to show a confirm dialog whose default resolves to "approved". Attendance is therefore
 an **explicit contract**:
@@ -1041,8 +1042,8 @@ attended: {
 | `"rpc"` | A person is behind an RPC client that has opted in | The client must complete the **approval-channel handshake** below, built only from `ctx.ui.input` / `ctx.ui.confirm`. No handshake → treated as `"off"` for this session, and the status line says so. |
 | `"off"` | Nobody is there (CI, ops runner, print mode) | Every `ask` is a deny; no dialog is ever attempted |
 
-**The RPC handshake, on pinned pi.** pi 1.1.0 gives an extension exactly the fixed
-[`extension_ui_request` methods](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/src/modes/rpc/rpc-types.ts)
+**The RPC handshake, on pinned pi.** pi 1.5.2 gives an extension exactly the fixed
+[`extension_ui_request` methods](https://github.com/earendil-works/pi/blob/b4afdddf44e059c67ccf5097e5317d913521b470/packages/coding-agent/src/modes/rpc/rpc-types.ts)
 — `select`, `confirm`, `input`, `editor`, plus fire-and-forget — and nothing custom. So the
 handshake is a defined use of `ctx.ui.input`, not a new message type:
 
@@ -1380,7 +1381,7 @@ after passing the eval.*
 **v1 release gate:** expand the reviewer corpus beyond repeated templates, qualify a real
 local model on target hardware with measured denial, approval and latency rates, and run
 the end-to-end approval, cancellation, resume and parallel-call flows against the packaged
-pi 1.1.0 integration. Publish the supported host and model limits with those results.
+pi 1.5.2 integration. Publish the supported host and model limits with those results.
 
 ### Phase 4a — Offline container backend
 
@@ -1758,7 +1759,7 @@ reviewer or sandbox extension *robust* rather than merely careful:
    the channel, can be bound to a secret the client holds.
 
 These are proposals for [`frycm/pi`](https://github.com/frycm/pi), with pi-enclave as the
-motivating use case. The pi v1.1 migration advances the fork to the exact stable upstream v1.1.0 tag and
+motivating use case. The fork matches the exact stable upstream v1.5.2 tag and
 contains no prototype patches. The fork's policy is fixed: it is **always rebased
 onto the latest stable upstream release** and carries *only* the patches above as discrete
 commits on top — no divergent features, no long-lived branch. pi-enclave itself targets
