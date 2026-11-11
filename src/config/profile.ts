@@ -9,12 +9,14 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { lstatSync, readdirSync, readFileSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { canonical, isUnder } from "../backend/paths.ts";
 import type { Profile } from "../backend/types.ts";
 import { buildChildEnv } from "../env/child-env.ts";
+import { isAgentConfigName } from "../persistence/agent.ts";
 import { findGitEntries, readGitfile } from "../persistence/git.ts";
+import type { ScanMatch } from "../persistence/scan.ts";
 import { type DefaultProfileOptions, defaultProfile } from "./defaults.ts";
 import type { EffectiveProfile } from "./types.ts";
 
@@ -128,6 +130,23 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 	const materializeWriteDenyFiles: string[] = [];
 	const writableRoots = effective.sandbox.writableRoots.map(canonical);
 	const isWritable = (path: string) => writableRoots.some((root) => isUnder(canonical(path), root));
+
+	// `.agents/skills` in the working directory is loaded by pi in a trusted
+	// project (#19). Materialised read-only like `.pi`, unless it is a symlink,
+	// which is protected through its target below instead.
+	const rootAgents = join(workspaceRoot, ".agents");
+	if (isWritable(workspaceRoot)) {
+		let rootAgentsIsLink = false;
+		try {
+			rootAgentsIsLink = lstatSync(rootAgents).isSymbolicLink();
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		if (!rootAgentsIsLink) {
+			writeDeny.push(rootAgents);
+			materializeWriteDeny.push(rootAgents);
+		}
+	}
 	const validateProtectedFile = (path: string, label: string): boolean => {
 		try {
 			const stat = lstatSync(path);
@@ -482,7 +501,38 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 	// as a database volume. Nothing run as this user reaches inside them, so
 	// they are skipped and listed in `/enclave status`.
 	const unscanned: string[] = [];
-	for (const entry of findGitEntries(writableRoots, { unscanned })) {
+	const agentConfig: ScanMatch[] = [];
+	const gitEntries = findGitEntries(writableRoots, {
+		unscanned,
+		alsoMatch: (name) => isAgentConfigName(name),
+		also: agentConfig,
+	});
+
+	// Every `.pi` and `.agents` directory in a writable root, not only the
+	// workspace's own (#19): pi started later in a subdirectory of a trusted
+	// project loads its extensions, settings and skills without a new prompt.
+	// One created after this point is the tripwire's job.
+	for (const entry of agentConfig) {
+		if (entry.kind === "dir") {
+			writeDeny.push(entry.path);
+			continue;
+		}
+		if (entry.kind !== "symlink") continue;
+		let target: string;
+		try {
+			target = realpathSync(entry.path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			throw new Error(
+				`pi-enclave: refusing a symlinked agent configuration path that points nowhere: ${entry.path}; ` +
+					"remove it, or keep it outside sandbox.writableRoots",
+			);
+		}
+		writeDeny.push(entry.path);
+		if (isWritable(target)) writeDeny.push(target);
+	}
+
+	for (const entry of gitEntries) {
 		if (entry.path === rootGitEntry) continue;
 		if (entry.bare) {
 			// A repository by shape, not by name (see GitEntry.bare). Its hooks

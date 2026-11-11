@@ -272,10 +272,19 @@ describe("the gate", () => {
 
 		it("does not confidently allow a multi-cd protected-path write", async () => {
 			const decision = await gate("bash", {
-				command: "mkdir .pi; cd .pi; mkdir extensions; cd extensions; printf x > evil.ts",
+				// Not `.pi`: since #19 `mkdir .pi` is denied by itself, which would
+				// stop this before the cwd tracking it exists to test.
+				command: "mkdir .github; cd .github; mkdir workflows; cd workflows; printf x > ci.yml",
 			});
 			expect(decision.outcome).toBe("ask-denied");
 			expect(decision.reason).toContain("cwd-change");
+		});
+
+		it("denies creating a nested .pi directory outright (#19)", async () => {
+			const decision = await gate("bash", {
+				command: "mkdir .pi; cd .pi; mkdir extensions; cd extensions; printf x > evil.ts",
+			});
+			expect(decision.outcome).toBe("deny");
 		});
 
 		// The rules were matched against a guess, so a deny rule may not have

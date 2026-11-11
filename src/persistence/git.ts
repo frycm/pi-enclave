@@ -13,7 +13,14 @@
  */
 import { closeSync, constants, type Dirent, lstatSync, openSync, readdirSync, readSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { type FingerprintBudget, fingerprint, PersistenceScanError, type ScanMatch, scanRoots } from "./scan.ts";
+import {
+	type EntryKind,
+	type FingerprintBudget,
+	fingerprint,
+	PersistenceScanError,
+	type ScanMatch,
+	scanRoots,
+} from "./scan.ts";
 
 export interface GitEntry extends ScanMatch {
 	/**
@@ -28,6 +35,12 @@ export interface GitEntry extends ScanMatch {
 
 export interface GitScanOptions {
 	maxEntries?: number;
+	/**
+	 * Other entries to collect in the same walk (#19), into `also`. They are
+	 * still walked into, so a repository inside one is found too.
+	 */
+	alsoMatch?(name: string, kind: EntryKind, path: string): boolean;
+	also?: ScanMatch[];
 	/** Receives directories nobody running as this user can reach. */
 	unscanned?: string[];
 }
@@ -61,7 +74,11 @@ function isGitDirListing(entries: readonly Dirent[]): boolean {
 export function findGitEntries(roots: readonly string[], options: GitScanOptions = {}): GitEntry[] {
 	const bare = new Set<string>();
 	const matches = scanRoots(roots, {
-		match: (name) => name === ".git",
+		match: (name, kind, path) => {
+			if (name === ".git") return true;
+			if (options.alsoMatch?.(name, kind, path)) options.also?.push({ path, kind });
+			return false;
+		},
 		matchListing: (dir, entries) => {
 			if (!isGitDirListing(entries)) return false;
 			bare.add(dir);
@@ -142,10 +159,7 @@ const METADATA_FILES = ["config", "config.worktree", "commondir"] as const;
  * A path that appears between two calls is a repository or a configuration
  * file the agent created; a fingerprint that changes is one it edited.
  */
-export function gitPersistenceSurface(
-	roots: readonly string[],
-	options: { maxEntries?: number } = {},
-): Map<string, string> {
+export function gitPersistenceSurface(roots: readonly string[], options: GitScanOptions = {}): Map<string, string> {
 	const surface = new Map<string, string>();
 	const budget: FingerprintBudget = { remaining: 65_536 };
 	const seen = new Set<string>();

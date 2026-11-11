@@ -360,6 +360,46 @@ describe("sandbox profile authority", () => {
 		expectWriteAllowed(backend, join(metadata, ".githooks"));
 	});
 
+	describe("pi configuration at any depth (#19)", () => {
+		const derive = (root: string) =>
+			toBackendProfile(defaultProfile({ cwd: root, home: "/home/u", tmp: SANDBOX_TMPDIR, agentDir: "/agent" }), root);
+
+		it("denies every existing .pi and .agents directory, and anchors the workspace's .agents", () => {
+			const root = mkdtempSync(join(tmpdir(), "enclave-agent-config-"));
+			roots.push(root);
+			mkdirSync(join(root, "sub", ".pi", "extensions"), { recursive: true });
+			mkdirSync(join(root, "pkg", "deep", ".agents", "skills"), { recursive: true });
+			const backend = derive(root);
+			materializeWriteDenyAnchors(backend);
+			// A directory denial covers everything below it.
+			expectWriteDenied(backend, join(root, "sub", ".pi"));
+			expectWriteDenied(backend, join(root, "pkg", "deep", ".agents"));
+			// Did not exist: materialised, so a skill cannot be created there either.
+			expect(backend.materializeWriteDeny).toContain(join(root, ".agents"));
+			expect(existsSync(join(root, ".agents"))).toBe(true);
+			expectWriteDenied(backend, join(root, ".agents"));
+			expectWriteAllowed(backend, join(root, "sub", "x"));
+		});
+
+		it("protects what a symlinked .agents points at instead of materialising over it", () => {
+			const root = mkdtempSync(join(tmpdir(), "enclave-agent-link-"));
+			roots.push(root);
+			mkdirSync(join(root, "shared-skills"));
+			symlinkSync(join(root, "shared-skills"), join(root, ".agents"));
+			const backend = derive(root);
+			expect(backend.materializeWriteDeny).not.toContain(join(root, ".agents"));
+			expectWriteDenied(backend, join(root, "shared-skills"));
+		});
+
+		it("refuses a symlinked .pi that points nowhere, with the way out in the message", () => {
+			const root = mkdtempSync(join(tmpdir(), "enclave-agent-dangling-"));
+			roots.push(root);
+			mkdirSync(join(root, "sub"));
+			symlinkSync(join(root, "sub", "later"), join(root, "sub", ".pi"));
+			expect(() => derive(root)).toThrow(/points nowhere.*remove it, or keep it outside/);
+		});
+	});
+
 	describe("nested repositories and the submodule anchor (#33)", () => {
 		const derive = (root: string, writableRoots?: string[]) => {
 			const effective = defaultProfile({ cwd: root, home: "/home/u", tmp: SANDBOX_TMPDIR, agentDir: "/agent" });

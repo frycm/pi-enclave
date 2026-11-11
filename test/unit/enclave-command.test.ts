@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { CompiledProfile, Profile, Violation } from "../../src/backend/types.ts";
 import {
@@ -8,6 +11,7 @@ import {
 	renderStatusLine,
 	renderViolations,
 } from "../../src/commands/enclave.ts";
+import { TripwireLedger } from "../../src/persistence/ledger.ts";
 import type { ProbeReport } from "../../src/probe.ts";
 
 const OK_REPORT: ProbeReport = {
@@ -177,6 +181,27 @@ describe("renderViolations", () => {
 		expect(text).toContain("5 earlier denial(s) not shown");
 		expect(text).toContain("/p24");
 		expect(text).not.toContain("/p4 ");
+	});
+});
+
+describe("/enclave tripwire (#19)", () => {
+	it("lists unacknowledged changes, shows them in status, and clears them on ack", () => {
+		const dir = mkdtempSync(join(tmpdir(), "enclave-tripwire-cmd-"));
+		try {
+			const tripwireLedger = TripwireLedger.forWorkspace(dir, "/work");
+			const withLedger = state({ tripwireLedger });
+			expect(handleEnclaveCommand(withLedger, "tripwire").text).toBe("no unacknowledged changes");
+			tripwireLedger.add([{ path: "/work/sub/.pi", change: "created" }], true);
+			const listed = handleEnclaveCommand(withLedger, "tripwire");
+			expect(listed.level).toBe("warning");
+			expect(listed.text).toContain("created: /work/sub/.pi");
+			expect(renderStatus(withLedger)).toContain("tripwire:   1 unacknowledged change(s)");
+			expect(handleEnclaveCommand(withLedger, "tripwire ack").text).toBe("acknowledged 1 change(s)");
+			expect(renderStatus(withLedger)).not.toContain("tripwire:");
+			expect(handleEnclaveCommand(state(), "tripwire").text).toBe("the tripwire is not running");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 

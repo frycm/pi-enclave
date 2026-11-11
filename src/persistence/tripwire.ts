@@ -14,6 +14,8 @@
  * next session's profile protects the new path at L2.
  */
 
+import { classifySurfacePath, type SurfaceKind } from "./agent.ts";
+
 export type TripwireChange = "created" | "modified" | "unverifiable";
 
 export interface TripwireHit {
@@ -73,14 +75,40 @@ export class PersistenceTripwire {
 	}
 }
 
-/** One line per hit, for the notification. */
+const LEADS: Record<SurfaceKind, (when: string) => string> = {
+	git: (when) =>
+		`Git configuration or hooks changed ${when}. Git run in this workspace outside the sandbox ` +
+		"would read them. Inspect before running git, for example with " +
+		"`git -c core.fsmonitor=false -c core.hooksPath=/dev/null --no-pager status --ignore-submodules=all`:",
+	agent: (when) =>
+		`pi configuration (.pi, .agents) changed ${when}. pi loads it outside the sandbox the next time it ` +
+		"starts in this tree. Review or remove it before then:",
+	project: (when) =>
+		`Files that agents, your shell or your editor load changed ${when} (instructions, .envrc, hook ` +
+		"managers, editor tasks). Treat them as untrusted until you have read them:",
+};
+
+/** One section per kind of surface, one line per hit, for the notification. */
 export function formatTripwireHits(hits: readonly TripwireHit[], when: string): string {
-	const lines = hits.slice(0, 10).map((hit) => `  ${hit.change}: ${hit.path}${hit.detail ? ` (${hit.detail})` : ""}`);
-	if (hits.length > 10) lines.push(`  ... and ${hits.length - 10} more`);
-	return [
-		`pi-enclave: Git configuration or hooks changed ${when}. Git run in this workspace outside the sandbox ` +
-			"would read them. Inspect before running git, for example with " +
-			"`git -c core.fsmonitor=false -c core.hooksPath=/dev/null --no-pager status --ignore-submodules=all`:",
-		...lines,
-	].join("\n");
+	const sections: string[] = [];
+	const unverifiable = hits.filter((hit) => hit.change === "unverifiable");
+	if (unverifiable.length > 0) {
+		sections.push(
+			[
+				`pi-enclave: the files loaded outside the sandbox could not be checked ${when}. ` +
+					"Treat the workspace as untrusted until they can be:",
+				...unverifiable.map((hit) => `  unverifiable: ${hit.path}${hit.detail ? ` (${hit.detail})` : ""}`),
+			].join("\n"),
+		);
+	}
+	for (const kind of ["git", "agent", "project"] as const) {
+		const ofKind = hits.filter((hit) => hit.change !== "unverifiable" && classifySurfacePath(hit.path) === kind);
+		if (ofKind.length === 0) continue;
+		const lines = ofKind
+			.slice(0, 10)
+			.map((hit) => `  ${hit.change}: ${hit.path}${hit.detail ? ` (${hit.detail})` : ""}`);
+		if (ofKind.length > 10) lines.push(`  ... and ${ofKind.length - 10} more`);
+		sections.push([`pi-enclave: ${LEADS[kind](when)}`, ...lines].join("\n"));
+	}
+	return sections.join("\n");
 }

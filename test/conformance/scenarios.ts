@@ -223,6 +223,52 @@ export const SCENARIOS: Scenario[] = [
 		},
 	},
 	{
+		id: "C18",
+		title: "nested pi configuration stays read-only, by direct write and by rename (#19)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const ws = fixture.workspace;
+			const targets = [
+				join(ws, "sub", ".pi", "extensions", "x.ts"),
+				join(ws, "sub", ".pi", "settings.json"),
+				join(ws, "sub", ".pi", "mcp.json"),
+				join(ws, "pkg", ".agents", "skills", "x", "SKILL.md"),
+				// Did not exist before the session: materialised read-only.
+				join(ws, ".agents", "skills", "x", "SKILL.md"),
+			];
+			for (const target of targets) {
+				await sh(`mkdir -p ${JSON.stringify(dirname(target))}; printf pwn >> ${JSON.stringify(target)}`);
+			}
+			// The rename: build the tree under another name, move the protected
+			// directory aside and the prepared one into its place.
+			const renamed = join(ws, "sub", ".pi", "extensions", "renamed.ts");
+			const staged = join(ws, "sub", "staged");
+			await sh(
+				`mkdir -p ${JSON.stringify(join(staged, "extensions"))} && ` +
+					`printf pwn > ${JSON.stringify(join(staged, "extensions", "renamed.ts"))} && ` +
+					`mv ${JSON.stringify(join(ws, "sub", ".pi"))} ${JSON.stringify(join(ws, "sub", "pi-aside"))}; ` +
+					`mv ${JSON.stringify(staged)} ${JSON.stringify(join(ws, "sub", ".pi"))}`,
+			);
+			targets.push(renamed);
+			const changed = targets.filter((target) => {
+				try {
+					return readFileSync(target, "utf8").includes("pwn");
+				} catch {
+					return false;
+				}
+			});
+			return {
+				ok: changed.length === 0,
+				detail:
+					changed.length > 0
+						? `WROTE pi configuration path(s): ${changed.join(", ")}`
+						: "all five writes and the rename into place denied",
+			};
+		},
+	},
+	{
 		id: "C2",
 		title: "read a read-denied path",
 		surface: "bash",

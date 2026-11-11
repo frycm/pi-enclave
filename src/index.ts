@@ -65,7 +65,8 @@ import { ActionLock } from "./gate/lock.ts";
 import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
 import { PROVENANCE_ENTRY_TYPE, ProvenanceTracker } from "./gate/provenance.ts";
 import { toolReachability } from "./gate/reachability.ts";
-import { gitPersistenceSurface } from "./persistence/git.ts";
+import { classifySurfacePath, persistenceSurface } from "./persistence/agent.ts";
+import { formatPendingHits, TripwireLedger } from "./persistence/ledger.ts";
 import { formatTripwireHits, PersistenceTripwire } from "./persistence/tripwire.ts";
 import { formatProbeReport } from "./probe.ts";
 import { probeHost } from "./probe-host.ts";
@@ -177,8 +178,13 @@ export default function (pi: ExtensionAPI): void {
 	let ownershipError: string | undefined;
 
 	let compiled: CompiledProfile | undefined;
-	/** Watches Git persistence paths the compiled profile could not deny (#33). */
+	/**
+	 * Watches Git, pi configuration and project files the compiled profile
+	 * could not deny (#33, #19).
+	 */
 	let tripwire: PersistenceTripwire | undefined;
+	/** Its hits, kept until the user acknowledges them, across sessions. */
+	let tripwireLedger: TripwireLedger | undefined;
 	/** Set by session_start, so the tripwire can warn outside an event with a context. */
 	let warnUser: ((message: string) => void) | undefined;
 	const violations: Violation[] = [];
@@ -328,6 +334,7 @@ export default function (pi: ExtensionAPI): void {
 		attendance: describeAttendance(attendance),
 		pendingRoot: stateDirs().state,
 		...(sessionId !== undefined ? { sessionId } : {}),
+		...(tripwireLedger ? { tripwireLedger } : {}),
 		breaker: { open: breaker.open, consecutive: breaker.state.consecutive, limit: effective?.breaker.consecutive ?? 3 },
 		// A configuration refusal and an ownership refusal are both "auto mode
 		// will not start"; the status line shows whichever came first.
@@ -376,17 +383,29 @@ export default function (pi: ExtensionAPI): void {
 	const checkTripwire = (agent: boolean) => {
 		const hits = tripwire?.check() ?? [];
 		if (hits.length === 0) return;
-		recordViolations(
-			hits.map((hit) => ({
+		const asViolations = (selected: typeof hits): Violation[] =>
+			selected.map((hit) => ({
 				kind: "write",
 				source: "tripwire",
 				op: hit.change,
 				path: hit.path,
 				backend: backend.name,
 				...(hit.detail ? { raw: hit.detail } : {}),
-			})),
-			agent,
-		);
+			}));
+		// Project files (AGENTS.md, .envrc, ...) are edited in ordinary work,
+		// often after an L1 approval, so a change there is reported and audited
+		// but never counted. Git and pi configuration count like a denial.
+		const isProject = (hit: (typeof hits)[number]) =>
+			hit.change !== "unverifiable" && classifySurfacePath(hit.path) === "project";
+		const counted = hits.filter((hit) => !isProject(hit));
+		const uncounted = hits.filter(isProject);
+		if (counted.length > 0) recordViolations(asViolations(counted), agent);
+		if (uncounted.length > 0) recordViolations(asViolations(uncounted), false);
+		try {
+			tripwireLedger?.add(hits, agent);
+		} catch (error) {
+			process.stderr.write(`pi-enclave: could not record tripwire hits: ${(error as Error).message}\n`);
+		}
 		const message = formatTripwireHits(hits, agent ? "during the agent's turn" : "since the agent's last turn");
 		process.stderr.write(`${message}\n`);
 		warnUser?.(message);
@@ -789,6 +808,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		compiled = undefined;
 		tripwire = undefined;
+		tripwireLedger = undefined;
 		warnUser = (message) => ctx.ui.notify(message, "warning");
 		// Pi 1.1 executes built-in operations relative to ctx.cwd. SDK sessions
 		// can differ from process.cwd(), so policy, hashes and grep must agree.
@@ -1017,7 +1037,15 @@ export default function (pi: ExtensionAPI): void {
 			// After compiling, which materialises the protected anchors, so their
 			// creation is not reported as the agent's.
 			const roots = profile.writableRoots;
-			tripwire = new PersistenceTripwire(() => gitPersistenceSurface(roots), cwd);
+			tripwire = new PersistenceTripwire(() => persistenceSurface(roots), cwd);
+			// Hits from earlier sessions nobody acknowledged: with attendance off,
+			// the notice at the time may have reached no one.
+			tripwireLedger = TripwireLedger.forWorkspace(stateDirs().state, cwd);
+			const pendingHits = formatPendingHits(tripwireLedger.read());
+			if (pendingHits) {
+				ctx.ui.notify(pendingHits, "warning");
+				process.stderr.write(`${pendingHits}\n`);
+			}
 		} catch (error) {
 			configError = (error as Error).message;
 			ctx.ui.notify(configError, "error");

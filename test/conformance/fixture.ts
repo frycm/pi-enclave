@@ -120,6 +120,10 @@ export function createFixture(): Fixture {
 	git(["init", "-q", join(workspace, "vendor", "inner")]);
 	// A repository by shape, not by name: Git finds it from any directory below.
 	git(["init", "-q", "--bare", join(workspace, "tools", "cache")]);
+	// pi configuration below the workspace root (#19): pi started later in
+	// `sub/` or `pkg/` loads it without a new trust prompt.
+	mkdirSync(join(workspace, "sub", ".pi", "extensions"), { recursive: true });
+	mkdirSync(join(workspace, "pkg", ".agents", "skills"), { recursive: true });
 
 	// The symlink-race pair: both live inside the writable workspace but resolve
 	// outside it. The kernel decides on the resolved path, which is the whole
