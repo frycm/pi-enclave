@@ -223,6 +223,9 @@ export const DEFAULT_PROTECTED_ASK: readonly string[] = [
 	"**/.husky/**",
 	"**/.pre-commit-config.yaml",
 	"**/lefthook.yml",
+	"**/lefthook.yaml",
+	"**/.lefthook.yml",
+	"**/.lefthook.yaml",
 	"**/.vscode/tasks.json",
 ];
 

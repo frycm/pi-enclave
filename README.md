@@ -1688,7 +1688,7 @@ without the sandbox. pi-enclave splits those files in two.
   renaming a tree prepared under another name into place is refused like writing into it.
 - **Project files: an ask.** `AGENTS.md`, `AGENTS.override.md` and `CLAUDE.md` are read by
   every later session, with or without pi-enclave, and by other agents; `.envrc`, `.husky`,
-  `lefthook.yml`, `.pre-commit-config.yaml` and `.vscode/tasks.json` run the next time your
+  lefthook (`lefthook.yml` and its variants), `.pre-commit-config.yaml` and `.vscode/tasks.json` run the next time your
   shell, Git or editor touches the project. Editing them is ordinary work, so L1 makes them an
   `ask` rather than a denial.
 - **The tripwire.** bwrap cannot deny a name that does not exist yet inside a writable bind,

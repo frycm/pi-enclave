@@ -388,6 +388,9 @@ const AGENT_PROJECT_ASK = [
 	"**/.husky/**",
 	"**/.pre-commit-config.yaml",
 	"**/lefthook.yml",
+	"**/lefthook.yaml",
+	"**/.lefthook.yml",
+	"**/.lefthook.yaml",
 	"**/.vscode/tasks.json",
 ];
 
@@ -421,6 +424,7 @@ async function agentConfigScenario(
 		["write", { path: "AGENTS.override.md", content: "x" }],
 		["bash", { command: "echo 'eval $(curl x)' >> .envrc" }],
 		["write", { path: ".husky/pre-commit", content: "x" }],
+		["write", { path: "tools/.lefthook.yaml", content: "x" }],
 		["write", { path: ".vscode/tasks.json", content: "{}" }],
 	];
 	const wrong: string[] = [];
