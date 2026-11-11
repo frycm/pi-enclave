@@ -198,7 +198,13 @@ export const DEFAULT_PROTECTED_DENY: readonly string[] = [
 	"**/.git/modules/**/config",
 	"**/.git/modules/**/hooks/**",
 	"**/.git/worktrees/**/config.worktree",
-	"**/.pi/extensions/**",
+	// Everything pi loads from a project, at any depth: extensions, settings,
+	// MCP servers and skills (#19). The directory itself too, so that renaming
+	// a prepared tree into place is refused like writing into it.
+	"**/.pi",
+	"**/.pi/**",
+	"**/.agents",
+	"**/.agents/**",
 	"**/.ssh/**",
 	"**/authorized_keys",
 ];
@@ -208,6 +214,19 @@ export const DEFAULT_PROTECTED_ASK: readonly string[] = [
 	"**/.github/workflows/**",
 	"**/Dockerfile",
 	"**/docker-compose*.y*ml",
+	// Loaded or run later outside the sandbox: instructions every agent reads,
+	// direnv, hook managers and editor tasks (#19).
+	"**/AGENTS.md",
+	"**/AGENTS.override.md",
+	"**/CLAUDE.md",
+	"**/.envrc",
+	"**/.husky/**",
+	"**/.pre-commit-config.yaml",
+	"**/lefthook.yml",
+	"**/lefthook.yaml",
+	"**/.lefthook.yml",
+	"**/.lefthook.yaml",
+	"**/.vscode/tasks.json",
 ];
 
 /** The seven tools pi-enclave owns and executes inside the sandbox. */

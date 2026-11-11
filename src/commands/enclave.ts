@@ -19,6 +19,7 @@ import type { LoadedSource } from "../config/sources.ts";
 import { renderSources } from "../config/sources.ts";
 import type { EffectiveProfile, Provenance } from "../config/types.ts";
 import { describeRecord, listPending } from "../escalate/pending.ts";
+import { formatPendingHits, type TripwireLedger } from "../persistence/ledger.ts";
 import { formatProbeReport, type ProbeReport } from "../probe.ts";
 import { formatVerifyResult, verifyLog } from "../state/audit.ts";
 
@@ -47,6 +48,8 @@ export interface EnclaveState {
 	/** Where pending approval records live, and the session they belong to. */
 	pendingRoot?: string;
 	sessionId?: string;
+	/** Unacknowledged tripwire hits for this workspace (#19). */
+	tripwireLedger?: TripwireLedger;
 	auditPath?: string;
 	/** True once an audit write has failed. Shown without being asked for. */
 	auditDegraded?: boolean;
@@ -118,6 +121,15 @@ export function renderStatus(state: EnclaveState): string {
 		`violations: ${state.violations.length} this session`,
 		`coverage:   ${COVERAGE_NOTE}`,
 	);
+	try {
+		const ledger = state.tripwireLedger?.state();
+		const pendingHits = ledger ? ledger.entries.length + ledger.droppedProject : 0;
+		if (pendingHits > 0) {
+			lines.push(`tripwire:   ${pendingHits} unacknowledged change(s); /enclave tripwire to review`);
+		}
+	} catch (error) {
+		lines.push(`tripwire:   ledger unreadable: ${(error as Error).message}`);
+	}
 	// Skipped by the persistence scan, so the user can see what was not looked at.
 	const unscanned = state.profile.unscanned ?? [];
 	if (unscanned.length > 0) {
@@ -181,7 +193,7 @@ export interface CommandOutput {
 }
 
 const USAGE =
-	"usage: /enclave [status|backend|violations|rules defaults|rules config|rules critique|eval-reviewer|audit [verify]|pending]";
+	"usage: /enclave [status|backend|violations|rules defaults|rules config|rules critique|eval-reviewer|audit [verify]|pending|tripwire [ack]]";
 
 /**
  * `rules defaults` and `rules config`.
@@ -243,6 +255,25 @@ function renderPending(state: EnclaveState): CommandOutput {
 	};
 }
 
+/**
+ * `tripwire` and `tripwire ack`.
+ *
+ * Acknowledging is a slash command, unlike approving a pending action: it
+ * changes no boundary, only stops a reminder, and the ledger lives in the
+ * state directory, which the sandbox cannot write.
+ */
+function renderTripwire(state: EnclaveState, argv: readonly string[]): CommandOutput {
+	const ledger = state.tripwireLedger;
+	if (!ledger) return { text: "the tripwire is not running", level: "warning" };
+	if (argv[0] === "ack") {
+		const count = ledger.clear();
+		return { text: count === 0 ? "nothing to acknowledge" : `acknowledged ${count} change(s)`, level: "info" };
+	}
+	if (argv[0] !== undefined) return { text: `unknown tripwire subcommand "${argv[0]}"\n${USAGE}`, level: "warning" };
+	const text = formatPendingHits(ledger.state(), Number.POSITIVE_INFINITY);
+	return text ? { text, level: "warning" } : { text: "no unacknowledged changes", level: "info" };
+}
+
 export function handleEnclaveCommand(state: EnclaveState, args: string): CommandOutput {
 	const sub = args.trim().split(/\s+/)[0] || "status";
 
@@ -259,6 +290,8 @@ export function handleEnclaveCommand(state: EnclaveState, args: string): Command
 			return renderAudit(state, args.trim().split(/\s+/).slice(1));
 		case "pending":
 			return renderPending(state);
+		case "tripwire":
+			return renderTripwire(state, args.trim().split(/\s+/).slice(1));
 		default:
 			return { text: `unknown subcommand "${sub}"\n${USAGE}`, level: "warning" };
 	}

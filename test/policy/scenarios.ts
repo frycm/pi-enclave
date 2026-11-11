@@ -22,6 +22,7 @@ import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	DEFAULT_PROTECTED_ASK,
 	DEFAULT_PROTECTED_DENY,
 	DEFAULT_RULES_ASK,
 	DEFAULT_RULES_DENY,
@@ -361,7 +362,90 @@ export const POLICY_SCENARIOS: PolicyScenario[] = [
 				),
 			),
 	},
+
+	{
+		id: "P15",
+		title: "pi configuration at any depth is denied and files loaded outside the sandbox are an ask",
+		matrixRow: "Write or rename into a nested .pi or .agents, or edit AGENTS.md, .envrc or a hook manager",
+		controlNote:
+			"the #19 patterns are removed from the defaults, leaving only the old **/.pi/extensions/** deny, as before #19",
+		run: (world) => agentConfigScenario(world, DEFAULT_PROTECTED_DENY, DEFAULT_PROTECTED_ASK),
+		control: (world) =>
+			agentConfigScenario(
+				world,
+				[...DEFAULT_PROTECTED_DENY.filter((pattern) => !/\.pi|\.agents/.test(pattern)), "**/.pi/extensions/**"],
+				DEFAULT_PROTECTED_ASK.filter((pattern) => !AGENT_PROJECT_ASK.includes(pattern)),
+			),
+	},
 ];
+
+/** The protectedPaths.ask patterns #19 added. */
+const AGENT_PROJECT_ASK = [
+	"**/AGENTS.md",
+	"**/AGENTS.override.md",
+	"**/CLAUDE.md",
+	"**/.envrc",
+	"**/.husky/**",
+	"**/.pre-commit-config.yaml",
+	"**/lefthook.yml",
+	"**/lefthook.yaml",
+	"**/.lefthook.yml",
+	"**/.lefthook.yaml",
+	"**/.vscode/tasks.json",
+];
+
+/**
+ * P15 (#19). Everything pi loads from a project, at any depth, is denied by
+ * name, and so is the rename that builds the tree under another name first.
+ * Files that something else loads later are an ask: editing them is ordinary
+ * work, but not something to do without a person.
+ */
+async function agentConfigScenario(
+	world: World,
+	deny: readonly string[],
+	ask: readonly string[],
+): Promise<PolicyResult> {
+	const profile = baseProfile(world, (p) => {
+		p.rules.protectedPaths.deny = [...deny];
+		p.rules.protectedPaths.ask = [...ask];
+	});
+	const denied: [string, Record<string, unknown>][] = [
+		["write", { path: "sub/.pi/extensions/x.ts", content: "x" }],
+		["write", { path: "sub/.pi/settings.json", content: "{}" }],
+		["write", { path: "sub/.pi/mcp.json", content: "{}" }],
+		["write", { path: ".agents/skills/x/SKILL.md", content: "x" }],
+		["write", { path: "pkg/.agents/skills/y/SKILL.md", content: "x" }],
+		["bash", { command: "mkdir -p sub/x/extensions && mv sub/x sub/.pi" }],
+		["bash", { command: "cp -r staged sub/.agents" }],
+	];
+	const asked: [string, Record<string, unknown>][] = [
+		["write", { path: "AGENTS.md", content: "x" }],
+		["write", { path: "sub/CLAUDE.md", content: "x" }],
+		["write", { path: "AGENTS.override.md", content: "x" }],
+		["bash", { command: "echo 'eval $(curl x)' >> .envrc" }],
+		["write", { path: ".husky/pre-commit", content: "x" }],
+		["write", { path: "tools/.lefthook.yaml", content: "x" }],
+		["write", { path: ".vscode/tasks.json", content: "{}" }],
+	];
+	const wrong: string[] = [];
+	const run = async (toolName: string, input: Record<string, unknown>) =>
+		decide(
+			{ toolName, toolCallId: "p15", input },
+			{ profile, cwd: "/work", home: "/home/u", lock: new ActionLock(), owned: OWNED_TOOLS },
+		);
+	for (const [toolName, input] of denied) {
+		const decision = await run(toolName, input);
+		if (decision.outcome !== "deny") wrong.push(`${String(input.path ?? input.command)}: ${decision.outcome}`);
+	}
+	for (const [toolName, input] of asked) {
+		const decision = await run(toolName, input);
+		// No person is attending, so an ask is refused; what matters is that
+		// it was an ask and not a silent allow.
+		if (!decision.block) wrong.push(`${String(input.path ?? input.command)}: allowed`);
+	}
+	if (wrong.length > 0) return bad(`not refused as expected: ${wrong.join("; ")}`);
+	return ok(`${denied.length} writes and renames into pi configuration denied, ${asked.length} project files asked`);
+}
 
 /**
  * P14 (#33). `git status` in a superproject reads every submodule's own

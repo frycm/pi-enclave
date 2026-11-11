@@ -180,6 +180,7 @@ exposes everything required: built-in tool overrides with pluggable operations, 
 | TOCTOU: input mutated between approval and execution by a later `tool_call` handler | Validate and deep-freeze → canonicalize and hash → execute the frozen snapshot | Refuse auto mode when untrusted repo-local extensions are loaded |
 | Reviewer outage (local model OOM, runtime restart) | Bounded retry, then deny and stop the turn (unattended) or `ask` (attended) | — |
 | Sandbox bypass through tools that do not go through `bash` (custom / MCP tools) | Auto mode denies any tool not in the allowlist; allowlisted tools are declared read-only or reviewed | Outer container or VM |
+| Persistence through files a later, unsandboxed process loads: pi configuration (`.pi`, `.agents`) at any depth, instruction files (`AGENTS.md`, `CLAUDE.md`), `.envrc`, hook managers, editor tasks, Git configuration (#19, #33) | Existing `.pi`, `.agents` and Git metadata are L2-denied at compile time; the trusted parent's post-turn tripwire reports new ones and changes, and keeps them until acknowledged | L1 `deny` for `.pi`/`.agents`, `ask` for project files. **Residual:** anything the agent writes into the workspace (build files, `package.json` scripts, `Makefile`, tests) must be treated as untrusted input by whatever reads it later — see [below](#files-loaded-outside-the-sandbox-19) |
 
 ---
 
@@ -916,6 +917,7 @@ not: the decision must happen outside the session the agent is driving.
 | `pi-enclave approve <nonce>` | Shows an action in full, asks in *that* terminal, and runs it once under the profile in force now |
 | `pi-enclave audit [verify]` | Reads or re-chains the audit log |
 | `pi-enclave attend-secret` | Provisions the RPC attendance secret |
+| `/enclave tripwire [ack]` | Lists changes to files loaded outside the sandbox that the tripwire found and nobody has acknowledged, across sessions; `ack` clears them (#19) |
 | `/enclave rules critique` | Uses pi's qualified isolated reviewer to critique user-global `review.*` entries; deterministic checks also flag contradictory entries and broad `skipReview` patterns. The standalone CLI points to this in-session command because it has no model registry |
 
 `critique` is advisory; `config` is what the qualification hash is computed over.
@@ -1571,6 +1573,7 @@ sandbox's, so a green row on a restricted host is not read as stronger evidence 
 | Interpreter/archive writes `$WORKSPACE/.pi/extensions` inside a writable workspace | Violation from L2 `writeDeny`; static shell inference is not the boundary | 1 | C15 |
 | Rename a writable ancestor of a protected Git config/hook leaf, recreate the original tree, then write a hook | Ancestor displacement or replacement write is denied by the native backend | 1 | C16 |
 | Write a submodule's `.git/modules/<name>/config` or hook, a nested repository's `config` or hook, or a new submodule's config below a repository with no `modules` yet | Violation from L2 `writeDeny`; L1 denies the same paths by name (#33) | 1, 2 | C17, P14 |
+| Write into a nested `.pi` or `.agents` directly or by renaming a prepared tree into place, or edit `AGENTS.md`, `.envrc` or a hook manager | Violation from L2 `writeDeny` for existing `.pi`/`.agents`; L1 denies `.pi`/`.agents` by name and asks for project files; the tripwire reports new ones (#19) | 1, 2 | C18, P15 |
 | `curl`, `nc`, `python -c "socket…"`, DNS lookup | Violation (`off` mode) | 1 | C5 |
 | Spawn a PTY (`vim`, `less`), Python multiprocessing, `git worktree` outside cwd | Works / violation as configured. **Linux:** bubblewrap cannot deny PTYs, so `allowPty: false` is not enforceable there and the compiled profile reports `pty on` | 1 | C6 |
 | Script that calls `sudo` / `su` / `systemctl` | Violation, not a policy denial | 1 | C7 |
@@ -1616,7 +1619,8 @@ do, which differs from each other more than the design assumed.
   per request; complete parent-side grep executions (including parsing and context reads)
   are serialized, the helper admits one potentially large response at a time, and response
   framing honors stdout backpressure before allocating the next frame.
-- **Executable project state is an L2 denial.** The workspace `.pi` root, Git hooks/config
+- **Executable project state is an L2 denial.** Every `.pi` and `.agents` directory in a
+  writable root (the workspace's own materialised if absent), Git hooks/config
   of the workspace, its submodules and any repository nested in a writable root, and
   submodule worktree gitfiles (including gitfile-inferred worktrees) are
   read-only inside an otherwise writable workspace, so an interpreter, archive or build
@@ -1667,6 +1671,48 @@ plus a process hop — and even that is under 7 ms.
 
 Linux figures were taken in `enableWeakerNestedSandbox` mode (see below), which does not
 change the I/O path.
+
+### Files loaded outside the sandbox (#19)
+
+A writable workspace is one whose files something else reads later, with your privileges and
+without the sandbox. pi-enclave splits those files in two.
+
+- **pi configuration: denied.** pi loads `.pi/extensions`, `.pi/settings.json` (packages,
+  `shellCommandPrefix`) and `.pi/mcp.json` from a project, and `.agents/skills` from the
+  working directory, in the pi process. Trust in a directory is inherited by its
+  subdirectories, so a `sub/.pi` written by the agent loads without a new prompt the next time
+  pi starts in `sub/`. At compile time every existing `.pi` and `.agents` directory in a
+  writable root is write-denied at L2, and the workspace's own `.agents` is materialised
+  read-only like `.pi`; a symlinked one is protected through its target, and one that points
+  nowhere refuses. L1 denies `**/.pi`, `**/.pi/**`, `**/.agents` and `**/.agents/**`, so
+  renaming a tree prepared under another name into place is refused like writing into it.
+- **Project files: an ask.** `AGENTS.md`, `AGENTS.override.md` and `CLAUDE.md` are read by
+  every later session, with or without pi-enclave, and by other agents; `.envrc`, `.husky`,
+  lefthook (`lefthook.yml` and its variants), `.pre-commit-config.yaml` and `.vscode/tasks.json` run the next time your
+  shell, Git or editor touches the project. Editing them is ordinary work, so L1 makes them an
+  `ask` rather than a denial.
+- **The tripwire.** bwrap cannot deny a name that does not exist yet inside a writable bind,
+  so the trusted parent walks the writable roots after every turn, as for Git (#33), and
+  records every `.pi` and `.agents` tree and every project file above (names compared
+  case-insensitively, since macOS opens `Agents.md` as `AGENTS.md`). One the compiled profile
+  already denies, or that lies outside every writable root, is recorded by identity only, so a
+  large protected `.pi` costs nothing; any other is fingerprinted with everything below it,
+  and one too large to fingerprint is reported as unverifiable at every check. A hit is
+  classified by the surface that found it, so a repository inside `.husky` is still Git. A new
+  or changed `.pi` or `.agents` counts against the turn like a denial; a changed project file
+  is reported and audited but not counted, since it may be an approved edit. Every hit is also
+  written to the state directory and repeated at each session start until you run
+  `/enclave tripwire ack`, so a change made in an unattended session is not lost after its one
+  notice. The reminder counts hits per kind and lists unverifiable, pi configuration and Git
+  hits before project files; only project-file entries are ever dropped to bound the ledger,
+  and the reminder says how many.
+  `/enclave tripwire` lists them, and `/enclave status` shows how many are waiting.
+
+**Residual risk.** Build and test files cannot be protected this way: `package.json`
+scripts, `Makefile`, test suites, `pyproject.toml` and the rest are exactly what the agent is
+there to edit, and they run with your privileges when you next build. Treat anything the agent
+wrote into the workspace as untrusted input to whatever reads it later, and review the diff
+before running it outside the sandbox.
 
 ### Known gaps
 
