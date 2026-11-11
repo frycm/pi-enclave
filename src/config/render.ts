@@ -109,6 +109,7 @@ export function renderConfig(profile: EffectiveProfile, provenance: Provenance):
 	lines.push(`sandbox.capabilities   ${profile.sandbox.capabilities}`);
 	lines.push(`sandbox.hostExec       ${profile.sandbox.hostExec}`);
 	lines.push(`sandbox.allowPty       ${profile.sandbox.allowPty}`);
+	lines.push(`sandbox.allowSelfHosting ${profile.sandbox.allowSelfHosting}`);
 	lines.push(`review.trigger         ${profile.review.trigger}`);
 	lines.push(`reviewer.model         ${profile.reviewer.model}`);
 	lines.push(

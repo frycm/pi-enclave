@@ -77,6 +77,7 @@ const SANDBOX_KEYS = [
 	"capabilities",
 	"hostExec",
 	"allowPty",
+	"allowSelfHosting",
 	"env",
 ] as const;
 const RULES_KEYS = ["deny", "ask", "skipReview", "protectedPaths"] as const;
@@ -456,6 +457,10 @@ class ParseContext {
 		if ("allowPty" in body) {
 			const allowPty = this.boolean(join(prefix, "allowPty"), body.allowPty);
 			if (allowPty !== undefined) out.allowPty = allowPty;
+		}
+		if ("allowSelfHosting" in body) {
+			const allow = this.boolean(join(prefix, "allowSelfHosting"), body.allowSelfHosting);
+			if (allow !== undefined) out.allowSelfHosting = allow;
 		}
 		if ("env" in body) {
 			const env = this.object(join(prefix, "env"), body.env);

@@ -54,6 +54,12 @@ export interface Profile {
 	 * as this user reaches inside them. Reported, never enforced.
 	 */
 	unscanned?: readonly string[];
+	/**
+	 * Loaded code below a writable root that `sandbox.allowSelfHosting`
+	 * write-denied rather than refused (#36). Also in `writeDeny`; kept here
+	 * for `/enclave status`.
+	 */
+	selfHosted?: readonly string[];
 	/** Absolute paths that may not be read, even though reads are otherwise open. */
 	readDeny: readonly string[];
 	/** The explicitly selected scratch path exposed to children as TMPDIR. */

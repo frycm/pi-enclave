@@ -141,6 +141,9 @@ export function narrowerOrEqual(a: EffectiveProfile, b: EffectiveProfile): Order
 		fail("sandbox.hostExec", `cannot widen from "${b.sandbox.hostExec}" to "${a.sandbox.hostExec}"`);
 	}
 	if (a.sandbox.allowPty && !b.sandbox.allowPty) fail("sandbox.allowPty", "cannot enable PTY allocation");
+	if (a.sandbox.allowSelfHosting && !b.sandbox.allowSelfHosting) {
+		fail("sandbox.allowSelfHosting", "only the user-global file can accept loaded code below a writable root");
+	}
 
 	subsetOf("sandbox.env.passthrough", a.sandbox.env.passthrough, b.sandbox.env.passthrough, fail);
 	supersetOf("sandbox.env.envDeny", a.sandbox.env.envDeny, b.sandbox.env.envDeny, fail);
@@ -340,6 +343,7 @@ export function applyPatch(base: EffectiveProfile, patch: ProfilePatch, options:
 		if (sandbox.capabilities !== undefined) next.sandbox.capabilities = sandbox.capabilities;
 		if (sandbox.hostExec !== undefined) next.sandbox.hostExec = sandbox.hostExec;
 		if (sandbox.allowPty !== undefined) next.sandbox.allowPty = sandbox.allowPty;
+		if (sandbox.allowSelfHosting !== undefined) next.sandbox.allowSelfHosting = sandbox.allowSelfHosting;
 		if (sandbox.env) {
 			if (sandbox.env.passthrough) {
 				track("sandbox.env.passthrough", sandbox.env.passthrough);

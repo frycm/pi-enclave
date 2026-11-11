@@ -16,6 +16,7 @@ import { join } from "node:path";
 import type { Profile } from "../../src/backend/types.ts";
 import { defaultProfile } from "../../src/config/defaults.ts";
 import { toBackendProfile } from "../../src/config/profile.ts";
+import { applySelfHosting, checkCodeRoots, collectCodeRoots } from "../../src/gate/code-roots.ts";
 
 /** Planted in the parent process so the env-leak scenario has something to find. */
 export const SECRET_ENV = {
@@ -166,6 +167,14 @@ export function createFixture(): Fixture {
 	symlinkSync(agentA, agentLink);
 	const deniedUnderLink = join(agentLink, "auth.json");
 
+	// An extension checked out in the workspace and loaded from there, with
+	// sandbox.allowSelfHosting (#36). Its package root is what is denied.
+	mkdirSync(join(workspace, "ext", "src"), { recursive: true });
+	mkdirSync(join(workspace, "ext", "node_modules", "dep"), { recursive: true });
+	writeFileSync(join(workspace, "ext", "package.json"), "{}\n");
+	writeFileSync(join(workspace, "ext", "src", "index.ts"), "export default () => {};\n");
+	writeFileSync(join(workspace, "ext", "node_modules", "dep", "index.js"), "");
+
 	// An ordinary tree for the find tool's pattern handling.
 	mkdirSync(join(workspace, "src", "a"), { recursive: true });
 	writeFileSync(join(workspace, "src", "a", "foo.spec.ts"), "");
@@ -175,7 +184,21 @@ export function createFixture(): Fixture {
 	// Only the write side is taken; the read side stays this fixture's own.
 	const derivation = defaultProfile({ cwd: workspace });
 	derivation.sandbox.readDeny = [];
-	const derived = toBackendProfile(derivation, workspace);
+	// The code-root check runs on the profile the session would compile, with
+	// only the extension above as loaded code inside the workspace.
+	const extension = join(workspace, "ext", "src", "index.ts");
+	const codeRoots = collectCodeRoots(
+		{
+			ownSource: extension,
+			dependencyEntries: [],
+			extensionPaths: [{ path: extension, from: "conformance extension" }],
+			execPath: process.execPath,
+			seccompHelper: null,
+			cwd: workspace,
+		},
+		[workspace],
+	);
+	const derived = applySelfHosting(toBackendProfile(derivation, workspace), checkCodeRoots(codeRoots, [workspace]));
 
 	const profile: Profile = {
 		mode: "workspace-write",

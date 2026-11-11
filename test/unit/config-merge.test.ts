@@ -81,6 +81,7 @@ describe("narrowerOrEqual", () => {
 				{ sandbox: { capabilities: "none" as const } },
 			],
 			["sandbox.allowPty", { sandbox: { allowPty: true } }, { sandbox: { allowPty: false } }],
+			["sandbox.allowSelfHosting", { sandbox: { allowSelfHosting: true } }, { sandbox: { allowSelfHosting: false } }],
 			["attended.mode", { attended: { mode: "tui" as const } }, { attended: { mode: "off" as const } }],
 		])("%s may only move toward the narrower value", (field, wide, narrow) => {
 			expect(narrowerOrEqual(patched(narrow), patched(wide))).toEqual([]);
@@ -239,6 +240,18 @@ describe("fold", () => {
 		);
 		if (!result.ok) throw new Error(JSON.stringify(result.errors));
 		expect(result.profile.sandbox.writableRoots).toEqual(["/work", "/work/build"]);
+	});
+
+	// #36: accepting loaded code below a writable root is the user's call.
+	it("lets only the user-global file enable sandbox.allowSelfHosting", () => {
+		const global = fold([{ source: "builtin" }, doc("user_global", { sandbox: { allowSelfHosting: true } })], OPTIONS);
+		if (!global.ok) throw new Error(JSON.stringify(global.errors));
+		expect(global.profile.sandbox.allowSelfHosting).toBe(true);
+		for (const source of ["project_local", "project_shared"] as const) {
+			const result = fold([{ source: "builtin" }, doc(source, { sandbox: { allowSelfHosting: true } })], OPTIONS);
+			expect(result.ok).toBe(false);
+			if (!result.ok) expect(result.errors.map((error) => error.field)).toContain("sandbox.allowSelfHosting");
+		}
 	});
 
 	it("accepts a project file that tightens", () => {
@@ -521,6 +534,7 @@ const arbPatch: fc.Arbitrary<ProfilePatch> = fc.record(
 				capabilities: fc.constantFrom("none" as const, "reviewed" as const),
 				hostExec: fc.constantFrom("never" as const, "human" as const),
 				allowPty: fc.boolean(),
+				allowSelfHosting: fc.boolean(),
 				env: fc.record(
 					{
 						passthrough: fc.array(fc.constantFrom("FOO", "BAR"), { maxLength: 2 }),

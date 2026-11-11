@@ -139,6 +139,14 @@ export function renderStatus(state: EnclaveState): string {
 			...(unscanned.length > 10 ? [`            ... and ${unscanned.length - 10} more`] : []),
 		);
 	}
+	// sandbox.allowSelfHosting: loaded code kept read-only rather than refused (#36).
+	const selfHosted = state.profile.selfHosted ?? [];
+	if (selfHosted.length > 0) {
+		lines.push(
+			`self-host:  ${selfHosted.length} loaded code root(s) below a writable root, write-denied for the session:`,
+			...selfHosted.map((dir) => `            ${dir}`),
+		);
+	}
 
 	if (state.configError) {
 		lines.push("", "configuration REJECTED -- every tool refuses:", state.configError);

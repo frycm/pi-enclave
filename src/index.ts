@@ -60,6 +60,13 @@ import {
 	shouldWithholdNonOwnedSibling,
 	steerMessage,
 } from "./gate/breaker.ts";
+import {
+	applySelfHosting,
+	checkCodeRoots,
+	collectCodeRoots,
+	formatCodeRootProblems,
+	resolveDependencyEntries,
+} from "./gate/code-roots.ts";
 import { decide, type GateDecision } from "./gate/gate.ts";
 import { ActionLock } from "./gate/lock.ts";
 import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
@@ -69,7 +76,7 @@ import { persistenceSurface, protectedByProfile } from "./persistence/agent.ts";
 import { formatPendingHits, TripwireLedger } from "./persistence/ledger.ts";
 import { countsAgainstTurn, formatTripwireHits, PersistenceTripwire } from "./persistence/tripwire.ts";
 import { formatProbeReport } from "./probe.ts";
-import { probeHost } from "./probe-host.ts";
+import { probeHost, resolveSeccompHelper } from "./probe-host.ts";
 import { critiqueRulebook, formatCritique } from "./reviewer/critique.ts";
 import { MAX_AUTHORIZATION_ENTRIES, MAX_CONTEXT_ENTRIES } from "./reviewer/evidence.ts";
 import { restoreReviewHistory } from "./reviewer/history.ts";
@@ -125,6 +132,22 @@ function resolveOwnPath(pi: ExtensionAPI): string | undefined {
 		}
 	}
 	return paths.size === 1 ? [...paths][0] : undefined;
+}
+
+/**
+ * Where every registered tool and command was loaded from, for the code-root
+ * check (#36). pi has no list of extensions; these are what it reports.
+ */
+function extensionSourcePaths(pi: ExtensionAPI): { path: string; from: string }[] {
+	const out: { path: string; from: string }[] = [];
+	const add = (kind: string, name: string, info: { path?: string; baseDir?: string } | undefined) => {
+		const from = `extension providing ${kind} "${name}"`;
+		if (info?.path) out.push({ path: info.path, from });
+		if (info?.baseDir) out.push({ path: info.baseDir, from });
+	};
+	for (const tool of pi.getAllTools?.() ?? []) add("tool", tool.name, tool.sourceInfo);
+	for (const command of pi.getCommands?.() ?? []) add("command", command.name, command.sourceInfo);
+	return out;
 }
 
 /** The text of a user message, whatever content shape pi used for it. */
@@ -866,6 +889,34 @@ export default function (pi: ExtensionAPI): void {
 			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
 			return;
 		}
+
+		// Loaded code below a writable root would run the agent's changes outside
+		// the sandbox at the next start (#36). Refused, or with the user-global
+		// opt-in write-denied for the session.
+		const codeCheck = checkCodeRoots(
+			collectCodeRoots(
+				{
+					ownSource: OWN_SOURCE_PATH,
+					dependencyEntries: resolveDependencyEntries(OWN_SOURCE_PATH),
+					...(process.argv[1] ? { piEntry: process.argv[1] } : {}),
+					extensionPaths: extensionSourcePaths(pi),
+					execPath: process.execPath,
+					seccompHelper: process.platform === "linux" ? resolveSeccompHelper() : null,
+					cwd,
+				},
+				profile.writableRoots,
+			),
+			profile.writableRoots,
+		);
+		const codeError = formatCodeRootProblems(codeCheck, loaded.profile.sandbox.allowSelfHosting);
+		if (codeError) {
+			ownershipError = codeError;
+			process.stderr.write(`${codeError}\n`);
+			ctx.ui.notify(codeError, "error");
+			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
+			return;
+		}
+		if (loaded.profile.sandbox.allowSelfHosting) profile = applySelfHosting(profile, codeCheck);
 		ownershipError = undefined;
 
 		// The state directory is opened before anything is recorded, and a
