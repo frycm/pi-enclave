@@ -20,7 +20,7 @@ import { ActionLock } from "../../src/gate/lock.ts";
 import { createWriteOperations } from "../../src/tools/file-ops.ts";
 import { bindOwnedTool } from "../../src/tools/locked.ts";
 
-describe("pi 1.1 credential boundary", () => {
+describe("pi 1.5 credential boundary", () => {
 	const options = { cwd: "/work", home: "/home/u", agentDir: "/custom/agent" };
 	const protectedPaths = [
 		"/custom/agent/mcp-auth.json",
@@ -54,7 +54,7 @@ async function withSession(
 	}) => Promise<void>,
 	mutate = false,
 ) {
-	const root = mkdtempSync(join(tmpdir(), "enclave-pi-1.1-"));
+	const root = mkdtempSync(join(tmpdir(), "enclave-pi-1.5-"));
 	const agentDir = join(root, "agent");
 	const profile = defaultProfile({ cwd: root, agentDir });
 	profile.rules.deny.push("write(**/blocked.txt)");
@@ -145,7 +145,7 @@ async function withSession(
 	}
 }
 
-describe("pi 1.1 nested execution", () => {
+describe("pi 1.5 nested execution", () => {
 	it("gates child calls and binds the complete input to their distinct IDs", async () => {
 		await withSession(async ({ nested, write, seen }) => {
 			expect((await nested("write", { path: "allowed.txt", content: "original" })).isError).toBe(false);

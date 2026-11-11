@@ -1,5 +1,5 @@
 /**
- * A fake pi, built to the semantics verified in 1.1.0 rather than to what is
+ * A fake pi, built to the semantics verified in 1.5.2 rather than to what is
  * convenient.
  *
  * Three of those semantics are the whole reason this harness exists, and a
@@ -16,7 +16,7 @@
  *    This is the window the execute-time re-check exists for: blocking a call
  *    cannot un-prepare a sibling that was already prepared.
  *
- * Sources on v1.1.0: extensions/runner.ts (emitToolCall), agent-loop.ts
+ * Sources on v1.5.2: extensions/runner.ts (emitToolCall), agent-loop.ts
  * (prepareToolCall and executeToolCallsParallel), agent-session.ts (_beforeToolCall).
  * The installed session's nested path is exercised separately in
  * test/unit/pi-1.1-integration.test.ts. Sequential tools prepare per call.

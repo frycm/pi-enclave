@@ -11,9 +11,9 @@
  */
 
 /** Inclusive lower bound of the supported pi range. */
-export const PI_RANGE_MIN = "1.1.0";
+export const PI_RANGE_MIN = "1.5.2";
 /** Exclusive upper bound. A new minor may change hook semantics the conformance suite has not seen. */
-export const PI_RANGE_MAX = "1.2.0";
+export const PI_RANGE_MAX = "1.6.0";
 
 /** Minimum Node for the pinned pi release (also satisfies sandbox-runtime). */
 export const NODE_RANGE_MIN = "22.19.0";

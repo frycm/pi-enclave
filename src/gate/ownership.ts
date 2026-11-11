@@ -2,7 +2,7 @@
  * Who owns the tools, and what else is loaded.
  *
  * The README described this as a load-order check against an extension that
- * registers `bash` *after* pi-enclave. Verified against pi 1.1.0, the
+ * registers `bash` *after* pi-enclave. Verified against pi 1.5.2, the
  * direction is the other way round, and the difference decides what the check
  * has to be:
  *

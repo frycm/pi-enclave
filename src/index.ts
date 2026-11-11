@@ -683,7 +683,7 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", (event) => {
-		directInput.confirmPrompt(event.prompt);
+		if (event.messageType === "user") directInput.confirmPrompt(event.prompt);
 	});
 
 	pi.on("message_start", (event) => {

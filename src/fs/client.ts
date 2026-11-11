@@ -367,10 +367,16 @@ export class HelperFsClient implements FsClient {
 
 	async grep(
 		args: readonly string[],
-		options: { limit?: number; signal?: AbortSignal; path?: string } = {},
+		options: { limit?: number; signal?: AbortSignal; path?: string; context?: number } = {},
 	): Promise<{ stdout: string; exitCode: number | null; limitReached?: boolean; capped?: boolean }> {
 		return (await this.call(
-			{ op: "grep", args: [...args], limit: options.limit ?? 0, path: options.path ?? "" },
+			{
+				op: "grep",
+				args: [...args],
+				limit: options.limit ?? 0,
+				path: options.path ?? "",
+				context: options.context ?? 0,
+			},
 			options.signal,
 		)) as {
 			stdout: string;

@@ -202,7 +202,7 @@ export interface FsClient {
 	glob(pattern: string, cwd: string, options: { ignore: string[]; limit: number }): Promise<string[]>;
 	grep(
 		args: readonly string[],
-		options?: { limit?: number; signal?: AbortSignal; path?: string },
+		options?: { limit?: number; signal?: AbortSignal; path?: string; context?: number },
 	): Promise<{ stdout: string; exitCode: number | null; limitReached?: boolean; capped?: boolean }>;
 }
 
