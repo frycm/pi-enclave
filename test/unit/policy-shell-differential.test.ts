@@ -133,8 +133,12 @@ describe.skipIf(!BASH)("the tokenizer against real bash", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
+	let runs = 0;
+
 	function run(script: string): string[] {
-		const log = join(root, "probe.log");
+		// One log per script: a job a script backgrounds may still write after
+		// bash returns, and must not be credited to the next script.
+		const log = join(root, `probe-${++runs}.log`);
 		writeFileSync(log, "");
 		spawnSync(BASH as string, ["--noprofile", "--norc", "-c", script], {
 			cwd: work,
