@@ -481,9 +481,9 @@ describe("BASH_PROMPT_GUIDELINES", () => {
 });
 
 describe("createDevProfile", () => {
-	it("makes the workspace and tmpdir writable and nothing else", () => {
+	it("makes the workspace writable and nothing else; the backend adds its own scratch (#20)", () => {
 		const profile = createDevProfile({ cwd: "/work", tmp: "/tmp" });
-		expect(profile.writableRoots).toEqual(["/work", "/tmp"]);
+		expect(profile.writableRoots).toEqual(["/work"]);
 		expect(profile.network).toBe("off");
 		expect(profile.mode).toBe("workspace-write");
 	});

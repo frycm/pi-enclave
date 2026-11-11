@@ -290,7 +290,7 @@ type Capability =
 
 interface SandboxProfile {
   mode: "read-only" | "workspace-write" | "custom";
-  writableRoots: string[];   // workspace, scratch, $TMPDIR, optional extras
+  writableRoots: string[];   // workspace, the per-session scratch, optional extras
   writeDeny: string[];       // protected persistence paths inside writable roots
   readDeny: string[];        // ~/.ssh, ~/.aws, ~/.gnupg, ~/.pi/**/auth*, keychains…
   grantableReadDeny: string[]; // user-global subset eligible for one-shot allow_read
@@ -349,11 +349,15 @@ const CHILD_ENV_BASE = [
 - `TMPDIR` is pinned to the sandbox scratch path and `PATH` is filtered to absolute,
   read-allowed, non-writable entries. Both each entry and its canonical symlink target are
   checked; relative entries and directories beneath a writable root are removed so a
-  repository cannot substitute its own `git`, interpreter or build tool. The default is
-  `/tmp/claude`; ambient `TMPDIR` never grants write
-  authority. An SRT `CLAUDE_CODE_TMPDIR` / `CLAUDE_TMPDIR` override is accepted only when
-  its canonical target is already beneath a configured writable root, otherwise startup
-  refuses. `HOME` remains the real home for tool compatibility, while credential/state
+  repository cannot substitute its own `git`, interpreter or build tool. The scratch path
+  is a private per-session directory the native backend creates itself,
+  `$XDG_RUNTIME_DIR/pi-enclave-<uid>/session-<pid>-<random>` (or under `/tmp` when
+  `XDG_RUNTIME_DIR` is not this user's `0700` directory). The per-user base and the session
+  directory must be real directories owned by this uid with mode `0700`, or compilation
+  refuses; the directory is removed when the session ends, and ones left by a crashed
+  session are swept at the next start. sandbox-runtime's fixed `/tmp/claude` default is
+  write-denied, and its injected `TMPDIR` is pinned to the session directory. Ambient
+  `TMPDIR`, `CLAUDE_CODE_TMPDIR` and `CLAUDE_TMPDIR` never grant write authority. `HOME` remains the real home for tool compatibility, while credential/state
   subpaths are kernel-denied. Every other SRT write default that is not a device node is
   explicitly denied.
 - **Provider credentials stay in the pi parent.** The reviewer call, the session model and
@@ -719,7 +723,7 @@ non-overridable persistence denial.
     "dev": {
       "sandbox": {
         "mode": "workspace-write",
-        "writableRoots": ["$WORKSPACE", "$TMPDIR", "~/.cache/pi-enclave"],
+        "writableRoots": ["$WORKSPACE", "~/.cache/pi-enclave"],
         "readDeny": ["$defaults", "~/private-source"],
         "grantableReadDeny": ["~/private-source"],
         "network": { "mode": "off" },
@@ -1536,9 +1540,11 @@ do, which differs from each other more than the design assumed.
   read-only inside an otherwise writable workspace, so an interpreter, archive or build
   script cannot plant code for a later privileged Pi/Git launch. Credential read-deny roots
   are write-denied too.
-- **Scratch authority is explicit.** Ambient `TMPDIR` never enters the profile; SRT-specific
-  overrides are accepted only when already contained by a configured writable root, and the
-  selected path is pinned into the child environment.
+- **Scratch is private to the session.** Ambient `TMPDIR` never enters the profile. The
+  native backend creates a `0700` per-session directory under a per-user base, refuses one
+  that is a symlink, foreign-owned or not `0700`, pins it into the child environment and
+  sandbox-runtime's injected `TMPDIR`, and removes it at shutdown. The shared `/tmp/claude`
+  is write-denied. In configuration files `$TMPDIR` expands to the per-user base.
 - **Credential roots follow XDG configuration.** An absolute `XDG_CONFIG_HOME` adds its
   `gh` and `claude` stores to the read/write denials without dropping the conventional
   `~/.config` locations; a relative XDG root is not exported to sandboxed children.

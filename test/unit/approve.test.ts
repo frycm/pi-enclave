@@ -622,7 +622,7 @@ describe("approving a record", () => {
 			record: record("bash", { command: "ls" }),
 			stateRoot,
 			current: profile((p) => {
-				p.sandbox.writableRoots = ["/work"];
+				p.sandbox.writableRoots = [];
 			}),
 			home: TEST_HOME,
 			io: channel.make(false),
@@ -630,7 +630,7 @@ describe("approving a record", () => {
 		});
 		const text = channel.out.join("\n");
 		expect(text).toContain("narrowed since this was recorded");
-		expect(text).toContain("/tmp");
+		expect(text).toContain("no longer writable: /work");
 		expect(text.indexOf("narrowed")).toBeLessThan(text.length);
 		expect(channel.asked).toHaveLength(1);
 	});

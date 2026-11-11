@@ -19,7 +19,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { SANDBOX_TMPDIR } from "../backend/types.ts";
+import { scratchBase } from "../backend/scratch.ts";
 import type { DefaultProfileOptions } from "./defaults.ts";
 import { type FoldError, fold, formatFoldErrors } from "./merge.ts";
 import { type Diagnostic, formatDiagnostics, parseDocument, parseEnvironment } from "./schema.ts";
@@ -69,7 +69,7 @@ export function configPaths(options: Pick<LoadOptions, "cwd" | "agentDir">) {
 
 export function loadConfig(options: LoadOptions): LoadResult {
 	const home = options.home ?? homedir();
-	const tmp = options.tmp ?? SANDBOX_TMPDIR;
+	const tmp = options.tmp ?? scratchBase(options.env ?? process.env);
 	const agentDir = options.agentDir ?? getAgentDir();
 	const env = options.env ?? process.env;
 	const defaults: DefaultProfileOptions = { cwd: options.cwd, home, tmp, agentDir, env };

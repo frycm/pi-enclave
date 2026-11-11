@@ -14,7 +14,6 @@
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { SANDBOX_TMPDIR } from "../backend/types.ts";
 import type {
 	AttendedSettings,
 	AuditSettings,
@@ -243,6 +242,11 @@ export interface DefaultProfileOptions {
 	/** The workspace root. Normally pi's cwd. */
 	cwd: string;
 	home?: string;
+	/**
+	 * What `$TMPDIR` expands to in configuration files. Not a writable root by
+	 * default: the native backend adds a private per-session directory below
+	 * this per-user base by itself (#20).
+	 */
 	tmp?: string;
 	agentDir?: string;
 	/** Parent environment used to derive effective credential locations. */
@@ -259,14 +263,18 @@ export interface DefaultProfileOptions {
  * whose default answer resolves to "approved".
  */
 export function defaultProfile(options: DefaultProfileOptions): EffectiveProfile {
-	const { cwd, home = homedir(), tmp = SANDBOX_TMPDIR, agentDir = getAgentDir(), env = process.env } = options;
+	const { cwd, home = homedir(), agentDir = getAgentDir(), env = process.env } = options;
 	return {
 		name: "dev",
 		auto: true,
 		sandbox: {
 			backend: { kind: "native", fallback: "podman", image: "", binary: "", socket: "", readableRoots: [] },
 			mode: "workspace-write",
-			writableRoots: [cwd, tmp],
+			// The temp directory is not configured here. The native backend adds a
+			// private per-session directory of its own and the container backend
+			// an in-container tmpfs; a fixed shared path such as /tmp/claude is
+			// exactly what must not be writable (#20).
+			writableRoots: [cwd],
 			readDeny: [...defaultReadDeny(home, agentDir, env), join(cwd, ".pi", "mcp.json")],
 			grantableReadDeny: [],
 			network: { mode: "off", allowHosts: [] },

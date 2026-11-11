@@ -90,7 +90,8 @@ describe("sandbox profile authority", () => {
 		process.env.TMPDIR = "/";
 		try {
 			const configured = defaultProfile({ cwd: "/work", home: "/home/u", agentDir: "/home/u/.pi/agent" });
-			expect(configured.sandbox.writableRoots).toEqual(["/work", SANDBOX_TMPDIR]);
+			// Neither ambient TMPDIR nor the fixed shared /tmp/claude (#20).
+			expect(configured.sandbox.writableRoots).toEqual(["/work"]);
 		} finally {
 			if (previous === undefined) delete process.env.TMPDIR;
 			else process.env.TMPDIR = previous;

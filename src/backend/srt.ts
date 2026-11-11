@@ -32,6 +32,7 @@ import type { BackendName } from "../probe.ts";
 import { hostExecutableSafety, hostRuntimeSafety, resolveSeccompHelper, whichSync } from "../probe-host.ts";
 import { shellCapabilityIssue, validateReadCapability, validateWriteCapability } from "./capability.ts";
 import { canonical, isUnder } from "./paths.ts";
+import { SessionScratch } from "./scratch.ts";
 import { checkUnixSocketBlocking } from "./self-test.ts";
 import {
 	type CompiledProfile,
@@ -219,9 +220,15 @@ export function effectiveProfile(
 	profile: Profile,
 	platform: NodeJS.Platform = process.platform,
 	env: NodeJS.ProcessEnv = process.env,
+	/**
+	 * The backend's own session scratch directory (#20). When given it is the
+	 * child's TMPDIR and the only temp root, and the ambient overrides are not
+	 * consulted: the backend pins SRT's injected TMPDIR to it.
+	 */
+	scratch?: string,
 ): Profile {
-	const tmp = srtTmpDir(env);
-	const hasAmbientOverride = Boolean(env.CLAUDE_CODE_TMPDIR || env.CLAUDE_TMPDIR);
+	const tmp = scratch ?? srtTmpDir(env);
+	const hasAmbientOverride = scratch === undefined && Boolean(env.CLAUDE_CODE_TMPDIR || env.CLAUDE_TMPDIR);
 	const tmpContained =
 		isAbsolute(tmp) && profile.writableRoots.some((root) => isUnder(canonical(tmp), canonical(root)));
 	if (hasAmbientOverride && tmp !== SANDBOX_TMPDIR && !tmpContained) {
@@ -441,6 +448,10 @@ export class SrtBackend implements SandboxBackend {
 	private helperArgv: string[] | undefined;
 	private helperDenySnapshot = "";
 	private hostTools: HostToolPaths = {};
+	/** Created at the first compile and kept for the backend's lifetime, so roots and hashes stay stable (#20). */
+	private scratch: SessionScratch | undefined;
+	/** The ambient SRT TMPDIR override, restored on dispose. `null` means it was unset. */
+	private ambientSrtTmp: string | null | undefined;
 	/** Set by the extension so helper denials reach the same audit trail as shell ones. */
 	onFsViolation: ((violation: Violation) => void) | undefined;
 
@@ -450,7 +461,11 @@ export class SrtBackend implements SandboxBackend {
 	}
 
 	async compile(requested: Profile): Promise<CompiledProfile> {
-		const profile = effectiveProfile(requested);
+		// Refuses when the per-user base or the new directory is not a private
+		// directory of ours, instead of letting the first `mktemp` fail (#20).
+		this.scratch ??= SessionScratch.create();
+		this.pinSrtTmpDir();
+		const profile = effectiveProfile(requested, process.platform, process.env, this.scratch.path);
 		const pathSafety = hostRuntimeSafety(profile.writableRoots);
 		if (!pathSafety.ok) {
 			throw new Error(`pi-enclave: refusing unsafe host executable lookup. ${pathSafety.detail}`);
@@ -487,17 +502,6 @@ export class SrtBackend implements SandboxBackend {
 		};
 		materializeWriteDenyAnchors(profile);
 		const config = toSrtConfig(profile, this.weakened, process.platform, this.hostTools);
-
-		// SRT points the child's TMPDIR here but never creates it. On macOS a
-		// child can mkdir it itself (the profile allows the path); on Linux bwrap
-		// skips an absent bind, leaving TMPDIR pointing nowhere and `mktemp`
-		// failing. Creating it makes both platforms behave the same.
-		try {
-			mkdirSync(profile.tmpDir ?? SANDBOX_TMPDIR, { recursive: true, mode: 0o700 });
-		} catch {
-			// A temp directory that cannot be created is the child's problem to
-			// report, not a reason to refuse to compile.
-		}
 
 		// The manager is global to the process, so initialise once and update
 		// thereafter. Re-initialising would tear down the proxy and log monitor
@@ -578,12 +582,27 @@ export class SrtBackend implements SandboxBackend {
 	}
 
 	/**
+	 * Point sandbox-runtime's injected `TMPDIR` at this backend's scratch.
+	 *
+	 * SRT reads `CLAUDE_CODE_TMPDIR` from the parent's environment each time it
+	 * wraps a command and has no other way to be told. Set before every wrap
+	 * rather than once, so a second backend in the same process (the tests,
+	 * the approve CLI) cannot leave this one pointing at its directory.
+	 */
+	private pinSrtTmpDir(): void {
+		if (!this.scratch) return;
+		if (this.ambientSrtTmp === undefined) this.ambientSrtTmp = process.env.CLAUDE_CODE_TMPDIR ?? null;
+		process.env.CLAUDE_CODE_TMPDIR = this.scratch.path;
+	}
+
+	/**
 	 * Re-apply the configuration and re-wrap the helper if a deny root has
 	 * appeared, vanished or been retargeted since the last wrap. Called before
 	 * every helper operation and every shell command; the cost is an lstat and
 	 * a realpath per deny root, microseconds against a round trip.
 	 */
 	private async refreshHelperIfStale(compiled: CompiledProfile): Promise<void> {
+		this.pinSrtTmpDir();
 		if (denySnapshot(compiled.profile) === this.helperDenySnapshot) return;
 		materializeWriteDenyAnchors(compiled.profile);
 		// Re-apply the configuration before re-wrapping: the manager resolves
@@ -618,10 +637,15 @@ export class SrtBackend implements SandboxBackend {
 			? validateReadCapability(compiled.profile, request.cwd, request.readCapability)
 			: undefined;
 		const customProfile = writeTarget
-			? effectiveProfile({
-					...compiled.profile,
-					writableRoots: [...compiled.profile.writableRoots, writeTarget],
-				})
+			? effectiveProfile(
+					{
+						...compiled.profile,
+						writableRoots: [...compiled.profile.writableRoots, writeTarget],
+					},
+					process.platform,
+					process.env,
+					this.scratch?.path,
+				)
 			: readTarget
 				? {
 						...compiled.profile,
@@ -897,8 +921,23 @@ export class SrtBackend implements SandboxBackend {
 	async dispose(): Promise<void> {
 		await this.fsClient?.dispose();
 		this.fsClient = undefined;
-		if (!this.initialized) return;
-		await SandboxManager.reset();
-		this.initialized = false;
+		if (this.initialized) {
+			await SandboxManager.reset();
+			this.initialized = false;
+		}
+		// The session's temp files go with it: the next task's agent must not
+		// find them (#20).
+		this.scratch?.dispose();
+		this.scratch = undefined;
+		if (this.ambientSrtTmp !== undefined) {
+			if (this.ambientSrtTmp === null) delete process.env.CLAUDE_CODE_TMPDIR;
+			else process.env.CLAUDE_CODE_TMPDIR = this.ambientSrtTmp;
+			this.ambientSrtTmp = undefined;
+		}
+	}
+
+	/** The session scratch directory, once compiled. Exposed for status and tests. */
+	get scratchDir(): string | undefined {
+		return this.scratch?.path;
 	}
 }

@@ -238,7 +238,7 @@ describe("fold", () => {
 			OPTIONS,
 		);
 		if (!result.ok) throw new Error(JSON.stringify(result.errors));
-		expect(result.profile.sandbox.writableRoots).toEqual(["/work", "/tmp", "/work/build"]);
+		expect(result.profile.sandbox.writableRoots).toEqual(["/work", "/work/build"]);
 	});
 
 	it("accepts a project file that tightens", () => {
