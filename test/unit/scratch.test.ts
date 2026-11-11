@@ -122,6 +122,49 @@ describe("session scratch lifecycle (#20)", () => {
 		scratch.dispose();
 	});
 
+	// Root ignores directory permissions, so only an unprivileged run can show
+	// that removal survives them. CI runs unprivileged.
+	it.skipIf(uid === 0)("removes a tree the agent made unreadable (000) or unwritable (555), without throwing", () => {
+		const base = join(workdir(), "pi-enclave-u");
+		const scratch = SessionScratch.create({ base });
+		for (const [name, mode] of [
+			["locked", 0o000],
+			["readonly", 0o555],
+		] as const) {
+			mkdirSync(join(scratch.path, name, "b"), { recursive: true });
+			writeFileSync(join(scratch.path, name, "b", "f"), "x");
+			chmodSync(join(scratch.path, name), mode);
+		}
+		const outside = join(workdir(), "outside");
+		mkdirSync(outside, { mode: 0o500 });
+		symlinkSync(outside, join(scratch.path, "link-to-outside"));
+		expect(scratch.dispose()).toBeUndefined();
+		expect(existsSync(scratch.path)).toBe(false);
+		// The planted link was removed, not followed, and its target untouched.
+		expect(statSync(outside).mode & 0o777).toBe(0o500);
+	});
+
+	it("checks the directory before each use and recreates it at the same path if it vanished", () => {
+		const base = join(workdir(), "pi-enclave-u");
+		const scratch = SessionScratch.create({ base });
+		rmSync(scratch.path, { recursive: true });
+		scratch.ensure();
+		expect(lstatSync(scratch.path).mode & 0o777).toBe(0o700);
+
+		chmodSync(scratch.path, 0o777);
+		expect(() => scratch.ensure()).toThrow(ScratchDirError);
+		chmodSync(scratch.path, 0o700);
+
+		// The runtime directory itself gone, as at logout without lingering.
+		const runtime = join(workdir(), "run-user");
+		mkdirSync(runtime, { mode: 0o700 });
+		const lost = SessionScratch.create({ base: join(runtime, "pi-enclave-u") });
+		rmSync(runtime, { recursive: true });
+		expect(() => lost.ensure()).toThrow(/no longer exists and cannot be recreated.*enable-linger/s);
+		scratch.dispose();
+		expect(() => scratch.ensure()).toThrow(/already removed/);
+	});
+
 	it("sweeps a dead session's directory at the next start, and keeps live or recent ones", () => {
 		const base = join(workdir(), "pi-enclave-u");
 		mkdirSync(base, { mode: 0o700 });

@@ -431,6 +431,33 @@ describe("fold", () => {
 		expect(result.errors[0]?.message).toContain("state directory");
 	});
 
+	describe("the per-user scratch base (#20)", () => {
+		const base = "/tmp/pi-enclave-1000";
+		const withBase = { ...OPTIONS, tmp: base, scratchBase: base };
+		const roots = (writableRoots: string[]) =>
+			fold([{ source: "builtin" }, doc("user_global", { sandbox: { writableRoots } })], withBase);
+
+		it('refuses "$TMPDIR", which older examples listed and now names the base', () => {
+			const result = roots(["$WORKSPACE", "$TMPDIR"]);
+			if (result.ok) throw new Error("expected rejection");
+			expect(result.errors.map((error) => error.message).join("\n")).toMatch(
+				/"\/tmp\/pi-enclave-1000" overlaps the per-user scratch directory.*\$TMPDIR/s,
+			);
+		});
+
+		it("refuses a root that contains the base, or one inside it", () => {
+			for (const root of ["/tmp", "/tmp/pi-enclave-1000/session-1-abc"]) {
+				const result = roots([root]);
+				expect(result.ok, root).toBe(false);
+			}
+		});
+
+		it("accepts roots that do not overlap it", () => {
+			const result = roots(["/work", "/tmp/build", "/tmp/pi-enclave-10000"]);
+			if (!result.ok) throw new Error(JSON.stringify(result.errors));
+		});
+	});
+
 	describe("grantable read denials", () => {
 		it("accepts an exact user-added denial", () => {
 			const result = fold(

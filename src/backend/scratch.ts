@@ -103,6 +103,65 @@ export function verifyPrivateDir(path: string, options: { lstat?: LstatFn; uid?:
 	}
 }
 
+/**
+ * Remove a tree the agent could write to, and never throw.
+ *
+ * `rmSync` alone fails on a directory the agent made unreadable or
+ * unwritable (`chmod 000`, `chmod 555`), and a throw here would abort the
+ * rest of shutdown. So a failed removal restores owner access on every real
+ * directory below the path (never through a symlink, never on one owned by
+ * someone else) and tries once more. Returns why the directory is still
+ * there, or `undefined` when it is gone.
+ *
+ * Node has no `lchmod` on Linux, so a directory swapped for a symlink between
+ * the `lstat` and the `chmod` would have the owner bits added to the link's
+ * target instead. That only ever adds permissions for the user to a directory
+ * they own, and the agent's processes are already stopped when this runs.
+ */
+export function removeTree(path: string, uid: number | undefined = process.getuid?.()): string | undefined {
+	try {
+		rmSync(path, { recursive: true, force: true });
+		return undefined;
+	} catch {
+		// Fall through: restore access and retry.
+	}
+	try {
+		restoreOwnerAccess(path, uid);
+	} catch {
+		// Best effort; the retry reports what is left.
+	}
+	try {
+		rmSync(path, { recursive: true, force: true });
+		return undefined;
+	} catch (error) {
+		return `could not remove scratch directory ${path}: ${(error as Error).message}`;
+	}
+}
+
+function restoreOwnerAccess(root: string, uid: number | undefined): void {
+	const stack = [root];
+	let budget = 100_000;
+	while (stack.length > 0 && budget-- > 0) {
+		const path = stack.pop() as string;
+		let stats: Stats;
+		try {
+			stats = lstatSync(path);
+		} catch {
+			continue;
+		}
+		if (stats.isSymbolicLink() || !stats.isDirectory()) continue;
+		if (uid !== undefined && stats.uid !== uid) continue;
+		if ((stats.mode & 0o700) !== 0o700) chmodSync(path, (stats.mode & 0o7777) | 0o700);
+		let names: string[];
+		try {
+			names = readdirSync(path);
+		} catch {
+			continue;
+		}
+		for (const name of names) stack.push(join(path, name));
+	}
+}
+
 /** Create the per-user base if absent, then verify it. */
 function ensureBase(base: string, options: { lstat?: LstatFn; uid?: number | undefined }): void {
 	try {
@@ -160,8 +219,7 @@ export function sweepStaleScratch(
 			const stats = lstat(path);
 			if (!stats.isDirectory() || stats.isSymbolicLink()) continue;
 			if (now - stats.mtimeMs < STALE_SCRATCH_MIN_AGE_MS) continue;
-			rmSync(path, { recursive: true, force: true });
-			removed.push(path);
+			if (removeTree(path) === undefined) removed.push(path);
 		} catch {
 			// Left for the next sweep.
 		}
@@ -200,12 +258,48 @@ export class SessionScratch {
 		return new SessionScratch(realpathSync(created), base);
 	}
 
-	/** Remove the directory and everything the session left in it. Idempotent. */
-	dispose(): void {
-		if (this.disposed) return;
+	/**
+	 * Check the directory is still there and still private before a command
+	 * is wrapped with it, and recreate it at the same path if it has gone.
+	 *
+	 * `$XDG_RUNTIME_DIR` is removed at logout unless lingering is enabled, so a
+	 * session left running in tmux can lose it. Recreating at the same path
+	 * keeps the compiled profile valid; when the runtime directory itself is
+	 * gone that is impossible, and the error says why.
+	 */
+	ensure(options: { uid?: number | undefined; lstat?: LstatFn } = {}): void {
+		if (this.disposed) throw new ScratchDirError(`scratch directory ${this.path} was already removed`);
+		const uid = "uid" in options ? options.uid : process.getuid?.();
+		const checks = { ...(options.lstat ? { lstat: options.lstat } : {}), uid };
+		const lstat = options.lstat ?? lstatSync;
+		try {
+			lstat(this.path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			try {
+				ensureBase(this.base, checks);
+				mkdirSync(this.path, { mode: 0o700 });
+				chmodSync(this.path, 0o700);
+			} catch (cause) {
+				throw new ScratchDirError(
+					`the session scratch directory ${this.path} no longer exists and cannot be recreated ` +
+						`(${(cause as Error).message}). If it was under $XDG_RUNTIME_DIR, that directory is removed at ` +
+						"logout unless lingering is enabled (loginctl enable-linger); start a new session.",
+				);
+			}
+		}
+		verifyPrivateDir(this.path, checks);
+	}
+
+	/**
+	 * Remove the directory and everything the session left in it. Idempotent,
+	 * and never throws: returns why removal failed, if it did.
+	 */
+	dispose(): string | undefined {
+		if (this.disposed) return undefined;
 		this.disposed = true;
 		// rmSync never follows a symlink it finds inside the tree, so whatever
 		// the agent left here cannot redirect the removal elsewhere.
-		rmSync(this.path, { recursive: true, force: true });
+		return removeTree(this.path);
 	}
 }

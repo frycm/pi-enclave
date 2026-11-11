@@ -591,6 +591,7 @@ export class SrtBackend implements SandboxBackend {
 	 */
 	private pinSrtTmpDir(): void {
 		if (!this.scratch) return;
+		this.scratch.ensure();
 		if (this.ambientSrtTmp === undefined) this.ambientSrtTmp = process.env.CLAUDE_CODE_TMPDIR ?? null;
 		process.env.CLAUDE_CODE_TMPDIR = this.scratch.path;
 	}
@@ -919,20 +920,25 @@ export class SrtBackend implements SandboxBackend {
 	}
 
 	async dispose(): Promise<void> {
-		await this.fsClient?.dispose();
-		this.fsClient = undefined;
-		if (this.initialized) {
-			await SandboxManager.reset();
-			this.initialized = false;
-		}
-		// The session's temp files go with it: the next task's agent must not
-		// find them (#20).
-		this.scratch?.dispose();
-		this.scratch = undefined;
-		if (this.ambientSrtTmp !== undefined) {
-			if (this.ambientSrtTmp === null) delete process.env.CLAUDE_CODE_TMPDIR;
-			else process.env.CLAUDE_CODE_TMPDIR = this.ambientSrtTmp;
-			this.ambientSrtTmp = undefined;
+		try {
+			await this.fsClient?.dispose();
+			this.fsClient = undefined;
+			if (this.initialized) {
+				await SandboxManager.reset();
+				this.initialized = false;
+			}
+		} finally {
+			// The session's temp files go with it: the next task's agent must not
+			// find them (#20). In a finally, and non-throwing, so nothing the agent
+			// left in the directory can cut the rest of shutdown short.
+			const failure = this.scratch?.dispose();
+			this.scratch = undefined;
+			if (this.ambientSrtTmp !== undefined) {
+				if (this.ambientSrtTmp === null) delete process.env.CLAUDE_CODE_TMPDIR;
+				else process.env.CLAUDE_CODE_TMPDIR = this.ambientSrtTmp;
+				this.ambientSrtTmp = undefined;
+			}
+			if (failure) process.stderr.write(`pi-enclave: ${failure}\n`);
 		}
 	}
 

@@ -354,8 +354,14 @@ const CHILD_ENV_BASE = [
   `$XDG_RUNTIME_DIR/pi-enclave-<uid>/session-<pid>-<random>` (or under `/tmp` when
   `XDG_RUNTIME_DIR` is not this user's `0700` directory). The per-user base and the session
   directory must be real directories owned by this uid with mode `0700`, or compilation
-  refuses; the directory is removed when the session ends, and ones left by a crashed
-  session are swept at the next start. sandbox-runtime's fixed `/tmp/claude` default is
+  refuses. It is checked before every wrapped command and recreated at the same path if it
+  has vanished; `$XDG_RUNTIME_DIR` itself is removed at logout unless lingering is enabled
+  (`loginctl enable-linger`), and a session that outlives it (say, in tmux) then refuses
+  commands with that explanation. The directory is removed when the session ends, including
+  subdirectories the agent made unreadable or read-only (owner access is restored first,
+  never through a symlink), and ones left by a crashed session are swept at the next start.
+  A configured writable root that equals, contains or lies inside the per-user base is
+  refused at load, because it would let sessions reach each other's scratch directories. sandbox-runtime's fixed `/tmp/claude` default is
   write-denied, and its injected `TMPDIR` is pinned to the session directory. Ambient
   `TMPDIR`, `CLAUDE_CODE_TMPDIR` and `CLAUDE_TMPDIR` never grant write authority. `HOME` remains the real home for tool compatibility, while credential/state
   subpaths are kernel-denied. Every other SRT write default that is not a device node is
@@ -1544,7 +1550,9 @@ do, which differs from each other more than the design assumed.
   native backend creates a `0700` per-session directory under a per-user base, refuses one
   that is a symlink, foreign-owned or not `0700`, pins it into the child environment and
   sandbox-runtime's injected `TMPDIR`, and removes it at shutdown. The shared `/tmp/claude`
-  is write-denied. In configuration files `$TMPDIR` expands to the per-user base.
+  is write-denied. In configuration files `$TMPDIR` expands to the per-user base, and a
+  writable root overlapping that base (such as `"$TMPDIR"`, which older examples listed) is
+  refused.
 - **Credential roots follow XDG configuration.** An absolute `XDG_CONFIG_HOME` adds its
   `gh` and `claude` stores to the read/write denials without dropping the conventional
   `~/.config` locations; a relative XDG root is not exported to sandboxed children.

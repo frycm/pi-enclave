@@ -163,7 +163,7 @@ export function loadConfig(options: LoadOptions): LoadResult {
 
 	if (errors.length > 0) return { ok: false, message: errors.join("\n\n"), sources };
 
-	const folded = fold(documents, defaults);
+	const folded = fold(documents, { ...defaults, scratchBase: scratchBase(env) });
 	if (!folded.ok) return { ok: false, message: formatFoldErrors(folded.errors), sources };
 
 	return { ok: true, profile: folded.profile, provenance: folded.provenance, sources };
