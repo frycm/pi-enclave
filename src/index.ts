@@ -67,7 +67,7 @@ import { PROVENANCE_ENTRY_TYPE, ProvenanceTracker } from "./gate/provenance.ts";
 import { toolReachability } from "./gate/reachability.ts";
 import { persistenceSurface, protectedByProfile } from "./persistence/agent.ts";
 import { formatPendingHits, TripwireLedger } from "./persistence/ledger.ts";
-import { formatTripwireHits, PersistenceTripwire } from "./persistence/tripwire.ts";
+import { countsAgainstTurn, formatTripwireHits, PersistenceTripwire } from "./persistence/tripwire.ts";
 import { formatProbeReport } from "./probe.ts";
 import { probeHost } from "./probe-host.ts";
 import { critiqueRulebook, formatCritique } from "./reviewer/critique.ts";
@@ -392,16 +392,10 @@ export default function (pi: ExtensionAPI): void {
 				backend: backend.name,
 				...(hit.detail ? { raw: hit.detail } : {}),
 			}));
-		// Project files (AGENTS.md, .envrc, ...) are edited in ordinary work,
-		// often after an L1 approval, so a change there is reported and audited
-		// but never counted. Git and pi configuration count like a denial.
-		// One entry too large to fingerprint is reported at every check, so it
-		// is not counted either: it would trip the breaker on its own. A surface
-		// that cannot be read at all (no kind) still counts.
-		const isUncounted = (hit: (typeof hits)[number]) =>
-			hit.kind === "project" || (hit.change === "unverifiable" && hit.kind !== undefined);
-		const counted = hits.filter((hit) => !isUncounted(hit));
-		const uncounted = hits.filter(isUncounted);
+		// Which hits count against the turn is decided in one place
+		// (countsAgainstTurn): project files and repeat reports never do.
+		const counted = hits.filter(countsAgainstTurn);
+		const uncounted = hits.filter((hit) => !countsAgainstTurn(hit));
 		if (counted.length > 0) recordViolations(asViolations(counted), agent);
 		if (uncounted.length > 0) recordViolations(asViolations(uncounted), false);
 		try {

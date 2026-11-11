@@ -25,7 +25,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { persistenceSurface, protectedByProfile } from "../../src/persistence/agent.ts";
 import { gitPersistenceSurface } from "../../src/persistence/git.ts";
 import { formatPendingHits, TripwireLedger } from "../../src/persistence/ledger.ts";
-import { formatTripwireHits, PersistenceTripwire } from "../../src/persistence/tripwire.ts";
+import { countsAgainstTurn, formatTripwireHits, PersistenceTripwire } from "../../src/persistence/tripwire.ts";
 
 const dirs: string[] = [];
 function tempDir(prefix: string): string {
@@ -138,6 +138,30 @@ describe("the agent configuration tripwire (#19)", () => {
 		expect(isProtected(join(root, "sub", ".pi"))).toBe(false);
 		expect(isProtected(join(root, ".pi-other"))).toBe(false);
 		expect(isProtected("/nowhere-writable/.pi")).toBe(true);
+	});
+
+	it("counts a .pi too large to fingerprint when it first appears or is padded, not on every repeat", () => {
+		const root = tempDir("enclave-agent-");
+		mkdirSync(join(root, "small", ".pi"), { recursive: true });
+		const tripwire = new PersistenceTripwire(() => persistenceSurface([root]), root);
+		const plant = (dir: string) => {
+			mkdirSync(dir, { recursive: true });
+			for (let index = 0; index < 17_000; index++) writeFileSync(join(dir, `f${index}`), "");
+		};
+		// A new, padded .pi and a small existing one padded past the budget.
+		plant(join(root, "planted", ".pi", "extensions"));
+		plant(join(root, "small", ".pi", "extensions"));
+		const first = tripwire.check();
+		expect(first.map((hit) => [hit.path, hit.change, countsAgainstTurn(hit)])).toEqual([
+			[join(root, "planted", ".pi"), "unverifiable", true],
+			[join(root, "small", ".pi"), "unverifiable", true],
+		]);
+		const repeat = tripwire.check();
+		expect(repeat).toHaveLength(2);
+		expect(repeat.some(countsAgainstTurn)).toBe(false);
+		// Project files never count; a surface that could not be read always does.
+		expect(countsAgainstTurn({ path: "/w/AGENTS.md", change: "modified", kind: "project" })).toBe(false);
+		expect(countsAgainstTurn({ path: "/w", change: "unverifiable", detail: "too many entries" })).toBe(true);
 	});
 
 	it("words the notice per kind", () => {

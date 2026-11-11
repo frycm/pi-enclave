@@ -28,6 +28,28 @@ export interface TripwireHit {
 	 * be read at all.
 	 */
 	kind?: SurfaceKind;
+	/**
+	 * On an `unverifiable` entry: the first report of it, because it is new
+	 * or was small enough to fingerprint at the previous check. It counts
+	 * like a `created` or `modified` one; later repeats do not.
+	 */
+	appeared?: true;
+}
+
+/**
+ * Whether a hit counts against the agent's turn, like a denial.
+ *
+ * Project files are edited in ordinary work, often after an L1 approval, so
+ * they never count. An entry too large to fingerprint is reported at every
+ * check, so it counts only when it first appears; otherwise padding a
+ * planted `.pi` with files would avoid the strike a small one gets, and an
+ * existing one would trip the breaker by itself. A surface that cannot be
+ * read at all (no kind) always counts.
+ */
+export function countsAgainstTurn(hit: TripwireHit): boolean {
+	if (hit.kind === "project") return false;
+	if (hit.change === "unverifiable" && hit.kind !== undefined) return hit.appeared === true;
+	return true;
 }
 
 /** Path -> fingerprint. Absent paths are absent from the map. */
@@ -68,7 +90,11 @@ export class PersistenceTripwire {
 			// Too large to fingerprint: it cannot be compared, so it is reported
 			// at every check rather than passed as unchanged.
 			if (isUnverifiableValue(value)) {
-				hits.push({ path, change: "unverifiable", detail: "too many entries to fingerprint", ...tag });
+				// New, or verifiable until now (padded past the budget): the first
+				// report. Later ones repeat it.
+				const before = this.baseline.get(path);
+				const appeared = before !== undefined && isUnverifiableValue(before) ? {} : { appeared: true as const };
+				hits.push({ path, change: "unverifiable", detail: "too many entries to fingerprint", ...tag, ...appeared });
 				continue;
 			}
 			const before = this.baseline.get(path);
