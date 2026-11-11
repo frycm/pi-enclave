@@ -255,7 +255,7 @@ describe("parseShell", () => {
 	describe("comments", () => {
 		it.each([
 			["ls # don't\ngit push --force origin main # won't", ["ls", "git push --force origin main"]],
-			['ls # say "hi"\nsudo id # "bye"', ["ls", "sudo id"]],
+			['ls # say "hi"\nchmod 777 x # "bye"', ["ls", "chmod 777 x"]],
 			["ls # a `tick\nrm -rf src # another `tick", ["ls", "rm -rf src"]],
 			["cat README.md # it's\nrm -rf src\n# it's", ["cat README.md", "rm -rf src"]],
 			["ls # trailing comment", ["ls"]],
@@ -309,7 +309,7 @@ describe("parseShell", () => {
 		// N known commands joined by newlines parses as those N commands, or is
 		// not confident.
 		it("parses N newline-joined commands as N commands or as non-confident", () => {
-			const known = ["ls", "git push --force origin main", "sudo id", "rm -rf src", "wc -l x", "cat README.md"];
+			const known = ["ls", "git push --force origin main", "chmod 777 x", "rm -rf src", "wc -l x", "cat README.md"];
 			const comments = ["", " # it's", ' # "x', " # `", " #'\"`", "\n# don't", "\n  # a 'b' \"c\"", " #"];
 			let state = 0x14;
 			const random = () => {
@@ -357,6 +357,154 @@ describe("parseShell", () => {
 				expect(parseShell(command).confident).toBe(true);
 			},
 		);
+	});
+
+	// #15. Confidence is an allowlist: a command name is trusted only when its
+	// argv is understood. A program that runs another command from its arguments
+	// or options, or a builtin that changes what a later name means, is not.
+	describe("command launchers", () => {
+		it.each([
+			// The table in #15.
+			["coproc rm -rf src", "wrapper"],
+			["flock /tmp/claude/l git push", "wrapper"],
+			["strace -f -o /dev/null rm -rf src", "wrapper"],
+			["ltrace rm -rf src", "wrapper"],
+			["script -qc 'rm -rf src' /dev/null", "wrapper"],
+			["vim -es -c '!rm -rf src' -c q", "wrapper"],
+			["tar -tf a.tar --checkpoint=1 --checkpoint-action=exec='rm -rf src'", "command-dispatch"],
+			["parallel rm -rf ::: src", "wrapper"],
+			["unshare -r rm -rf src", "wrapper"],
+			["chroot / rm -rf src", "wrapper"],
+			["nsenter -t 1 rm -rf src", "wrapper"],
+			["ssh host rm -rf /", "wrapper"],
+			["rsync -e 'sh -c \"id\"' a b:", "wrapper"],
+			["sort --compress-program=./x -S 1k big", "command-dispatch"],
+			["git config alias.st '!rm -rf src'", "command-dispatch"],
+			["git st", "command-dispatch"],
+			["hash -p /usr/bin/rm ls", "shell-state"],
+			["hash -p /usr/bin/rm ls\nls -rf src", "shell-state"],
+			["shopt -s expand_aliases\nalias ls='rm -rf'\nls src", "shell-state"],
+			["alias ls='rm -rf'", "shell-state"],
+			// The comment on #15.
+			["man -P 'echo PWNED' ls", "wrapper"],
+			["git grep -O'echo PWNED' x", "command-dispatch"],
+			["git diff --ext-diff", "command-dispatch"],
+			["git submodule foreach 'git config core.fsmonitor /work/x.sh'", "command-dispatch"],
+			// The same family, named in #15.
+			["fc -s", "wrapper"],
+			["less +'!id' README.md", "wrapper"],
+			["gdb -batch -ex 'shell id'", "wrapper"],
+			["sudo id", "wrapper"],
+			["export PATH=/work/bin:$PATH", "shell-state"],
+			["declare -x LD_PRELOAD=/work/x.so", "shell-state"],
+			["set -o vi", "shell-state"],
+			// An unlisted program may launch another one; it is not trusted.
+			["pytest -q", "unknown-command"],
+			["curl -s http://localhost:8080/", "unknown-command"],
+			["mystery-tool --run 'rm -rf src'", "unknown-command"],
+		])("%j is not confident (%s)", (command, marker) => {
+			const parsed = parseShell(command);
+			expect(parsed.confident).toBe(false);
+			expect(parsed.markers).toContain(marker);
+		});
+
+		// The practical complement to the differential test, which cannot see
+		// commands a program runs itself: every option of a known binary that
+		// takes a command, in the spellings the program accepts.
+		it.each([
+			"sort --compress-program=gzip x",
+			"sort --compress-program gzip x",
+			"sort --compress=gzip x",
+			"sort --co=gzip x",
+			"split --filter='./x' big",
+			"split --fi=./x big",
+			"tar -cf a.tar --to-command=./x .",
+			"tar -xf a.tar --to-c=./x",
+			"tar -cf a.tar --use-compress-program=./x .",
+			"tar -cf a.tar -I ./x .",
+			"tar -cIf ./x a.tar .",
+			"tar cIf ./x a.tar .",
+			"tar -tf a.tar --checkpoint-action=exec=./x",
+			"tar -tf a.tar --checkpoint-a=exec=./x",
+			"tar -tf a.tar --checkpoint-=exec=./x",
+			"tar -cf host:a.tar --rs=./x .",
+			"tar -cf a.tar --inf=./x .",
+			"tar -cf a.tar --new-=./x .",
+			"tar -cf host:a.tar --rsh-command=./x .",
+			"tar -cf a.tar --rmt-command=./x .",
+			"tar -cf a.tar -F ./x .",
+			"tar -cf a.tar --info-script=./x .",
+			"tar -cf a.tar --new-volume-script=./x .",
+			"rg --pre ./x pattern",
+			"rg --pre=./x pattern",
+			"rg --hostname-bin=./x pattern",
+			"git grep -O pattern",
+			"git grep --open-files-in-pager=./x pattern",
+			"git log --ext-diff -p",
+			"git show --ext-diff",
+			"git difftool -x ./x",
+			"git mergetool --tool-help",
+			"git rebase -x ./x main",
+			"git rebase --exec=./x main",
+			"git rebase --exe=./x main",
+			"git fetch --upload-p=./x origin",
+			"git clone -u ./x origin dir",
+			"git ls-remote -u ./x origin",
+			"git rebase -ix ./x main",
+			"git bisect run ./x",
+			"git submodule foreach ./x",
+			"git submodule --quiet foreach ./x",
+			"git fetch --upload-pack=./x origin",
+			"git push --receive-pack=./x origin",
+			"git ls-remote --upload-pack ./x origin",
+			"git -c core.pager=./x log",
+			"git --exec-path=/work log",
+			"git config core.pager ./x",
+			"git config --global core.editor ./x",
+			"git config set core.hooksPath hooks",
+			"git filter-branch --tree-filter ./x",
+			"gh extension exec x",
+			"gh alias set co 'pr checkout'",
+			"gh codespace ssh",
+			"gh my-extension",
+			"gh pr view 6 --web",
+			"gh repo view -w",
+			"read PATH < /work/p",
+			"printf -v PATH /work/bin",
+			"wait -p PATH",
+			"find . -exec ./x ';'",
+			"find . -execdir ./x ';'",
+			"find . -ok ./x ';'",
+			"find . -okdir ./x ';'",
+		])("%s is not confident", (command) => {
+			expect(parseShell(command).confident).toBe(false);
+		});
+
+		// The allowlist must not swallow the ordinary forms of the same tools.
+		it.each([
+			"git status --short",
+			"git log --oneline -5",
+			"git diff HEAD~1",
+			"git config --get user.name",
+			"git config --list",
+			"git grep -n pattern",
+			"git rebase main",
+			"git submodule status",
+			"git bisect start",
+			"gh pr view 6",
+			"sort -u names.txt",
+			"tar -tf a.tar",
+			"rg -n pattern src",
+			"find . -name README.md",
+			"set -euo pipefail\nls",
+			"mkdir -p build && touch build/x && cp a b && mv b c && rm -f c",
+			"chmod +x x && ln -s a b",
+			"echo ok | tee out.txt",
+		])("%s stays confident", (command) => {
+			const parsed = parseShell(command);
+			expect(parsed.markers).toEqual([]);
+			expect(parsed.confident).toBe(true);
+		});
 	});
 
 	it("preserves quote syntax while normalizing harmless whitespace", () => {

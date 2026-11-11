@@ -46,7 +46,9 @@ export type ShellMarker =
 	| "compound"
 	| "clobber"
 	| "unaccounted-line"
-	| "unusual-whitespace";
+	| "unusual-whitespace"
+	| "shell-state"
+	| "unknown-command";
 
 export interface Redirect {
 	/** The operator as written: `>`, `>>`, `2>`, `&>`, `<`, `<>`. */
@@ -138,6 +140,371 @@ const WRAPPER_COMMANDS = new Set([
 	"watch",
 	"nice",
 ]);
+
+/**
+ * Programs that run another command taken from their arguments or options.
+ *
+ * Like the wrappers above, any argument marks them non-confident: `flock l git
+ * push`, `strace -f rm -rf src`, `vim -es -c '!rm -rf src'`, `man -P 'cmd' ls`,
+ * `ssh host cmd`, `rsync -e 'sh -c …'`. Unwrapping them would mean modelling
+ * each program's option grammar, and a single mistake there is a bypass.
+ */
+const LAUNCHER_COMMANDS = new Set([
+	"coproc",
+	"flock",
+	"strace",
+	"ltrace",
+	"script",
+	"parallel",
+	"unshare",
+	"nsenter",
+	"chroot",
+	"ssh",
+	"scp",
+	"sftp",
+	"rsync",
+	"vim",
+	"vi",
+	"nvim",
+	"view",
+	"ex",
+	"ed",
+	"emacs",
+	"nano",
+	"less",
+	"more",
+	"most",
+	"man",
+	"gdb",
+	"lldb",
+	"fc",
+	// Denied outright by `rules.deny`; listed so the parse is not confident either.
+	"sudo",
+	"su",
+	"doas",
+]);
+
+/**
+ * Builtins that change what a later command in the same script means.
+ *
+ * `hash -p /usr/bin/rm ls` and `shopt -s expand_aliases; alias ls='rm -rf'`
+ * make a later `ls` run `rm`, and `export`/`declare` change the environment
+ * every later command inherits. The tokenizer reads each command name
+ * literally, so a script that uses one of these is not confident. `set` is
+ * handled separately: its common error-handling options are harmless.
+ */
+const SHELL_STATE_BUILTINS = new Set([
+	"hash",
+	"alias",
+	"unalias",
+	"shopt",
+	"export",
+	"declare",
+	"typeset",
+	"readonly",
+	"local",
+	"unset",
+]);
+
+/** `set` options that only change error handling or tracing, never what a name runs. */
+const HARMLESS_SET_ARG = /^(?:[-+][euxvo]+|pipefail|errexit|nounset|xtrace|verbose|--)$/;
+
+/**
+ * Commands whose argv the tokenizer understands: they do not run another
+ * command taken from their arguments, and what they touch is named in argv.
+ *
+ * Confidence is an allowlist. A command name that is not here and not
+ * classified by one of the tables above (interpreters, script runners,
+ * wrappers, launchers, opaque commands, keywords) is `unknown-command`, because
+ * an unlisted program may launch another one from its options and the
+ * tokenizer cannot tell. Entries with options that do run a command (`sort
+ * --compress-program`, `tar --to-command`, `rg --pre`, several `git`
+ * subcommands) are checked separately below.
+ */
+const KNOWN_COMMANDS = new Set([
+	// Shell builtins and utilities with no hidden effect.
+	":",
+	"[",
+	"[[",
+	"echo",
+	"printf",
+	"true",
+	"false",
+	"test",
+	"pwd",
+	"sleep",
+	"wait",
+	"jobs",
+	"read",
+	"shift",
+	"exit",
+	"return",
+	"break",
+	"continue",
+	"umask",
+	"ulimit",
+	"type",
+	"which",
+	"set",
+	"cd",
+	"pushd",
+	"popd",
+	".",
+	"source",
+	// Reading and inspecting.
+	"ls",
+	"dir",
+	"cat",
+	"tac",
+	"head",
+	"tail",
+	"wc",
+	"nl",
+	"cut",
+	"paste",
+	"tr",
+	"uniq",
+	"sort",
+	"comm",
+	"join",
+	"fold",
+	"fmt",
+	"column",
+	"expand",
+	"unexpand",
+	"rev",
+	"shuf",
+	"seq",
+	"od",
+	"xxd",
+	"hexdump",
+	"base64",
+	"md5sum",
+	"sha1sum",
+	"sha256sum",
+	"sha512sum",
+	"shasum",
+	"cksum",
+	"grep",
+	"egrep",
+	"fgrep",
+	"rg",
+	"jq",
+	"find",
+	"tree",
+	"du",
+	"df",
+	"stat",
+	"file",
+	"basename",
+	"dirname",
+	"realpath",
+	"readlink",
+	"diff",
+	"cmp",
+	"date",
+	"id",
+	"whoami",
+	"groups",
+	"uname",
+	"hostname",
+	"uptime",
+	"nproc",
+	"printenv",
+	"ps",
+	"pgrep",
+	// Writing, with every target in argv.
+	"mkdir",
+	"rmdir",
+	"touch",
+	"cp",
+	"mv",
+	"rm",
+	"ln",
+	"chmod",
+	"chown",
+	"chgrp",
+	"truncate",
+	"dd",
+	"tee",
+	"mktemp",
+	"mkfifo",
+	"split",
+	"csplit",
+	"gzip",
+	"gunzip",
+	"zcat",
+	"bzip2",
+	"bunzip2",
+	"xz",
+	"unxz",
+	"zstd",
+	"kill",
+	"pkill",
+	"killall",
+	// Classified elsewhere in this module, with their own markers.
+	"sed",
+	"tar",
+	"unzip",
+	"cpio",
+	"busybox",
+	"git",
+	"gh",
+]);
+
+/**
+ * `git` subcommands whose argv the tokenizer understands. Any other word may be
+ * an alias (`git config alias.st '!cmd'`) or a `git-<name>` program on PATH.
+ */
+const GIT_SUBCOMMANDS = new Set([
+	"add",
+	"apply",
+	"archive",
+	"bisect",
+	"blame",
+	"branch",
+	"cat-file",
+	"checkout",
+	"cherry-pick",
+	"clean",
+	"clone",
+	"commit",
+	"config",
+	"count-objects",
+	"describe",
+	"diff",
+	"fetch",
+	"for-each-ref",
+	"format-patch",
+	"fsck",
+	"gc",
+	"grep",
+	"help",
+	"init",
+	"log",
+	"ls-files",
+	"ls-remote",
+	"ls-tree",
+	"merge",
+	"merge-base",
+	"mv",
+	"notes",
+	"pull",
+	"push",
+	"rebase",
+	"reflog",
+	"remote",
+	"reset",
+	"restore",
+	"rev-list",
+	"rev-parse",
+	"revert",
+	"rm",
+	"shortlog",
+	"show",
+	"stash",
+	"status",
+	"submodule",
+	"switch",
+	"symbolic-ref",
+	"tag",
+	"version",
+	"worktree",
+]);
+
+/**
+ * True when an argument spells one of the named long options.
+ *
+ * GNU getopt and git's parse-options accept any unambiguous abbreviation of a
+ * long option (`sort --co=x` is `--compress-program=x`, `tar --rs=x` is
+ * `--rsh-command=x`), so an option name that is a prefix of a listed one counts
+ * as that option. An ambiguous abbreviation is an error in the program and
+ * over-asks here, which is the safe direction.
+ */
+function hasLongOption(args: readonly string[], options: readonly string[]): boolean {
+	return args.some((arg) => {
+		if (!arg.startsWith("--") || arg.length < 3) return false;
+		const name = arg.split("=", 1)[0] as string;
+		return options.some((option) => option.startsWith(name) || name.startsWith(option));
+	});
+}
+
+/** Options, on any `git` subcommand, that name a program for git to run. */
+const GIT_PROGRAM_OPTIONS = [
+	"--upload-pack",
+	"--receive-pack",
+	"--exec",
+	"--ext-diff",
+	"--extcmd",
+	"--open-files-in-pager",
+];
+
+/** `git config` forms that only read. Every other form may set an alias, pager, editor or hook path. */
+const GIT_CONFIG_READS = new Set(["--get", "--get-all", "--get-regexp", "--list", "-l", "get", "list"]);
+
+/** True when a `git` invocation can run a program its argv does not show. */
+function gitDispatches(args: readonly string[]): boolean {
+	const [subcommand, ...rest] = args;
+	if (subcommand === undefined) return false;
+	// `git -c core.pager=… log` and `git --exec-path=…` configure programs.
+	if (subcommand.startsWith("-")) return true;
+	if (!GIT_SUBCOMMANDS.has(subcommand)) return true;
+	if (hasLongOption(rest, GIT_PROGRAM_OPTIONS)) return true;
+	switch (subcommand) {
+		case "config":
+			return !rest.some((arg) => GIT_CONFIG_READS.has(arg));
+		case "grep":
+			// `-O<pager>` opens matches in a program of the caller's choosing.
+			return rest.some((arg) => /^-[^-]*O/.test(arg));
+		case "rebase":
+			return rest.some((arg) => /^-[^-]*x/.test(arg));
+		case "submodule":
+			return rest.includes("foreach");
+		case "bisect":
+			return rest[0] === "run";
+		case "clone":
+		case "ls-remote":
+			// `-u <program>` is `--upload-pack`.
+			return rest.some((arg) => /^-[^-]*u/.test(arg));
+		default:
+			return false;
+	}
+}
+
+/** `gh` command groups that do not run extensions, aliases or other programs. */
+const GH_GROUPS = new Set([
+	"api",
+	"auth",
+	"cache",
+	"gist",
+	"issue",
+	"label",
+	"pr",
+	"release",
+	"repo",
+	"run",
+	"search",
+	"status",
+	"workflow",
+]);
+
+/** `tar` long options that name a program for tar to run. */
+const TAR_PROGRAM_OPTIONS = [
+	"--checkpoint-action",
+	"--to-command",
+	"--use-compress-program",
+	"--rsh-command",
+	"--rmt-command",
+	"--info-script",
+	"--new-volume-script",
+];
+
+/** True when `tar` would run a program named in its options. */
+function tarDispatches(args: readonly string[]): boolean {
+	if (hasLongOption(args, TAR_PROGRAM_OPTIONS)) return true;
+	// `-I prog` / `-F script` in a short cluster, or in old-style first argument (`tar xIf …`).
+	return args.some((arg, i) => (/^-[^-]/.test(arg) || (i === 0 && !arg.startsWith("-"))) && /[IF]/.test(arg));
+}
 
 /** `$IFS` / `${IFS}` -- the internal field separator, used to rebuild a command from an argument. */
 const IFS_EXPANSION = /\$\{?IFS\}?/;
@@ -370,7 +737,44 @@ export function parseShell(command: string): ParsedShell {
 		if (SCRIPT_RUNNERS.has(name)) markers.add("script-runner");
 		if (cmd.assignments.length > 0) markers.add("environment-assignment");
 		if (isWorkspaceExecutable(cmd.name)) markers.add("workspace-executable");
-		if (name === "git" && cmd.args[0]?.startsWith("-")) markers.add("command-dispatch");
+		if (name === "git" && gitDispatches(cmd.args)) markers.add("command-dispatch");
+		// `gh <extension>` and `gh <alias>` run arbitrary code; `--web` launches a browser.
+		if (
+			name === "gh" &&
+			((cmd.args[0] !== undefined && !GH_GROUPS.has(cmd.args[0])) ||
+				cmd.args.includes("-w") ||
+				hasLongOption(cmd.args, ["--web"]))
+		) {
+			markers.add("command-dispatch");
+		}
+		// Builtins that assign a variable named in their arguments can set PATH.
+		if (
+			name === "read" ||
+			(name === "printf" && cmd.args.includes("-v")) ||
+			(name === "wait" && cmd.args.includes("-p"))
+		) {
+			markers.add("shell-state");
+		}
+		if (name === "sort" && hasLongOption(cmd.args, ["--compress-program"])) markers.add("command-dispatch");
+		if (name === "split" && hasLongOption(cmd.args, ["--filter"])) markers.add("command-dispatch");
+		if (name === "tar" && tarDispatches(cmd.args)) markers.add("command-dispatch");
+		if (name === "rg" && hasLongOption(cmd.args, ["--pre", "--hostname-bin"])) markers.add("command-dispatch");
+		if (LAUNCHER_COMMANDS.has(name) && cmd.args.length > 0) markers.add("wrapper");
+		if (SHELL_STATE_BUILTINS.has(name)) markers.add("shell-state");
+		if (name === "set" && !cmd.args.every((arg) => HARMLESS_SET_ARG.test(arg))) markers.add("shell-state");
+		if (
+			cmd.name !== "" &&
+			!KNOWN_COMMANDS.has(name) &&
+			!LAUNCHER_COMMANDS.has(name) &&
+			!SHELL_STATE_BUILTINS.has(name) &&
+			!WRAPPER_COMMANDS.has(name) &&
+			!SHELL_KEYWORDS.has(name) &&
+			!SCRIPT_RUNNERS.has(name) &&
+			!isInterpreterCommand(name) &&
+			OPAQUE_COMMANDS[name] === undefined
+		) {
+			markers.add("unknown-command");
+		}
 		if (name === "sed" && cmd.args.length > 0) markers.add("command-dispatch");
 		if (name === "find" && cmd.args.some((arg) => ["-exec", "-execdir", "-ok", "-okdir", "-delete"].includes(arg))) {
 			markers.add("command-dispatch");

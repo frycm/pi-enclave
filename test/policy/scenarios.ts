@@ -329,6 +329,16 @@ export const POLICY_SCENARIOS: PolicyScenario[] = [
 		run: () => hiddenCommandScenario(true),
 		control: () => hiddenCommandScenario(false),
 	},
+
+	{
+		id: "P13",
+		title: "A command run by a launcher is never a confident ordinary command",
+		matrixRow: "Shell command run by a launcher or rebound by a builtin",
+		controlNote:
+			"every command name is trusted as ordinary, which is what a deny-list of known wrappers amounted to for any launcher missing from it",
+		run: () => launcherScenario(true),
+		control: () => launcherScenario(false),
+	},
 ];
 
 // ---------------------------------------------------------------------------
@@ -577,4 +587,42 @@ function naiveShell(command: string): ParsedShell {
 		confident: true,
 		markers: [],
 	};
+}
+
+/**
+ * P13. #15: a launcher runs its inner command without the rules seeing it, so
+ * it must be non-confident, or matched by the same rules as the inner command.
+ */
+function launcherScenario(withAllowlist: boolean): PolicyResult {
+	const rules = {
+		deny: DEFAULT_RULES_DENY,
+		ask: DEFAULT_RULES_ASK,
+		skipReview: [],
+		protectedPaths: { deny: [], ask: [] },
+	};
+	const rows = [
+		"coproc git push origin main",
+		"flock /tmp/l git push origin main",
+		"strace -f -o /dev/null git push origin main",
+		"script -qc 'git push origin main' /dev/null",
+		"vim -es -c '!git push origin main' -c q",
+		"git submodule foreach 'git push origin main'",
+		"man -P 'git push origin main' ls",
+		"hash -p /usr/bin/git ls\nls push origin main",
+	];
+	for (const command of rows) {
+		const parsed = bash(command);
+		const action: CanonicalAction = withAllowlist
+			? parsed
+			: {
+					...parsed,
+					...(parsed.shell ? { shell: { ...parsed.shell, confident: true, markers: [] } } : {}),
+					confident: true,
+				};
+		const verdict = evaluateRules(action, rules).verdict;
+		if (action.confident && verdict !== "ask" && verdict !== "deny") {
+			return bad(`${JSON.stringify(command)} passed L1 as a confident ${action.shell?.commands[0]?.name}`);
+		}
+	}
+	return ok("every launcher row is non-confident or meets the inner command's rule");
 }

@@ -773,7 +773,23 @@ tokenized (pipelines and connectors split, each simple command matched) and path
 resolved. Directory changes, interpreters/scripts, archive extraction, pathname expansion,
 and parameter-expanded arguments are deliberately non-confident and therefore never
 fast-pathed. This remains a heuristic; a real parser can replace it without changing the
-rule format. `review.*` entries are never matched — they
+rule format.
+
+**What a confident parse guarantees.** A bash command is confident only when every
+simple command in it names a program from a fixed table whose argv the tokenizer
+understands (coreutils-style tools, `grep`/`rg`/`jq`/`find`, and `git`/`gh` with an
+allowlist of subcommands), none of those commands uses an option that runs another
+program (`sort --compress-program`, `tar --to-command`/`-I`/`--checkpoint-action`, `rg
+--pre`, `git grep -O`, `git --ext-diff`, `git rebase -x`, `git submodule foreach`, `git -c`,
+`git config` writes, `find -exec`), no builtin changes what a later name means (`hash`,
+`alias`, `shopt`, `export`, `declare`, `unset`, `set` beyond `-euxo pipefail`), and none of
+the constructs above appears. Then the listed simple commands are the ones bash runs, and
+`rules.deny`/`rules.ask` see each of them. Any other command name, including a program
+that launches another one (`flock`, `strace`, `script`, `parallel`, `ssh`, `rsync`, `vim
+-c`, `man -P`, …) or simply one the table does not list, is `unknown-command` or `wrapper`
+and makes the parse non-confident. The table only grows with tests; it does not claim
+that a listed program is harmless, only that its argv says what it does, and L2 still
+bounds it. `review.*` entries are never matched — they
 are spliced, in order, into the reviewer prompt. `"$defaults"` in any list splices the
 built-in entries at that position; omitting it takes full ownership of that list, and
 `/enclave rules defaults` prints what is being given up.
@@ -1507,6 +1523,7 @@ sandbox's, so a green row on a restricted host is not read as stronger evidence 
 | Bash read capability and an ordinary sibling overlap | Linux grant reaches only the capability process; macOS refuses Bash widening because it cannot guarantee lifetime | 3 | native SRT conformance |
 | Pending record edited on disk, or mode changed to `0644`, or nonce reused, or a nonce containing a path | Refused with an audit entry | 2 | P10 |
 | **Hidden shell command**: a command after a commented line whose comment contains a quote (`ls # don't⏎sudo id`), or inside a double-quoted backtick (`` cat "`git push`" ``) | The comment is dropped and the hidden command meets `rules.deny`/`rules.ask` as its own simple command, or the parse is non-confident and escalates; never a confident read-only parse of the first command. A differential test runs generated scripts under real bash and checks that a confident parse lists every command bash ran | 2 | P12 + `policy-shell-differential` unit test |
+| **Launcher**: a program or option that runs another command (`flock l git push`, `git submodule foreach …`, `man -P cmd`, `sort --compress-program=x`), or a builtin that rebinds a name (`hash -p /usr/bin/rm ls`, `alias`) | Non-confident, so it escalates in deterministic mode and is never read-only; a command name outside the known table is `unknown-command` | 2 | P13 + `policy-shell` launcher tables |
 | **Environment leak**: provider keys set in the pi process; `env`, `$VAR` expansion, `os.environ`, `/proc/self/environ` inside the sandbox | None of the values appear; a `passthrough` entry matching `envDeny` is rejected at config load | 1 | C9 |
 | **Stale resume**: pending record written, user then removes a writable root/tool grant, disables capabilities, re-adds a `readDeny`, or loosens config; `pi-enclave approve` | Safe narrowing before the prompt executes under current policy; a revoked tool/capability or wider config is refused. Any effective policy change during the prompt or compilation leaves the record pending | 2 | P11 + approval freshness unit tests |
 
@@ -1680,6 +1697,8 @@ quietly absorbs its own corrections teaches nobody anything.
   process substitution (also inside double quotes), backticks, heredocs, `eval`, `xargs`,
   scripts/interpreters, archive extraction, directory changes, parameter/pathname expansion
   and unbalanced quotes — and a non-confident parse escalates rather than being trusted.
+  Confidence is an allowlist of known command names (see "What a confident parse
+  guarantees" above), so an unlisted program asks rather than being trusted.
   Comments are removed with bash's rule (an unquoted `#` that starts a word after a space,
   tab, newline or metacharacter), and a command containing any other whitespace or control
   character (CR, FF, VT, NUL, Unicode spaces, BOM) is non-confident. As a tripwire
