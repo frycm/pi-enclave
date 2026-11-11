@@ -17,6 +17,7 @@ import {
 	type CodeSources,
 	checkCodeRoots,
 	collectCodeRoots,
+	extensionArguments,
 	formatCodeRootProblems,
 	packageRootOf,
 	resolveDependencyEntries,
@@ -99,7 +100,7 @@ describe("loaded code roots (#36)", () => {
 
 	it("accepts nothing outside the writable roots", () => {
 		const result = check(sources({ extensionPaths: [] }));
-		expect(result).toEqual({ exposed: [], refused: [] });
+		expect(result).toEqual({ exposed: [], refused: [], missing: [] });
 		expect(formatCodeRootProblems(result, false)).toBeUndefined();
 	});
 
@@ -108,8 +109,71 @@ describe("loaded code roots (#36)", () => {
 		expect(formatCodeRootProblems(result, true)).toBeUndefined();
 		const profile = applySelfHosting(toBackendProfile(defaultProfile({ cwd: ws }), ws), result);
 		expect(profile.writeDeny).toContain(join(ws, "ext"));
-		expect(profile.selfHosted).toEqual([join(ws, "ext")]);
+		// The node_modules a later start would search above it, created read-only.
+		expect(profile.selfHosted).toEqual([join(ws, "ext"), join(ws, "node_modules")]);
+		expect(profile.materializeWriteDeny).toContain(join(ws, "node_modules"));
 		expect(toSrtConfig(profile, false, "linux").filesystem.denyWrite).toContain(join(ws, "ext"));
+	});
+
+	it("with the opt-in, protects every missing node_modules between a root and its writable root", () => {
+		// The npm workspace layout from the review: a hoisted dependency in
+		// <pi>/node_modules, and packages/agent loaded. A new
+		// packages/node_modules/dep would shadow the hoisted one.
+		const pi = join(ws, "pi");
+		mkdirSync(join(pi, "node_modules", "dep"), { recursive: true });
+		mkdirSync(join(pi, "packages", "agent", "dist"), { recursive: true });
+		writeFileSync(join(pi, "package.json"), "{}\n");
+		writeFileSync(join(pi, "packages", "agent", "package.json"), "{}\n");
+		writeFileSync(join(pi, "packages", "agent", "dist", "cli.js"), "");
+		const result = check(sources({ extensionPaths: [], piEntry: join(pi, "packages", "agent", "dist", "cli.js") }));
+		expect(result.exposed.map((r) => r.path).sort()).toEqual([join(pi, "node_modules"), join(pi, "packages", "agent")]);
+		expect(result.missing.sort()).toEqual([join(ws, "node_modules"), join(pi, "packages", "node_modules")]);
+		const profile = applySelfHosting(toBackendProfile(defaultProfile({ cwd: ws }), ws), result);
+		expect(profile.writeDeny).toEqual(expect.arrayContaining([join(pi, "packages", "node_modules")]));
+		expect(profile.materializeWriteDeny).toEqual(expect.arrayContaining([join(pi, "packages", "node_modules")]));
+	});
+
+	it("refuses a symlinked node_modules between a root and its writable root", () => {
+		mkdirSync(join(outside, "elsewhere"));
+		symlinkSync(join(outside, "elsewhere"), join(ws, "node_modules"));
+		const result = check(sources());
+		expect(result.refused.map((r) => r.root.path)).toContain(join(ws, "node_modules"));
+		expect(formatCodeRootProblems(result, true)).toMatch(/replace it with a directory/);
+	});
+
+	it("follows symlinked workspace packages to the code they name, transitively", () => {
+		// pi started from packages/agent outside the workspace; cwd is the
+		// sibling package it loads through node_modules/@x/tui, which in turn
+		// links @x/ai.
+		const pi = join(outside, "pi-fork");
+		const tui = join(ws, "tui");
+		const ai = join(ws, "ai");
+		mkdirSync(join(pi, "node_modules", "@x"), { recursive: true });
+		mkdirSync(join(pi, "packages", "agent", "dist"), { recursive: true });
+		writeFileSync(join(pi, "packages", "agent", "package.json"), "{}\n");
+		writeFileSync(join(pi, "packages", "agent", "dist", "cli.js"), "");
+		for (const dir of [tui, ai]) {
+			mkdirSync(join(dir, "node_modules", "@x"), { recursive: true });
+			writeFileSync(join(dir, "package.json"), "{}\n");
+		}
+		symlinkSync(tui, join(pi, "node_modules", "@x", "tui"));
+		symlinkSync(ai, join(tui, "node_modules", "@x", "ai"));
+		const result = check(sources({ extensionPaths: [], piEntry: join(pi, "packages", "agent", "dist", "cli.js") }));
+		expect(result.exposed.map((r) => r.path).sort()).toEqual([ai, tui]);
+		expect(formatCodeRootProblems(result, false)).toContain(
+			`package linked from ${join(pi, "node_modules", "@x", "tui")}`,
+		);
+		// The workspace itself as one of the linked packages: refused outright.
+		const self = check(sources({ extensionPaths: [], piEntry: join(pi, "packages", "agent", "dist", "cli.js") }), [
+			tui,
+		]);
+		expect(self.refused.map((r) => r.root.path)).toContain(tui);
+	});
+
+	it("reads extension paths from -e and --extension", () => {
+		expect(extensionArguments(["node", "pi", "-e", "./a.ts", "--extension", "/b", "--extension=c", "-p", "x"])).toEqual(
+			["./a.ts", "/b", "c"],
+		);
 	});
 
 	it("counts every existing node_modules above a root as loaded code", () => {
@@ -175,7 +239,7 @@ describe("loaded code roots (#36)", () => {
 				],
 			}),
 		);
-		expect(result).toEqual({ exposed: [], refused: [] });
+		expect(result).toEqual({ exposed: [], refused: [], missing: [] });
 	});
 
 	it("checks the running Node binary among the native host executables", () => {
@@ -213,14 +277,17 @@ describe("session_start with loaded code under cwd (#36)", () => {
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 	});
 
-	async function start(allowSelfHosting: boolean) {
+	async function start(
+		allowSelfHosting: boolean,
+		// pi reports the extension at its configured path, by default under cwd.
+		extension = { path: join(ws, "ext", "src", "index.ts"), baseDir: join(ws, "ext", "src") },
+		commands: { name: string; source: string; sourceInfo: { path: string; baseDir?: string } }[] = [],
+	) {
 		const { default: register } = await import("../../src/index.ts");
 		const effective: EffectiveProfile = defaultProfile({ cwd: ws, agentDir });
 		effective.sandbox.allowSelfHosting = allowSelfHosting;
 		effective.attended.mode = "off";
 		mocks.loadConfig.mockReturnValue({ ok: true, profile: effective, provenance: new Map(), sources: [] });
-		// pi reports the extension at its configured path, under cwd.
-		const extension = { path: join(ws, "ext", "src", "index.ts"), baseDir: join(ws, "ext", "src") };
 		const handlers = new Map<string, (event: unknown, context: ExtensionContext) => unknown>();
 		const api = {
 			registerTool: () => {},
@@ -232,7 +299,7 @@ describe("session_start with loaded code under cwd (#36)", () => {
 				handlers.set(event, handler);
 			},
 			getAllTools: () => OWNED_TOOLS.map((name) => ({ name, sourceInfo: extension })),
-			getCommands: () => [{ name: "enclave", sourceInfo: extension }],
+			getCommands: () => [{ name: "enclave", source: "extension", sourceInfo: extension }, ...commands],
 		} as unknown as ExtensionAPI;
 		register(api);
 		const notify = vi.fn();
@@ -279,7 +346,45 @@ describe("session_start with loaded code under cwd (#36)", () => {
 			expect(mocks.compile).toHaveBeenCalledTimes(1);
 			const compiled = mocks.compile.mock.calls[0]?.[0] as Profile;
 			expect(compiled.writeDeny).toContain(join(ws, "ext"));
-			expect(compiled.selfHosted).toEqual([join(ws, "ext")]);
+			expect(compiled.selfHosted).toEqual([join(ws, "ext"), join(ws, "node_modules")]);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	// Review of #47: getCommands() also lists prompt templates and skills.
+	it("starts in a Node project with a project prompt and skill", async () => {
+		writeFileSync(join(ws, "package.json"), "{}\n");
+		mkdirSync(join(ws, ".pi", "prompts"), { recursive: true });
+		mkdirSync(join(ws, ".agents", "skills", "deploy"), { recursive: true });
+		writeFileSync(join(ws, ".pi", "prompts", "review.md"), "review\n");
+		writeFileSync(join(ws, ".agents", "skills", "deploy", "SKILL.md"), "deploy\n");
+		mkdirSync(join(outside, "ext", "src"), { recursive: true });
+		writeFileSync(join(outside, "ext", "package.json"), "{}\n");
+		writeFileSync(join(outside, "ext", "src", "index.ts"), "");
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			const { notify } = await start(
+				false,
+				{ path: join(outside, "ext", "src", "index.ts"), baseDir: join(outside, "ext", "src") },
+				[
+					{
+						name: "review",
+						source: "prompt",
+						sourceInfo: { path: join(ws, ".pi", "prompts", "review.md"), baseDir: join(ws, ".pi", "prompts") },
+					},
+					{
+						name: "skill:deploy",
+						source: "skill",
+						sourceInfo: {
+							path: join(ws, ".agents", "skills", "deploy", "SKILL.md"),
+							baseDir: join(ws, ".agents", "skills", "deploy"),
+						},
+					},
+				],
+			);
+			expect(notify.mock.calls.filter(([, level]) => level === "error")).toEqual([]);
+			expect(mocks.compile).toHaveBeenCalledTimes(1);
 		} finally {
 			stderr.mockRestore();
 		}

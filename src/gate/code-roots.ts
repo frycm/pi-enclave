@@ -20,12 +20,18 @@
  * file, and treating it as one would make every workspace in the home
  * directory "inside loaded code".
  *
- * Limits, stated in the README: pi offers no list of loaded extensions, so an
- * extension that registers neither a tool nor a command is not seen; and an
- * `node_modules` directory that does not exist yet is not protected, so a
- * package a dependency loads only when it is present can still be planted.
+ * Symlinked packages in any collected `node_modules` (npm workspaces,
+ * `npm link`) are followed to their targets, transitively. With the opt-in,
+ * a `node_modules` that does not exist between an exposed root and its
+ * writable root is created read-only, since one created there would shadow
+ * the dependencies the root resolves from further up.
+ *
+ * Limit, stated in the README: pi offers no list of loaded extensions. An
+ * extension that registers neither a tool nor a command and was not named
+ * with `-e`/`--extension` (one listed in `settings.json`, for example) is not
+ * seen.
  */
-import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
+import { type Dirent, existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -63,6 +69,17 @@ export interface CodeSources {
 	cwd: string;
 	/** Injected by tests. */
 	home?: string;
+}
+
+/** The values of `-e`/`--extension` on pi's command line. */
+export function extensionArguments(argv: readonly string[]): string[] {
+	const values: string[] = [];
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i] as string;
+		if ((arg === "-e" || arg === "--extension") && argv[i + 1] !== undefined) values.push(argv[++i] as string);
+		else if (arg.startsWith("--extension=")) values.push(arg.slice("--extension=".length));
+	}
+	return values;
 }
 
 /** Synthetic `sourceInfo.path` values that name no file, such as `builtin:read`. */
@@ -103,6 +120,27 @@ function resolutionDirs(root: string): string[] {
 		if (dirname(dir) === dir) break;
 	}
 	return dirs;
+}
+
+/** The symlinked packages directly in a `node_modules` directory, `@scope/*` included. */
+function linkedPackages(dir: string): string[] {
+	const list = (path: string): Dirent[] => {
+		try {
+			return readdirSync(path, { withFileTypes: true });
+		} catch {
+			return [];
+		}
+	};
+	const links: string[] = [];
+	for (const entry of list(dir)) {
+		if (entry.name === ".bin") continue;
+		const path = join(dir, entry.name);
+		if (entry.isSymbolicLink()) links.push(path);
+		else if (entry.name.startsWith("@") && entry.isDirectory()) {
+			for (const scoped of list(path)) if (scoped.isSymbolicLink()) links.push(join(path, scoped.name));
+		}
+	}
+	return links;
 }
 
 /**
@@ -166,10 +204,19 @@ function linksBelow(path: string, roots: readonly string[]): string[] {
 export function collectCodeRoots(sources: CodeSources, writableRoots: readonly string[] = []): CodeRoot[] {
 	const home = sources.home ?? homedir();
 	const found: CodeRoot[] = [];
+	// `node_modules` directories still to look through for symlinked packages.
+	const pending: string[] = [];
 	const addPackage = (path: string, from: string) => {
 		const root = packageRootOf(path, home);
 		found.push({ path: root, from });
-		for (const dir of resolutionDirs(root)) found.push({ path: dir, from: `module resolution for ${from}` });
+		// A package's own node_modules can itself be a symlink to elsewhere.
+		const own = canonical(join(root, "node_modules"));
+		if (isDirectory(own) && !isUnder(own, root)) found.push({ path: own, from: `dependencies of ${from}` });
+		pending.push(own);
+		for (const dir of resolutionDirs(root)) {
+			found.push({ path: dir, from: `module resolution for ${from}` });
+			pending.push(dir);
+		}
 	};
 	const addLinks = (path: string, from: string) => {
 		for (const link of linksBelow(path, writableRoots)) {
@@ -205,6 +252,26 @@ export function collectCodeRoots(sources: CodeSources, writableRoots: readonly s
 	addLinks(sources.execPath, "the Node binary");
 	if (sources.seccompHelper) found.push({ path: canonical(sources.seccompHelper), from: "the seccomp helper" });
 
+	// An npm workspace or `npm link` puts a symlink in `node_modules` and the
+	// code elsewhere, so a collected directory does not contain everything it
+	// resolves to. Follow every symlinked package to its target, and the
+	// target's own `node_modules`, until nothing new appears. A target inside a
+	// root already collected adds nothing (pnpm's links stay in `.pnpm`).
+	const scanned = new Set<string>();
+	while (pending.length > 0) {
+		const dir = canonical(pending.shift() as string);
+		if (scanned.has(dir) || !isDirectory(dir)) continue;
+		scanned.add(dir);
+		for (const link of linkedPackages(dir)) {
+			const target = canonical(link);
+			if (!isDirectory(target)) continue;
+			if (found.some((root) => !root.link && root.path !== canonical(sources.execPath) && isUnder(target, root.path))) {
+				continue;
+			}
+			addPackage(target, `package linked from ${link}`);
+		}
+	}
+
 	const unique = new Map<string, CodeRoot>();
 	for (const root of found) if (!unique.has(root.path)) unique.set(root.path, root);
 	const all = [...unique.values()];
@@ -221,12 +288,20 @@ export interface CodeRootCheck {
 	exposed: CodeRoot[];
 	/** Refused either way: it contains a writable root, or it is {@link CodeRoot.fixed}. */
 	refused: { root: CodeRoot; reason: string }[];
+	/**
+	 * `node_modules` directories that do not exist between an exposed root and
+	 * its writable root. Node searches each on the way up, so one created there
+	 * would shadow a dependency the root resolves from further up. With the
+	 * opt-in they are created read-only.
+	 */
+	missing: string[];
 }
 
 export function checkCodeRoots(roots: readonly CodeRoot[], writableRoots: readonly string[]): CodeRootCheck {
 	const writable = [...new Set(writableRoots.flatMap((root) => [normalizePath(root), canonical(root)]))];
 	const exposed: CodeRoot[] = [];
 	const refused: CodeRootCheck["refused"] = [];
+	const missing = new Set<string>();
 	for (const root of roots) {
 		const over = root.link ? undefined : writable.find((dir) => isUnder(dir, root.path));
 		if (over !== undefined) {
@@ -241,7 +316,30 @@ export function checkCodeRoots(roots: readonly CodeRoot[], writableRoots: readon
 		if (root.fixed) refused.push({ root, reason: `it is below a writable root; ${root.fixed}` });
 		else exposed.push(root);
 	}
-	return { exposed, refused };
+	for (const root of exposed) {
+		if (!isDirectory(root.path)) continue;
+		const top = writable.filter((dir) => isUnder(root.path, dir)).sort((a, b) => a.length - b.length)[0] as string;
+		for (let dir = dirname(root.path); isUnder(dir, top); dir = dirname(dir)) {
+			const candidate = join(dir, "node_modules");
+			if (candidate === root.path) continue;
+			let stat: ReturnType<typeof lstatSync> | undefined;
+			try {
+				stat = lstatSync(candidate);
+			} catch {
+				missing.add(candidate);
+			}
+			// An existing directory is a resolution directory, collected above.
+			// A symlink there could be pointed at other code.
+			if (stat?.isSymbolicLink()) {
+				refused.push({
+					root: { path: candidate, from: `module resolution for ${root.from}`, link: true },
+					reason: "it is a symlink below a writable root; replace it with a directory",
+				});
+			}
+			if (dir === top) break;
+		}
+	}
+	return { exposed, refused, missing: [...missing].filter((dir) => !exposed.some((root) => isUnder(dir, root.path))) };
 }
 
 /**
@@ -274,10 +372,13 @@ export function formatCodeRootProblems(check: CodeRootCheck, allowSelfHosting: b
  */
 export function applySelfHosting(profile: Profile, check: CodeRootCheck): Profile {
 	if (check.exposed.length === 0) return profile;
-	const paths = check.exposed.map((root) => root.path);
+	const paths = [...check.exposed.map((root) => root.path), ...check.missing];
 	return {
 		...profile,
 		writeDeny: [...new Set([...(profile.writeDeny ?? []), ...paths])],
+		// bwrap can only deny a path that exists, so a missing node_modules is
+		// created read-only, as `.pi` is.
+		materializeWriteDeny: [...new Set([...(profile.materializeWriteDeny ?? []), ...check.missing])],
 		selfHosted: paths,
 	};
 }

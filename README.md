@@ -1577,7 +1577,7 @@ sandbox's, so a green row on a restricted host is not read as stronger evidence 
 | Rename a writable ancestor of a protected Git config/hook leaf, recreate the original tree, then write a hook | Ancestor displacement or replacement write is denied by the native backend | 1 | C16 |
 | Write a submodule's `.git/modules/<name>/config` or hook, a nested repository's `config` or hook, or a new submodule's config below a repository with no `modules` yet | Violation from L2 `writeDeny`; L1 denies the same paths by name (#33) | 1, 2 | C17, P14 |
 | Write into a nested `.pi` or `.agents` directly or by renaming a prepared tree into place, or edit `AGENTS.md`, `.envrc` or a hook manager | Violation from L2 `writeDeny` for existing `.pi`/`.agents`; L1 denies `.pi`/`.agents` by name and asks for project files; the tripwire reports new ones (#19) | 1, 2 | C18, P15 |
-| Write the source, `package.json` or `node_modules` of an extension loaded from inside the workspace, or move its package aside and replace it | Auto mode refuses to start by default; with `sandbox.allowSelfHosting`, violation from L2 `writeDeny` on the package root (#36) | 1 | C19 |
+| Write the source, `package.json` or `node_modules` of an extension loaded from inside the workspace, plant a `node_modules` above it, or move its package aside and replace it | Auto mode refuses to start by default; with `sandbox.allowSelfHosting`, violation from L2 `writeDeny` on the package root and on the materialised `node_modules` above it (#36) | 1 | C19 |
 | `curl`, `nc`, `python -c "socket…"`, DNS lookup | Violation (`off` mode) | 1 | C5 |
 | Spawn a PTY (`vim`, `less`), Python multiprocessing, `git worktree` outside cwd | Works / violation as configured. **Linux:** bubblewrap cannot deny PTYs, so `allowPty: false` is not enforceable there and the compiled profile reports `pty on` | 1 | C6 |
 | Script that calls `sudo` / `su` / `systemctl` | Violation, not a policy denial | 1 | C7 |
@@ -1729,10 +1729,19 @@ when `writableRoots` includes a parent of `~/.pi/agent/git`, the global `node_mo
 Node version manager directory.
 
 At `session_start`, after the ownership check, pi-enclave collects the code it has loaded:
-the package root of pi-enclave (the nearest directory with a `package.json`), of each of its
-dependencies, of pi's entry script, and of the `sourceInfo.path` and `baseDir` of every
-registered tool and command; every existing `node_modules` directory above each of those,
-because Node's resolution walks up through them; the Node binary; and the seccomp helper.
+
+- the package root (the nearest directory with a `package.json`) of pi-enclave, of each of its
+  dependencies, of pi's entry script, of every `-e`/`--extension` value pi was started with,
+  and of the `sourceInfo.path` and `baseDir` of every registered tool and extension command.
+  Prompt templates and skills, which `getCommands()` also lists, are Markdown rather than code
+  and are already protected through `.pi` and `.agents`;
+- every existing `node_modules` directory above each root, because Node's resolution walks up
+  through them;
+- the target of every symlinked package (top level and `@scope/*`) in any of those
+  `node_modules` directories, transitively, so a sibling package an npm workspace or `npm link`
+  resolves to elsewhere is collected too;
+- the Node binary and the seccomp helper.
+
 A `package.json` directly in your home directory or at `/` does not count as a package root.
 All of it is compared canonically against the writable roots.
 
@@ -1740,22 +1749,24 @@ All of it is compared canonically against the writable roots.
   the path and what loaded it, like the state-directory check.
 - **With `sandbox.allowSelfHosting: true`** in `~/.pi/agent/enclave.json`, each such root is
   added to L2 `writeDeny` instead: the session can read, build against and test the code, but
-  cannot change what the next start loads. `/enclave status` lists the roots it denied. A
-  project file can turn the setting off but never on.
+  cannot change what the next start loads. Every `node_modules` that does not exist between
+  such a root and its writable root is created read-only too, since one created there would
+  shadow the dependencies the root resolves from further up. `/enclave status` lists the
+  denied paths. A project file can turn the setting off but never on.
 - **Refused either way:** a code root that is or contains a writable root (pi loaded from the
   checkout you are editing; denying it would deny the whole workspace), a symlink below a
   writable root that the configured path runs through (the agent could point it at other
-  code; load the extension by its real path), and a Node binary below a writable root.
+  code; load the extension by its real path; a symlinked `node_modules` above a code root is
+  refused the same way), and a Node binary below a writable root.
 
 So work on an extension happens in a second worktree: load it from one checkout, edit
 another. The native backend's host-executable check covers `process.execPath` too, as the
 container backend's already did, and accepts the seccomp helper inside a code root the opt-in
 write-denies.
 
-**Limits.** pi has no list of loaded extensions, so one that registers neither a tool nor a
-command is not seen. A `node_modules` directory that does not exist yet is not protected, so
-a package that a dependency loads only when it is present could still be planted above a
-code root.
+**Limit.** pi has no list of loaded extensions. One that registers neither a tool nor a
+command and was not named with `-e`/`--extension` (for example one listed in `settings.json`
+that only registers event handlers) is not seen.
 
 ### Known gaps
 

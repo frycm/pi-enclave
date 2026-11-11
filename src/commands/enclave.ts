@@ -50,6 +50,11 @@ export interface EnclaveState {
 	sessionId?: string;
 	/** Unacknowledged tripwire hits for this workspace (#19). */
 	tripwireLedger?: TripwireLedger;
+	/**
+	 * Every code root the pi process loaded, from the session_start check
+	 * (#36), so a later check on trusted code has the list.
+	 */
+	loadedCode?: readonly string[];
 	auditPath?: string;
 	/** True once an audit write has failed. Shown without being asked for. */
 	auditDegraded?: boolean;

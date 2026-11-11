@@ -282,8 +282,13 @@ export const SCENARIOS: Scenario[] = [
 				join(ext, "node_modules", "dep", "index.js"),
 				// Did not exist: a new file in the package is loaded code too.
 				join(ext, "src", "added.ts"),
+				// No node_modules above the package: one created there would
+				// shadow a hoisted dependency, so it was materialised read-only.
+				join(fixture.workspace, "node_modules", "dep", "index.js"),
 			];
-			for (const target of targets) await sh(`printf pwn >> ${JSON.stringify(target)}`);
+			for (const target of targets) {
+				await sh(`mkdir -p ${JSON.stringify(dirname(target))}; printf pwn >> ${JSON.stringify(target)}`);
+			}
 			// As C16 does for Git: move the package aside and put another in its place.
 			const replaced = join(ext, "src", "index.ts");
 			await sh(
@@ -302,7 +307,7 @@ export const SCENARIOS: Scenario[] = [
 				detail:
 					changed.length > 0
 						? `WROTE loaded extension code: ${changed.join(", ")}`
-						: "all four writes and the replacement denied",
+						: "all five writes and the replacement denied",
 			};
 		},
 	},
