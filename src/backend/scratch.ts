@@ -260,7 +260,8 @@ export class SessionScratch {
 
 	/**
 	 * Check the directory is still there and still private before a command
-	 * is wrapped with it, and recreate it at the same path if it has gone.
+	 * is wrapped with it, repair its mode if the agent changed it, and
+	 * recreate it at the same path if it has gone.
 	 *
 	 * `$XDG_RUNTIME_DIR` is removed at logout unless lingering is enabled, so a
 	 * session left running in tmux can lose it. Recreating at the same path
@@ -273,7 +274,22 @@ export class SessionScratch {
 		const checks = { ...(options.lstat ? { lstat: options.lstat } : {}), uid };
 		const lstat = options.lstat ?? lstatSync;
 		try {
-			lstat(this.path);
+			const stats = lstat(this.path);
+			// The agent owns this directory and may chmod it; that must not stop
+			// every later command. The base is still 0700 and still refused when
+			// it is not, which is what keeps other users out, so the session
+			// directory's own mode is repaired. A symlink, a non-directory or a
+			// foreign owner is still refused below. The base is not writable from
+			// the sandbox, so the directory cannot be swapped between the lstat
+			// and the chmod.
+			if (
+				stats.isDirectory() &&
+				!stats.isSymbolicLink() &&
+				(uid === undefined || stats.uid === uid) &&
+				(stats.mode & 0o777) !== 0o700
+			) {
+				chmodSync(this.path, 0o700);
+			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			try {
@@ -288,6 +304,7 @@ export class SessionScratch {
 				);
 			}
 		}
+		verifyPrivateDir(this.base, checks);
 		verifyPrivateDir(this.path, checks);
 	}
 

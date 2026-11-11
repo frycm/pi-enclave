@@ -151,9 +151,17 @@ describe("session scratch lifecycle (#20)", () => {
 		scratch.ensure();
 		expect(lstatSync(scratch.path).mode & 0o777).toBe(0o700);
 
-		chmodSync(scratch.path, 0o777);
+		// The agent owns the session directory, so a mode it set is repaired,
+		// not a reason to refuse every later command. The base's 0700 is what
+		// keeps other users out, and a wrong base still refuses.
+		for (const mode of [0o777, 0o000]) {
+			chmodSync(scratch.path, mode);
+			scratch.ensure();
+			expect(lstatSync(scratch.path).mode & 0o777).toBe(0o700);
+		}
+		chmodSync(base, 0o755);
 		expect(() => scratch.ensure()).toThrow(ScratchDirError);
-		chmodSync(scratch.path, 0o700);
+		chmodSync(base, 0o700);
 
 		// The runtime directory itself gone, as at logout without lingering.
 		const runtime = join(workdir(), "run-user");
