@@ -7,6 +7,8 @@ import { checkOwnership } from "../../src/gate/ownership.ts";
 import { checkTool } from "../../src/gate/tools.ts";
 import { canonicalize } from "../../src/policy/canonical.ts";
 import { buildReviewEvidence } from "../../src/reviewer/evidence.ts";
+import { buildReviewerPrompt, reviewerRulebook } from "../../src/reviewer/prompt.ts";
+import { IsolatedReviewer } from "../../src/reviewer/reviewer.ts";
 import type { ActionReviewer, ReviewerResult } from "../../src/reviewer/types.ts";
 import { FakePi } from "../harness/fake-pi.ts";
 
@@ -384,6 +386,55 @@ describe("the gate", () => {
 			expect(decision.outcome).toBe("review-allow");
 			expect(decision.block).toBe(false);
 			expect(frozen).toBe(true);
+		});
+
+		// #16, end to end: a reviewer that always answers allow/low, unattended.
+		// A non-confident command needs a person or an exact direct instruction,
+		// so the high floor turns the allow into an ask, whether or not the
+		// command mentions a path.
+		it.each([
+			"npm test",
+			"npm test -- ./x",
+			"python3 scripts/check.py",
+			"node scripts/gen.js",
+			"cat > notes.txt <<'EOF'\nhello\nEOF",
+		])("does not let a model allow clear the high floor for %j", async (command) => {
+			const configured = reviewProfile();
+			const reviewer = new IsolatedReviewer({
+				profile: configured,
+				prompt: buildReviewerPrompt(reviewerRulebook(configured.review, new Map())),
+				primary: {
+					name: "always-allow",
+					async complete(request) {
+						return request.maxTokens === 1 ? "0" : '{"decision":"allow","risk":"low","reason":"fine"}';
+					},
+				},
+				timeoutMs: 1_000,
+				evidence: { attended: "off" },
+				delay: async () => {},
+			});
+			const decision = await gate("bash", { command }, { profile: configured, reviewer });
+			expect(decision.outcome).toBe("ask-denied");
+		});
+
+		it("still lets a model allow a confident write", async () => {
+			const configured = reviewProfile();
+			const reviewer = new IsolatedReviewer({
+				profile: configured,
+				prompt: buildReviewerPrompt(reviewerRulebook(configured.review, new Map())),
+				primary: {
+					name: "always-allow",
+					async complete(request) {
+						return request.maxTokens === 1 ? "0" : '{"decision":"allow","risk":"low","reason":"fine"}';
+					},
+				},
+				timeoutMs: 1_000,
+				evidence: { attended: "off" },
+				delay: async () => {},
+			});
+			expect((await gate("bash", { command: "touch output.txt" }, { profile: configured, reviewer })).outcome).toBe(
+				"review-allow",
+			);
 		});
 
 		it("keeps a classified read on the fast path", async () => {
