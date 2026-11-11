@@ -60,7 +60,7 @@ describe("the suite itself", () => {
 		}
 	});
 
-	it("covers P1 through P11", () => {
+	it("covers P1 through P12", () => {
 		expect(POLICY_SCENARIOS.map((scenario) => scenario.id)).toEqual([
 			"P1",
 			"P2",
@@ -73,6 +73,7 @@ describe("the suite itself", () => {
 			"P9",
 			"P10",
 			"P11",
+			"P12",
 		]);
 	});
 });

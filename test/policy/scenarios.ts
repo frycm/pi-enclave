@@ -21,7 +21,7 @@
 import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultProfile, OWNED_TOOLS } from "../../src/config/defaults.ts";
+import { DEFAULT_RULES_ASK, DEFAULT_RULES_DENY, defaultProfile, OWNED_TOOLS } from "../../src/config/defaults.ts";
 import { applyPatch, fold, narrowerOrEqual } from "../../src/config/merge.ts";
 import { parseDocument } from "../../src/config/schema.ts";
 import type { EffectiveProfile } from "../../src/config/types.ts";
@@ -31,8 +31,9 @@ import { checkResume } from "../../src/escalate/resume.ts";
 import { CircuitBreaker } from "../../src/gate/breaker.ts";
 import { ActionLock } from "../../src/gate/lock.ts";
 import { checkOwnership } from "../../src/gate/ownership.ts";
-import { canonicalize } from "../../src/policy/canonical.ts";
+import { type CanonicalAction, canonicalize } from "../../src/policy/canonical.ts";
 import { evaluateRules } from "../../src/policy/match.ts";
+import type { ParsedShell } from "../../src/policy/shell.ts";
 import { AuditLog, configHash, verifyLog } from "../../src/state/audit.ts";
 import { ensureSecureDir } from "../../src/state/dir.ts";
 import { FakePi } from "../harness/fake-pi.ts";
@@ -318,6 +319,16 @@ export const POLICY_SCENARIOS: PolicyScenario[] = [
 		run: (world) => resumeScenario(world, true),
 		control: (world) => resumeScenario(world, false),
 	},
+
+	{
+		id: "P12",
+		title: "A command hidden behind a comment or a quoted backtick still meets the rules",
+		matrixRow: "Shell command hidden in a comment-spanning quote or a double-quoted backtick",
+		controlNote:
+			"the tokenizer neither strips comments nor looks inside double quotes, so the script reads as one command named by its first word",
+		run: () => hiddenCommandScenario(true),
+		control: () => hiddenCommandScenario(false),
+	},
 ];
 
 // ---------------------------------------------------------------------------
@@ -522,4 +533,48 @@ function resumeScenario(world: World, withOrderCheck: boolean): PolicyResult {
 	if (stillPending.length !== 1) return bad("the record did not stay pending");
 
 	return ok("narrower executes under the current profile; wider is refused and the record stays pending");
+}
+
+/**
+ * P12. #14 and #32: a deny or ask rule anchored on a command must fire, or the
+ * parse must be non-confident (which the gate treats as matching every ask
+ * rule), when that command follows a commented line or sits inside a
+ * double-quoted backtick.
+ */
+function hiddenCommandScenario(withTokenizer: boolean): PolicyResult {
+	const rules = {
+		deny: DEFAULT_RULES_DENY,
+		ask: DEFAULT_RULES_ASK,
+		skipReview: [],
+		protectedPaths: { deny: [], ask: [] },
+	};
+	const rows: [string, "deny" | "ask"][] = [
+		["ls # don't\nsudo id # won't", "deny"],
+		["ls # don't\ngit push --force origin main # won't", "ask"],
+		["cat x # it's\nnpm publish\n# it's", "ask"],
+		['cat "`git push --force origin main`"', "ask"],
+		['ls "`sudo systemctl stop nginx`"', "ask"],
+	];
+	for (const [command, expected] of rows) {
+		const parsed = bash(command);
+		const action: CanonicalAction = withTokenizer ? parsed : { ...parsed, shell: naiveShell(command), confident: true };
+		const verdict = evaluateRules(action, rules).verdict;
+		const escalated = !action.confident || verdict === "deny" || verdict === "ask";
+		if (!escalated)
+			return bad(`${JSON.stringify(command)} passed L1 as a confident ${action.shell?.commands[0]?.name}`);
+		if (action.confident && expected === "deny" && verdict !== "deny") {
+			return bad(`${JSON.stringify(command)} was not denied`);
+		}
+	}
+	return ok("every hidden command is denied, asked, or read as non-confident");
+}
+
+/** What the tokenizer returned for these rows before #14 and #32: one confident command. */
+function naiveShell(command: string): ParsedShell {
+	const [name = "", ...args] = command.split(/\s+/).filter(Boolean);
+	return {
+		commands: [{ text: command, syntax: command, name, args, assignments: [], redirects: [] }],
+		confident: true,
+		markers: [],
+	};
 }

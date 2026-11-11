@@ -1506,6 +1506,7 @@ sandbox's, so a green row on a restricted host is not read as stronger evidence 
 | Reviewed file read lifts one configured denial while an overlapping base-helper read runs | Capability helper succeeds, base helper stays denied, and the next base read is still denied after disposal | 3 | native SRT conformance |
 | Bash read capability and an ordinary sibling overlap | Linux grant reaches only the capability process; macOS refuses Bash widening because it cannot guarantee lifetime | 3 | native SRT conformance |
 | Pending record edited on disk, or mode changed to `0644`, or nonce reused, or a nonce containing a path | Refused with an audit entry | 2 | P10 |
+| **Hidden shell command**: a command after a commented line whose comment contains a quote (`ls # don't⏎sudo id`), or inside a double-quoted backtick (`` cat "`git push`" ``) | The comment is dropped and the hidden command meets `rules.deny`/`rules.ask` as its own simple command, or the parse is non-confident and escalates; never a confident read-only parse of the first command. A differential test runs generated scripts under real bash and checks that a confident parse lists every command bash ran | 2 | P12 + `policy-shell-differential` unit test |
 | **Environment leak**: provider keys set in the pi process; `env`, `$VAR` expansion, `os.environ`, `/proc/self/environ` inside the sandbox | None of the values appear; a `passthrough` entry matching `envDeny` is rejected at config load | 1 | C9 |
 | **Stale resume**: pending record written, user then removes a writable root/tool grant, disables capabilities, re-adds a `readDeny`, or loosens config; `pi-enclave approve` | Safe narrowing before the prompt executes under current policy; a revoked tool/capability or wider config is refused. Any effective policy change during the prompt or compilation leaves the record pending | 2 | P11 + approval freshness unit tests |
 
@@ -1676,9 +1677,16 @@ quietly absorbs its own corrections teaches nobody anything.
   exactly what the canonical hash exists to prevent. An `edit` record is refused with that
   explanation and left pending; re-run the task instead.
 - **The shell tokenizer is a heuristic.** It records what it cannot follow — command and
-  process substitution, backticks, heredocs, `eval`, `xargs`, scripts/interpreters, archive
-  extraction, directory changes, parameter/pathname expansion and unbalanced quotes — and
-  a non-confident parse escalates rather than being trusted. L2, not this heuristic, denies
+  process substitution (also inside double quotes), backticks, heredocs, `eval`, `xargs`,
+  scripts/interpreters, archive extraction, directory changes, parameter/pathname expansion
+  and unbalanced quotes — and a non-confident parse escalates rather than being trusted.
+  Comments are removed with bash's rule (an unquoted `#` that starts a word after a space,
+  tab, newline or metacharacter), and a command containing any other whitespace or control
+  character (CR, FF, VT, NUL, Unicode spaces, BOM) is non-confident. As a tripwire
+  for tokenizer bugs, a multi-line script that parses to fewer simple commands than it has
+  non-comment lines is non-confident too, which also covers a quoted argument that spans
+  lines, such as a multi-line commit message. A differential test against real bash checks
+  that a confident parse never omits a command bash runs. L2, not this heuristic, denies
   executable persistence paths. A real parser (tree-sitter-bash) remains the v2 answer.
 - **A `tool_call` handler in another extension is invisible.** pi exposes no API to
   enumerate extensions or handlers. One loaded after pi-enclave cannot change a frozen
