@@ -118,6 +118,15 @@ export function renderStatus(state: EnclaveState): string {
 		`violations: ${state.violations.length} this session`,
 		`coverage:   ${COVERAGE_NOTE}`,
 	);
+	// Skipped by the persistence scan, so the user can see what was not looked at.
+	const unscanned = state.profile.unscanned ?? [];
+	if (unscanned.length > 0) {
+		lines.push(
+			`unscanned:  ${unscanned.length} directory(ies) owned by another account and not searchable by this user:`,
+			...unscanned.slice(0, 10).map((dir) => `            ${dir}`),
+			...(unscanned.length > 10 ? [`            ... and ${unscanned.length - 10} more`] : []),
+		);
+	}
 
 	if (state.configError) {
 		lines.push("", "configuration REJECTED -- every tool refuses:", state.configError);

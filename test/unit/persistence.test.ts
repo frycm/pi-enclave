@@ -153,6 +153,32 @@ describe("Git persistence surface (#33)", () => {
 		expect(tripwire.check().map((hit) => hit.path)).toContain(join(root, "hidden", ".git"));
 	});
 
+	it("treats a bare-shaped directory as a repository whatever its name", () => {
+		const root = superproject();
+		const tripwire = new PersistenceTripwire(() => gitPersistenceSurface([root]), root);
+		// Git accepts `tools/cache` as a repository from `tools/cache/sub` too:
+		// with core.bare=false and core.worktree=., its fsmonitor runs there.
+		git(["init", "-q", "--bare", join(root, "tools", "cache")]);
+		const cache = join(root, "tools", "cache");
+		const hits = new Map(tripwire.check().map((hit) => [hit.path, hit.change]));
+		expect(hits.get(cache)).toBe("created");
+		expect(hits.get(join(cache, "config"))).toBe("created");
+		expect(hits.get(join(cache, "hooks"))).toBe("created");
+		writeFileSync(join(cache, "config"), "[core]\n\tbare = false\n\tworktree = .\n\tfsmonitor = /tmp/x.sh\n");
+		expect(tripwire.check()).toEqual([{ path: join(cache, "config"), change: "modified" }]);
+		expect(findGitEntries([root]).find((entry) => entry.path === cache)?.bare).toBe(true);
+	});
+
+	it("leaves alone a directory whose HEAD Git would not accept", () => {
+		const root = tempDir("enclave-git-surface-");
+		mkdirSync(join(root, "cache", "objects"), { recursive: true });
+		mkdirSync(join(root, "cache", "refs"));
+		writeFileSync(join(root, "cache", "HEAD"), "not a ref\n");
+		expect(findGitEntries([root])).toEqual([]);
+		writeFileSync(join(root, "cache", "HEAD"), "ref: refs/heads/main\n");
+		expect(findGitEntries([root])).toEqual([{ path: join(root, "cache"), kind: "dir", bare: true }]);
+	});
+
 	it("names each path and a safe way to inspect the tree", () => {
 		const message = formatTripwireHits([{ path: "/work/.git/modules/lib/config", change: "modified" }], "now");
 		expect(message).toContain("modified: /work/.git/modules/lib/config");

@@ -12,7 +12,16 @@
  * refusal, not a partial answer, because a partial answer is exactly what an
  * agent that wants to hide something would arrange.
  */
-import { type Dirent, lstatSync, readdirSync, readlinkSync, realpathSync, type Stats } from "node:fs";
+import {
+	accessSync,
+	constants,
+	type Dirent,
+	lstatSync,
+	readdirSync,
+	readlinkSync,
+	realpathSync,
+	type Stats,
+} from "node:fs";
 import { join } from "node:path";
 import { isUnder } from "../backend/paths.ts";
 
@@ -40,9 +49,20 @@ export interface ScanMatch {
 export interface ScanOptions {
 	/** Whether an entry is one the caller is looking for. */
 	match(name: string, kind: EntryKind, path: string): boolean;
+	/**
+	 * Whether a directory is one the caller is looking for, judged by what it
+	 * contains. Called once per listed directory, roots included; a match is
+	 * still walked.
+	 */
+	matchListing?(dir: string, entries: readonly Dirent[]): boolean;
 	/** Look inside a matched directory too. Off by default. */
 	descendIntoMatches?: boolean;
 	maxEntries?: number;
+	/**
+	 * Receives each directory skipped because nobody running as this user can
+	 * reach inside it (see {@link isOutOfReach}), so the caller can say so.
+	 */
+	unscanned?: string[];
 }
 
 function kindOf(entry: Dirent | Stats): EntryKind {
@@ -72,6 +92,34 @@ export function walkableRoots(roots: readonly string[]): string[] {
 }
 
 /**
+ * Whether a directory that could not be listed holds nothing this user can
+ * reach: owned by another account, and without search permission for us.
+ *
+ * Then neither the sandboxed agent nor Git run later by the user can open,
+ * create or run anything inside it, so it cannot hide a persistence path from
+ * them either. A database volume (`pgdata/`, owned by the database's uid with
+ * mode 0700) is the common case. A directory we own, or one we can search but
+ * not list, is the opposite: that is what an agent hiding something would
+ * arrange, so the walk still refuses it.
+ */
+function isOutOfReach(dir: string): boolean {
+	let stats: Stats;
+	try {
+		stats = lstatSync(dir);
+	} catch {
+		return false;
+	}
+	if (!stats.isDirectory() || stats.uid === process.getuid?.()) return false;
+	try {
+		accessSync(dir, constants.X_OK);
+		return false;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		return code === "EACCES" || code === "EPERM";
+	}
+}
+
+/**
  * Every entry under `roots` that `match` accepts. Symlinks are reported when
  * they match, and never followed.
  */
@@ -90,10 +138,15 @@ export function scanRoots(roots: readonly string[], options: ScanOptions): ScanM
 				const code = (error as NodeJS.ErrnoException).code;
 				// Removed while we walked: nothing left to find there.
 				if (code === "ENOENT" || code === "ENOTDIR") continue;
+				if ((code === "EACCES" || code === "EPERM") && isOutOfReach(dir)) {
+					options.unscanned?.push(dir);
+					continue;
+				}
 				// Anything else is a directory we cannot see into, and so cannot
 				// vouch for.
 				throw new PersistenceScanError(`cannot inspect ${dir}: ${(error as Error).message}`);
 			}
+			if (options.matchListing?.(dir, entries)) found.push({ path: dir, kind: "dir" });
 			for (const entry of entries) {
 				visited++;
 				if (visited > limit) {

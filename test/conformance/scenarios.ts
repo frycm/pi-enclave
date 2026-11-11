@@ -190,6 +190,10 @@ export const SCENARIOS: Scenario[] = [
 				// read-only anchor: a submodule added there cannot bring a writable
 				// config with it.
 				join(nested, "modules", "added", "config"),
+				// A bare-shaped directory not named .git: core.bare=false and
+				// core.worktree=. would make `git status` below it run this config.
+				join(fixture.workspace, "tools", "cache", "config"),
+				join(fixture.workspace, "tools", "cache", "hooks", "post-checkout"),
 			];
 			for (const target of targets) {
 				await sh(`mkdir -p ${JSON.stringify(dirname(target))}; printf pwn >> ${JSON.stringify(target)}`);
@@ -214,7 +218,7 @@ export const SCENARIOS: Scenario[] = [
 				detail:
 					changed.length > 0
 						? `WROTE Git persistence path(s): ${changed.join(", ")}`
-						: "all five writes and the displacement denied",
+						: "all seven writes and the displacement denied",
 			};
 		},
 	},

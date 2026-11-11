@@ -384,6 +384,36 @@ describe("sandbox profile authority", () => {
 			expectWriteAllowed(backend, join(nested, ".git", "objects"));
 		});
 
+		it("protects a repository that is one by shape rather than by name, and its worktree's hooks", () => {
+			const root = mkdtempSync(join(tmpdir(), "enclave-bare-shaped-"));
+			roots.push(root);
+			initGit(root);
+			const cache = join(root, "tools", "cache");
+			const result = spawnSync("git", ["init", "-q", "--bare", cache], { encoding: "utf8" });
+			expect(result.status, result.stderr).toBe(0);
+			// What makes `git status` in tools/cache/sub run the fsmonitor.
+			writeFileSync(
+				join(cache, "config"),
+				"[core]\n\tbare = false\n\tworktree = .\n\thooksPath = .githooks\n\tfsmonitor = /tmp/x.sh\n",
+			);
+			const backend = derive(root);
+			materializeWriteDenyAnchors(backend);
+			expectWriteDenied(backend, join(cache, "config"));
+			expectWriteDenied(backend, join(cache, "hooks"));
+			expectWriteDenied(backend, join(cache, ".githooks"));
+			expectWriteAllowed(backend, join(cache, "objects"));
+			expectWriteAllowed(backend, join(root, "tools", "other"));
+		});
+
+		it("refuses a symlinked nested .git with the way out in the message", () => {
+			const root = mkdtempSync(join(tmpdir(), "enclave-nested-link-"));
+			roots.push(root);
+			initGit(root);
+			mkdirSync(join(root, "vendor"));
+			symlinkSync(join(root, ".git"), join(root, "vendor", ".git"));
+			expect(() => derive(root)).toThrow(/symlinked nested Git metadata path.*remove it, or keep it outside/);
+		});
+
 		it("protects a nested repository even when the workspace itself is not one", () => {
 			const root = mkdtempSync(join(tmpdir(), "enclave-nested-only-"));
 			roots.push(root);

@@ -478,11 +478,31 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 	// own, and `git status` in a superproject reads them for every submodule.
 	// Repositories created after this point are the tripwire's job.
 	const rootGitEntry = join(canonical(workspaceRoot), ".git");
-	for (const entry of findGitEntries(writableRoots)) {
+	// Directories owned by another account that this user cannot search, such
+	// as a database volume. Nothing run as this user reaches inside them, so
+	// they are skipped and listed in `/enclave status`.
+	const unscanned: string[] = [];
+	for (const entry of findGitEntries(writableRoots, { unscanned })) {
 		if (entry.path === rootGitEntry) continue;
+		if (entry.bare) {
+			// A repository by shape, not by name (see GitEntry.bare). Its hooks
+			// run in the worktree its config names, or in the directory itself.
+			if (protectedGitDirs.has(canonical(entry.path))) continue;
+			const worktree = validateProtectedFile(join(entry.path, "config"), "Git configuration")
+				? (submoduleWorktreeRoot(entry.path) ?? entry.path)
+				: entry.path;
+			if (isUnder(canonical(worktree), canonical(workspaceRoot))) discoverSubmoduleWorktrees(worktree);
+			protectGitMetadata(entry.path, worktree);
+			anchorModules(entry.path);
+			protectSubmoduleContainer(join(canonical(entry.path), "modules"));
+			continue;
+		}
 		const worktree = dirname(entry.path);
 		if (entry.kind === "symlink") {
-			throw new Error(`pi-enclave: refusing a symlinked nested Git metadata path: ${entry.path}`);
+			throw new Error(
+				`pi-enclave: refusing a symlinked nested Git metadata path: ${entry.path}; ` +
+					"remove it, or keep it outside sandbox.writableRoots",
+			);
 		}
 		let metadataDir: string;
 		if (entry.kind === "dir") {
@@ -491,7 +511,10 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 			validateProtectedFile(entry.path, "nested Git metadata file");
 			const target = readGitfile(entry.path);
 			if (target === undefined) {
-				throw new Error(`pi-enclave: refusing an invalid nested Git metadata file: ${entry.path}`);
+				throw new Error(
+					`pi-enclave: refusing an invalid nested Git metadata file: ${entry.path}; ` +
+						"remove it, or keep it outside sandbox.writableRoots",
+				);
 			}
 			protectWritableFile(entry.path);
 			try {
@@ -504,7 +527,10 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 			}
 			metadataDir = target;
 		} else {
-			throw new Error(`pi-enclave: refusing a non-file nested Git metadata path: ${entry.path}`);
+			throw new Error(
+				`pi-enclave: refusing a non-file nested Git metadata path: ${entry.path}; ` +
+					"remove it, or keep it outside sandbox.writableRoots",
+			);
 		}
 		if (protectedGitDirs.has(canonical(metadataDir))) continue;
 		if (isUnder(worktree, canonical(workspaceRoot))) discoverSubmoduleWorktrees(worktree);
@@ -611,6 +637,7 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 		allowPty: effective.sandbox.allowPty,
 		envPassthrough: [...effective.sandbox.env.passthrough],
 		envDeny: [...effective.sandbox.env.envDeny],
+		...(unscanned.length > 0 ? { unscanned } : {}),
 	};
 }
 

@@ -733,8 +733,17 @@ layers:
   symlinks and without running Git, and protects the `config`, `config.worktree` and `hooks` of
   every Git directory it finds: the workspace's own, each submodule's below `.git/modules`
   (including nested and namespaced names), linked worktrees via `commondir`, and any other
-  repository nested in the tree, through its `.git` directory or gitfile. A symlinked nested
-  `.git` refuses. A Git directory with no `modules` yet gets a read-only, materialized
+  repository nested in the tree, through its `.git` directory or gitfile. It also protects any
+  directory that is a repository by its contents rather than its name (a valid `HEAD` with
+  `objects` and `refs`, or with `commondir`): Git checks every ancestor of the current
+  directory for that shape, so with `core.bare = false` and `core.worktree = .` in its config,
+  `git status` anywhere below it runs that config. Its hooks are resolved against the worktree
+  its config names. A symlinked or invalid nested `.git` refuses; remove it or keep it outside
+  `sandbox.writableRoots`. A directory owned by another account that you cannot search (a
+  database volume such as `pgdata/`, mode 0700) is skipped, since nothing run as you, the
+  agent included, can reach inside it; `/enclave status` lists such directories under
+  `unscanned`. A directory you own but cannot list, or one you can search but not list, still
+  refuses, because that is what a hidden path would look like. A Git directory with no `modules` yet gets a read-only, materialized
   `modules` anchor, so a submodule the agent adds cannot bring a writable config with it;
   adding or initializing a submodule then needs a person, as above. On Linux the directories
   between a writable root and each protected path are pinned as mount points, as for the
@@ -744,8 +753,9 @@ layers:
   the tree.
 - **After every turn (tripwire).** A repository created after compile time, or a new
   submodule directory below an existing `.git/modules`, cannot be denied by name inside a
-  writable bind. So the parent fingerprints that surface at session start (each `.git` entry,
-  and every Git directory's `config`, `config.worktree`, `commondir`, `hooks` tree and
+  writable bind. So the parent fingerprints that surface at session start (each `.git` entry
+  and bare-shaped Git directory, each skipped directory by owner and mode, and every Git
+  directory's `config`, `config.worktree`, `commondir`, `hooks` tree and
   `modules` listing, by inode, size and times) and compares it at the end of every turn. A
   path that appeared or changed is recorded as a violation (source `tripwire`), counted for the
   breaker, written to the audit log and shown as a warning naming the paths. Changes found

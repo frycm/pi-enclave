@@ -118,6 +118,8 @@ export function createFixture(): Fixture {
 	git(["init", "-q", "--separate-git-dir", join(workspace, ".git", "modules", "lib"), join(workspace, "lib")]);
 	writeFileSync(join(workspace, ".gitmodules"), '[submodule "lib"]\n\tpath = lib\n\turl = ../lib\n');
 	git(["init", "-q", join(workspace, "vendor", "inner")]);
+	// A repository by shape, not by name: Git finds it from any directory below.
+	git(["init", "-q", "--bare", join(workspace, "tools", "cache")]);
 
 	// The symlink-race pair: both live inside the writable workspace but resolve
 	// outside it. The kernel decides on the resolved path, which is the whole
