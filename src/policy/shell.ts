@@ -144,7 +144,8 @@ const WRAPPER_COMMANDS = new Set([
 /**
  * Programs that run another command taken from their arguments or options.
  *
- * Like the wrappers above, any argument marks them non-confident: `flock l git
+ * Unlike the wrappers above, they are marked even with no argument, since several
+ * read commands from stdin. Examples: `flock l git
  * push`, `strace -f rm -rf src`, `vim -es -c '!rm -rf src'`, `man -P 'cmd' ls`,
  * `ssh host cmd`, `rsync -e 'sh -c …'`. Unwrapping them would mean modelling
  * each program's option grammar, and a single mistake there is a bypass.
@@ -439,8 +440,19 @@ const GIT_PROGRAM_OPTIONS = [
 	"--open-files-in-pager",
 ];
 
-/** `git config` forms that only read. Every other form may set an alias, pager, editor or hook path. */
+/**
+ * `git config` forms that only read, accepted only as the first argument (after
+ * an optional scope flag). Every other form may set an alias, pager, editor or
+ * hook path: `git config core.hooksPath list` sets the value `list`, and an
+ * option that takes a value (`--file --get k v`) can swallow a read flag.
+ */
 const GIT_CONFIG_READS = new Set(["--get", "--get-all", "--get-regexp", "--list", "-l", "get", "list"]);
+const GIT_CONFIG_SCOPES = new Set(["--global", "--system", "--local", "--worktree"]);
+
+function gitConfigReads(args: readonly string[]): boolean {
+	const first = GIT_CONFIG_SCOPES.has(args[0] ?? "") ? args[1] : args[0];
+	return first !== undefined && GIT_CONFIG_READS.has(first);
+}
 
 /** True when a `git` invocation can run a program its argv does not show. */
 function gitDispatches(args: readonly string[]): boolean {
@@ -452,7 +464,7 @@ function gitDispatches(args: readonly string[]): boolean {
 	if (hasLongOption(rest, GIT_PROGRAM_OPTIONS)) return true;
 	switch (subcommand) {
 		case "config":
-			return !rest.some((arg) => GIT_CONFIG_READS.has(arg));
+			return !gitConfigReads(rest);
 		case "grep":
 			// `-O<pager>` opens matches in a program of the caller's choosing.
 			return rest.some((arg) => /^-[^-]*O/.test(arg));
@@ -759,7 +771,11 @@ export function parseShell(command: string): ParsedShell {
 		if (name === "split" && hasLongOption(cmd.args, ["--filter"])) markers.add("command-dispatch");
 		if (name === "tar" && tarDispatches(cmd.args)) markers.add("command-dispatch");
 		if (name === "rg" && hasLongOption(cmd.args, ["--pre", "--hostname-bin"])) markers.add("command-dispatch");
-		if (LAUNCHER_COMMANDS.has(name) && cmd.args.length > 0) markers.add("wrapper");
+		// Unconditionally: `ex`, `vim`, `gdb`, `script` and others also run
+		// commands read from stdin (`echo ':!cmd' | ex`, `ex < file`).
+		if (LAUNCHER_COMMANDS.has(name)) markers.add("wrapper");
+		// `exec < file` with no command rebinds stdin for the rest of the script.
+		if (name === "exec" && cmd.args.length === 0) markers.add("shell-state");
 		if (SHELL_STATE_BUILTINS.has(name)) markers.add("shell-state");
 		if (name === "set" && !cmd.args.every((arg) => HARMLESS_SET_ARG.test(arg))) markers.add("shell-state");
 		if (
@@ -791,10 +807,9 @@ export function parseShell(command: string): ParsedShell {
 		const marker = OPAQUE_COMMANDS[name];
 		if (marker) {
 			// A shell script is as opaque as `-c`: its writes are not represented in
-			// this argv. A bare interactive shell has no hidden input and stays ordinary.
-			if (marker === "shell-c" && cmd.args.length === 0 && cmd.redirects.length === 0 && cmd.connector !== "|") {
-				continue;
-			}
+			// this argv. A shell with no arguments is too, because it runs whatever
+			// reaches its stdin, and that need not be a visible pipe: `cat a |& sh`,
+			// a pipe followed by a newline, or `exec < file` earlier in the script.
 			markers.add(marker);
 			continue;
 		}

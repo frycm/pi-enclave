@@ -785,9 +785,11 @@ program (`sort --compress-program`, `tar --to-command`/`-I`/`--checkpoint-action
 `alias`, `shopt`, `export`, `declare`, `unset`, `set` beyond `-euxo pipefail`), and none of
 the constructs above appears. Then the listed simple commands are the ones bash runs, and
 `rules.deny`/`rules.ask` see each of them. Any other command name, including a program
-that launches another one (`flock`, `strace`, `script`, `parallel`, `ssh`, `rsync`, `vim
--c`, `man -P`, …) or simply one the table does not list, is `unknown-command` or `wrapper`
-and makes the parse non-confident. The table only grows with tests; it does not claim
+that launches another one (`flock`, `strace`, `script`, `parallel`, `ssh`, `rsync`, `vim`,
+`ex`, `man`, `gdb`, …, with or without arguments, since several read commands from stdin)
+or simply one the table does not list, is `unknown-command` or `wrapper` and makes the
+parse non-confident. A shell name (`sh`, `bash`, …) is always opaque, even with no
+arguments, because it runs whatever reaches its stdin (`cat a |& sh`, `exec < f; sh`). The table only grows with tests; it does not claim
 that a listed program is harmless, only that its argv says what it does, and L2 still
 bounds it. `review.*` entries are never matched — they
 are spliced, in order, into the reviewer prompt. `"$defaults"` in any list splices the

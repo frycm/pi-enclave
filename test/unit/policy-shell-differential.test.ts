@@ -68,6 +68,10 @@ const FRAGMENTS = [
 	"probe @ {#,x}",
 	"probe @ # a comment ending in a backslash \\",
 	"(#comment\nprobe @)",
+	// A shell with no arguments runs what reaches its stdin.
+	"echo 'probe @' |& sh",
+	"echo 'probe @' |\nsh",
+	"echo 'probe @' > f; exec < f; sh",
 	// Characters JavaScript's \s treats as blanks and bash does not: a `#`
 	// after one of them is literal, so the rest of the line runs.
 	"echo a\r#b; probe @",
