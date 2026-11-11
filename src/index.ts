@@ -65,7 +65,7 @@ import { ActionLock } from "./gate/lock.ts";
 import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
 import { PROVENANCE_ENTRY_TYPE, ProvenanceTracker } from "./gate/provenance.ts";
 import { toolReachability } from "./gate/reachability.ts";
-import { classifySurfacePath, persistenceSurface } from "./persistence/agent.ts";
+import { persistenceSurface, protectedByProfile } from "./persistence/agent.ts";
 import { formatPendingHits, TripwireLedger } from "./persistence/ledger.ts";
 import { formatTripwireHits, PersistenceTripwire } from "./persistence/tripwire.ts";
 import { formatProbeReport } from "./probe.ts";
@@ -395,10 +395,13 @@ export default function (pi: ExtensionAPI): void {
 		// Project files (AGENTS.md, .envrc, ...) are edited in ordinary work,
 		// often after an L1 approval, so a change there is reported and audited
 		// but never counted. Git and pi configuration count like a denial.
-		const isProject = (hit: (typeof hits)[number]) =>
-			hit.change !== "unverifiable" && classifySurfacePath(hit.path) === "project";
-		const counted = hits.filter((hit) => !isProject(hit));
-		const uncounted = hits.filter(isProject);
+		// One entry too large to fingerprint is reported at every check, so it
+		// is not counted either: it would trip the breaker on its own. A surface
+		// that cannot be read at all (no kind) still counts.
+		const isUncounted = (hit: (typeof hits)[number]) =>
+			hit.kind === "project" || (hit.change === "unverifiable" && hit.kind !== undefined);
+		const counted = hits.filter((hit) => !isUncounted(hit));
+		const uncounted = hits.filter(isUncounted);
 		if (counted.length > 0) recordViolations(asViolations(counted), agent);
 		if (uncounted.length > 0) recordViolations(asViolations(uncounted), false);
 		try {
@@ -1037,11 +1040,14 @@ export default function (pi: ExtensionAPI): void {
 			// After compiling, which materialises the protected anchors, so their
 			// creation is not reported as the agent's.
 			const roots = profile.writableRoots;
-			tripwire = new PersistenceTripwire(() => persistenceSurface(roots), cwd);
+			// Directories the profile in force write-denies are watched by
+			// identity only, so a large protected `.pi` costs nothing per turn.
+			const isProtected = protectedByProfile(compiled.profile);
+			tripwire = new PersistenceTripwire(() => persistenceSurface(roots, { isProtected }), cwd);
 			// Hits from earlier sessions nobody acknowledged: with attendance off,
 			// the notice at the time may have reached no one.
 			tripwireLedger = TripwireLedger.forWorkspace(stateDirs().state, cwd);
-			const pendingHits = formatPendingHits(tripwireLedger.read());
+			const pendingHits = formatPendingHits(tripwireLedger.state());
 			if (pendingHits) {
 				ctx.ui.notify(pendingHits, "warning");
 				process.stderr.write(`${pendingHits}\n`);

@@ -20,10 +20,12 @@
  * Names are compared case-insensitively: on a case-insensitive file system
  * (macOS by default) `Agents.md` is the file pi opens as `AGENTS.md`.
  */
-import { realpathSync } from "node:fs";
+import { lstatSync, readlinkSync, realpathSync, type Stats } from "node:fs";
 import { basename, dirname } from "node:path";
+import { canonical, isUnder } from "../backend/paths.ts";
+import type { Profile } from "../backend/types.ts";
 import { gitPersistenceSurface } from "./git.ts";
-import { type EntryKind, type FingerprintBudget, fingerprint, type ScanMatch } from "./scan.ts";
+import { type EntryKind, type FingerprintBudget, fingerprint, PersistenceScanError, type ScanMatch } from "./scan.ts";
 
 /** Directories pi loads code or configuration from. */
 export const AGENT_CONFIG_DIRS: readonly string[] = [".pi", ".agents"];
@@ -60,47 +62,121 @@ export function isAgentSurfaceEntry(name: string, _kind: EntryKind, path: string
 }
 
 /**
- * Which kind of surface a path reported by {@link persistenceSurface} is on.
- * Anything inside a `.pi` or `.agents` directory is agent configuration, so a
- * `CLAUDE.md` inside `.agents/skills` counts as one.
+ * Every value in {@link persistenceSurface} is prefixed with the kind of the
+ * surface that produced it, so a hit is classified by where it came from and
+ * not by its path: a repository at `.husky/r/.git` is Git metadata, not a
+ * project file.
  */
-export function classifySurfacePath(path: string): SurfaceKind {
-	const parts = path.split(/[\\/]/);
-	if (parts.some(isAgentConfigName)) return "agent";
-	const name = parts.at(-1) ?? "";
-	if (parts.some((part) => part.toLowerCase() === ".husky") || isProjectFileName(name, path)) return "project";
-	return "git";
+const KIND_SEPARATOR = "\u0000";
+const KINDS: readonly SurfaceKind[] = ["git", "agent", "project"];
+
+/** The kind a {@link persistenceSurface} value was produced by, if it carries one. */
+export function surfaceValueKind(value: string): SurfaceKind | undefined {
+	const index = value.indexOf(KIND_SEPARATOR);
+	if (index < 0) return undefined;
+	const kind = value.slice(0, index) as SurfaceKind;
+	return KINDS.includes(kind) ? kind : undefined;
 }
 
-function targetFingerprint(link: string, budget: FingerprintBudget): string {
-	let target: string;
+const UNVERIFIABLE = "unverifiable:";
+
+/** Whether a value says its entry was too large to fingerprint. */
+export function isUnverifiableValue(value: string): boolean {
+	const index = value.indexOf(KIND_SEPARATOR);
+	return value.startsWith(UNVERIFIABLE, index < 0 ? 0 : index + 1);
+}
+
+export interface PersistenceSurfaceOptions {
+	maxEntries?: number;
+	/**
+	 * Whether the sandbox cannot write below a canonical path: the compiled
+	 * profile write-denies it, or it lies outside every writable root. Such a
+	 * directory is recorded by identity only, as a Git directory is, so a
+	 * large `.pi` (pi started in a home directory) costs nothing to watch.
+	 */
+	isProtected?(path: string): boolean;
+}
+
+/**
+ * {@link PersistenceSurfaceOptions.isProtected} for a compiled profile: a
+ * path its `writeDeny` covers, or one outside every writable root.
+ */
+export function protectedByProfile(profile: Pick<Profile, "writableRoots" | "writeDeny">): (path: string) => boolean {
+	const roots = profile.writableRoots.map(canonical);
+	const denied = (profile.writeDeny ?? []).map(canonical);
+	return (path) => denied.some((deny) => isUnder(path, deny)) || !roots.some((root) => isUnder(path, root));
+}
+
+/** Per entry, and for the whole surface, so one huge tree cannot hide the rest. */
+const ENTRY_BUDGET = 16_384;
+const TOTAL_BUDGET = 262_144;
+
+function entryValue(
+	entry: ScanMatch,
+	isProtected: (path: string) => boolean,
+	total: FingerprintBudget,
+): string | undefined {
+	let stats: Stats;
 	try {
-		target = realpathSync(link);
-	} catch {
-		return "dangling";
+		stats = lstatSync(entry.path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
 	}
-	return `${target}=${fingerprint(target, budget)}`;
+	let target: string | undefined = entry.path;
+	if (entry.kind === "symlink") {
+		try {
+			target = realpathSync(entry.path);
+		} catch {
+			target = undefined;
+		}
+	}
+	const link = entry.kind === "symlink" ? `->${readlinkSync(entry.path)}` : "";
+	if (target !== undefined && isProtected(target)) {
+		return `protected:${stats.ino}${link}:${lstatSync(target).ino}`;
+	}
+	const budget: FingerprintBudget = { remaining: Math.min(ENTRY_BUDGET, total.remaining) };
+	const start = budget.remaining;
+	try {
+		const value = fingerprint(entry.path, budget);
+		if (value === undefined) return undefined;
+		// A symlinked `.pi` loads what it points at, so what it points at is
+		// what has to stay the same.
+		if (entry.kind !== "symlink") return value;
+		return target === undefined ? `${value}|dangling` : `${value}|${target}=${fingerprint(target, budget)}`;
+	} catch (error) {
+		if (!(error instanceof PersistenceScanError)) throw error;
+		// Reported as unverifiable at every check, never passed as unchanged.
+		return `${UNVERIFIABLE}${stats.ino}`;
+	} finally {
+		total.remaining -= start - Math.max(budget.remaining, 0);
+	}
 }
 
 /**
  * The whole persistence surface in one walk: Git's (see
  * {@link gitPersistenceSurface}) plus every agent configuration directory and
- * project file, each fingerprinted with everything below it.
+ * project file. One the sandbox can write below is fingerprinted with
+ * everything below it; one it cannot is recorded by identity.
  */
 export function persistenceSurface(
 	roots: readonly string[],
-	options: { maxEntries?: number } = {},
+	options: PersistenceSurfaceOptions = {},
 ): Map<string, string> {
 	const also: ScanMatch[] = [];
-	const surface = gitPersistenceSurface(roots, { ...options, alsoMatch: isAgentSurfaceEntry, also });
-	const budget: FingerprintBudget = { remaining: 65_536 };
+	const git = gitPersistenceSurface(roots, {
+		...(options.maxEntries !== undefined ? { maxEntries: options.maxEntries } : {}),
+		alsoMatch: isAgentSurfaceEntry,
+		also,
+	});
+	const surface = new Map<string, string>();
+	for (const [path, value] of git) surface.set(path, `git${KIND_SEPARATOR}${value}`);
+	const isProtected = options.isProtected ?? (() => false);
+	const total: FingerprintBudget = { remaining: TOTAL_BUDGET };
 	for (const entry of also) {
-		let value = fingerprint(entry.path, budget);
-		if (value === undefined) continue;
-		// A symlinked `.pi` loads what it points at, so what it points at is
-		// what has to stay the same.
-		if (entry.kind === "symlink") value += `|${targetFingerprint(entry.path, budget)}`;
-		surface.set(entry.path, value);
+		const kind: SurfaceKind = isAgentConfigName(basename(entry.path)) ? "agent" : "project";
+		const value = entryValue(entry, isProtected, total);
+		if (value !== undefined) surface.set(entry.path, `${kind}${KIND_SEPARATOR}${value}`);
 	}
 	return surface;
 }

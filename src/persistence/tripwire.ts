@@ -14,7 +14,7 @@
  * next session's profile protects the new path at L2.
  */
 
-import { classifySurfacePath, type SurfaceKind } from "./agent.ts";
+import { isUnverifiableValue, type SurfaceKind, surfaceValueKind } from "./agent.ts";
 
 export type TripwireChange = "created" | "modified" | "unverifiable";
 
@@ -22,6 +22,12 @@ export interface TripwireHit {
 	path: string;
 	change: TripwireChange;
 	detail?: string;
+	/**
+	 * Which surface the path is on, when the surface says. Absent for a
+	 * surface that does not tag its values, and for a surface that could not
+	 * be read at all.
+	 */
+	kind?: SurfaceKind;
 }
 
 /** Path -> fingerprint. Absent paths are absent from the map. */
@@ -57,9 +63,17 @@ export class PersistenceTripwire {
 		}
 		const hits: TripwireHit[] = [];
 		for (const [path, value] of current) {
+			const kind = surfaceValueKind(value);
+			const tag = kind ? { kind } : {};
+			// Too large to fingerprint: it cannot be compared, so it is reported
+			// at every check rather than passed as unchanged.
+			if (isUnverifiableValue(value)) {
+				hits.push({ path, change: "unverifiable", detail: "too many entries to fingerprint", ...tag });
+				continue;
+			}
 			const before = this.baseline.get(path);
-			if (before === undefined) hits.push({ path, change: "created" });
-			else if (before !== value) hits.push({ path, change: "modified" });
+			if (before === undefined) hits.push({ path, change: "created", ...tag });
+			else if (before !== value) hits.push({ path, change: "modified", ...tag });
 		}
 		this.baseline = current;
 		return hits.sort((a, b) => a.path.localeCompare(b.path));
@@ -102,7 +116,7 @@ export function formatTripwireHits(hits: readonly TripwireHit[], when: string): 
 		);
 	}
 	for (const kind of ["git", "agent", "project"] as const) {
-		const ofKind = hits.filter((hit) => hit.change !== "unverifiable" && classifySurfacePath(hit.path) === kind);
+		const ofKind = hits.filter((hit) => hit.change !== "unverifiable" && (hit.kind ?? "git") === kind);
 		if (ofKind.length === 0) continue;
 		const lines = ofKind
 			.slice(0, 10)

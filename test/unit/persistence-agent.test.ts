@@ -6,6 +6,7 @@
  * or by renaming a prepared tree into place, has to be found by the trusted
  * parent's walk after the turn.
  */
+import { spawnSync } from "node:child_process";
 import {
 	lstatSync,
 	mkdirSync,
@@ -21,7 +22,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { classifySurfacePath, persistenceSurface } from "../../src/persistence/agent.ts";
+import { persistenceSurface, protectedByProfile } from "../../src/persistence/agent.ts";
 import { gitPersistenceSurface } from "../../src/persistence/git.ts";
 import { formatPendingHits, TripwireLedger } from "../../src/persistence/ledger.ts";
 import { formatTripwireHits, PersistenceTripwire } from "../../src/persistence/tripwire.ts";
@@ -113,27 +114,70 @@ describe("the agent configuration tripwire (#19)", () => {
 		expect(changes(tripwire).get(join(root, "sub", ".pi"))).toBe("modified");
 	});
 
-	it("classifies each path, and words the notice per kind", () => {
-		expect(classifySurfacePath("/w/sub/.pi")).toBe("agent");
-		expect(classifySurfacePath("/w/.agents/skills/x/CLAUDE.md")).toBe("agent");
-		expect(classifySurfacePath("/w/AGENTS.md")).toBe("project");
-		expect(classifySurfacePath("/w/.husky/pre-commit")).toBe("project");
-		expect(classifySurfacePath("/w/.vscode/tasks.json")).toBe("project");
-		expect(classifySurfacePath("/w/vendor/x/.git/config")).toBe("git");
+	it("classifies a hit by the surface that produced it, not by its path", () => {
+		const root = tempDir("enclave-agent-");
+		mkdirSync(join(root, ".husky"));
+		const tripwire = new PersistenceTripwire(() => persistenceSurface([root]), root);
+		// A repository inside a project-file directory is still Git metadata.
+		const git = spawnSync("git", ["init", "-q", join(root, ".husky", "r")], { encoding: "utf8" });
+		expect(git.status, git.stderr).toBe(0);
+		mkdirSync(join(root, "sub", ".pi"), { recursive: true });
+		writeFileSync(join(root, "AGENTS.md"), "x");
+		const kinds = new Map(tripwire.check().map((hit) => [hit.path, hit.kind]));
+		expect(kinds.get(join(root, ".husky", "r", ".git", "config"))).toBe("git");
+		expect(kinds.get(join(root, ".husky"))).toBe("project");
+		expect(kinds.get(join(root, "sub", ".pi"))).toBe("agent");
+		expect(kinds.get(join(root, "AGENTS.md"))).toBe("project");
+	});
+
+	it("treats what the compiled profile denies, or cannot write at all, as protected", () => {
+		const root = tempDir("enclave-agent-");
+		const isProtected = protectedByProfile({ writableRoots: [root], writeDeny: [join(root, ".pi")] });
+		expect(isProtected(join(root, ".pi"))).toBe(true);
+		expect(isProtected(join(root, ".pi", "agent"))).toBe(true);
+		expect(isProtected(join(root, "sub", ".pi"))).toBe(false);
+		expect(isProtected(join(root, ".pi-other"))).toBe(false);
+		expect(isProtected("/nowhere-writable/.pi")).toBe(true);
+	});
+
+	it("words the notice per kind", () => {
 		const message = formatTripwireHits(
 			[
-				{ path: "/w/sub/.pi", change: "created" },
-				{ path: "/w/AGENTS.md", change: "modified" },
+				{ path: "/w/sub/.pi", change: "created", kind: "agent" },
+				{ path: "/w/.husky/r/.git/config", change: "created", kind: "git" },
+				{ path: "/w/AGENTS.md", change: "modified", kind: "project" },
 				{ path: "/w", change: "unverifiable", detail: "too many entries" },
 			],
 			"during the agent's turn",
 		);
 		expect(message).toContain("pi configuration (.pi, .agents) changed during the agent's turn");
 		expect(message).toContain("created: /w/sub/.pi");
+		expect(message).toContain("Git configuration or hooks changed");
+		expect(message).toContain("created: /w/.husky/r/.git/config");
 		expect(message).toContain("Treat them as untrusted");
 		expect(message).toContain("modified: /w/AGENTS.md");
 		expect(message).toContain("could not be checked");
-		expect(message).not.toContain("Git configuration");
+	});
+
+	it("records a protected .pi by identity, however large, and reports an unprotected one it cannot fingerprint", () => {
+		const root = tempDir("enclave-agent-");
+		// pi started in a home directory: `.pi/agent` holds sessions and more.
+		const big = join(root, ".pi", "agent", "sessions");
+		mkdirSync(big, { recursive: true });
+		for (let index = 0; index < 17_000; index++) writeFileSync(join(big, `s${index}`), "");
+		const isProtected = (path: string) => path === join(root, ".pi");
+		const tripwire = new PersistenceTripwire(() => persistenceSurface([root], { isProtected }), root);
+		expect(tripwire.check()).toEqual([]);
+
+		// The same tree where the sandbox could write it: too large to compare,
+		// so it is reported at every check instead of passed as unchanged, and
+		// the baseline does not throw.
+		const exposed = new PersistenceTripwire(() => persistenceSurface([root]), root);
+		for (let round = 0; round < 2; round++) {
+			expect(exposed.check()).toEqual([
+				{ path: join(root, ".pi"), change: "unverifiable", detail: "too many entries to fingerprint", kind: "agent" },
+			]);
+		}
 	});
 });
 
@@ -141,11 +185,11 @@ describe("the tripwire ledger (#19)", () => {
 	it("keeps hits across sessions until they are acknowledged", () => {
 		const state = tempDir("enclave-ledger-");
 		const first = TripwireLedger.forWorkspace(state, "/work");
-		first.add([{ path: "/work/sub/.pi", change: "created" }], true, new Date("2026-11-11T10:00:00Z"));
+		first.add([{ path: "/work/sub/.pi", change: "created", kind: "agent" }], true, new Date("2026-11-11T10:00:00Z"));
 		first.add(
 			[
-				{ path: "/work/sub/.pi", change: "created" },
-				{ path: "/work/AGENTS.md", change: "modified" },
+				{ path: "/work/sub/.pi", change: "created", kind: "agent" },
+				{ path: "/work/AGENTS.md", change: "modified", kind: "project" },
 			],
 			false,
 			new Date("2026-11-11T11:00:00Z"),
@@ -157,7 +201,7 @@ describe("the tripwire ledger (#19)", () => {
 			{ path: "/work/sub/.pi", change: "created", kind: "agent", at: "2026-11-11T10:00:00.000Z", agent: true },
 			{ path: "/work/AGENTS.md", change: "modified", kind: "project", at: "2026-11-11T11:00:00.000Z", agent: false },
 		]);
-		const reminder = formatPendingHits(later.read());
+		const reminder = formatPendingHits(later.state());
 		expect(reminder).toContain("2 change(s)");
 		expect(reminder).toContain("created: /work/sub/.pi (agent's turn)");
 		expect(reminder).toContain("/enclave tripwire ack");
@@ -167,7 +211,34 @@ describe("the tripwire ledger (#19)", () => {
 
 		expect(later.clear()).toBe(2);
 		expect(later.read()).toEqual([]);
-		expect(formatPendingHits(later.read())).toBeUndefined();
+		expect(formatPendingHits(later.state())).toBeUndefined();
+	});
+
+	it("never drops pi configuration for project files, and lists it first", () => {
+		const root = tempDir("enclave-agent-");
+		const state = tempDir("enclave-ledger-");
+		const ledger = TripwireLedger.forWorkspace(state, root);
+		const tripwire = new PersistenceTripwire(() => persistenceSurface([root]), root);
+		mkdirSync(join(root, "sub", ".pi"), { recursive: true });
+		ledger.add(tripwire.check(), true);
+		// A later turn floods the ledger with project files.
+		for (let index = 0; index < 520; index++) {
+			mkdirSync(join(root, `d${index}`));
+			writeFileSync(join(root, `d${index}`, ".envrc"), "x");
+		}
+		ledger.add(tripwire.check(), true);
+
+		const { entries, droppedProject } = ledger.state();
+		expect(entries.map((entry) => entry.path)).toContain(join(root, "sub", ".pi"));
+		expect(entries).toHaveLength(500);
+		expect(droppedProject).toBe(21);
+		const reminder = formatPendingHits(ledger.state()) ?? "";
+		expect(reminder).toContain("521 change(s)");
+		expect(reminder).toContain("1 pi configuration, 520 project files");
+		// The planted .pi is the first entry listed, ahead of every .envrc.
+		expect(reminder.split("\n")[1]).toContain(`created: ${join(root, "sub", ".pi")}`);
+		expect(reminder).toContain("21 older project-file change(s) no longer listed");
+		expect(ledger.clear()).toBe(521);
 	});
 
 	it("writes privately, and reports a ledger it cannot parse instead of reading it as empty", () => {

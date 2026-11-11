@@ -1693,12 +1693,19 @@ without the sandbox. pi-enclave splits those files in two.
   `ask` rather than a denial.
 - **The tripwire.** bwrap cannot deny a name that does not exist yet inside a writable bind,
   so the trusted parent walks the writable roots after every turn, as for Git (#33), and
-  fingerprints every `.pi` and `.agents` tree and every project file above (names compared
-  case-insensitively, since macOS opens `Agents.md` as `AGENTS.md`). A new or changed `.pi`
-  or `.agents` counts against the turn like a denial; a changed project file is reported and
-  audited but not counted, since it may be an approved edit. Every hit is also written to the
-  state directory and repeated at each session start until you run `/enclave tripwire ack`,
-  so a change made in an unattended session is not lost after its one notice.
+  records every `.pi` and `.agents` tree and every project file above (names compared
+  case-insensitively, since macOS opens `Agents.md` as `AGENTS.md`). One the compiled profile
+  already denies, or that lies outside every writable root, is recorded by identity only, so a
+  large protected `.pi` costs nothing; any other is fingerprinted with everything below it,
+  and one too large to fingerprint is reported as unverifiable at every check. A hit is
+  classified by the surface that found it, so a repository inside `.husky` is still Git. A new
+  or changed `.pi` or `.agents` counts against the turn like a denial; a changed project file
+  is reported and audited but not counted, since it may be an approved edit. Every hit is also
+  written to the state directory and repeated at each session start until you run
+  `/enclave tripwire ack`, so a change made in an unattended session is not lost after its one
+  notice. The reminder counts hits per kind and lists unverifiable, pi configuration and Git
+  hits before project files; only project-file entries are ever dropped to bound the ledger,
+  and the reminder says how many.
   `/enclave tripwire` lists them, and `/enclave status` shows how many are waiting.
 
 **Residual risk.** Build and test files cannot be protected this way: `package.json`

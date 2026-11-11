@@ -122,7 +122,8 @@ export function renderStatus(state: EnclaveState): string {
 		`coverage:   ${COVERAGE_NOTE}`,
 	);
 	try {
-		const pendingHits = state.tripwireLedger?.read().length ?? 0;
+		const ledger = state.tripwireLedger?.state();
+		const pendingHits = ledger ? ledger.entries.length + ledger.droppedProject : 0;
 		if (pendingHits > 0) {
 			lines.push(`tripwire:   ${pendingHits} unacknowledged change(s); /enclave tripwire to review`);
 		}
@@ -269,7 +270,7 @@ function renderTripwire(state: EnclaveState, argv: readonly string[]): CommandOu
 		return { text: count === 0 ? "nothing to acknowledge" : `acknowledged ${count} change(s)`, level: "info" };
 	}
 	if (argv[0] !== undefined) return { text: `unknown tripwire subcommand "${argv[0]}"\n${USAGE}`, level: "warning" };
-	const text = formatPendingHits(ledger.read(), Number.POSITIVE_INFINITY);
+	const text = formatPendingHits(ledger.state(), Number.POSITIVE_INFINITY);
 	return text ? { text, level: "warning" } : { text: "no unacknowledged changes", level: "info" };
 }
 
