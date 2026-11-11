@@ -27,6 +27,12 @@ import {
 
 /** How long a single operation may take before it is abandoned. */
 const DEFAULT_CALL_TIMEOUT_MS = 30_000;
+/**
+ * How long a helper has to answer a ping once a call has timed out. The helper
+ * is one thread, so one that cannot answer a ping is stuck in a blocking call
+ * and will not read the cancel either (#35).
+ */
+const LIVENESS_GRACE_MS = 1_000;
 /** How long to wait for the helper's ready frame. */
 const READY_TIMEOUT_MS = 15_000;
 /**
@@ -80,6 +86,8 @@ export interface FsClientOptions {
 	 */
 	beforeCall?: () => Promise<void>;
 	callTimeoutMs?: number;
+	/** How long a timed-out helper has to answer a ping before it is replaced. */
+	livenessGraceMs?: number;
 	/** Notified for every classified denial, for the audit log and status line. */
 	onViolation?: (violation: Violation) => void;
 }
@@ -239,6 +247,33 @@ export class HelperFsClient implements FsClient {
 		child?.stdin.end();
 	}
 
+	/**
+	 * After a call times out, ask the helper whether it is still answering. If
+	 * it is not, kill it: everything in flight fails now rather than at its own
+	 * timeout, and the next call starts a fresh helper under the usual restart
+	 * budget. Without this, one blocking call left every later file operation
+	 * waiting out the full timeout for the rest of the session.
+	 */
+	private checkAlive(child: ChildProcessWithoutNullStreams): void {
+		if (this.child !== child) return;
+		const id = ++this.sequence;
+		const timer = setTimeout(() => {
+			this.pending.delete(id);
+			if (this.child !== child) return;
+			this.child = undefined;
+			this.ready = undefined;
+			this.failAll(new Error("pi-enclave: the filesystem helper stopped responding and was replaced"));
+			child.stdin.destroy();
+			child.kill("SIGKILL");
+		}, this.options.livenessGraceMs ?? LIVENESS_GRACE_MS);
+		this.pending.set(id, { resolve: () => {}, reject: () => {}, timer });
+		try {
+			this.send(child, encodeFrame({ op: "ping", id }));
+		} catch {
+			// Already gone; the close handler or the timer above settles it.
+		}
+	}
+
 	private async prepare(signal?: AbortSignal, expectedChild?: ChildProcessWithoutNullStreams) {
 		signal?.throwIfAborted();
 		if (this.disposed) throw new Error("pi-enclave: the filesystem helper was shut down");
@@ -285,6 +320,7 @@ export class HelperFsClient implements FsClient {
 			const timer = setTimeout(() => {
 				this.pending.delete(id);
 				cancel();
+				this.checkAlive(child);
 				reject(new Error(`pi-enclave: ${request.op} timed out after ${timeoutMs}ms`));
 			}, timeoutMs);
 			const onAbort = () => {

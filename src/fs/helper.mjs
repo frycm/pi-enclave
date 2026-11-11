@@ -23,16 +23,16 @@ import {
 	closeSync,
 	constants,
 	fstatSync,
+	ftruncateSync,
 	lstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
-	readFileSync,
 	readlinkSync,
 	readSync,
 	realpathSync,
 	statSync,
-	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 
@@ -199,6 +199,62 @@ function runTool(requestId, bin, args, stopAfterLines, cwd) {
 	});
 }
 
+/**
+ * Open a path for `head`, `readFile` or `writeFile` without ever blocking, and
+ * refuse anything that is not a regular file (#35).
+ *
+ * A blocking open of a FIFO waits for the other end, and this helper is one
+ * thread: it would never read the cancel frame or any later request. A
+ * character device or socket reports size 0 and then reads without end. So
+ * the open is non-blocking and the descriptor, not the path, is checked.
+ * A write-only open of a FIFO with no reader fails with ENXIO at once, which
+ * is reported as the same refusal.
+ */
+function openRegularFile(path, flags) {
+	let fd;
+	try {
+		fd = openSync(path, flags | constants.O_NONBLOCK, 0o666);
+	} catch (error) {
+		if (error?.code === "ENXIO") throw notRegular(path);
+		throw error;
+	}
+	try {
+		const stat = fstatSync(fd);
+		if (!stat.isFile()) throw notRegular(path);
+		return { fd, size: stat.size };
+	} catch (error) {
+		closeSync(fd);
+		throw error;
+	}
+}
+
+function notRegular(path) {
+	return Object.assign(new Error(`${path} is not a regular file; the file tools only read and write regular files`), {
+		code: "EINVAL",
+	});
+}
+
+function readBounded(fd, path) {
+	const chunks = [];
+	let total = 0;
+	for (;;) {
+		const buffer = Buffer.alloc(READ_CHUNK_BYTES);
+		const count = readSync(fd, buffer, 0, buffer.length, null);
+		if (count === 0) break;
+		total += count;
+		// Checked against what was read, not what stat said: a file that grows
+		// while it is read, or a size that lies, is still bounded.
+		if (total > MAX_READ_BYTES) {
+			throw Object.assign(
+				new Error(`${path} is larger than ${MAX_READ_BYTES} bytes; the sandboxed read tool returns at most that`),
+				{ code: "EFBIG" },
+			);
+		}
+		chunks.push(buffer.subarray(0, count));
+	}
+	return Buffer.concat(chunks, total);
+}
+
 async function handle(request) {
 	switch (request.op) {
 		case "ping":
@@ -241,21 +297,25 @@ async function handle(request) {
 			closeRead(request.stream);
 			return null;
 		case "readFile": {
-			const size = statSync(request.path).size;
-			if (size > MAX_READ_BYTES) {
-				throw Object.assign(
-					new Error(`${request.path} is ${size} bytes; the sandboxed read tool returns at most ${MAX_READ_BYTES}`),
-					{ code: "EFBIG" },
-				);
+			const { fd, size } = openRegularFile(request.path, constants.O_RDONLY);
+			try {
+				if (size > MAX_READ_BYTES) {
+					throw Object.assign(
+						new Error(`${request.path} is ${size} bytes; the sandboxed read tool returns at most ${MAX_READ_BYTES}`),
+						{ code: "EFBIG" },
+					);
+				}
+				// Base64 so arbitrary bytes survive a JSON frame.
+				return readBounded(fd, request.path).toString("base64");
+			} finally {
+				closeSync(fd);
 			}
-			// Base64 so arbitrary bytes survive a JSON frame.
-			return readFileSync(request.path).toString("base64");
 		}
 		case "head": {
 			// A bounded read from the start of the file, for image sniffing: the
 			// whole point is not to pay for a full read (and not to exceed the
 			// frame) just to learn a file is a PNG.
-			const fd = openSync(request.path, "r");
+			const { fd } = openRegularFile(request.path, constants.O_RDONLY);
 			try {
 				const buffer = Buffer.alloc(Math.min(request.bytes, MAX_READ_BYTES));
 				const read = readSync(fd, buffer, 0, buffer.length, 0);
@@ -264,9 +324,19 @@ async function handle(request) {
 				closeSync(fd);
 			}
 		}
-		case "writeFile":
-			writeFileSync(request.path, request.content, "utf8");
-			return null;
+		case "writeFile": {
+			// Truncated only once the descriptor is known to be a regular file.
+			const { fd } = openRegularFile(request.path, constants.O_WRONLY | constants.O_CREAT);
+			try {
+				ftruncateSync(fd, 0);
+				const data = Buffer.from(request.content, "utf8");
+				let written = 0;
+				while (written < data.length) written += writeSync(fd, data, written, data.length - written, written);
+				return null;
+			} finally {
+				closeSync(fd);
+			}
+		}
 		case "mkdir":
 			mkdirSync(request.path, { recursive: true });
 			return null;
