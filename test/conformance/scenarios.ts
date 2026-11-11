@@ -15,7 +15,7 @@
  * sandbox at all.
  */
 import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { CompiledProfile, SandboxBackend, ViolationKind } from "../../src/backend/types.ts";
 import { SandboxDenied } from "../../src/backend/types.ts";
 import { buildChildEnv } from "../../src/env/child-env.ts";
@@ -169,6 +169,52 @@ export const SCENARIOS: Scenario[] = [
 				detail: replaced
 					? "DISPLACED the protected Git metadata tree and wrote a hook"
 					: "ancestor displacement denied",
+			};
+		},
+	},
+	{
+		id: "C17",
+		title: "submodule and nested-repository Git configuration and hooks remain read-only (#33)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const submodule = join(fixture.workspace, ".git", "modules", "lib");
+			const nested = join(fixture.workspace, "vendor", "inner", ".git");
+			const targets = [
+				join(submodule, "config"),
+				join(submodule, "hooks", "post-checkout"),
+				join(nested, "config"),
+				join(nested, "hooks", "pre-commit"),
+				// `modules` did not exist in the nested repository, so it is a
+				// read-only anchor: a submodule added there cannot bring a writable
+				// config with it.
+				join(nested, "modules", "added", "config"),
+			];
+			for (const target of targets) {
+				await sh(`mkdir -p ${JSON.stringify(dirname(target))}; printf pwn >> ${JSON.stringify(target)}`);
+			}
+			// As C16 does for the workspace's own: move the nested Git directory
+			// aside and plant a hook at the old path.
+			const displaced = join(nested, "hooks", "post-merge");
+			await sh(
+				`mv ${JSON.stringify(nested)} ${JSON.stringify(`${nested}-moved`)} && ` +
+					`mkdir -p ${JSON.stringify(dirname(displaced))} && printf pwn > ${JSON.stringify(displaced)}`,
+			);
+			targets.push(displaced);
+			const changed = targets.filter((target) => {
+				try {
+					return readFileSync(target, "utf8").includes("pwn");
+				} catch {
+					return false;
+				}
+			});
+			return {
+				ok: changed.length === 0,
+				detail:
+					changed.length > 0
+						? `WROTE Git persistence path(s): ${changed.join(", ")}`
+						: "all five writes and the displacement denied",
 			};
 		},
 	},

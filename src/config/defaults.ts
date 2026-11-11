@@ -193,6 +193,11 @@ export const DEFAULT_PROTECTED_DENY: readonly string[] = [
 	"**/.git",
 	"**/.git/hooks/**",
 	"**/.git/config",
+	// Submodule and linked-worktree Git directories have their own config and
+	// hooks, read by `git status` in the superproject (#33).
+	"**/.git/modules/**/config",
+	"**/.git/modules/**/hooks/**",
+	"**/.git/worktrees/**/config.worktree",
 	"**/.pi/extensions/**",
 	"**/.ssh/**",
 	"**/authorized_keys",
