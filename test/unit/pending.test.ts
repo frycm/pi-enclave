@@ -89,7 +89,7 @@ describe("writing a record", () => {
 
 	it("carries the profile it was evaluated under", () => {
 		const { record } = write();
-		expect(record.profileSnapshot.sandbox.writableRoots).toEqual(["/work", "/tmp"]);
+		expect(record.profileSnapshot.sandbox.writableRoots).toEqual(["/work"]);
 	});
 
 	it("carries the independently observed tool source", () => {
@@ -490,11 +490,11 @@ describe("resuming", () => {
 		const notes = describeNarrowing(
 			record,
 			profile((p) => {
-				p.sandbox.writableRoots = ["/work"];
+				p.sandbox.writableRoots = [];
 				p.rules.ask.push("bash(deploy*)");
 			}),
 		);
-		expect(notes.join("\n")).toContain("/tmp");
+		expect(notes.join("\n")).toContain("no longer writable: /work");
 		expect(notes.join("\n")).toContain("bash(deploy*)");
 	});
 

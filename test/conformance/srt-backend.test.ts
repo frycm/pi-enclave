@@ -12,6 +12,7 @@
  */
 import {
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -23,8 +24,9 @@ import {
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { scratchBase } from "../../src/backend/scratch.ts";
 import { checkUnixSocketBlocking } from "../../src/backend/self-test.ts";
-import { effectiveProfile, partitionSrtDefaults, SrtBackend, srtTmpDir, toSrtConfig } from "../../src/backend/srt.ts";
+import { effectiveProfile, partitionSrtDefaults, SrtBackend, toSrtConfig } from "../../src/backend/srt.ts";
 import { SandboxDenied } from "../../src/backend/types.ts";
 import { formatProbeReport } from "../../src/probe.ts";
 import { probeHost } from "../../src/probe-host.ts";
@@ -184,14 +186,17 @@ describe.skipIf(!supported)("sandbox-runtime profile translation", () => {
 	});
 
 	it("advertises the temp directory the child is actually given", () => {
-		// SRT injects TMPDIR=/tmp/claude and makes it writable regardless of the
-		// profile. Denying it would leave the child with an unwritable TMPDIR;
-		// omitting it would describe a narrower boundary than the real one.
-		const profile = effectiveProfile(requested);
-		expect(profile.writableRoots).toContain(srtTmpDir());
+		// The backend pins SRT's injected TMPDIR to its own session scratch
+		// (#20), so that is the root the profile must advertise, and SRT's fixed
+		// default /tmp/claude falls into the explicitly denied set.
+		const scratch = "/run/user/1000/pi-enclave-1000/session-1-abc";
+		const profile = effectiveProfile(requested, process.platform, process.env, scratch);
+		expect(profile.writableRoots).toContain(scratch);
+		expect(profile.tmpDir).toBe(scratch);
 		const { denied } = partitionSrtDefaults(profile.writableRoots);
-		expect(denied).not.toContain(srtTmpDir());
-		expect(toSrtConfig(profile).filesystem.allowWrite).toEqual(["/tmp/ws", srtTmpDir()]);
+		expect(denied).not.toContain(scratch);
+		expect(denied).toContain("/tmp/claude");
+		expect(toSrtConfig(profile).filesystem.allowWrite).toEqual(["/tmp/ws", scratch]);
 	});
 
 	it("allowlists no host when the profile is offline", () => {
@@ -227,6 +232,57 @@ describe.skipIf(!supported || process.platform !== "linux")("session-start Unix-
 			await backend.dispose();
 			fixture.cleanup();
 		}
+	}, 60_000);
+});
+
+describe.skipIf(!supported)("per-session scratch directory (#20)", () => {
+	it("gives the child a private TMPDIR, keeps /tmp/claude unwritable, and removes the directory on dispose", async () => {
+		const first = new SrtBackend({ weakerNestedSandbox: weakerNested });
+		const second = new SrtBackend({ weakerNestedSandbox: weakerNested });
+		const fixture = createFixture();
+		const probe = `/tmp/claude/pi-enclave-scratch-probe-${process.pid}`;
+		let scratch: string | undefined;
+		try {
+			const compiled = await first.compile(fixture.profile);
+			scratch = first.scratchDir;
+			expect(scratch).toBeDefined();
+			expect(compiled.profile.tmpDir).toBe(scratch);
+			expect(compiled.profile.writableRoots).toContain(scratch);
+			expect(compiled.profile.writableRoots).not.toContain("/tmp/claude");
+			const stats = lstatSync(scratch ?? "");
+			expect(stats.isDirectory() && !stats.isSymbolicLink()).toBe(true);
+			expect(stats.mode & 0o777).toBe(0o700);
+			expect(scratch?.startsWith(realpathSync(dirname(scratchBase())))).toBe(true);
+
+			let output = "";
+			await first.run(compiled, {
+				command:
+					// An explicit template: macOS mktemp without one ignores TMPDIR and
+					// uses the per-user /var/folders directory instead.
+					`printf 'TMPDIR=%s\\n' "$TMPDIR"; f=$(mktemp "$TMPDIR/probe.XXXXXX") && printf ok > "$f" && ` +
+					`printf 'MKTEMP-OK=%s\\n' "$f"; ` +
+					`mkdir -p /tmp/claude 2>/dev/null; printf leak > ${JSON.stringify(probe)} 2>/dev/null; true`,
+				cwd: fixture.workspace,
+				env: scenarioEnv(fixture),
+				commandId: "scratch-tmpdir-1",
+				onData: (chunk) => {
+					output += chunk.toString("utf8");
+				},
+			});
+			expect(output).toContain(`TMPDIR=${scratch}`);
+			expect(output).toContain(`MKTEMP-OK=${scratch}/probe.`);
+			expect(existsSync(probe), "the shared /tmp/claude was writable from the sandbox").toBe(false);
+
+			await second.compile(fixture.profile);
+			expect(second.scratchDir).toBeDefined();
+			expect(second.scratchDir).not.toBe(scratch);
+		} finally {
+			await second.dispose();
+			await first.dispose();
+			rmSync(probe, { force: true });
+			fixture.cleanup();
+		}
+		expect(existsSync(scratch ?? ""), "the scratch directory survived dispose").toBe(false);
 	}, 60_000);
 });
 

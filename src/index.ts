@@ -973,8 +973,11 @@ export default function (pi: ExtensionAPI): void {
 		// an audit append that the first flush has already passed. The second
 		// flush is what keeps that final record from being lost on exit.
 		await audit?.flush();
-		await backend.dispose();
-		await audit?.flush();
+		try {
+			await backend.dispose();
+		} finally {
+			await audit?.flush();
+		}
 	});
 
 	pi.registerCommand("enclave", {

@@ -445,7 +445,16 @@ export function expandPath(value: string, options: DefaultProfileOptions): strin
  * error is the user's typo and a relation error is a trust decision, and they
  * deserve different messages.
  */
-export function fold(documents: readonly ConfigDocument[], options: DefaultProfileOptions): FoldResult {
+export interface FoldOptions extends DefaultProfileOptions {
+	/**
+	 * The per-user base the native backend creates session scratch directories
+	 * in (#20). No writable root may overlap it: one that contains it lets one
+	 * session write into another's temp files.
+	 */
+	scratchBase?: string;
+}
+
+export function fold(documents: readonly ConfigDocument[], options: FoldOptions): FoldResult {
 	const errors: FoldError[] = [];
 	const provenance: Provenance = new Map();
 
@@ -543,6 +552,31 @@ export function fold(documents: readonly ConfigDocument[], options: DefaultProfi
 					`its own approval records and read the attendance secret.\n` +
 					`    Fix it by moving pi's agent directory outside the workspace (unset PI_CODING_AGENT_DIR, or point ` +
 					`it somewhere the agent cannot write), or by narrowing sandbox.writableRoots so it does not contain that path.`,
+			});
+		}
+	}
+
+	// The same kind of invariant for the per-user scratch base. Configuration
+	// written for earlier versions listed "$TMPDIR" as a writable root, and
+	// `$TMPDIR` now expands to this base, so an old file would otherwise open
+	// every session's scratch directory to every other session.
+	if (options.scratchBase !== undefined) {
+		const base = options.scratchBase;
+		for (const root of current.sandbox.writableRoots) {
+			const overlaps =
+				isUnder(base, root) ||
+				isUnder(root, base) ||
+				isUnder(canonical(base), canonical(root)) ||
+				isUnder(canonical(root), canonical(base));
+			if (!overlaps) continue;
+			errors.push({
+				source: "builtin",
+				field: "sandbox.writableRoots",
+				message:
+					`"${root}" overlaps the per-user scratch directory (${base}), where every session keeps its own ` +
+					"private temp directory, so one session could read or replace another's temp files.\n" +
+					'    Fix it by removing the entry (often "$TMPDIR", which older examples listed): each session ' +
+					"already gets a private, writable TMPDIR of its own.",
 			});
 		}
 	}

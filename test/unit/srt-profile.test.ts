@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { shellWriteCapabilityIssue, validateWriteCapability } from "../../src/backend/capability.ts";
 import { canonical } from "../../src/backend/paths.ts";
+import { SessionScratch } from "../../src/backend/scratch.ts";
 import {
 	effectiveProfile,
 	linuxWriteMountPins,
@@ -43,6 +44,37 @@ function expectWriteDenied(profile: Profile, path: string): void {
 function expectWriteAllowed(profile: Profile, path: string): void {
 	expect((profile.writeDeny ?? []).map(canonical)).not.toContain(canonical(path));
 }
+
+describe("backend shutdown (#20)", () => {
+	it("removes the scratch directory and restores the environment even when an earlier step fails", async () => {
+		const ambient = process.env.CLAUDE_CODE_TMPDIR;
+		const root = mkdtempSync(join(tmpdir(), "enclave-dispose-"));
+		roots.push(root);
+		const backend = new SrtBackend();
+		const scratch = SessionScratch.create({ base: join(root, "pi-enclave-u") });
+		const internals = backend as unknown as {
+			scratch?: SessionScratch;
+			ambientSrtTmp?: string | null;
+			fsClient?: { dispose(): Promise<void> };
+		};
+		internals.scratch = scratch;
+		internals.ambientSrtTmp = null;
+		internals.fsClient = {
+			dispose: async () => {
+				throw new Error("helper teardown failed");
+			},
+		};
+		process.env.CLAUDE_CODE_TMPDIR = scratch.path;
+		try {
+			await expect(backend.dispose()).rejects.toThrow("helper teardown failed");
+			expect(process.env.CLAUDE_CODE_TMPDIR).toBeUndefined();
+			expect(existsSync(scratch.path)).toBe(false);
+		} finally {
+			if (ambient === undefined) delete process.env.CLAUDE_CODE_TMPDIR;
+			else process.env.CLAUDE_CODE_TMPDIR = ambient;
+		}
+	});
+});
 
 describe("sandbox profile authority", () => {
 	it("withholds inherited Java options from SRT's argv composition", () => {
@@ -90,7 +122,8 @@ describe("sandbox profile authority", () => {
 		process.env.TMPDIR = "/";
 		try {
 			const configured = defaultProfile({ cwd: "/work", home: "/home/u", agentDir: "/home/u/.pi/agent" });
-			expect(configured.sandbox.writableRoots).toEqual(["/work", SANDBOX_TMPDIR]);
+			// Neither ambient TMPDIR nor the fixed shared /tmp/claude (#20).
+			expect(configured.sandbox.writableRoots).toEqual(["/work"]);
 		} finally {
 			if (previous === undefined) delete process.env.TMPDIR;
 			else process.env.TMPDIR = previous;
