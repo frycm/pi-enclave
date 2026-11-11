@@ -448,7 +448,7 @@ describe("sandbox profile authority", () => {
 			initGit(root);
 			const anchored = derive(root);
 			expectWriteDenied(anchored, join(root, ".git", "modules"));
-			expect(anchored.materializeWriteDeny).toContain(join(root, ".git", "modules"));
+			expect((anchored.materializeWriteDeny ?? []).map(canonical)).toContain(canonical(join(root, ".git", "modules")));
 			materializeWriteDenyAnchors(anchored);
 			expect(existsSync(join(root, ".git", "modules"))).toBe(true);
 

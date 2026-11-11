@@ -553,8 +553,15 @@ describe.skipIf(!supported)("stale profile guard", () => {
 		const fixture = createFixture();
 		try {
 			const first = await backend.compile(fixture.profile);
-			// A second compile replaces the manager's configuration.
-			await backend.compile({ ...fixture.profile, writableRoots: [] });
+			// A second compile replaces the manager's configuration. With no
+			// writable root there is nowhere to materialise the fixture's Git
+			// anchors, which compile rightly refuses, so they go too.
+			await backend.compile({
+				...fixture.profile,
+				writableRoots: [],
+				materializeWriteDeny: [],
+				materializeWriteDenyFiles: [],
+			});
 
 			await expect(
 				backend.run(first, { command: "true", cwd: fixture.workspace, env: {}, commandId: "stale-1" }),
