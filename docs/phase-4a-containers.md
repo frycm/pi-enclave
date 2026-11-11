@@ -118,7 +118,7 @@ The versioned local corpus has 14 mandatory rows:
 | Topology change | Replacing a protected mount source requires recompilation |
 
 `npm run test:container` runs those rows against a selected real engine, then drives the
-installed pi 1.1.0 session's nested write/read/bash pipeline and standalone approval
+installed pi 1.5.2 session's nested write/read/bash pipeline and standalone approval
 through production backend selection. It also runs the shared native conformance suite.
 Missing or symlinked read-denial rows F10/F13/F14 assert compilation refusal instead of
 running an action under that unsupported layout. All other shared rows execute.

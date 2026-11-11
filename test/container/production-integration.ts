@@ -8,6 +8,7 @@ import {
 	ModelRuntime,
 	SessionManager,
 	SettingsManager,
+	VERSION,
 } from "@earendil-works/pi-coding-agent";
 import { expect } from "vitest";
 import { selectBackend } from "../../src/backend/select.ts";
@@ -115,7 +116,7 @@ export async function exerciseProduction(settings: BackendSettings, root: string
 			}),
 		).toEqual({ outcome: "executed", exitCode: 0 });
 		expect(readFileSync(join(workspace, "from-approval.txt"), "utf8")).toBe("approved\n");
-		await expect(selectBackend(settings, "1.1.0", { root: join(root, "unqualified") })).rejects.toThrow(/unqualified/);
+		await expect(selectBackend(settings, VERSION, { root: join(root, "unqualified") })).rejects.toThrow(/unqualified/);
 	} finally {
 		await session?.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 		session?.dispose();
