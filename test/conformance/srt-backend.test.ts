@@ -257,7 +257,10 @@ describe.skipIf(!supported)("per-session scratch directory (#20)", () => {
 			let output = "";
 			await first.run(compiled, {
 				command:
-					`printf 'TMPDIR=%s\\n' "$TMPDIR"; f=$(mktemp) && printf ok > "$f" && echo MKTEMP-OK; ` +
+					// An explicit template: macOS mktemp without one ignores TMPDIR and
+					// uses the per-user /var/folders directory instead.
+					`printf 'TMPDIR=%s\\n' "$TMPDIR"; f=$(mktemp "$TMPDIR/probe.XXXXXX") && printf ok > "$f" && ` +
+					`printf 'MKTEMP-OK=%s\\n' "$f"; ` +
 					`mkdir -p /tmp/claude 2>/dev/null; printf leak > ${JSON.stringify(probe)} 2>/dev/null; true`,
 				cwd: fixture.workspace,
 				env: scenarioEnv(fixture),
@@ -267,7 +270,7 @@ describe.skipIf(!supported)("per-session scratch directory (#20)", () => {
 				},
 			});
 			expect(output).toContain(`TMPDIR=${scratch}`);
-			expect(output).toContain("MKTEMP-OK");
+			expect(output).toContain(`MKTEMP-OK=${scratch}/probe.`);
 			expect(existsSync(probe), "the shared /tmp/claude was writable from the sandbox").toBe(false);
 
 			await second.compile(fixture.profile);
