@@ -45,7 +45,8 @@ export type ShellMarker =
 	| "subshell"
 	| "compound"
 	| "clobber"
-	| "unaccounted-line";
+	| "unaccounted-line"
+	| "unusual-whitespace";
 
 export interface Redirect {
 	/** The operator as written: `>`, `>>`, `2>`, `&>`, `<`, `<>`. */
@@ -298,7 +299,10 @@ function stripComments(command: string): string {
 			i = end - 1;
 			continue;
 		}
-		wordStart = /[\s;&|()<>]/.test(char);
+		// Exactly bash's blanks and metacharacters. JavaScript's `\s` also
+		// matches CR, FF, VT and Unicode spaces, after which bash does *not*
+		// start a word, so a `#` there is literal and the rest of the line runs.
+		wordStart = /[ \t\n;&|()<>]/.test(char);
 		out += char;
 	}
 	return out;
@@ -324,8 +328,23 @@ function countScriptLines(command: string): number {
 	return count;
 }
 
+/**
+ * Whitespace and control characters bash does not treat as blanks.
+ *
+ * Bash separates words only at space, tab and newline. The scanners here use
+ * JavaScript's `\s` in places, which also matches CR, FF, VT and the Unicode
+ * spaces, and a word boundary the two disagree on can hide or invent a
+ * command. Rather than prove every such case harmless, a command containing
+ * one of these characters is not confident. A CRLF line ending is the one
+ * ordinary source, and it over-asks.
+ */
+const UNUSUAL_WHITESPACE =
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point
+	/[\0-\x08\v\f\r\x0e-\x1f\x7f\u0085\u00a0\u1680\u180e\u2000-\u200b\u2028\u2029\u202f\u205f\u3000\ufeff]/;
+
 export function parseShell(command: string): ParsedShell {
 	const markers = new Set<ShellMarker>();
+	if (UNUSUAL_WHITESPACE.test(command)) markers.add("unusual-whitespace");
 	const segments = splitSegments(stripComments(command), markers);
 	const commands = segments
 		.map((segment) => {

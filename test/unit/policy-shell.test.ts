@@ -278,6 +278,19 @@ describe("parseShell", () => {
 			expect(parseShell(command).commands.map(commandLine)).toEqual(expected);
 		});
 
+		// Bash starts a word only after space, tab, newline or a metacharacter. A
+		// `#` after any other whitespace-like character is literal, and the rest
+		// of the line runs, so those characters make the parse non-confident.
+		it.each(["\r", "\f", "\v", "\u00a0", "\u2028", "\u3000", "\ufeff", "\u0000", "\u001b"])(
+			"a # after %j does not start a comment, and the parse is not confident",
+			(char) => {
+				const parsed = parseShell(`echo a${char}#b; git push --force origin main`);
+				expect(parsed.confident).toBe(false);
+				expect(parsed.markers).toContain("unusual-whitespace");
+				expect(parsed.commands.map((cmd) => cmd.name)).toContain("git");
+			},
+		);
+
 		it("keeps $# and the length expansion, which are not comments", () => {
 			// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion under test
 			const parsed = parseShell("echo $# ${#x}");

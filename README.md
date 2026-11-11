@@ -1673,7 +1673,9 @@ quietly absorbs its own corrections teaches nobody anything.
   process substitution (also inside double quotes), backticks, heredocs, `eval`, `xargs`,
   scripts/interpreters, archive extraction, directory changes, parameter/pathname expansion
   and unbalanced quotes — and a non-confident parse escalates rather than being trusted.
-  Comments are removed with bash's rule (an unquoted `#` that starts a word). As a tripwire
+  Comments are removed with bash's rule (an unquoted `#` that starts a word after a space,
+  tab, newline or metacharacter), and a command containing any other whitespace or control
+  character (CR, FF, VT, NUL, Unicode spaces, BOM) is non-confident. As a tripwire
   for tokenizer bugs, a multi-line script that parses to fewer simple commands than it has
   non-comment lines is non-confident too, which also covers a quoted argument that spans
   lines, such as a multi-line commit message. A differential test against real bash checks

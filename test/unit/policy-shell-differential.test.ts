@@ -60,6 +60,15 @@ const FRAGMENTS = [
 	"probe @ {#,x}",
 	"probe @ # a comment ending in a backslash \\",
 	"(#comment\nprobe @)",
+	// Characters JavaScript's \s treats as blanks and bash does not: a `#`
+	// after one of them is literal, so the rest of the line runs.
+	"echo a\r#b; probe @",
+	"echo a\f#b; probe @",
+	"echo a\v#b; probe @",
+	"echo a\u00a0#b; probe @",
+	"echo a\u2028#b; probe @",
+	"echo a\u3000#b; probe @",
+	"echo a\ufeff#b; probe @",
 	"probe @ | probe @",
 	"probe @ && probe @",
 	"{ probe @; }",
