@@ -38,26 +38,46 @@ function criticalWriteTarget(path: string): boolean {
 	return isUnderAny(normalized, CRITICAL_TREES);
 }
 
+/**
+ * The deterministic floor under the reviewer's risk.
+ *
+ * Computed as the maximum over independent contributions rather than as a
+ * chain of early returns, so adding a property to an action can never lower
+ * its floor. The chain this replaced checked "has a write path" before "bash
+ * parse is not confident", and every path-shaped argument of a non-reader is a
+ * write, so appending `./x` to an opaque command moved it from `high` to
+ * `medium` (#16).
+ */
 export function minimumRisk(action: CanonicalAction, profile: EffectiveProfile): ReviewRisk {
-	if (action.capability?.kind === "host") return "critical";
+	let floor: ReviewRisk = "low";
+	const raise = (risk: ReviewRisk) => {
+		floor = maxRisk(floor, risk);
+	};
+
+	if (action.capability?.kind === "host") raise("critical");
 	if (action.capability?.kind === "read") {
-		if (broadCapability(action.capability.value)) return "critical";
-		const target = resolveCapabilityTarget(action.cwd, action.capability.value);
-		if (!profile.sandbox.grantableReadDeny.some((entry) => canonical(entry) === target)) return "critical";
-		return "high";
+		const value = action.capability.value;
+		const grantable = (): boolean => {
+			const target = resolveCapabilityTarget(action.cwd, value);
+			return profile.sandbox.grantableReadDeny.some((entry) => canonical(entry) === target);
+		};
+		raise(broadCapability(value) || !grantable() ? "critical" : "high");
 	}
 	if (action.capability?.kind === "write") {
-		if (broadCapability(action.capability.value)) return "critical";
-		const target = resolveCapabilityTarget(action.cwd, action.capability.value);
-		if (criticalWriteTarget(target)) return "critical";
-		if (action.paths.some((path) => isUnderAny(path.resolved, profile.sandbox.readDeny))) return "critical";
-		return "high";
+		const value = action.capability.value;
+		const critical =
+			broadCapability(value) ||
+			criticalWriteTarget(resolveCapabilityTarget(action.cwd, value)) ||
+			action.paths.some((path) => isUnderAny(path.resolved, profile.sandbox.readDeny));
+		raise(critical ? "critical" : "high");
 	}
-	if (action.paths.some((path) => path.writes && criticalWriteTarget(path.resolved))) return "critical";
-	if (destructiveShell(action)) return "high";
-	if (action.tool === "write" || action.tool === "edit" || action.paths.some((path) => path.writes)) return "medium";
-	if (action.tool === "bash" && !action.confident) return "high";
-	return "low";
+	if (action.paths.some((path) => path.writes && criticalWriteTarget(path.resolved))) raise("critical");
+	if (destructiveShell(action)) raise("high");
+	if (action.tool === "write" || action.tool === "edit" || action.paths.some((path) => path.writes)) raise("medium");
+	// An opaque or otherwise non-confident command needs a person or an exact
+	// direct instruction, whatever else it carries.
+	if (action.tool === "bash" && !action.confident) raise("high");
+	return floor;
 }
 
 // Request grammar is case-insensitive; executable data is byte-exact. A suffix

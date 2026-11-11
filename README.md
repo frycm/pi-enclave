@@ -930,7 +930,9 @@ rules end in `deny` or `ask` before L3 exists.
   `{"decision":"allow"|"deny"|"ask","risk":"low"|"medium"|"high"|"critical","reason":"…"}`.
   The model's `risk` is advisory and can only raise the result. Code computes a
   deterministic `minimumRisk` from tool class, requested capability, target breadth,
-  protected/credential ancestry and destructive flags, then evaluates consistency against
+  protected/credential ancestry, destructive flags and parse confidence (a non-confident
+  bash command is at least `high`, whatever arguments it carries), as the maximum over
+  those contributions so that adding a property can never lower it, then evaluates consistency against
   `max(modelRisk, minimumRisk)`. `critical` can never be allowed; effective `high` requires
   direct authorization that deterministically covers this action. A model cannot emit
   `allow` plus `low` to bypass those requirements.
