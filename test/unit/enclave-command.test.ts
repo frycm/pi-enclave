@@ -127,6 +127,13 @@ describe("renderStatus", () => {
 		expect(text).toContain("capabilities");
 	});
 
+	it("lists the directories the persistence scan could not look into (#33)", () => {
+		const text = renderStatus(state({ profile: { ...PROFILE, unscanned: ["/work/pgdata"] } }));
+		expect(text).toContain("unscanned:  1 directory(ies) owned by another account");
+		expect(text).toContain("/work/pgdata");
+		expect(renderStatus(state())).not.toContain("unscanned");
+	});
+
 	it("marks the backend as not started before the first compile", () => {
 		expect(renderStatus(state({ compiled: undefined }))).toContain("not started");
 	});

@@ -360,6 +360,135 @@ describe("sandbox profile authority", () => {
 		expectWriteAllowed(backend, join(metadata, ".githooks"));
 	});
 
+	describe("nested repositories and the submodule anchor (#33)", () => {
+		const derive = (root: string, writableRoots?: string[]) => {
+			const effective = defaultProfile({ cwd: root, home: "/home/u", tmp: SANDBOX_TMPDIR, agentDir: "/agent" });
+			if (writableRoots) effective.sandbox.writableRoots = writableRoots;
+			return toBackendProfile(effective, root);
+		};
+
+		it("protects the config and hooks of a repository nested anywhere in the workspace", () => {
+			const root = mkdtempSync(join(tmpdir(), "enclave-nested-git-"));
+			roots.push(root);
+			initGit(root);
+			const nested = join(root, "vendor", "deep", "inner");
+			initGit(nested);
+			writeFileSync(join(nested, ".git", "config"), "[core]\n\tbare = false\n\thooksPath = .githooks\n");
+			const backend = derive(root);
+			materializeWriteDenyAnchors(backend);
+			expectWriteDenied(backend, join(nested, ".git", "config"));
+			expectWriteDenied(backend, join(nested, ".git", "config.worktree"));
+			expectWriteDenied(backend, join(nested, ".git", "hooks"));
+			// Its own core.hooksPath resolves against its own worktree.
+			expectWriteDenied(backend, join(nested, ".githooks"));
+			expectWriteAllowed(backend, join(nested, ".git", "objects"));
+		});
+
+		it("protects a repository that is one by shape rather than by name, and its worktree's hooks", () => {
+			const root = mkdtempSync(join(tmpdir(), "enclave-bare-shaped-"));
+			roots.push(root);
+			initGit(root);
+			const cache = join(root, "tools", "cache");
+			const result = spawnSync("git", ["init", "-q", "--bare", cache], { encoding: "utf8" });
+			expect(result.status, result.stderr).toBe(0);
+			// What makes `git status` in tools/cache/sub run the fsmonitor.
+			writeFileSync(
+				join(cache, "config"),
+				"[core]\n\tbare = false\n\tworktree = .\n\thooksPath = .githooks\n\tfsmonitor = /tmp/x.sh\n",
+			);
+			const backend = derive(root);
+			materializeWriteDenyAnchors(backend);
+			expectWriteDenied(backend, join(cache, "config"));
+			expectWriteDenied(backend, join(cache, "hooks"));
+			expectWriteDenied(backend, join(cache, ".githooks"));
+			expectWriteAllowed(backend, join(cache, "objects"));
+			expectWriteAllowed(backend, join(root, "tools", "other"));
+		});
+
+		it("refuses a symlinked nested .git with the way out in the message", () => {
+			const root = mkdtempSync(join(tmpdir(), "enclave-nested-link-"));
+			roots.push(root);
+			initGit(root);
+			mkdirSync(join(root, "vendor"));
+			symlinkSync(join(root, ".git"), join(root, "vendor", ".git"));
+			expect(() => derive(root)).toThrow(/symlinked nested Git metadata path.*remove it, or keep it outside/);
+		});
+
+		it("protects a nested repository even when the workspace itself is not one", () => {
+			const root = mkdtempSync(join(tmpdir(), "enclave-nested-only-"));
+			roots.push(root);
+			const nested = join(root, "checkout");
+			initGit(nested);
+			const backend = derive(root);
+			expectWriteDenied(backend, join(nested, ".git", "config"));
+			expectWriteDenied(backend, join(nested, ".git", "hooks"));
+		});
+
+		it("protects a nested gitfile and the directory it points at", () => {
+			const root = mkdtempSync(join(tmpdir(), "enclave-nested-gitfile-"));
+			roots.push(root);
+			initGit(root);
+			const metadata = join(root, "store", "repo.git");
+			const worktree = join(root, "tree");
+			mkdirSync(join(root, "store"));
+			const created = spawnSync("git", ["init", "-q", "--separate-git-dir", metadata, worktree], { encoding: "utf8" });
+			if (created.status !== 0) throw new Error(created.stderr);
+			const backend = derive(root);
+			expectWriteDenied(backend, join(worktree, ".git"));
+			expectWriteDenied(backend, join(metadata, "config"));
+			expectWriteDenied(backend, join(metadata, "hooks"));
+		});
+
+		it("walks every writable root, not only the workspace", () => {
+			const root = mkdtempSync(join(tmpdir(), "enclave-nested-root-"));
+			const extra = mkdtempSync(join(tmpdir(), "enclave-nested-extra-"));
+			roots.push(root, extra);
+			initGit(join(extra, "build", "dep"));
+			const backend = derive(root, [root, extra]);
+			expectWriteDenied(backend, join(extra, "build", "dep", ".git", "config"));
+			expectWriteDenied(backend, join(extra, "build", "dep", ".git", "hooks"));
+		});
+
+		it("compiles a workspace that holds many repositories, protecting each", () => {
+			// Each repository has its own hooks tree and config seeds, so the
+			// per-tree and include bounds must not add up across repositories.
+			const root = mkdtempSync(join(tmpdir(), "enclave-many-repos-"));
+			roots.push(root);
+			initGit(root);
+			for (let index = 0; index < 80; index++) initGit(join(root, `repo${index}`));
+			const backend = derive(root);
+			expectWriteDenied(backend, join(root, "repo79", ".git", "config"));
+			expectWriteDenied(backend, join(root, "repo0", ".git", "hooks"));
+		});
+
+		it("refuses a symlinked nested .git", () => {
+			const root = mkdtempSync(join(tmpdir(), "enclave-nested-link-"));
+			const elsewhere = mkdtempSync(join(tmpdir(), "enclave-nested-link-target-"));
+			roots.push(root, elsewhere);
+			initGit(root);
+			initGit(elsewhere);
+			mkdirSync(join(root, "sub"));
+			symlinkSync(join(elsewhere, ".git"), join(root, "sub", ".git"));
+			expect(() => derive(root)).toThrow(/symlinked nested Git metadata/);
+		});
+
+		it("anchors an absent modules directory read-only, and leaves an existing one writable", () => {
+			const root = mkdtempSync(join(tmpdir(), "enclave-modules-anchor-"));
+			roots.push(root);
+			initGit(root);
+			const anchored = derive(root);
+			expectWriteDenied(anchored, join(root, ".git", "modules"));
+			expect((anchored.materializeWriteDeny ?? []).map(canonical)).toContain(canonical(join(root, ".git", "modules")));
+			materializeWriteDenyAnchors(anchored);
+			expect(existsSync(join(root, ".git", "modules"))).toBe(true);
+
+			// Now it exists (as it would after a person added a submodule), so the
+			// next profile protects per submodule instead of the whole directory.
+			const existing = derive(root);
+			expectWriteAllowed(existing, join(root, ".git", "modules"));
+		});
+	});
+
 	it("materializes a missing reachable include before the sandbox starts", () => {
 		const root = mkdtempSync(join(tmpdir(), "enclave-git-future-include-"));
 		roots.push(root);

@@ -14,6 +14,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { canonical, isUnder } from "../backend/paths.ts";
 import type { Profile } from "../backend/types.ts";
 import { buildChildEnv } from "../env/child-env.ts";
+import { findGitEntries, readGitfile } from "../persistence/git.ts";
 import { type DefaultProfileOptions, defaultProfile } from "./defaults.ts";
 import type { EffectiveProfile } from "./types.ts";
 
@@ -142,8 +143,9 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 			throw error;
 		}
 	};
-	let inspectedHookEntries = 0;
-	const validateHookTree = (path: string): void => {
+	// Bounded per hooks tree rather than per profile: a workspace that holds
+	// many repositories has one tree each (#33).
+	const validateHookTree = (path: string, budget = { remaining: 1024 }): void => {
 		let stat: ReturnType<typeof lstatSync>;
 		try {
 			stat = lstatSync(path);
@@ -155,14 +157,14 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 			throw new Error(`pi-enclave: Git hooks path is not a real directory: ${path}`);
 		}
 		for (const entry of readdirSync(path, { withFileTypes: true })) {
-			inspectedHookEntries++;
-			if (inspectedHookEntries > 1024) throw new Error("pi-enclave: Git hooks trees exceed 1024 entries");
+			budget.remaining--;
+			if (budget.remaining < 0) throw new Error(`pi-enclave: Git hooks tree exceeds 1024 entries: ${path}`);
 			const child = join(path, entry.name);
 			const childStat = lstatSync(child);
 			if (childStat.isSymbolicLink()) {
 				throw new Error(`pi-enclave: refusing a symlinked Git hook entry: ${child}`);
 			}
-			if (childStat.isDirectory()) validateHookTree(child);
+			if (childStat.isDirectory()) validateHookTree(child, budget);
 			else if (!childStat.isFile()) throw new Error(`pi-enclave: refusing a non-file Git hook entry: ${child}`);
 			else if (childStat.nlink !== 1) {
 				throw new Error(`pi-enclave: Git hook entry has multiple hard links: ${child}`);
@@ -232,6 +234,30 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 			protectGitMetadata(isAbsolute(commonValue) ? commonValue : resolve(resolved, commonValue), hooksBase);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	};
+
+	// A repository with no submodules has no `modules` directory, so nothing
+	// above protects the `config` and `hooks` of one the agent adds later.
+	// Anchor `modules` read-only instead; adding or initialising a submodule
+	// then needs an approval (#33). Linked worktrees keep submodules in the
+	// common directory, which is what gets the anchor.
+	const anchorModules = (metadataDir: string) => {
+		let resolved = canonical(metadataDir);
+		const commonFile = join(resolved, "commondir");
+		if (validateProtectedFile(commonFile, "Git commondir")) {
+			const commonValue = readFileSync(commonFile, "utf8").trim();
+			if (!commonValue) throw new Error(`pi-enclave: empty Git commondir file: ${commonFile}`);
+			resolved = canonical(isAbsolute(commonValue) ? commonValue : resolve(resolved, commonValue));
+		}
+		if (!isWritable(resolved)) return;
+		const modules = join(resolved, "modules");
+		try {
+			lstatSync(modules);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			writeDeny.push(modules);
+			materializeWriteDeny.push(modules);
 		}
 	};
 
@@ -371,6 +397,7 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 				}
 				protectGitMetadata(candidate, worktree);
 				protectSubmoduleGitfile(worktree, candidate);
+				anchorModules(candidate);
 				protectSubmoduleContainer(join(candidate, "modules"));
 			} else {
 				// Submodule names may contain slashes, which Git represents as
@@ -389,8 +416,10 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 		const stat = lstatSync(gitDir);
 		hasGitMetadata = true;
 		if (stat.isSymbolicLink()) throw new Error(`pi-enclave: refusing a symlinked Git metadata path: ${gitDir}`);
-		if (stat.isDirectory()) protectGitMetadata(gitDir);
-		else if (stat.isFile()) {
+		if (stat.isDirectory()) {
+			protectGitMetadata(gitDir);
+			anchorModules(gitDir);
+		} else if (stat.isFile()) {
 			if (stat.nlink !== 1) throw new Error(`pi-enclave: Git metadata file has multiple hard links: ${gitDir}`);
 			writeDeny.push(gitDir);
 			const firstLine = readFileSync(gitDir, "utf8").split(/\r?\n/, 1)[0] ?? "";
@@ -398,6 +427,7 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 			if (!match?.[1]) throw new Error(`pi-enclave: refusing an invalid Git metadata file: ${gitDir}`);
 			const target = isAbsolute(match[1]) ? match[1] : resolve(dirname(gitDir), match[1]);
 			protectGitMetadata(target);
+			anchorModules(target);
 		} else throw new Error(`pi-enclave: refusing a non-file Git metadata path: ${gitDir}`);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -431,17 +461,84 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 		protectSubmoduleContainer(join(metadataDir, "modules"));
 	}
 
-	const initializedGitMetadata =
-		hasGitMetadata &&
-		[...protectedGitDirs].some((metadataDir) => {
+	const isInitialized = (metadataDir: string) => {
+		try {
+			const head = lstatSync(join(metadataDir, "HEAD"));
+			return head.isFile() && !head.isSymbolicLink();
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
+	};
+	const initializedGitMetadata = hasGitMetadata && [...protectedGitDirs].some(isInitialized);
+
+	// Repositories anywhere else in a writable root: a cloned dependency, a
+	// fixture, or one the agent planted before this session (#33). Running Git
+	// inside one reads its `config` and `hooks` exactly as for the workspace's
+	// own, and `git status` in a superproject reads them for every submodule.
+	// Repositories created after this point are the tripwire's job.
+	const rootGitEntry = join(canonical(workspaceRoot), ".git");
+	// Directories owned by another account that this user cannot search, such
+	// as a database volume. Nothing run as this user reaches inside them, so
+	// they are skipped and listed in `/enclave status`.
+	const unscanned: string[] = [];
+	for (const entry of findGitEntries(writableRoots, { unscanned })) {
+		if (entry.path === rootGitEntry) continue;
+		if (entry.bare) {
+			// A repository by shape, not by name (see GitEntry.bare). Its hooks
+			// run in the worktree its config names, or in the directory itself.
+			if (protectedGitDirs.has(canonical(entry.path))) continue;
+			const worktree = validateProtectedFile(join(entry.path, "config"), "Git configuration")
+				? (submoduleWorktreeRoot(entry.path) ?? entry.path)
+				: entry.path;
+			if (isUnder(canonical(worktree), canonical(workspaceRoot))) discoverSubmoduleWorktrees(worktree);
+			protectGitMetadata(entry.path, worktree);
+			anchorModules(entry.path);
+			protectSubmoduleContainer(join(canonical(entry.path), "modules"));
+			continue;
+		}
+		const worktree = dirname(entry.path);
+		if (entry.kind === "symlink") {
+			throw new Error(
+				`pi-enclave: refusing a symlinked nested Git metadata path: ${entry.path}; ` +
+					"remove it, or keep it outside sandbox.writableRoots",
+			);
+		}
+		let metadataDir: string;
+		if (entry.kind === "dir") {
+			metadataDir = entry.path;
+		} else if (entry.kind === "file") {
+			validateProtectedFile(entry.path, "nested Git metadata file");
+			const target = readGitfile(entry.path);
+			if (target === undefined) {
+				throw new Error(
+					`pi-enclave: refusing an invalid nested Git metadata file: ${entry.path}; ` +
+						"remove it, or keep it outside sandbox.writableRoots",
+				);
+			}
+			protectWritableFile(entry.path);
 			try {
-				const head = lstatSync(join(metadataDir, "HEAD"));
-				return head.isFile() && !head.isSymbolicLink();
+				lstatSync(target);
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+				// Points nowhere: Git refuses to run there. The tripwire watches the
+				// gitfile in case the target is created later.
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
 				throw error;
 			}
-		});
+			metadataDir = target;
+		} else {
+			throw new Error(
+				`pi-enclave: refusing a non-file nested Git metadata path: ${entry.path}; ` +
+					"remove it, or keep it outside sandbox.writableRoots",
+			);
+		}
+		if (protectedGitDirs.has(canonical(metadataDir))) continue;
+		if (isUnder(worktree, canonical(workspaceRoot))) discoverSubmoduleWorktrees(worktree);
+		protectGitMetadata(metadataDir, worktree);
+		anchorModules(metadataDir);
+		protectSubmoduleContainer(join(canonical(metadataDir), "modules"));
+	}
+
 	if (initializedGitMetadata) {
 		const active = parseGitConfigWithOrigins(
 			gitCommand(workspaceRoot, effective.sandbox.writableRoots, [
@@ -459,11 +556,20 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 			seedGitConfig(absolute, workspaceRoot);
 			protectWritableFile(absolute);
 		}
+	}
 
+	// Includes and `core.hooksPath` of every initialised repository, the
+	// workspace's own and nested ones alike.
+	if (initializedGitMetadata || [...protectedGitDirs].some(isInitialized)) {
 		const queue = [...gitConfigSeeds];
+		// The bound is on files reached through includes. Each repository seeds
+		// its own config and config.worktree, and a workspace may hold many.
+		const includeLimit = queue.length + 64;
 		const visited = new Set<string>();
 		for (let index = 0; index < queue.length; index++) {
-			if (queue.length > 64) throw new Error("pi-enclave: Git configuration include graph exceeds 64 files");
+			if (queue.length > includeLimit) {
+				throw new Error("pi-enclave: Git configuration include graph exceeds 64 files");
+			}
 			const queued = queue[index];
 			if (!queued) continue;
 			const { path: configFile, hooksBase } = queued;
@@ -508,7 +614,9 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 				}
 			}
 		}
+	}
 
+	if (initializedGitMetadata) {
 		const effectiveHooks = gitCommand(workspaceRoot, effective.sandbox.writableRoots, [
 			"rev-parse",
 			"--path-format=absolute",
@@ -529,6 +637,7 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 		allowPty: effective.sandbox.allowPty,
 		envPassthrough: [...effective.sandbox.env.passthrough],
 		envDeny: [...effective.sandbox.env.envDeny],
+		...(unscanned.length > 0 ? { unscanned } : {}),
 	};
 }
 

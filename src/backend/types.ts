@@ -48,6 +48,12 @@ export interface Profile {
 	materializeWriteDeny?: readonly string[];
 	/** Missing protected metadata files the trusted parent creates atomically. */
 	materializeWriteDenyFiles?: readonly string[];
+	/**
+	 * Directories below a writable root that the persistence scan skipped:
+	 * owned by another account and not searchable by this user, so nothing run
+	 * as this user reaches inside them. Reported, never enforced.
+	 */
+	unscanned?: readonly string[];
 	/** Absolute paths that may not be read, even though reads are otherwise open. */
 	readDeny: readonly string[];
 	/** The explicitly selected scratch path exposed to children as TMPDIR. */
@@ -114,8 +120,11 @@ export type ViolationKind = "read" | "write" | "network" | "exec" | "socket";
  * - `proxy`      -- a userspace decision by the egress proxy, not the kernel.
  * - `policy`     -- a failed bash invocation explicitly targeted a configured
  *                  denied read path on a backend that emits no read event.
+ * - `tripwire`   -- not a denial: the trusted parent found a persistence path
+ *                  (Git configuration or hooks) that appeared or changed
+ *                  during the turn, where the kernel profile could not deny it.
  */
-export type ViolationSource = "errno" | "kernel-log" | "proxy" | "policy";
+export type ViolationSource = "errno" | "kernel-log" | "proxy" | "policy" | "tripwire";
 
 export interface Violation {
 	kind: ViolationKind;

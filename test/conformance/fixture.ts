@@ -14,6 +14,8 @@ import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Profile } from "../../src/backend/types.ts";
+import { defaultProfile } from "../../src/config/defaults.ts";
+import { toBackendProfile } from "../../src/config/profile.ts";
 
 /** Planted in the parent process so the env-leak scenario has something to find. */
 export const SECRET_ENV = {
@@ -103,8 +105,21 @@ export function createFixture(): Fixture {
 	// hook execution surfaces after the sandbox profile was compiled. C6 can then
 	// prove ordinary Git writes (index, objects and refs) remain usable while the
 	// pre-existing config and hooks stay read-only.
-	const initialized = spawnSync("git", ["init", "-q", workspace], { encoding: "utf8" });
-	if (initialized.status !== 0) throw new Error(initialized.stderr || "conformance fixture git init failed");
+	const git = (args: string[]) => {
+		const result = spawnSync("git", args, { encoding: "utf8" });
+		if (result.status !== 0) throw new Error(result.stderr || `conformance fixture git ${args.join(" ")} failed`);
+	};
+	git(["init", "-q", workspace]);
+	// A submodule's Git directory, below the superproject's `.git/modules`, and
+	// a repository nested elsewhere in the workspace (#33). Each has its own
+	// `config` and `hooks`, which `git status` reads. The submodule is laid out
+	// as `git submodule add` leaves it, without needing a remote to clone.
+	mkdirSync(join(workspace, ".git", "modules"));
+	git(["init", "-q", "--separate-git-dir", join(workspace, ".git", "modules", "lib"), join(workspace, "lib")]);
+	writeFileSync(join(workspace, ".gitmodules"), '[submodule "lib"]\n\tpath = lib\n\turl = ../lib\n');
+	git(["init", "-q", join(workspace, "vendor", "inner")]);
+	// A repository by shape, not by name: Git finds it from any directory below.
+	git(["init", "-q", "--bare", join(workspace, "tools", "cache")]);
 
 	// The symlink-race pair: both live inside the writable workspace but resolve
 	// outside it. The kernel decides on the resolved path, which is the whole
@@ -151,10 +166,19 @@ export function createFixture(): Fixture {
 	mkdirSync(join(workspace, "src", "a"), { recursive: true });
 	writeFileSync(join(workspace, "src", "a", "foo.spec.ts"), "");
 
+	// The Git persistence paths come from the production derivation rather than
+	// a hand-written list, so C15 and C17 test what a session actually compiles.
+	// Only the write side is taken; the read side stays this fixture's own.
+	const derivation = defaultProfile({ cwd: workspace });
+	derivation.sandbox.readDeny = [];
+	const derived = toBackendProfile(derivation, workspace);
+
 	const profile: Profile = {
 		mode: "workspace-write",
 		writableRoots: [workspace],
-		writeDeny: [join(workspace, ".pi"), join(workspace, ".git", "hooks"), join(workspace, ".git", "config")],
+		writeDeny: derived.writeDeny ?? [],
+		...(derived.materializeWriteDeny ? { materializeWriteDeny: derived.materializeWriteDeny } : {}),
+		...(derived.materializeWriteDenyFiles ? { materializeWriteDenyFiles: derived.materializeWriteDenyFiles } : {}),
 		readDeny: [deniedHome, lateDenied, deniedFile, deniedLink, deniedUnderLink],
 		network: "off",
 		allowPty: true,

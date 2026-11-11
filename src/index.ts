@@ -65,6 +65,8 @@ import { ActionLock } from "./gate/lock.ts";
 import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
 import { PROVENANCE_ENTRY_TYPE, ProvenanceTracker } from "./gate/provenance.ts";
 import { toolReachability } from "./gate/reachability.ts";
+import { gitPersistenceSurface } from "./persistence/git.ts";
+import { formatTripwireHits, PersistenceTripwire } from "./persistence/tripwire.ts";
 import { formatProbeReport } from "./probe.ts";
 import { probeHost } from "./probe-host.ts";
 import { critiqueRulebook, formatCritique } from "./reviewer/critique.ts";
@@ -175,6 +177,10 @@ export default function (pi: ExtensionAPI): void {
 	let ownershipError: string | undefined;
 
 	let compiled: CompiledProfile | undefined;
+	/** Watches Git persistence paths the compiled profile could not deny (#33). */
+	let tripwire: PersistenceTripwire | undefined;
+	/** Set by session_start, so the tripwire can warn outside an event with a context. */
+	let warnUser: ((message: string) => void) | undefined;
 	const violations: Violation[] = [];
 
 	/**
@@ -359,6 +365,33 @@ export default function (pi: ExtensionAPI): void {
 		refreshStatusLine?.();
 	};
 
+	/**
+	 * Report persistence paths that appeared or changed since the last check.
+	 *
+	 * `agent` says whether the change can only have come from the agent's
+	 * turn. It then counts for the breaker like a denial. A change found
+	 * between turns may be the user's own (an editor, a terminal), so it is
+	 * reported and audited, but not counted.
+	 */
+	const checkTripwire = (agent: boolean) => {
+		const hits = tripwire?.check() ?? [];
+		if (hits.length === 0) return;
+		recordViolations(
+			hits.map((hit) => ({
+				kind: "write",
+				source: "tripwire",
+				op: hit.change,
+				path: hit.path,
+				backend: backend.name,
+				...(hit.detail ? { raw: hit.detail } : {}),
+			})),
+			agent,
+		);
+		const message = formatTripwireHits(hits, agent ? "during the agent's turn" : "since the agent's last turn");
+		process.stderr.write(`${message}\n`);
+		warnUser?.(message);
+	};
+
 	// Denials seen by the filesystem helper reach the same counter and footer as
 	// shell ones. Without this the file tools would enforce silently -- the whole
 	// point of step 7 being invisible in the one place a user looks.
@@ -456,8 +489,22 @@ export default function (pi: ExtensionAPI): void {
 		// rather than the gated `operations`, which would refuse them as unlocked.
 		// With no sandbox the shortcut is answered outright rather than left to a
 		// throwing exec, so the user sees the diagnosis and not a stack trace.
+		// A `!` command is the user's own, so what it changes is accepted, not
+		// reported. Anything already changed before it is checked first, so it
+		// cannot be absorbed into the user's baseline.
+		const userBashWithTripwire: typeof userBashOperations = {
+			...userBashOperations,
+			async exec(...args) {
+				checkTripwire(false);
+				try {
+					return await userBashOperations.exec(...args);
+				} finally {
+					tripwire?.rebaseline();
+				}
+			},
+		};
 		pi.on("user_bash", () => {
-			if (report.ok) return { operations: userBashOperations };
+			if (report.ok) return { operations: userBashWithTripwire };
 			return {
 				result: {
 					output: `pi-enclave: refusing to run unsandboxed.\n${formatProbeReport(report)}\n`,
@@ -658,6 +705,9 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
+		// Before the breaker closes the turn, so a persistence path created in
+		// this turn is a strike against it.
+		checkTripwire(true);
 		// Whether this turn contributed a strike, before finishTurn consumes it.
 		const recorded = breaker.hasOutcome(event.turnIndex);
 		const opened = breaker.finishTurn(event.turnIndex);
@@ -689,6 +739,10 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", (event) => {
+		// Changes made while the agent was idle are reported now, and then
+		// belong to the baseline, so the user's own edits are never counted
+		// against the next turn.
+		checkTripwire(false);
 		if (event.messageType === "user") directInput.confirmPrompt(event.prompt);
 	});
 
@@ -734,6 +788,8 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		compiled = undefined;
+		tripwire = undefined;
+		warnUser = (message) => ctx.ui.notify(message, "warning");
 		// Pi 1.1 executes built-in operations relative to ctx.cwd. SDK sessions
 		// can differ from process.cwd(), so policy, hashes and grep must agree.
 		cwd = ctx.cwd;
@@ -958,6 +1014,10 @@ export default function (pi: ExtensionAPI): void {
 
 		try {
 			compiled = await backend.compile(profile);
+			// After compiling, which materialises the protected anchors, so their
+			// creation is not reported as the agent's.
+			const roots = profile.writableRoots;
+			tripwire = new PersistenceTripwire(() => gitPersistenceSurface(roots), cwd);
 		} catch (error) {
 			configError = (error as Error).message;
 			ctx.ui.notify(configError, "error");

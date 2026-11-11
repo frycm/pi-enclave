@@ -700,7 +700,8 @@ are treated the same way; Git's documented global options are also stripped for 
 `git -C nested init`, `git -c … reset --hard`, and `git -C . push` still hit their built-in
 rules. The built-in executable persistence roots (`$WORKSPACE/.pi`, the active Git hooks
 directory, normal, bare and existing submodule repository config/hooks and worktree
-`.git` files, and any top-level `.git` gitfile) and credential
+`.git` files, any top-level `.git` gitfile, and the config/hooks of every repository nested
+anywhere in a writable root) and credential
 roots are also `writeDeny` entries in L2. Before compiling the sandbox, the trusted parent
 asks Git for its effective configuration, recursively follows both `include.path` and every
 reachable `includeIf.*.path`, and protects each config origin and each possible
@@ -721,6 +722,57 @@ session compiles their persistence paths. If a configured include or hook path h
 an absent or symlinked parent that cannot be mounted safely, profile compilation fails
 closed. L1 improves diagnostics and handles `ask`; it is never the sole enforcement of a
 non-overridable persistence denial.
+
+**Submodules and nested repositories (#33).** `git status` in a superproject runs `git status`
+in every submodule, and each reads its own `config`, so a `core.fsmonitor`, `core.hooksPath`,
+`core.pager`, filter driver or alias written into `.git/modules/<name>/config` would run with
+your privileges the next time you or your editor touch the repository. Protection is in three
+layers:
+
+- **At compile time (L2).** The trusted parent walks every writable root, without following
+  symlinks and without running Git, and protects the `config`, `config.worktree` and `hooks` of
+  every Git directory it finds: the workspace's own, each submodule's below `.git/modules`
+  (including nested and namespaced names), linked worktrees via `commondir`, and any other
+  repository nested in the tree, through its `.git` directory or gitfile. It also protects any
+  directory that is a repository by its contents rather than its name (a `HEAD` entry with
+  `objects` and `refs`, or with `commondir`): Git checks every ancestor of the current
+  directory for that shape, so with `core.bare = false` and `core.worktree = .` in its config,
+  `git status` anywhere below it runs that config. Its hooks are resolved against the worktree
+  its config names. A symlinked or invalid nested `.git` refuses; remove it or keep it outside
+  `sandbox.writableRoots`. A directory owned by another account that you cannot search (a
+  database volume such as `pgdata/`, mode 0700) is skipped, since nothing run as you, the
+  agent included, can reach inside it; `/enclave status` lists such directories under
+  `unscanned`. A directory you own but cannot list, or one you can search but not list, still
+  refuses, because that is what a hidden path would look like. A Git directory with no `modules` yet gets a read-only, materialized
+  `modules` anchor, so a submodule the agent adds cannot bring a writable config with it;
+  adding or initializing a submodule then needs a person, as above. On Linux the directories
+  between a writable root and each protected path are pinned as mount points, as for the
+  workspace's own `.git`, so a nested Git directory cannot be moved aside and replaced; the
+  cost is that those directories cannot be renamed or removed inside the sandbox either. The
+  walk is bounded to 500,000 entries and refuses beyond that rather than protecting part of
+  the tree.
+- **After every turn (tripwire).** A repository created after compile time, or a new
+  submodule directory below an existing `.git/modules`, cannot be denied by name inside a
+  writable bind. So the parent fingerprints that surface at session start (each `.git` entry
+  and bare-shaped Git directory, each skipped directory by owner and mode, and every Git
+  directory's `config`, `config.worktree`, `commondir`, `hooks` tree and
+  `modules` listing, by inode, size and times) and compares it at the end of every turn. A
+  path that appeared or changed is recorded as a violation (source `tripwire`), counted for the
+  breaker, written to the audit log and shown as a warning naming the paths. Changes found
+  between turns, or before a `!` command, are reported but not counted, since they may be
+  yours; a `!` command's own changes are accepted. The next session's profile protects any new
+  repository at L2. The tripwire detects; it does not undo the change.
+- **L1 defaults.** `protectedPaths.deny` includes `**/.git/modules/**/config`,
+  `**/.git/modules/**/hooks/**` and `**/.git/worktrees/**/config.worktree`.
+
+Running Git in a workspace an agent has written to still reads agent-writable configuration
+wherever the above does not reach (for example a repository the agent created between your
+last two turns, which the tripwire reports but does not revert). To inspect such a tree
+safely:
+
+```sh
+git -c core.fsmonitor=false -c core.hooksPath=/dev/null --no-pager status --ignore-submodules=all
+```
 
 ```json
 {
@@ -1518,6 +1570,7 @@ sandbox's, so a green row on a restricted host is not read as stronger evidence 
 | **Symlink write**: `ws/out → /etc/passwd`, then `write ws/out` | Violation | 1 | C4, F2 |
 | Interpreter/archive writes `$WORKSPACE/.pi/extensions` inside a writable workspace | Violation from L2 `writeDeny`; static shell inference is not the boundary | 1 | C15 |
 | Rename a writable ancestor of a protected Git config/hook leaf, recreate the original tree, then write a hook | Ancestor displacement or replacement write is denied by the native backend | 1 | C16 |
+| Write a submodule's `.git/modules/<name>/config` or hook, a nested repository's `config` or hook, or a new submodule's config below a repository with no `modules` yet | Violation from L2 `writeDeny`; L1 denies the same paths by name (#33) | 1, 2 | C17, P14 |
 | `curl`, `nc`, `python -c "socket…"`, DNS lookup | Violation (`off` mode) | 1 | C5 |
 | Spawn a PTY (`vim`, `less`), Python multiprocessing, `git worktree` outside cwd | Works / violation as configured. **Linux:** bubblewrap cannot deny PTYs, so `allowPty: false` is not enforceable there and the compiled profile reports `pty on` | 1 | C6 |
 | Script that calls `sudo` / `su` / `systemctl` | Violation, not a policy denial | 1 | C7 |
@@ -1563,8 +1616,9 @@ do, which differs from each other more than the design assumed.
   per request; complete parent-side grep executions (including parsing and context reads)
   are serialized, the helper admits one potentially large response at a time, and response
   framing honors stdout backpressure before allocating the next frame.
-- **Executable project state is an L2 denial.** The workspace `.pi` root, Git hooks/config,
-  and submodule worktree gitfiles (including gitfile-inferred worktrees) are
+- **Executable project state is an L2 denial.** The workspace `.pi` root, Git hooks/config
+  of the workspace, its submodules and any repository nested in a writable root, and
+  submodule worktree gitfiles (including gitfile-inferred worktrees) are
   read-only inside an otherwise writable workspace, so an interpreter, archive or build
   script cannot plant code for a later privileged Pi/Git launch. Credential read-deny roots
   are write-denied too.

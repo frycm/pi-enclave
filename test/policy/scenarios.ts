@@ -21,7 +21,13 @@
 import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_RULES_ASK, DEFAULT_RULES_DENY, defaultProfile, OWNED_TOOLS } from "../../src/config/defaults.ts";
+import {
+	DEFAULT_PROTECTED_DENY,
+	DEFAULT_RULES_ASK,
+	DEFAULT_RULES_DENY,
+	defaultProfile,
+	OWNED_TOOLS,
+} from "../../src/config/defaults.ts";
 import { applyPatch, fold, narrowerOrEqual } from "../../src/config/merge.ts";
 import { parseDocument } from "../../src/config/schema.ts";
 import type { EffectiveProfile } from "../../src/config/types.ts";
@@ -29,6 +35,7 @@ import { resolveAttendance } from "../../src/escalate/attendance.ts";
 import { pendingDirs, readPending, writePending } from "../../src/escalate/pending.ts";
 import { checkResume } from "../../src/escalate/resume.ts";
 import { CircuitBreaker } from "../../src/gate/breaker.ts";
+import { decide } from "../../src/gate/gate.ts";
 import { ActionLock } from "../../src/gate/lock.ts";
 import { checkOwnership } from "../../src/gate/ownership.ts";
 import { type CanonicalAction, canonicalize } from "../../src/policy/canonical.ts";
@@ -339,7 +346,52 @@ export const POLICY_SCENARIOS: PolicyScenario[] = [
 		run: () => launcherScenario(true),
 		control: () => launcherScenario(false),
 	},
+
+	{
+		id: "P14",
+		title: "Submodule and linked-worktree Git configuration and hooks are protected paths",
+		matrixRow: "Write to a submodule's config or hooks, or a linked worktree's config.worktree",
+		controlNote: "the three #33 patterns are removed from the default protectedPaths.deny",
+		run: (world) => submoduleProtectionScenario(world, DEFAULT_PROTECTED_DENY),
+		control: (world) =>
+			submoduleProtectionScenario(
+				world,
+				DEFAULT_PROTECTED_DENY.filter(
+					(pattern) => !pattern.startsWith("**/.git/modules/") && !pattern.startsWith("**/.git/worktrees/"),
+				),
+			),
+	},
 ];
+
+/**
+ * P14 (#33). `git status` in a superproject reads every submodule's own
+ * `config`, so `core.fsmonitor` there runs outside the sandbox. L2 denies the
+ * paths that exist at compile time; L1 must refuse the same writes by name,
+ * including a nested submodule name and a direct `git config -f`.
+ */
+async function submoduleProtectionScenario(world: World, deny: readonly string[]): Promise<PolicyResult> {
+	const profile = baseProfile(world, (p) => {
+		p.rules.protectedPaths.deny = [...deny];
+	});
+	const calls: [string, Record<string, unknown>][] = [
+		["write", { path: ".git/modules/lib/config", content: "[core]\n\tfsmonitor = /work/x.sh\n" }],
+		["write", { path: ".git/modules/lib/hooks/post-checkout", content: "#!/bin/sh\n" }],
+		["write", { path: ".git/modules/vendor/nested/modules/inner/config", content: "x" }],
+		["write", { path: "sub/.git/modules/lib/hooks/pre-commit", content: "x" }],
+		["write", { path: ".git/worktrees/feature/config.worktree", content: "x" }],
+		["bash", { command: "git config -f .git/modules/lib/config core.fsmonitor /work/tools/x.sh" }],
+	];
+	const allowed: string[] = [];
+	for (const [toolName, input] of calls) {
+		const decision = await decide(
+			{ toolName, toolCallId: "p14", input },
+			{ profile, cwd: "/work", home: "/home/u", lock: new ActionLock(), owned: OWNED_TOOLS },
+		);
+		if (!decision.block) allowed.push(String(input.path ?? input.command));
+	}
+	if (allowed.length > 0) return bad(`not refused: ${allowed.join("; ")}`);
+	return ok(`all ${calls.length} writes to submodule and worktree Git configuration or hooks were refused`);
+}
 
 // ---------------------------------------------------------------------------
 // The scenarios with enough machinery to need a function
