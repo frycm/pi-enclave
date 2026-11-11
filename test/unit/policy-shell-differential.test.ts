@@ -16,6 +16,11 @@
  * argument. Nothing else in the fragments has an effect: only `probe`, `echo`
  * and `true` are run, in a throwaway directory.
  *
+ * The probe is installed under the name of a command in the tokenizer's known
+ * table (`PROBE`), because an unknown command name is never confident and the
+ * property would hold vacuously. The fragments are written with `probe` and
+ * renamed before they run; the real program of that name is never run.
+ *
  * Over-listing (the parser lists a probe bash did not run, for example one in a
  * comment it failed to strip) is not a safety failure and is not asserted here;
  * the unit tests pin the exact parse for those cases.
@@ -26,6 +31,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { parseShell } from "../../src/policy/shell.ts";
+
+/** A known command name, shadowed on PATH by the probe script. */
+const PROBE = "tac";
 
 const BASH = ["/bin/bash", "/usr/bin/bash"].find((path) => spawnSync(path, ["-c", "true"]).status === 0);
 
@@ -60,6 +68,10 @@ const FRAGMENTS = [
 	"probe @ {#,x}",
 	"probe @ # a comment ending in a backslash \\",
 	"(#comment\nprobe @)",
+	// A shell with no arguments runs what reaches its stdin.
+	"echo 'probe @' |& sh",
+	"echo 'probe @' |\nsh",
+	"echo 'probe @' > f; exec < f; sh",
 	// Characters JavaScript's \s treats as blanks and bash does not: a `#`
 	// after one of them is literal, so the rest of the line runs.
 	"echo a\r#b; probe @",
@@ -101,7 +113,7 @@ function buildScripts(): string[] {
 	}
 	return scripts.map((script) => {
 		let id = 0;
-		return script.replace(/@/g, () => `p${++id}`);
+		return script.replace(/@/g, () => `p${++id}`).replace(/\bprobe\b/g, PROBE);
 	});
 }
 
@@ -116,7 +128,7 @@ describe.skipIf(!BASH)("the tokenizer against real bash", () => {
 		work = join(root, "work");
 		mkdirSync(bin);
 		mkdirSync(work);
-		const probe = join(bin, "probe");
+		const probe = join(bin, PROBE);
 		writeFileSync(probe, '#!/bin/sh\nprintf "%s\\n" "$1" >> "$PROBE_LOG"\n');
 		chmodSync(probe, 0o755);
 	});
@@ -125,8 +137,12 @@ describe.skipIf(!BASH)("the tokenizer against real bash", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
+	let runs = 0;
+
 	function run(script: string): string[] {
-		const log = join(root, "probe.log");
+		// One log per script: a job a script backgrounds may still write after
+		// bash returns, and must not be credited to the next script.
+		const log = join(root, `probe-${++runs}.log`);
 		writeFileSync(log, "");
 		spawnSync(BASH as string, ["--noprofile", "--norc", "-c", script], {
 			cwd: work,
@@ -149,7 +165,7 @@ describe.skipIf(!BASH)("the tokenizer against real bash", () => {
 			confident++;
 			const listed = new Set(
 				parsed.commands
-					.filter((command) => command.name === "probe")
+					.filter((command) => command.name === PROBE)
 					.map((command) => command.args[0])
 					.filter((arg): arg is string => arg !== undefined),
 			);
@@ -167,7 +183,7 @@ describe.skipIf(!BASH)("the tokenizer against real bash", () => {
 	// A control for the harness itself: a parse that drops a command bash runs
 	// must be detected, otherwise the property above could hold vacuously.
 	it("detects a command the parser failed to list", () => {
-		expect(run("probe p1 # it's\nprobe p2 # it's")).toEqual(["p1", "p2"]);
-		expect(run('true "`probe p1`"')).toEqual(["p1"]);
+		expect(run(`${PROBE} p1 # it's\n${PROBE} p2 # it's`)).toEqual(["p1", "p2"]);
+		expect(run(`true "\`${PROBE} p1\`"`)).toEqual(["p1"]);
 	});
 });

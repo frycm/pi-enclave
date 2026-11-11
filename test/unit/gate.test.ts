@@ -314,6 +314,29 @@ describe("the gate", () => {
 			expect((await gate("bash", { command })).outcome).toBe(outcome);
 		});
 
+		// #15: a launcher that runs the inner command is not trusted as ordinary.
+		// In deterministic mode it asks, like an identified wrapper always did.
+		it.each([
+			"coproc rm -rf src",
+			"flock /tmp/claude/l git push",
+			"strace -f -o /dev/null rm -rf src",
+			"script -qc 'rm -rf src' /dev/null",
+			"vim -es -c '!rm -rf src' -c q",
+			"parallel rm -rf ::: src",
+			"sort --compress-program=./x -S 1k big",
+			"git config alias.st '!rm -rf src'",
+			"git st",
+			"hash -p /usr/bin/rm ls\nls -rf src",
+			"man -P 'echo PWNED' ls",
+			"git grep -O'echo PWNED' x",
+			"git diff --ext-diff",
+			"git submodule foreach 'git config core.fsmonitor /work/x.sh'",
+		])("asks for the launcher %j", async (command) => {
+			const decision = await gate("bash", { command });
+			expect(decision.outcome).toBe("ask-denied");
+			expect(decision.reason).toContain("could not be parsed with confidence");
+		});
+
 		it("does not ask for a command it parsed confidently", async () => {
 			expect((await gate("bash", { command: "ls -la" })).outcome).toBe("allow");
 		});

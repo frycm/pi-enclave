@@ -68,6 +68,19 @@ describe("reviewer trigger classifier", () => {
 		expect(classify(command).classification.readOnly).toBe(false);
 	});
 
+	// #15: a builtin that rebinds a later command name makes the whole script
+	// mutating, even when every other command is a listed reader.
+	it.each([
+		"hash -p /usr/bin/rm ls\nls -rf src",
+		"hash -p /usr/bin/rm cat; cat x",
+		"shopt -s expand_aliases\nalias ls='rm -rf'\nls src",
+		"alias cat='rm -rf'; cat src",
+		"unalias ls; ls",
+		"shopt -s extglob; ls",
+	])("never classifies a script with a state-changing builtin as read-only: %j", (command) => {
+		expect(classify(command).classification.readOnly).toBe(false);
+	});
+
 	it("still fast-paths a reader with a comment", () => {
 		expect(classify("cat README.md # it's the readme").classification.readOnly).toBe(true);
 	});
