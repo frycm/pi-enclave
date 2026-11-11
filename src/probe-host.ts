@@ -4,7 +4,7 @@
  * exhaustively from any platform.
  */
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { arch } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -130,23 +130,57 @@ export function readTextSync(path: string): string | null {
 }
 
 /**
+ * sandbox-runtime's vendor directory name for an architecture, or null where it
+ * ships no helper. Mirrors SRT's own mapping: ia32 is deliberately absent,
+ * because `socketcall()` multiplexes every socket operation there and the
+ * filter cannot see the address family.
+ */
+export function seccompHelperArch(architecture: string): "x64" | "arm64" | null {
+	if (architecture === "x64") return "x64";
+	if (architecture === "arm64") return "arm64";
+	return null;
+}
+
+/** The installed sandbox-runtime package root, or null when it cannot be resolved. */
+function srtPackageRoot(): string | null {
+	try {
+		const entry = fileURLToPath(import.meta.resolve("@anthropic-ai/sandbox-runtime"));
+		// dist/index.js -> package root
+		return dirname(dirname(entry));
+	} catch {
+		return null;
+	}
+}
+
+/**
  * Locate sandbox-runtime's vendored seccomp helper for this architecture.
+ *
+ * The helper is what blocks `socket(AF_UNIX, ...)` inside the Linux sandbox.
+ * When sandbox-runtime cannot find it, it records a warning nobody reads and
+ * runs every command without the filter, so a null here must fail the probe
+ * rather than pass it (#34).
+ *
+ * Only the package pi-enclave itself depends on is searched. sandbox-runtime
+ * would also fall back to a global npm install, which nothing here has
+ * vetted; the resolved path is passed to it explicitly so that fallback is
+ * never taken. The canonical path is returned, so the writable-root check sees
+ * the file bwrap will actually execute.
  *
  * Resolved from the installed package rather than hardcoded, so a version bump
  * that moves or renames it surfaces as "helper not found" instead of a silently
  * skipped check.
  */
-function resolveSeccompHelper(): string | null {
+export function resolveSeccompHelper(
+	packageRoot: string | null = srtPackageRoot(),
+	architecture: string = arch(),
+): string | null {
+	const name = seccompHelperArch(architecture);
+	if (!packageRoot || !name) return null;
+	const candidate = join(packageRoot, "vendor", "seccomp", name, "apply-seccomp");
 	try {
-		const entry = fileURLToPath(import.meta.resolve("@anthropic-ai/sandbox-runtime"));
-		// dist/index.js -> package root
-		const root = dirname(dirname(entry));
-		const arches = arch() === "arm64" ? ["arm64"] : ["x64"];
-		for (const name of arches) {
-			const candidate = join(root, "vendor", "seccomp", name, "apply-seccomp");
-			if (existsSync(candidate)) return candidate;
-		}
-		return null;
+		accessSync(candidate, constants.X_OK);
+		const resolved = realpathSync(candidate);
+		return statSync(resolved).isFile() ? resolved : null;
 	} catch {
 		return null;
 	}
@@ -172,7 +206,13 @@ export function canNestNamespaces(
 	if (!executableSafety.ok) return executableSafety;
 
 	const helper = resolveSeccompHelper();
-	const inner = helper ? [helper, "true"] : ["true"];
+	// Without the helper there is nothing to nest, and running plain `true`
+	// would report a working sandbox that has no Unix-socket filter. The
+	// seccomp-helper check states the cause; this one must not contradict it.
+	if (helper === null) {
+		return { ok: false, detail: "the seccomp helper is missing, so the namespace chain cannot be checked" };
+	}
+	const inner = [helper, "true"];
 	const probe = spawnSync(
 		bwrap,
 		[
@@ -194,12 +234,7 @@ export function canNestNamespaces(
 	);
 
 	if (probe.status === 0) {
-		return {
-			ok: true,
-			detail: helper
-				? "bubblewrap and the seccomp helper can both create the namespaces they need"
-				: "bubblewrap can create a capability-bearing namespace (seccomp helper not found; check is partial)",
-		};
+		return { ok: true, detail: "bubblewrap and the seccomp helper can both create the namespaces they need" };
 	}
 
 	const message = `${probe.stderr ?? ""}${probe.stdout ?? ""}`.trim().split("\n")[0] ?? "unknown failure";
@@ -221,6 +256,7 @@ export function hostProbeEnv(piVersion: string | null): ProbeEnv {
 		which: whichSync,
 		readText: readTextSync,
 		canNestNamespaces,
+		seccompHelper: () => resolveSeccompHelper(),
 		pathSafety: () => hostRuntimeSafety([process.cwd()]),
 	};
 }

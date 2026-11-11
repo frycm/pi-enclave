@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { shellWriteCapabilityIssue, validateWriteCapability } from "../../src/backend/capability.ts";
 import { canonical } from "../../src/backend/paths.ts";
@@ -9,12 +9,14 @@ import {
 	effectiveProfile,
 	linuxWriteMountPins,
 	materializeWriteDenyAnchors,
+	SrtBackend,
 	srtTmpDir,
 	toSrtConfig,
 } from "../../src/backend/srt.ts";
 import { type Profile, SANDBOX_TMPDIR } from "../../src/backend/types.ts";
 import { defaultProfile } from "../../src/config/defaults.ts";
 import { toBackendProfile } from "../../src/config/profile.ts";
+import { resolveSeccompHelper } from "../../src/probe-host.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -47,6 +49,30 @@ describe("sandbox profile authority", () => {
 		const config = toSrtConfig(profile(["/work"]));
 		expect(config.credentials.envVars).toContainEqual({ name: "JAVA_TOOL_OPTIONS", mode: "deny" });
 	});
+	it("pins the probed seccomp helper on Linux so SRT never falls back to a global install (#34)", () => {
+		const applyPath = "/opt/srt/vendor/seccomp/x64/apply-seccomp";
+		expect(toSrtConfig(profile(["/work"]), false, "linux", { seccompHelper: applyPath }).seccomp).toEqual({
+			applyPath,
+		});
+		expect(toSrtConfig(profile(["/work"]), false, "darwin", { seccompHelper: applyPath }).seccomp).toBeUndefined();
+	});
+	it.skipIf(process.platform !== "linux")(
+		"refuses to compile when the seccomp helper sits under a writable root (#34)",
+		async () => {
+			const helper = resolveSeccompHelper();
+			if (helper === null) throw new Error("the installed sandbox-runtime ships no helper for this architecture");
+			const packageRoot = join(dirname(helper), "..", "..", "..");
+			const ambientPath = process.env.PATH;
+			process.env.PATH = "/usr/bin:/bin";
+			const backend = new SrtBackend();
+			try {
+				await expect(backend.compile(profile([packageRoot]))).rejects.toThrow(/agent-writable seccomp helper/);
+			} finally {
+				process.env.PATH = ambientPath;
+				await backend.dispose();
+			}
+		},
+	);
 	it("fails closed for shell write grants whose process lifetime cannot be contained on macOS", () => {
 		expect(shellWriteCapabilityIssue("darwin")).toContain("could outlive the invocation");
 		expect(shellWriteCapabilityIssue("linux")).toBeUndefined();
