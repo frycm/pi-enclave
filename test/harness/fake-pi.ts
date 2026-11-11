@@ -19,7 +19,7 @@
  * Sources on v1.5.2: extensions/runner.ts (emitToolCall), agent-loop.ts
  * (prepareToolCall and executeToolCallsParallel), agent-session.ts (_beforeToolCall).
  * The installed session's nested path is exercised separately in
- * test/unit/pi-1.1-integration.test.ts. Sequential tools prepare per call.
+ * test/unit/pi-integration.test.ts. Sequential tools prepare per call.
  */
 
 export interface FakeToolCallEvent {
