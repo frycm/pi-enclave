@@ -161,6 +161,7 @@ async function completeOllama(target: Endpoint, request: CompletionRequest): Pro
 	) {
 		throw new Error("pi-enclave: invalid isolated Ollama completion");
 	}
+	request.onFirstOutput?.();
 	return message.content;
 }
 
@@ -170,7 +171,7 @@ async function completeSnapshot(target: Endpoint, request: CompletionRequest): P
 		throw new Error("pi-enclave: unsupported reviewer identity or sampling adapter");
 	// Invoke the pinned adapter with the exact checked endpoint/auth snapshot.
 	// ModelRegistry.complete would resolve auth (including baseUrl) again.
-	const response = await streamOpenAI(
+	const stream = streamOpenAI(
 		{ ...target.model, api: "openai-completions", samplingParams: {} },
 		normalizeContext({
 			messages: [
@@ -188,7 +189,15 @@ async function completeSnapshot(target: Endpoint, request: CompletionRequest): P
 			samplingParams: { seed: request.seed },
 			fetch: (url, init) => fetch(url, { ...init, redirect: "error" }),
 		},
-	).result();
+	);
+	let observed = false;
+	for await (const event of stream) {
+		if (!observed && event.type === "text_delta" && event.delta.length > 0) {
+			observed = true;
+			request.onFirstOutput?.();
+		}
+	}
+	const response = await stream.result();
 	if (response.stopReason === "error" || response.stopReason === "aborted")
 		throw new Error(response.errorMessage ?? `completion stopped with ${response.stopReason}`);
 	return response.content

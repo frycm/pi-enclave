@@ -64,6 +64,13 @@ export function formatQualificationRuns(runs: readonly QualificationRun[]): stri
 			`  completion errors: ${metrics.errors}`,
 			`  record: ${run.path}`,
 		);
+		for (const [label, value] of [
+			["authorization", metrics.p95AuthorizationMs],
+			["decision", metrics.p95DecisionMs],
+			["first output", metrics.p95FirstOutputMs],
+		] as const) {
+			if (value !== undefined) lines.push(`  p95 ${label}: ${value.toFixed(0)} ms`);
+		}
 	}
 	return lines.join("\n");
 }

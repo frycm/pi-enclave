@@ -2,6 +2,7 @@ import type { EffectiveProfile } from "../config/types.ts";
 import { buildReviewEvidence, renderReviewEvidence } from "./evidence.ts";
 import { parseReviewerOutput, ReviewerOutputError } from "./output.ts";
 import { enforceReview } from "./risk.ts";
+import { ReviewerTelemetry, type ReviewerTelemetrySummary } from "./telemetry.ts";
 import type {
 	ActionReviewer,
 	BuildEvidenceOptions,
@@ -25,6 +26,8 @@ export interface CompletionRequest {
 	temperature: number;
 	seed: number;
 	numCtx: number;
+	/** Observation only; no output bytes or authorization flow through this callback. */
+	onFirstOutput?: () => void;
 }
 
 /** A model-specific transport. It returns only assistant text and carries no tools or session context. */
@@ -47,6 +50,7 @@ export interface IsolatedReviewerOptions {
 	delay?: (milliseconds: number) => Promise<void>;
 	maxAttempts?: number;
 	seed?: number;
+	onTelemetry?: (metrics: ReviewerTelemetrySummary, request: ReviewerRequest) => void;
 }
 
 function timeoutSignal(milliseconds: number): {
@@ -86,6 +90,15 @@ export class IsolatedReviewer implements ActionReviewer {
 	}
 
 	async review(request: ReviewerRequest): Promise<ReviewerResult> {
+		const telemetry = new ReviewerTelemetry();
+		try {
+			return await this.performReview(request, telemetry);
+		} finally {
+			this.options.onTelemetry?.(telemetry.summary(), request);
+		}
+	}
+
+	private async performReview(request: ReviewerRequest, telemetry: ReviewerTelemetry): Promise<ReviewerResult> {
 		const suppliedEvidence =
 			typeof this.options.evidence === "function" ? this.options.evidence(request) : this.options.evidence;
 		// Keep trusted full records separate from the bounded model representation.
@@ -106,31 +119,37 @@ export class IsolatedReviewer implements ActionReviewer {
 				attempt === maxAttempts - 1 && this.options.fallback ? this.options.fallback : this.options.primary;
 			const timer = timeoutSignal(this.options.timeoutMs);
 			try {
-				const gate = await timer.wait(
-					completion.complete({
-						system: this.options.prompt.authorizationSystem,
-						user: rendered,
-						signal: timer.signal,
-						maxTokens: 1,
-						temperature: REVIEWER_TEMPERATURE,
-						seed: seed + attempt,
-						numCtx: REVIEWER_NUM_CTX,
-					}),
+				const gate = await telemetry.measure("authorization", attempt + 1, timer.signal, (onFirstOutput) =>
+					timer.wait(
+						completion.complete({
+							system: this.options.prompt.authorizationSystem,
+							user: rendered,
+							signal: timer.signal,
+							maxTokens: 1,
+							temperature: REVIEWER_TEMPERATURE,
+							seed: seed + attempt,
+							numCtx: REVIEWER_NUM_CTX,
+							onFirstOutput,
+						}),
+					),
 				);
 				if (gate !== "0" && gate !== "1") {
 					return invalidOutput(`authorization stage returned ${JSON.stringify(gate)} instead of 0 or 1`, evidence);
 				}
 
-				const text = await timer.wait(
-					completion.complete({
-						system: this.options.prompt.decisionSystem[gate],
-						user: rendered,
-						signal: timer.signal,
-						maxTokens: REVIEWER_MAX_TOKENS,
-						temperature: REVIEWER_TEMPERATURE,
-						seed: seed + attempt,
-						numCtx: REVIEWER_NUM_CTX,
-					}),
+				const text = await telemetry.measure("decision", attempt + 1, timer.signal, (onFirstOutput) =>
+					timer.wait(
+						completion.complete({
+							system: this.options.prompt.decisionSystem[gate],
+							user: rendered,
+							signal: timer.signal,
+							maxTokens: REVIEWER_MAX_TOKENS,
+							temperature: REVIEWER_TEMPERATURE,
+							seed: seed + attempt,
+							numCtx: REVIEWER_NUM_CTX,
+							onFirstOutput,
+						}),
+					),
 				);
 				let model: ModelReview;
 				try {

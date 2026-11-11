@@ -3,6 +3,7 @@ import { defaultProfile } from "../../src/config/defaults.ts";
 import { canonicalize } from "../../src/policy/canonical.ts";
 import { buildReviewerPrompt, reviewerRulebook } from "../../src/reviewer/prompt.ts";
 import { IsolatedReviewer, type ReviewerCompletion } from "../../src/reviewer/reviewer.ts";
+import { ReviewerTelemetry, type ReviewerTelemetrySummary } from "../../src/reviewer/telemetry.ts";
 
 const PROFILE = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
 const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map()));
@@ -44,6 +45,82 @@ function reviewer(primary: ReviewerCompletion, fallback?: ReviewerCompletion) {
 }
 
 describe("isolated reviewer", () => {
+	it("records bounded stage metrics without copying evidence, output or provider errors", async () => {
+		const seen: ReviewerTelemetrySummary[] = [];
+		let calls = 0;
+		const primary: ReviewerCompletion = {
+			name: "fixture",
+			async complete(request) {
+				request.onFirstOutput?.();
+				if (++calls === 1) throw new Error("PRIVATE_PROVIDER_DETAIL");
+				return request.maxTokens === 1 ? "0" : '{"decision":"deny","risk":"high","reason":"PRIVATE_MODEL_OUTPUT"}';
+			},
+		};
+		const result = await new IsolatedReviewer({
+			profile: PROFILE,
+			prompt: PROMPT,
+			primary,
+			timeoutMs: 1000,
+			evidence: { attended: "off" },
+			delay: async () => {},
+			onTelemetry: (metrics) => seen.push(metrics),
+		}).review({ action: action("touch PRIVATE_ACTION"), trigger: "mutating" });
+		expect(result.ok).toBe(true);
+		expect(seen).toHaveLength(1);
+		expect(seen[0]?.stages.map((stage) => [stage.stage, stage.attempt, stage.outcome])).toEqual([
+			["authorization", 1, "error"],
+			["authorization", 2, "ok"],
+			["decision", 2, "ok"],
+		]);
+		expect(
+			seen[0]?.stages.every((stage) => stage.firstOutputMs !== undefined && stage.firstOutputMs <= stage.durationMs),
+		).toBe(true);
+		expect(JSON.stringify(seen)).not.toContain("PRIVATE_");
+	});
+
+	it("settles timeout telemetry even when a transport ignores abort and emits output later", async () => {
+		let output!: () => void;
+		let metrics: ReviewerTelemetrySummary | undefined;
+		await new IsolatedReviewer({
+			profile: PROFILE,
+			prompt: PROMPT,
+			primary: {
+				name: "hanging",
+				complete: async (request) => {
+					output = request.onFirstOutput ?? (() => {});
+					return new Promise<string>(() => {});
+				},
+			},
+			timeoutMs: 5,
+			maxAttempts: 1,
+			evidence: { attended: "off" },
+			onTelemetry: (value) => {
+				metrics = value;
+			},
+		}).review({ action: action(), trigger: "mutating" });
+		expect(metrics?.stages).toMatchObject([{ outcome: "aborted" }]);
+		const before = JSON.stringify(metrics);
+		output();
+		expect(JSON.stringify(metrics)).toBe(before);
+	});
+
+	it("keeps raw exceptions out of pi telemetry spans and records first output only once", async () => {
+		const telemetry = new ReviewerTelemetry();
+		const controller = new AbortController();
+		await expect(
+			telemetry.measure("decision", 1, controller.signal, async (first) => {
+				first();
+				first();
+				throw new Error("PRIVATE_EXCEPTION");
+			}),
+		).rejects.toThrow("PRIVATE_EXCEPTION");
+		expect(JSON.stringify(telemetry.context.getSpans())).not.toContain("PRIVATE_EXCEPTION");
+		expect(telemetry.context.getSpans()[0]?.events).toHaveLength(1);
+		expect(telemetry.context.getMetrics().filter((entry) => entry.name.endsWith("first_output.duration"))).toHaveLength(
+			1,
+		);
+	});
+
 	it("runs the one-token authorization stage before the strict verdict", async () => {
 		const completion = scripted("primary", ["0", '{"decision":"allow","risk":"low","reason":"routine output"}']);
 		const result = await reviewer(completion).review({ action: action(), trigger: "mutating" });

@@ -29,6 +29,9 @@ export interface QualificationMetrics {
 	falseDenialRate: number;
 	p95LatencyMs: number;
 	errors: number;
+	p95AuthorizationMs?: number;
+	p95DecisionMs?: number;
+	p95FirstOutputMs?: number;
 }
 
 export interface QualificationRecord extends QualificationBinding {
@@ -77,7 +80,10 @@ export function isQualificationRecord(value: unknown): value is QualificationRec
 		isFiniteNumber(metrics.benignFalseDenials) &&
 		isFiniteNumber(metrics.falseDenialRate) &&
 		isFiniteNumber(metrics.p95LatencyMs) &&
-		isFiniteNumber(metrics.errors)
+		isFiniteNumber(metrics.errors) &&
+		[metrics.p95AuthorizationMs, metrics.p95DecisionMs, metrics.p95FirstOutputMs].every(
+			(value) => value === undefined || isFiniteNumber(value),
+		)
 	);
 }
 
