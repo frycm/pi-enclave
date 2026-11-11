@@ -48,7 +48,7 @@ import {
 	recheckAttendance,
 	resolveAttendance,
 } from "./escalate/attendance.ts";
-import { createConfirmEscalator } from "./escalate/confirm.ts";
+import { type ConfirmUI, createConfirmEscalator } from "./escalate/confirm.ts";
 import { describeHandshakeFailure, runHandshake } from "./escalate/handshake.ts";
 import { writePending } from "./escalate/pending.ts";
 import {
@@ -64,6 +64,7 @@ import { decide, type GateDecision } from "./gate/gate.ts";
 import { ActionLock } from "./gate/lock.ts";
 import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
 import { PROVENANCE_ENTRY_TYPE, ProvenanceTracker } from "./gate/provenance.ts";
+import { toolReachability } from "./gate/reachability.ts";
 import { formatProbeReport } from "./probe.ts";
 import { probeHost } from "./probe-host.ts";
 import { critiqueRulebook, formatCritique } from "./reviewer/critique.ts";
@@ -156,12 +157,6 @@ function isFsClientLease(value: FsClient | FsClientLease): value is FsClientLeas
 	return "client" in value && "dispose" in value;
 }
 
-type ConfirmFn = (
-	title: string,
-	message: string,
-	options?: { timeout?: number; signal?: AbortSignal },
-) => Promise<boolean>;
-
 export default function (pi: ExtensionAPI): void {
 	const nativeReport = probeHost(PI_VERSION ?? null);
 	let report = nativeReport;
@@ -208,6 +203,7 @@ export default function (pi: ExtensionAPI): void {
 	 * "is anyone there?" must be the one that is true now.
 	 */
 	const escalator = createConfirmEscalator({
+		reachability: (action) => toolReachability(pi.getAllTools?.() ?? [], action.tool, action.input),
 		ui: () => uiContext,
 		attendance: () => attendance,
 		confirmTimeoutMs: () => effective?.attended.confirmTimeoutMs ?? 300_000,
@@ -257,6 +253,7 @@ export default function (pi: ExtensionAPI): void {
 				outcome: event.outcome,
 				attended: event.attended,
 				hash: event.action.hash,
+				...(event.reachability ? { reachability: event.reachability } : {}),
 				tool: event.action.tool,
 				reason: event.reason,
 			});
@@ -269,7 +266,7 @@ export default function (pi: ExtensionAPI): void {
 	let audit: AuditLog | undefined;
 	let attendance: AttendanceState = { configured: "off", effective: "off" };
 	/** Rebuilt per escalation from the live context, so a lost channel is seen. */
-	let uiContext: { confirm: ConfirmFn } | undefined;
+	let uiContext: ConfirmUI | undefined;
 	/** The pi mode this session is running in, captured once at session start. */
 	let piMode: "tui" | "rpc" | "json" | "print" = "print";
 	let sessionId: string | undefined;
@@ -610,9 +607,9 @@ export default function (pi: ExtensionAPI): void {
 						});
 						return;
 					}
-					audit?.append(
-						"decision",
-						decisionFields({
+					const reachability = toolReachability(pi.getAllTools?.() ?? [], result.action.tool, result.action.input);
+					audit?.append("decision", {
+						...decisionFields({
 							action: result.action,
 							outcome: result.outcome,
 							matches: result.matches,
@@ -620,7 +617,8 @@ export default function (pi: ExtensionAPI): void {
 							attended: effective?.attended.mode ?? "off",
 							...(result.reason !== undefined ? { reason: result.reason } : {}),
 						}),
-					);
+						...(reachability ? { reachability } : {}),
+					});
 				},
 			},
 		);
@@ -899,7 +897,7 @@ export default function (pi: ExtensionAPI): void {
 			return;
 		}
 
-		uiContext = { confirm: (title, message, options) => ctx.ui.confirm(title, message, options) };
+		uiContext = ctx.ui;
 		if (reviewerSetup) {
 			actionReviewer = new IsolatedReviewer({
 				profile: loaded.profile,
@@ -907,6 +905,8 @@ export default function (pi: ExtensionAPI): void {
 				primary: reviewerSetup.primary,
 				...(reviewerSetup.fallback ? { fallback: reviewerSetup.fallback } : {}),
 				timeoutMs: loaded.profile.reviewer.timeoutMs,
+				onTelemetry: (metrics, request) =>
+					audit?.append("reviewer", { event: "timing", hash: request.action.hash, ...metrics }),
 				evidence: (request) => {
 					// A stale or unrelated denial is not evidence for this decision.
 					// Violations are supplied only for a capability retry of the same
@@ -926,8 +926,10 @@ export default function (pi: ExtensionAPI): void {
 										isUnder(canonicalPath(entry.path), target),
 								)
 						: undefined;
+					const reachability = toolReachability(pi.getAllTools?.() ?? [], request.action.tool, request.action.input);
 					return {
 						attended: attendance.effective,
+						...(reachability ? { toolReachability: reachability } : {}),
 						authorization: reviewAuthorization,
 						context: reviewContext,
 						...(violation ? { violation } : {}),

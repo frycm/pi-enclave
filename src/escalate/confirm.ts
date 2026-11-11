@@ -13,18 +13,23 @@
  * they can see is the whole mechanism.
  */
 
+import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { Escalator } from "../gate/gate.ts";
+import { describeReachability, type ToolReachability } from "../gate/reachability.ts";
 import type { CanonicalAction } from "../policy/canonical.ts";
 import { approvalSerialize, describeActionForApproval } from "../policy/canonical.ts";
 import type { AttendanceState } from "./attendance.ts";
+import { confirmPermission } from "./dialog.ts";
 
 export interface ConfirmUI {
 	confirm(title: string, message: string, options?: { timeout?: number; signal?: AbortSignal }): Promise<boolean>;
+	custom?: ExtensionUIContext["custom"];
 }
 
 export type EscalationOutcome = "approved" | "declined" | "timeout" | "unattended";
 
 export interface EscalationEvent {
+	reachability?: ToolReachability;
 	action: CanonicalAction;
 	reason: string;
 	outcome: EscalationOutcome;
@@ -32,6 +37,7 @@ export interface EscalationEvent {
 }
 
 export interface ConfirmEscalatorOptions {
+	reachability?: (action: CanonicalAction) => ToolReachability | undefined;
 	ui: () => ConfirmUI | undefined;
 	/** Re-evaluated per escalation: a channel can be lost mid-session. */
 	attendance: () => AttendanceState;
@@ -44,6 +50,8 @@ export interface ConfirmEscalatorOptions {
 export function createConfirmEscalator(options: ConfirmEscalatorOptions): Escalator {
 	return {
 		async confirm(action, reason, toolSource) {
+			const reachability = options.reachability?.(action);
+			if (reachability) reason = `${reason}\n${describeReachability(reachability)}`;
 			const attendance = options.attendance();
 			const ui = options.ui();
 
@@ -61,10 +69,13 @@ export function createConfirmEscalator(options: ConfirmEscalatorOptions): Escala
 			const timer = setTimeout(() => controller.abort(), timeoutMs);
 			let answered = false;
 			try {
-				answered = await ui.confirm(escalationTitle(action), escalationMessage(action, reason, timeoutMs), {
-					timeout: timeoutMs,
-					signal: controller.signal,
-				});
+				const title = escalationTitle(action);
+				const message = escalationMessage(action, reason, timeoutMs);
+				answered =
+					attendance.effective === "tui" && ui.custom
+						? await confirmPermission({ custom: ui.custom.bind(ui) }, title, message, controller.signal)
+						: await ui.confirm(title, message, { timeout: timeoutMs, signal: controller.signal });
+				answered = answered && !controller.signal.aborted;
 			} catch {
 				// A rejected confirm is a disconnected client. Same verdict.
 				answered = false;
@@ -73,7 +84,13 @@ export function createConfirmEscalator(options: ConfirmEscalatorOptions): Escala
 			}
 
 			const outcome: EscalationOutcome = answered ? "approved" : controller.signal.aborted ? "timeout" : "declined";
-			options.onEscalation?.({ action, reason, outcome, attended: attendance.effective });
+			options.onEscalation?.({
+				action,
+				reason,
+				outcome,
+				attended: attendance.effective,
+				...(reachability ? { reachability } : {}),
+			});
 			if (!answered) await options.onUnattended?.(action, reason, toolSource);
 			return answered;
 		},

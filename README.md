@@ -59,6 +59,9 @@ has not seen, and "probably fine" is not a sandbox guarantee.
 
 The [pi 1.5 migration and dependency review](docs/pi-1.5-upgrade.md) records the
 startup-event change, sandboxed grep parity, sandbox-runtime update and validation.
+The [pi 1.5 API adoption](docs/pi-1.5-api-adoption.md) adds sandboxed streaming
+reads, private reviewer timing, advisory tool reachability and permission-blocked
+TUI approvals while retaining invocation-bound grants and child-call checks.
 Policy initialization continues to use `ctx.cwd`; the old `pi-server` workaround
 remains unnecessary. Native Linux/macOS conformance on the upgrade commit is
 required before merge. The [pi 1.1 migration review](docs/pi-1.1-upgrade.md) retains
