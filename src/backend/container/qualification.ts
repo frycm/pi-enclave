@@ -210,6 +210,10 @@ export async function qualifyContainer(
 		});
 		await row("file-helper-and-search", async () => {
 			const fs = backend.fs(compiled);
+			let streamed = "";
+			for await (const chunk of fs.createReadStream(join(workspace, "ordinary.txt")))
+				streamed += Buffer.from(chunk).toString();
+			assert(streamed === "ordinary", "helper streaming read failed");
 			assert(
 				(await fs.readFile(join(workspace, "ordinary.txt"))).toString() === "ordinary",
 				"helper ordinary read failed",
@@ -226,6 +230,14 @@ export async function qualifyContainer(
 				denied = true;
 			}
 			assert(denied, "helper disclosed masked read");
+			denied = false;
+			let streamedBytes = 0;
+			try {
+				for await (const chunk of fs.createReadStream(secret)) streamedBytes += chunk.byteLength;
+			} catch {
+				denied = true;
+			}
+			assert(denied && streamedBytes === 0, "streaming helper disclosed masked read");
 		});
 		await row("write-grant-sibling-isolation", async () => {
 			const [granted, sibling] = await Promise.all([
@@ -254,6 +266,9 @@ export async function qualifyContainer(
 			);
 			try {
 				assert((await lease.client.readFile(secret)).toString() === "QUALIFICATION-SECRET", "leased read failed");
+				let streamed = "";
+				for await (const chunk of lease.client.createReadStream(secret)) streamed += Buffer.from(chunk).toString();
+				assert(streamed === "QUALIFICATION-SECRET", "leased streaming read failed");
 			} finally {
 				await lease.dispose();
 			}

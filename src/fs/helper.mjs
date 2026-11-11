@@ -22,6 +22,7 @@ import {
 	accessSync,
 	closeSync,
 	constants,
+	fstatSync,
 	lstatSync,
 	mkdirSync,
 	openSync,
@@ -37,7 +38,25 @@ import { basename, dirname, resolve } from "node:path";
 
 const HEADER_BYTES = 4;
 const MAX_FRAME_BYTES = 64 * 1024 * 1024;
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
+const READ_CHUNK_BYTES = 64 * 1024;
+const MAX_OPEN_READS = 32;
+const READ_IDLE_MS = 30_000;
+const reads = new Map();
+
+function closeRead(stream) {
+	const entry = reads.get(stream);
+	if (!entry) return;
+	reads.delete(stream);
+	clearTimeout(entry.timer);
+	closeSync(entry.fd);
+}
+
+function keepReadAlive(stream, entry) {
+	clearTimeout(entry.timer);
+	entry.timer = setTimeout(() => closeRead(stream), READ_IDLE_MS);
+	entry.timer.unref();
+}
 /**
  * The most a single read returns. Base64 inflates by a third, and a frame the
  * client must reject takes down the helper and every operation in flight, so
@@ -184,6 +203,43 @@ async function handle(request) {
 	switch (request.op) {
 		case "ping":
 			return "pong";
+		case "openRead": {
+			if (reads.size >= MAX_OPEN_READS || reads.has(request.stream)) {
+				throw Object.assign(new Error("sandboxed read stream limit reached or duplicate stream"), { code: "EMFILE" });
+			}
+			// Nonblocking opens keep a repository FIFO from trapping the helper
+			// before it can process cancellation. Regular file behavior is unchanged.
+			const fd = openSync(request.path, constants.O_RDONLY | constants.O_NONBLOCK);
+			try {
+				const stat = fstatSync(fd);
+				const entry = { fd, remaining: stat.isFile() && stat.size > 0 ? stat.size : Infinity, timer: undefined };
+				reads.set(request.stream, entry);
+				keepReadAlive(request.stream, entry);
+				return null;
+			} catch (error) {
+				closeSync(fd);
+				throw error;
+			}
+		}
+		case "readChunk": {
+			const entry = reads.get(request.stream);
+			if (!entry) throw Object.assign(new Error("sandboxed read stream is closed"), { code: "EBADF" });
+			try {
+				const buffer = Buffer.alloc(Math.min(READ_CHUNK_BYTES, entry.remaining));
+				const count = readSync(entry.fd, buffer, 0, buffer.length, null);
+				entry.remaining -= count;
+				const done = count === 0 || entry.remaining === 0;
+				if (done) closeRead(request.stream);
+				else keepReadAlive(request.stream, entry);
+				return { data: buffer.subarray(0, count).toString("base64"), done };
+			} catch (error) {
+				closeRead(request.stream);
+				throw error;
+			}
+		}
+		case "closeRead":
+			closeRead(request.stream);
+			return null;
 		case "readFile": {
 			const size = statSync(request.path).size;
 			if (size > MAX_READ_BYTES) {
@@ -235,6 +291,7 @@ async function handle(request) {
 				throw error;
 			}
 		case "cancel": {
+			if (request.stream) closeRead(request.stream);
 			const child = running.get(request.target);
 			if (child) child.kill("SIGKILL");
 			else if (pendingSearches.has(request.target)) cancelledSearches.add(request.target);
@@ -383,7 +440,18 @@ function resolveForReport(path) {
  * file: a denied directory is an empty tmpfs, a denied *file* is a read-only
  * bind of /dev/null, so reads come back empty and access checks pass.
  */
-const MASKABLE = new Set(["exists", "readdir", "stat", "glob", "grep", "readFile", "head", "access"]);
+const MASKABLE = new Set([
+	"exists",
+	"readdir",
+	"stat",
+	"glob",
+	"grep",
+	"readFile",
+	"openRead",
+	"readChunk",
+	"head",
+	"access",
+]);
 
 /**
  * Keep the large-response permit through the stdout drain. Releasing when rg

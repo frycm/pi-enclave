@@ -201,6 +201,8 @@ export interface FsClientLease {
  */
 export interface FsClient {
 	readFile(path: string): Promise<Buffer>;
+	/** Pull bounded chunks from one descriptor opened inside the sandbox. */
+	createReadStream(path: string, options?: { signal?: AbortSignal }): AsyncIterable<Uint8Array>;
 	/** The first `bytes` of a file, for type sniffing without a full read. */
 	head(path: string, bytes: number): Promise<Buffer>;
 	writeFile(path: string, content: string): Promise<void>;

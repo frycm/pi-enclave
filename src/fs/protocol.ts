@@ -22,6 +22,9 @@ export const HEADER_BYTES = 4;
  */
 export const MAX_FRAME_BYTES = 64 * 1024 * 1024;
 
+/** One pull response; consumers never need to buffer the complete file. */
+export const READ_CHUNK_BYTES = 64 * 1024;
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
@@ -35,6 +38,9 @@ export const MAX_FRAME_BYTES = 64 * 1024 * 1024;
  */
 export type FsCall =
 	| { op: "readFile"; path: string }
+	| { op: "openRead"; path: string; stream: string }
+	| { op: "readChunk"; path: string; stream: string }
+	| { op: "closeRead"; stream: string }
 	| { op: "head"; path: string; bytes: number }
 	| { op: "writeFile"; path: string; content: string }
 	| { op: "mkdir"; path: string }
@@ -44,7 +50,7 @@ export type FsCall =
 	| { op: "exists"; path: string }
 	| { op: "glob"; pattern: string; cwd: string; ignore: string[]; limit: number }
 	| { op: "grep"; args: string[]; limit: number; path: string; context?: number }
-	| { op: "cancel"; target: number }
+	| { op: "cancel"; target: number; stream?: string }
 	| { op: "ping" };
 
 export type FsRequest = FsCall & { id: number };
@@ -95,7 +101,7 @@ export interface FsReady {
 }
 
 /** Bumped whenever the message shapes change incompatibly. */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 // ---------------------------------------------------------------------------
 // Framing

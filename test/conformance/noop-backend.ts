@@ -11,7 +11,7 @@
  * It is test-only and must never be exported from `src/`.
  */
 import { spawn } from "node:child_process";
-import { constants, promises as fs } from "node:fs";
+import { constants, createReadStream, promises as fs } from "node:fs";
 import type {
 	CompiledProfile,
 	FsClient,
@@ -80,6 +80,7 @@ export class NoopBackend implements SandboxBackend {
 	fs(_compiled: CompiledProfile): FsClient {
 		return {
 			readFile: (path) => fs.readFile(path),
+			createReadStream: (path, options) => createReadStream(path, options),
 			head: async (path, bytes) => (await fs.readFile(path)).subarray(0, bytes),
 			writeFile: (path, content) => fs.writeFile(path, content, "utf8"),
 			mkdir: async (path) => {
