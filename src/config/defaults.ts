@@ -310,6 +310,8 @@ export function defaultProfile(options: DefaultProfileOptions): EffectiveProfile
 			// from the boundary. On Linux the field is informational -- bubblewrap
 			// cannot deny PTYs.
 			allowPty: true,
+			// Loaded code below a writable root refuses auto mode (#36).
+			allowSelfHosting: false,
 			env: { passthrough: [], envDeny: [...DEFAULT_ENV_DENY] },
 		},
 		rules: {

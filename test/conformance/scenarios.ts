@@ -269,6 +269,49 @@ export const SCENARIOS: Scenario[] = [
 		},
 	},
 	{
+		id: "C19",
+		title: "loaded extension code below the workspace stays read-only with sandbox.allowSelfHosting (#36)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const ext = join(fixture.workspace, "ext");
+			const targets = [
+				join(ext, "src", "index.ts"),
+				join(ext, "package.json"),
+				join(ext, "node_modules", "dep", "index.js"),
+				// Did not exist: a new file in the package is loaded code too.
+				join(ext, "src", "added.ts"),
+				// No node_modules above the package: one created there would
+				// shadow a hoisted dependency, so it was materialised read-only.
+				join(fixture.workspace, "node_modules", "dep", "index.js"),
+			];
+			for (const target of targets) {
+				await sh(`mkdir -p ${JSON.stringify(dirname(target))}; printf pwn >> ${JSON.stringify(target)}`);
+			}
+			// As C16 does for Git: move the package aside and put another in its place.
+			const replaced = join(ext, "src", "index.ts");
+			await sh(
+				`mv ${JSON.stringify(ext)} ${JSON.stringify(`${ext}-aside`)} && ` +
+					`mkdir -p ${JSON.stringify(dirname(replaced))} && printf pwn > ${JSON.stringify(replaced)}`,
+			);
+			const changed = targets.filter((target) => {
+				try {
+					return readFileSync(target, "utf8").includes("pwn");
+				} catch {
+					return false;
+				}
+			});
+			return {
+				ok: changed.length === 0,
+				detail:
+					changed.length > 0
+						? `WROTE loaded extension code: ${changed.join(", ")}`
+						: "all five writes and the replacement denied",
+			};
+		},
+	},
+	{
 		id: "C2",
 		title: "read a read-denied path",
 		surface: "bash",

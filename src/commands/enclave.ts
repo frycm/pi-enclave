@@ -50,6 +50,11 @@ export interface EnclaveState {
 	sessionId?: string;
 	/** Unacknowledged tripwire hits for this workspace (#19). */
 	tripwireLedger?: TripwireLedger;
+	/**
+	 * Every code root the pi process loaded, from the session_start check
+	 * (#36), so a later check on trusted code has the list.
+	 */
+	loadedCode?: readonly string[];
 	auditPath?: string;
 	/** True once an audit write has failed. Shown without being asked for. */
 	auditDegraded?: boolean;
@@ -137,6 +142,14 @@ export function renderStatus(state: EnclaveState): string {
 			`unscanned:  ${unscanned.length} directory(ies) owned by another account and not searchable by this user:`,
 			...unscanned.slice(0, 10).map((dir) => `            ${dir}`),
 			...(unscanned.length > 10 ? [`            ... and ${unscanned.length - 10} more`] : []),
+		);
+	}
+	// sandbox.allowSelfHosting: loaded code kept read-only rather than refused (#36).
+	const selfHosted = state.profile.selfHosted ?? [];
+	if (selfHosted.length > 0) {
+		lines.push(
+			`self-host:  ${selfHosted.length} loaded code root(s) below a writable root, write-denied for the session:`,
+			...selfHosted.map((dir) => `            ${dir}`),
 		);
 	}
 

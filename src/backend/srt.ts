@@ -466,7 +466,12 @@ export class SrtBackend implements SandboxBackend {
 		this.scratch ??= SessionScratch.create();
 		this.pinSrtTmpDir();
 		const profile = effectiveProfile(requested, process.platform, process.env, this.scratch.path);
-		const pathSafety = hostRuntimeSafety(profile.writableRoots);
+		const pathSafety = hostRuntimeSafety(
+			profile.writableRoots,
+			process.env.PATH ?? "",
+			process.platform,
+			profile.writeDeny ?? [],
+		);
 		if (!pathSafety.ok) {
 			throw new Error(`pi-enclave: refusing unsafe host executable lookup. ${pathSafety.detail}`);
 		}
@@ -488,7 +493,7 @@ export class SrtBackend implements SandboxBackend {
 		// write would let it replace the filter it runs under. Checked against
 		// the compiled roots rather than in the probe, which only knows the cwd.
 		if (seccompHelper !== null) {
-			const helperSafety = hostExecutableSafety(profile.writableRoots, [seccompHelper]);
+			const helperSafety = hostExecutableSafety(profile.writableRoots, [seccompHelper], profile.writeDeny ?? []);
 			if (!helperSafety.ok) {
 				throw new Error(`pi-enclave: refusing an agent-writable seccomp helper. ${helperSafety.detail}`);
 			}

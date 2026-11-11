@@ -52,16 +52,37 @@ function hostRuntimeExecutables(platform: NodeJS.Platform, searchPath: string): 
 		const path = whichSync(absolute, searchPath);
 		if (path) resolved.push(path);
 	}
+	// The binary running pi itself, and so pi-enclave: a copy the agent can
+	// replace runs everything at the next start (#36). The container backend
+	// already checks it.
+	resolved.push(process.execPath);
 	return [...new Set(resolved)];
 }
 
-/** Refuse a selected host executable whose canonical target is agent-writable. */
-export function hostExecutableSafety(writableRoots: readonly string[], executables: readonly string[]): HostPathSafety {
+/**
+ * Refuse a selected host executable whose canonical target is agent-writable.
+ *
+ * One that the profile write-denies is not agent-writable, whatever root it
+ * sits below: that is how `sandbox.allowSelfHosting` keeps a Node binary or
+ * seccomp helper inside the workspace (#36). Both its spellings must be
+ * covered, so a symlink the agent could retarget is not accepted.
+ */
+export function hostExecutableSafety(
+	writableRoots: readonly string[],
+	executables: readonly string[],
+	writeDeny: readonly string[] = [],
+): HostPathSafety {
 	const roots = writableRoots.map(canonical);
+	const denied = writeDeny.map(canonical);
 	const unsafe = executables.filter((path) => {
 		const lexical = resolve(path);
 		const resolved = canonical(lexical);
-		return writableRoots.some((root) => isUnder(lexical, root)) || roots.some((root) => isUnder(resolved, root));
+		const writable =
+			writableRoots.some((root) => isUnder(lexical, root)) || roots.some((root) => isUnder(resolved, root));
+		if (!writable) return false;
+		const protectedPath = (spelling: string) =>
+			writeDeny.some((entry) => isUnder(spelling, entry)) || denied.some((entry) => isUnder(spelling, entry));
+		return !(protectedPath(lexical) && protectedPath(resolved));
 	});
 	if (unsafe.length === 0) return { ok: true, detail: "host executable targets are outside writable roots" };
 	return {
@@ -110,10 +131,11 @@ export function hostRuntimeSafety(
 	writableRoots: readonly string[],
 	searchPath = process.env.PATH ?? "",
 	platform: NodeJS.Platform = process.platform,
+	writeDeny: readonly string[] = [],
 ): HostPathSafety {
 	const path = hostPathSafety(writableRoots, searchPath);
 	if (!path.ok) return path;
-	const executables = hostExecutableSafety(writableRoots, hostRuntimeExecutables(platform, searchPath));
+	const executables = hostExecutableSafety(writableRoots, hostRuntimeExecutables(platform, searchPath), writeDeny);
 	if (!executables.ok) return executables;
 	return {
 		ok: true,

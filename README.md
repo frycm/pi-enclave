@@ -180,6 +180,7 @@ exposes everything required: built-in tool overrides with pluggable operations, 
 | TOCTOU: input mutated between approval and execution by a later `tool_call` handler | Validate and deep-freeze → canonicalize and hash → execute the frozen snapshot | Refuse auto mode when untrusted repo-local extensions are loaded |
 | Reviewer outage (local model OOM, runtime restart) | Bounded retry, then deny and stop the turn (unattended) or `ask` (attended) | — |
 | Sandbox bypass through tools that do not go through `bash` (custom / MCP tools) | Auto mode denies any tool not in the allowlist; allowlisted tools are declared read-only or reviewed | Outer container or VM |
+| Agent changes code the trusted pi process loads (pi-enclave or another extension checked out in the workspace, its `node_modules`, the Node binary) so the change runs at the next start (#36) | Auto mode refuses when any loaded code root is below a writable root | User-global `sandbox.allowSelfHosting` write-denies those roots at L2 instead — see [below](#loaded-code-below-a-writable-root-36) |
 | Persistence through files a later, unsandboxed process loads: pi configuration (`.pi`, `.agents`) at any depth, instruction files (`AGENTS.md`, `CLAUDE.md`), `.envrc`, hook managers, editor tasks, Git configuration (#19, #33) | Existing `.pi`, `.agents` and Git metadata are L2-denied at compile time; the trusted parent's post-turn tripwire reports new ones and changes, and keeps them until acknowledged | L1 `deny` for `.pi`/`.agents`, `ask` for project files. **Residual:** anything the agent writes into the workspace (build files, `package.json` scripts, `Makefile`, tests) must be treated as untrusted input by whatever reads it later — see [below](#files-loaded-outside-the-sandbox-19) |
 
 ---
@@ -300,6 +301,7 @@ interface SandboxProfile {
   capabilities: "none" | "reviewed";  // may the agent request a one-shot Capability (→ L3)?
   hostExec: "never" | "human";        // "human" is reserved and rejected throughout v1
   pty: boolean;
+  allowSelfHosting: boolean;  // loaded code below a writable root is write-denied, not refused (#36); user-global only
   env?: { passthrough?: string[] };  // extra host vars to forward, by exact name; user-global only
 }
 ```
@@ -649,6 +651,7 @@ the result must satisfy `effective ⊑ incoming` under a partial order defined p
 | `sandbox.grantableReadDeny` | Subset — user-global only, and every entry must exactly match a non-built-in `readDeny` entry |
 | `sandbox.network.allowHosts` | Subset; `mode` may go `proxy → off`, never the reverse |
 | `sandbox.capabilities` / `hostExec` | `none ⊑ reviewed`, `never ⊑ human`; may only move left. `human` is reserved and rejected throughout v1. |
+| `sandbox.allowSelfHosting` | `false ⊑ true`; only the user-global file can turn it on (#36) |
 | `rules.deny` / `rules.ask` / `rules.protectedPaths.*` | Superset |
 | `rules.skipReview` | Subset — user-global only; any project-file entry rejects the file |
 | `review.environment` / `hard_deny` / `soft_deny` / `allow` (the four prose lists) | **Immutable below user-global.** Prose has no partial order a merge can check: "append only" is a syntactic superset, not a semantic tightening, and a project-supplied string inside the reviewer prompt is the repo-to-reviewer injection path the threat model excludes. A project file that contains any of these four keys is rejected whole. `review.trigger` is the only `review` key a project may set. |
@@ -1574,6 +1577,7 @@ sandbox's, so a green row on a restricted host is not read as stronger evidence 
 | Rename a writable ancestor of a protected Git config/hook leaf, recreate the original tree, then write a hook | Ancestor displacement or replacement write is denied by the native backend | 1 | C16 |
 | Write a submodule's `.git/modules/<name>/config` or hook, a nested repository's `config` or hook, or a new submodule's config below a repository with no `modules` yet | Violation from L2 `writeDeny`; L1 denies the same paths by name (#33) | 1, 2 | C17, P14 |
 | Write into a nested `.pi` or `.agents` directly or by renaming a prepared tree into place, or edit `AGENTS.md`, `.envrc` or a hook manager | Violation from L2 `writeDeny` for existing `.pi`/`.agents`; L1 denies `.pi`/`.agents` by name and asks for project files; the tripwire reports new ones (#19) | 1, 2 | C18, P15 |
+| Write the source, `package.json` or `node_modules` of an extension loaded from inside the workspace, plant a `node_modules` above it, or move its package aside and replace it | Auto mode refuses to start by default; with `sandbox.allowSelfHosting`, violation from L2 `writeDeny` on the package root and on the materialised `node_modules` above it (#36) | 1 | C19 |
 | `curl`, `nc`, `python -c "socket…"`, DNS lookup | Violation (`off` mode) | 1 | C5 |
 | Spawn a PTY (`vim`, `less`), Python multiprocessing, `git worktree` outside cwd | Works / violation as configured. **Linux:** bubblewrap cannot deny PTYs, so `allowPty: false` is not enforceable there and the compiled profile reports `pty on` | 1 | C6 |
 | Script that calls `sudo` / `su` / `systemctl` | Violation, not a policy denial | 1 | C7 |
@@ -1713,6 +1717,56 @@ scripts, `Makefile`, test suites, `pyproject.toml` and the rest are exactly what
 there to edit, and they run with your privileges when you next build. Treat anything the agent
 wrote into the workspace as untrusted input to whatever reads it later, and review the diff
 before running it outside the sandbox.
+
+### Loaded code below a writable root (#36)
+
+The files above are data a later start reads. The code itself is the same risk one step
+closer: pi, pi-enclave and its dependencies, every other extension, the Node binary and the
+seccomp helper all run in the trusted pi process, and a change to any of them is inert now
+and runs with your privileges, outside every layer, the next time pi starts. That happens
+when you develop an extension with pi-enclave active and load it from the working tree, or
+when `writableRoots` includes a parent of `~/.pi/agent/git`, the global `node_modules` or a
+Node version manager directory.
+
+At `session_start`, after the ownership check, pi-enclave collects the code it has loaded:
+
+- the package root (the nearest directory with a `package.json`) of pi-enclave, of each of its
+  dependencies, of pi's entry script, of every `-e`/`--extension` value pi was started with,
+  and of the `sourceInfo.path` and `baseDir` of every registered tool and extension command.
+  Prompt templates and skills, which `getCommands()` also lists, are Markdown rather than code
+  and are already protected through `.pi` and `.agents`;
+- every existing `node_modules` directory above each root, because Node's resolution walks up
+  through them;
+- the target of every symlinked package (top level and `@scope/*`) in any of those
+  `node_modules` directories, transitively, so a sibling package an npm workspace or `npm link`
+  resolves to elsewhere is collected too;
+- the Node binary and the seccomp helper.
+
+A `package.json` directly in your home directory or at `/` does not count as a package root.
+All of it is compared canonically against the writable roots.
+
+- **By default, any of it below a writable root refuses auto mode**, with a message naming
+  the path and what loaded it, like the state-directory check.
+- **With `sandbox.allowSelfHosting: true`** in `~/.pi/agent/enclave.json`, each such root is
+  added to L2 `writeDeny` instead: the session can read, build against and test the code, but
+  cannot change what the next start loads. Every `node_modules` that does not exist between
+  such a root and its writable root is created read-only too, since one created there would
+  shadow the dependencies the root resolves from further up. `/enclave status` lists the
+  denied paths. A project file can turn the setting off but never on.
+- **Refused either way:** a code root that is or contains a writable root (pi loaded from the
+  checkout you are editing; denying it would deny the whole workspace), a symlink below a
+  writable root that the configured path runs through (the agent could point it at other
+  code; load the extension by its real path; a symlinked `node_modules` above a code root is
+  refused the same way), and a Node binary below a writable root.
+
+So work on an extension happens in a second worktree: load it from one checkout, edit
+another. The native backend's host-executable check covers `process.execPath` too, as the
+container backend's already did, and accepts the seccomp helper inside a code root the opt-in
+write-denies.
+
+**Limit.** pi has no list of loaded extensions. One that registers neither a tool nor a
+command and was not named with `-e`/`--extension` (for example one listed in `settings.json`
+that only registers event handlers) is not seen.
 
 ### Known gaps
 

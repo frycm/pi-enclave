@@ -82,6 +82,12 @@ export interface SandboxSettings {
 	/** May a *human* approve an unsandboxed run? Never a model. */
 	hostExec: HostExecMode;
 	allowPty: boolean;
+	/**
+	 * Accept loaded code (pi, pi-enclave, other extensions) below a writable
+	 * root by write-denying it, instead of refusing auto mode (#36).
+	 * User-global only.
+	 */
+	allowSelfHosting: boolean;
 	env: EnvSettings;
 }
 
