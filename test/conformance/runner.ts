@@ -10,7 +10,14 @@
 import type { CompiledProfile, SandboxBackend } from "../../src/backend/types.ts";
 import { dedupeViolations } from "../../src/backend/violations.ts";
 import type { Fixture } from "./fixture.ts";
-import { SCENARIOS, type Scenario, type ScenarioContext, type ShellOutcome, scenarioEnv } from "./scenarios.ts";
+import {
+	SCENARIOS,
+	type Scenario,
+	type ScenarioContext,
+	type ShellExtra,
+	type ShellOutcome,
+	scenarioEnv,
+} from "./scenarios.ts";
 
 export interface ConformanceRow {
 	id: string;
@@ -35,6 +42,12 @@ export interface RunOptions {
 	 * that checks the env scenario fails when credentials are not stripped.
 	 */
 	envOverride?: (fixture: Fixture) => Readonly<Record<string, string>>;
+	/**
+	 * Drop the per-call protected writes (#64). The falsifiability control for
+	 * the W rows: with the real sandbox and without them, the rows must fail,
+	 * which shows the per-call deny holds the files and not the session profile.
+	 */
+	dropProtectWrites?: boolean;
 }
 
 /**
@@ -51,7 +64,7 @@ export async function runConformance(
 	makeFixture: () => Fixture,
 	options: RunOptions = {},
 ): Promise<ConformanceRow[]> {
-	const { includeFs = false, only, envOverride } = options;
+	const { includeFs = false, only, envOverride, dropProtectWrites = false } = options;
 
 	const selected = SCENARIOS.filter(
 		(scenario) => (includeFs || scenario.surface !== "fs") && (!only || only.includes(scenario.id)),
@@ -65,7 +78,7 @@ export async function runConformance(
 		const compiled: CompiledProfile = await backend.compile(fixture.profile);
 		const env = envOverride ? envOverride(fixture) : scenarioEnv(fixture);
 
-		const sh = async (command: string): Promise<ShellOutcome> => {
+		const sh = async (command: string, extra: ShellExtra = {}): Promise<ShellOutcome> => {
 			// A unique id per invocation: sandbox-runtime attributes violations by
 			// this key and compares only the first 100 characters, so reusing the
 			// command text would cross-attribute between similar scenarios.
@@ -77,6 +90,7 @@ export async function runConformance(
 				env,
 				commandId,
 				timeout: 30,
+				...(extra.protectWrites && !dropProtectWrites ? { protectWrites: extra.protectWrites } : {}),
 				onData: (chunk) => chunks.push(chunk),
 			});
 			return {

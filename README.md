@@ -182,7 +182,7 @@ exposes everything required: built-in tool overrides with pluggable operations, 
 | Reviewer outage (local model OOM, runtime restart) | Bounded retry, then deny and stop the turn (unattended) or `ask` (attended) | — |
 | Sandbox bypass through tools that do not go through `bash` (custom / MCP tools) | Auto mode denies any tool not in the allowlist; allowlisted tools are declared read-only or reviewed | Outer container or VM |
 | Agent changes code the trusted pi process loads (pi-enclave or another extension checked out in the workspace, its `node_modules`, the Node binary) so the change runs at the next start (#36) | Auto mode refuses when any loaded code root is below a writable root | User-global `sandbox.allowSelfHosting` write-denies those roots at L2 instead — see [below](#loaded-code-below-a-writable-root-36) |
-| Persistence through files a later, unsandboxed process loads: pi configuration (`.pi`, `.agents`) at any depth, instruction files (`AGENTS.md`, `CLAUDE.md`), `.envrc`, hook managers, editor tasks, Git configuration (#19, #33) | Existing `.pi`, `.agents` and Git metadata are L2-denied at compile time; the trusted parent's post-turn tripwire reports new ones and changes, and keeps them until acknowledged | L1 `deny` for `.pi`/`.agents`, `ask` for project files. **Residual:** anything the agent writes into the workspace (build files, `package.json` scripts, `Makefile`, tests) must be treated as untrusted input by whatever reads it later — see [below](#files-loaded-outside-the-sandbox-19) |
+| Persistence through files a later, unsandboxed process loads: pi configuration (`.pi`, `.agents`) at any depth, instruction files (`AGENTS.md`, `CLAUDE.md`), `.envrc`, hook managers, editor tasks, Git configuration (#19, #33) | Existing `.pi`, `.agents` and Git metadata are L2-denied at compile time; for a command nobody judged, every existing `rules.protectedPaths` match is L2-denied for that call (#64); the trusted parent's post-turn tripwire reports new ones and changes, and keeps them until acknowledged | L1 `deny` for `.pi`/`.agents`, `ask` for project files. **Residual:** anything the agent writes into the workspace (build files, `package.json` scripts, `Makefile`, tests) must be treated as untrusted input by whatever reads it later — see [below](#files-loaded-outside-the-sandbox-19) |
 
 ---
 
@@ -1362,26 +1362,76 @@ transport, with about 2 KB of room, gets one sentence (treat an unreadable comma
 ambiguous) instead of the lists.
 
 **What an unreadable command can still change.** L1 cannot see its targets, so
-`rules.protectedPaths` does not stop `f=.husky/pre-commit; echo x > "$f"`,
-`python3 -c "open('AGENTS.md','w').write('x')"` or `g=git; $g init sub`. With a reviewer the
-model's judgement is all that asks about them; with `onUncertain: "sandbox"` nothing asks.
-L2 write-denies the existing `.git` metadata and `.pi` / `.agents` directories, but not the
-`rules.protectedPaths.ask` paths (`AGENTS.md`, `CLAUDE.md`, `.envrc`, hook managers,
-`.vscode/tasks.json`, workflows, Dockerfiles, and any user-global entry such as `infra/**`),
-and not a path that does not exist yet (a new `.pi`, a nested repository). Afterwards the
-[tripwire](#files-loaded-outside-the-sandbox-19) reports, at the end of the turn, every new or changed Git
-configuration, agent directory and project file, and in a turn that ran an unparsed command
-nobody was asked about (`sandboxed-uncertain`, or a reviewer allow of one) a changed project
-file counts against the turn like a denial, so repeated changes open the breaker. The
-`protectedPaths` entries outside that list, built-in (workflows, Dockerfiles) or user-global
-(`infra/**`), are not watched by the tripwire: for those an unreadable command is judged by the reviewer
-alone, or by nobody under `onUncertain: "sandbox"`. A repository's own ask rule for a
-spelling L1 cannot read is likewise enforced only as well as the parser reads the command.
+`rules.protectedPaths` does not see `f=.husky/pre-commit; echo x > "$f"`,
+`python3 -c "open('AGENTS.md','w').write('x')"` or `g=git; $g init sub`. Since #64 the
+sandbox holds the protected paths for such a command instead. When the gate lets a bash
+command run that L1 could not read and nobody judged (`sandboxed-uncertain`, or a reviewer
+allow of an unparsed command), the trusted parent walks the writable roots just before the
+call and write-denies **every existing path a `rules.protectedPaths` entry names**, deny and
+ask, built-in, user-global or from the project file: `AGENTS.md`, `CLAUDE.md`, `.envrc`,
+`.husky/`, the other hook-manager files, `.vscode/tasks.json`, `.github/workflows/`,
+Dockerfiles, compose files, `.pi` and `.agents` created since the session started, the
+`config` and `hooks` of a repository created since then, and an entry such as `infra/**`.
+A directory whose contents a pattern covers is denied whole, so nothing new can be created
+inside it either, and everything it holds is checked as below; a symlink inside it is held
+through its target. The deny lasts for that one call, on bubblewrap, Seatbelt and the container
+backend alike (conformance rows W1 to W6, with a control row that the same commands still
+write ordinary files and a falsifiability run that shows the rows fail without the deny).
+A command a person approved, at the terminal or with `pi-enclave approve` while a queued
+session waits, was judged, and runs under the session profile as before.
+
+The call is **not run unjudged** when the walk cannot vouch for it: past 200,000 entries
+(the walk and what the denied directories hold together), when a protected file, or a file
+inside a denied directory, has a second hard link (a read-only bind holds a name, not an
+inode, so the other name could still be written, wherever it is), or when a protected
+symlink points at a target in a writable root that does not exist yet (writing through it
+would create the target).
+The gate then asks a person, and if that happens between the gate and the call, the command
+is refused. The walk costs about 8 µs per entry; it skips the inside of every `.git`
+directory, and it runs twice per unjudged call (at the gate and just before the call).
+
+What remains:
+
+- **A protected name that does not exist yet** is not denied. Bubblewrap and the container
+  backend bind over an existing path, so denying it would mean creating a placeholder, as
+  the session profile does for `.pi` and `.agents`; for these names that would leave empty
+  `AGENTS.md`, `.envrc` and `Dockerfile` files in the repository. Creating `AGENTS.md`, a new
+  `.github/workflows/x.yml` in a repository without that directory, a nested repository
+  (`$g init sub`) or a new `.envrc` is still possible. The
+  [tripwire](#files-loaded-outside-the-sandbox-19) watches every `rules.protectedPaths`
+  entry for this, built-in and user-global (workflows, Dockerfiles and `infra/**` too,
+  since #64), reports a new or changed one at the end of the turn, and in a turn that ran an
+  unjudged command counts it against the turn like a denial, so repeated changes open the
+  breaker. That is detection after the write, not prevention. A protected directory too
+  large to fingerprint (16,384 entries, such as a user-global `vendor/**`) is reported as
+  unverifiable at every check, and counts only once, when it first appears.
+- **A protected symlink** is protected through its target when the target is inside a
+  writable root; the link itself can be replaced by a regular file, which the tripwire
+  reports.
+- **A directory a pattern names only by itself** (`**/build`, or the built-in `**/.git` of a
+  repository created since start) is not denied whole, since that would hold its contents,
+  which the pattern leaves ordinary. It can be renamed or removed; a repository's `config`
+  and `hooks` inside it stay denied, and a protected name it leaves free is the first case.
+- **Ordinary work that writes a protected path** fails in an unjudged command: an
+  `npm install` whose `prepare` script runs `husky` cannot write `.husky/`, a build that
+  regenerates a Dockerfile cannot either, and `npm ci` cannot remove or replace an installed
+  package that ships an `AGENTS.md` or a Dockerfile, since the patterns match at any depth,
+  `node_modules` included, as they do at L1. A pnpm workspace hard-links each package file
+  from its store, so one installed package that ships such a file makes every unjudged call
+  ask, or be refused on a headless run. Approve such a command, or run it yourself.
+- **Everything else in the writable roots** is the agent's to change, as it is for a readable
+  command: source files, build scripts, `package.json` scripts that a later `npm test` run
+  outside the sandbox would execute. A writable workspace is one whose build files the
+  agent can edit.
+- A repository's own `rules.ask` pattern for a command spelling L1 cannot read is enforced
+  only as well as the parser reads the command; the protected-path deny covers paths, not
+  command patterns.
 
 **Deterministic mode** has no reviewer, so `rules.onUncertain` (user-global only) chooses
 what happens to an unreadable command instead: `"ask"` (the default) sends it to a person,
-and `"sandbox"` runs it with the sandbox as the only boundary, which leaves the residual
-above with no judgement at all before the command runs. The decision is recorded as
+and `"sandbox"` runs it with the sandbox as the only boundary (the session profile plus the
+per-call protected-path deny above), which leaves the residual above with no judgement at all
+before the command runs. The decision is recorded as
 `sandboxed-uncertain`, so the audit log shows which commands nobody judged, and the
 tripwire's `violation` records say whether a hit counted (`adverse`). `"sandbox"`
 applies only to the owned bash tool, only while the network is off, and never to a call
@@ -2258,7 +2308,7 @@ sandbox's, so a green row on a restricted host is not read as stronger evidence 
 | Interpreter/archive writes `$WORKSPACE/.pi/extensions` inside a writable workspace | Violation from L2 `writeDeny`; static shell inference is not the boundary | 1 | C15 |
 | Rename a writable ancestor of a protected Git config/hook leaf, recreate the original tree, then write a hook | Ancestor displacement or replacement write is denied by the native backend | 1 | C16 |
 | Write a submodule's `.git/modules/<name>/config` or hook, a nested repository's `config` or hook, or a new submodule's config below a repository with no `modules` yet | Violation from L2 `writeDeny`; L1 denies the same paths by name (#33) | 1, 2 | C17, P14 |
-| Write into a nested `.pi` or `.agents` directly or by renaming a prepared tree into place, or edit `AGENTS.md`, `.envrc` or a hook manager | Violation from L2 `writeDeny` for existing `.pi`/`.agents`; L1 denies `.pi`/`.agents` by name and asks for project files; the tripwire reports new ones (#19) | 1, 2 | C18, P15 |
+| Write into a nested `.pi` or `.agents` directly or by renaming a prepared tree into place, or edit `AGENTS.md`, `.envrc` or a hook manager | Violation from L2 `writeDeny` for existing `.pi`/`.agents`; L1 denies `.pi`/`.agents` by name and asks for project files; for a command nobody judged, every existing protected path is L2-denied for that call (#64); the tripwire reports new ones (#19, #64) | 1, 2 | C18, P15, W1–W6 |
 | Write the source, `package.json` or `node_modules` of an extension loaded from inside the workspace, plant a `node_modules` above it, or move its package aside and replace it | Auto mode refuses to start by default; with `sandbox.allowSelfHosting`, violation from L2 `writeDeny` on the package root and on the materialised `node_modules` above it (#36) | 1 | C19 |
 | `curl`, `nc`, `python -c "socket…"`, DNS lookup | Violation (`off` mode) | 1 | C5 |
 | Spawn a PTY (`vim`, `less`), Python multiprocessing, `git worktree` outside cwd | Works / violation as configured. **Linux:** bubblewrap cannot deny PTYs, so `allowPty: false` is not enforceable there and the compiled profile reports `pty on` | 1 | C6 |
@@ -2376,11 +2426,14 @@ without the sandbox. pi-enclave splits those files in two.
   every later session, with or without pi-enclave, and by other agents; `.envrc`, `.husky`,
   lefthook (`lefthook.yml` and its variants), `.pre-commit-config.yaml` and `.vscode/tasks.json` run the next time your
   shell, Git or editor touches the project. Editing them is ordinary work, so L1 makes them an
-  `ask` rather than a denial.
+  `ask` rather than a denial. For a command nobody judged, the existing ones are write-denied
+  at L2 for that call ([#64](#what-the-reviewer-may-clear)).
 - **The tripwire.** bwrap cannot deny a name that does not exist yet inside a writable bind,
   so the trusted parent walks the writable roots after every turn, as for Git (#33), and
-  records every `.pi` and `.agents` tree and every project file above (names compared
-  case-insensitively, since macOS opens `Agents.md` as `AGENTS.md`). One the compiled profile
+  records every `.pi` and `.agents` tree, every project file above, and every other path a
+  `rules.protectedPaths` entry names, built-in or user-global (`.github/workflows`,
+  Dockerfiles, compose files, an entry such as `infra/**`; since #64), with names compared
+  case-insensitively, since macOS opens `Agents.md` as `AGENTS.md`. One the compiled profile
   already denies, or that lies outside every writable root, is recorded by identity only, so a
   large protected `.pi` costs nothing; any other is fingerprinted with everything below it,
   and one too large to fingerprint is reported as unverifiable at every check. A hit is

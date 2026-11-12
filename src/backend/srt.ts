@@ -31,7 +31,12 @@ import { buildChildEnv } from "../env/child-env.ts";
 import { HelperFsClient } from "../fs/client.ts";
 import type { BackendName } from "../probe.ts";
 import { hostExecutableSafety, hostRuntimeSafety, resolveSeccompHelper, whichSync } from "../probe-host.ts";
-import { shellCapabilityIssue, validateReadCapability, validateWriteCapability } from "./capability.ts";
+import {
+	shellCapabilityIssue,
+	validateReadCapability,
+	validateWriteCapability,
+	withProtectedWrites,
+} from "./capability.ts";
 import {
 	effectiveTimeout,
 	freeSpaceIssue,
@@ -689,7 +694,7 @@ export class SrtBackend implements SandboxBackend {
 		const readTarget = request.readCapability
 			? validateReadCapability(compiled.profile, request.cwd, request.readCapability)
 			: undefined;
-		const customProfile = writeTarget
+		const capabilityProfile = writeTarget
 			? effectiveProfile(
 					{
 						...compiled.profile,
@@ -702,6 +707,9 @@ export class SrtBackend implements SandboxBackend {
 			: readTarget
 				? withReadCapability(compiled.profile, readTarget)
 				: undefined;
+		const customProfile = request.protectWrites?.length
+			? withProtectedWrites(capabilityProfile ?? compiled.profile, request.protectWrites)
+			: capabilityProfile;
 		const customConfig = customProfile
 			? toSrtConfig(customProfile, this.weakened, process.platform, this.hostTools)
 			: undefined;

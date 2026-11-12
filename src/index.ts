@@ -79,6 +79,7 @@ import { describeTally, emptyTally, recordLayer } from "./gate/layers.ts";
 import { ActionLock } from "./gate/lock.ts";
 import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
 import { answerProjectTrust } from "./gate/project-trust.ts";
+import { protectedEntryMatcher, protectedWriteTargets } from "./gate/protected-writes.ts";
 import { PROVENANCE_ENTRY_TYPE, ProvenanceTracker } from "./gate/provenance.ts";
 import { toolReachability } from "./gate/reachability.ts";
 import { checkTool, describeDeclaredHints, grantWarnings } from "./gate/tools.ts";
@@ -284,6 +285,19 @@ export default function (pi: ExtensionAPI): void {
 	 * project file counts against the turn.
 	 */
 	let unjudgedInTurn = false;
+	/** Tool calls the gate let run unjudged; their protected paths are write-denied (#64). */
+	const unjudgedCalls = new Set<string>();
+	/** Every existing path `rules.protectedPaths` names, for one unjudged call (#64). */
+	const protectedTargets = () => {
+		const backendProfile = compiled?.profile ?? profile;
+		const rules = effective?.rules.protectedPaths;
+		return protectedWriteTargets({
+			writableRoots: backendProfile.writableRoots,
+			workspace: cwd,
+			patterns: rules ? [...rules.deny, ...rules.ask] : [],
+			writeDeny: backendProfile.writeDeny ?? [],
+		});
+	};
 	const directInput = new ProvenanceTracker();
 	// `pendingOpen`, not just `open`: the breaker only opens in turn_end, after a
 	// batch has run, but the whole batch's outcome is recorded before any of it
@@ -627,6 +641,18 @@ export default function (pi: ExtensionAPI): void {
 			if (toolCallId !== undefined) exitCodes.set(toolCallId, exitCode);
 		},
 		guard: guardCommand,
+		protectWrites: (action) => {
+			const toolCallId = callOfAction.get(action);
+			if (toolCallId === undefined || !unjudgedCalls.has(toolCallId)) return undefined;
+			const found = protectedTargets();
+			if (!found.ok) {
+				throw new Error(
+					`pi-enclave: this command was not judged by anyone, and its protected paths cannot all be ` +
+						`write-denied for it (${found.reason}); it does not run.`,
+				);
+			}
+			return found.paths;
+		},
 	});
 
 	/**
@@ -877,6 +903,10 @@ export default function (pi: ExtensionAPI): void {
 					}
 				},
 				breakerOpen: breakerBlocks,
+				unjudgedWriteIssue: () => {
+					const found = protectedTargets();
+					return found.ok ? undefined : found.reason;
+				},
 				withholdBeforeExecution: () =>
 					shouldWithholdNonOwnedSibling(breaker, queuedOwnedCall, ownedTool)
 						? "pi-enclave: this third-party tool is withheld because an earlier sandboxed call in the same batch could open the denial circuit breaker at runtime."
@@ -890,11 +920,10 @@ export default function (pi: ExtensionAPI): void {
 					// count.
 					if (effective?.auto && result.outcome !== "breaker-open") breaker.record(currentTurn, result.adverse);
 					if (effective?.auto) recordLayer(layers, result.outcome);
-					if (
-						result.outcome === "sandboxed-uncertain" ||
-						(result.outcome === "review-allow" && result.action?.tool === "bash" && !result.action.confident)
-					)
+					if (result.unjudged) {
 						unjudgedInTurn = true;
+						unjudgedCalls.add(event.toolCallId);
+					}
 					if (!result.action) {
 						audit?.append("decision", {
 							outcome: result.outcome,
@@ -962,6 +991,7 @@ export default function (pi: ExtensionAPI): void {
 		currentTurn = event.turnIndex;
 		queuedOwnedCall = false;
 		unjudgedInTurn = false;
+		unjudgedCalls.clear();
 		// A server that connected mid-run has its tools judged here, not only
 		// at the next prompt.
 		applyActiveTools();
@@ -1506,7 +1536,15 @@ export default function (pi: ExtensionAPI): void {
 			// Directories the profile in force write-denies are watched by
 			// identity only, so a large protected `.pi` costs nothing per turn.
 			const isProtected = protectedByProfile(compiled.profile);
-			tripwire = new PersistenceTripwire(() => persistenceSurface(roots, { isProtected }), cwd);
+			// Every protected pattern, built-in and user-global (#64): what L2
+			// cannot deny before it exists is reported, and counted after an
+			// unjudged command.
+			const protectedPaths = effective?.rules.protectedPaths;
+			const isProtectedPath = protectedEntryMatcher(
+				protectedPaths ? [...protectedPaths.deny, ...protectedPaths.ask] : [],
+				cwd,
+			);
+			tripwire = new PersistenceTripwire(() => persistenceSurface(roots, { isProtected, isProtectedPath }), cwd);
 			// Hits from earlier sessions nobody acknowledged: with attendance off,
 			// the notice at the time may have reached no one.
 			tripwireLedger = TripwireLedger.forWorkspace(stateDirs().state, cwd);

@@ -60,4 +60,34 @@ describe.skipIf(!image)(`shared conformance: ${engine}`, () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 	}, 240_000);
+
+	// #64: the W rows hold on the container backend because of the per-call
+	// deny, not because the image lacks a tool: without it each one changes
+	// its file.
+	it("fails the protected-write rows without the per-call deny (falsifiability, #64)", async () => {
+		const root = mkdtempSync(join(tmpdir(), "enclave-container-w-"));
+		const backend = new ContainerBackend(
+			{
+				kind: engine,
+				fallback: engine,
+				image: image ?? "",
+				binary: `/usr/bin/${engine}`,
+				socket: "/var/run/docker.sock",
+				readableRoots: [],
+			},
+			root,
+		);
+		try {
+			const ids = SCENARIOS.filter((s) => /^W\d+$/.test(s.id) && s.expectation === "denied").map((s) => s.id);
+			expect(ids.length).toBeGreaterThanOrEqual(5);
+			const without = await runConformance(backend, createFixture, { only: ids, dropProtectWrites: true });
+			expect(
+				without.filter((row) => row.ok),
+				formatRows(without),
+			).toEqual([]);
+		} finally {
+			await backend.dispose();
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 240_000);
 });

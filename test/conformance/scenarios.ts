@@ -26,7 +26,9 @@ import type {
 	ViolationKind,
 } from "../../src/backend/types.ts";
 import { SandboxDenied } from "../../src/backend/types.ts";
+import { DEFAULT_PROTECTED_ASK, DEFAULT_PROTECTED_DENY } from "../../src/config/defaults.ts";
 import { buildChildEnv } from "../../src/env/child-env.ts";
+import { protectedWriteTargets } from "../../src/gate/protected-writes.ts";
 import { createReadOperations } from "../../src/tools/file-ops.ts";
 import { type GrepOutcome, runSandboxedGrep } from "../../src/tools/grep.ts";
 import { type Fixture, hostCapEff, OUTSIDE_FILE_CONTENT, SECRET_ENV, SECRET_FILE_CONTENT } from "./fixture.ts";
@@ -36,7 +38,13 @@ export interface ScenarioContext {
 	compiled: CompiledProfile;
 	fixture: Fixture;
 	/** Run a shell command in the workspace and collect everything it produced. */
-	sh(command: string): Promise<ShellOutcome>;
+	sh(command: string, extra?: ShellExtra): Promise<ShellOutcome>;
+}
+
+/** Per-invocation request fields a scenario may set. */
+export interface ShellExtra {
+	/** The protected paths of an unjudged command (#64). */
+	protectWrites?: readonly string[];
 }
 
 export interface ShellOutcome {
@@ -1412,6 +1420,219 @@ SCENARIOS.push({
 		}
 	},
 });
+
+// ---------------------------------------------------------------------------
+// #64: a command nobody judged runs with the existing protected paths
+// write-denied for that call. The trusted parent finds them with the same
+// walk the extension uses; the rows check the backend holds them read-only.
+// ---------------------------------------------------------------------------
+
+const PROTECTED_ORIGINAL = "PROTECTED-ORIGINAL-CONTENT\n";
+
+/** The protected paths of the fixture, as the extension would compute them for one call. */
+function protectedFor(fixture: Fixture, userGlobal: readonly string[] = []): string[] {
+	const found = protectedWriteTargets({
+		writableRoots: fixture.profile.writableRoots,
+		workspace: fixture.workspace,
+		patterns: [...DEFAULT_PROTECTED_DENY, ...DEFAULT_PROTECTED_ASK, ...userGlobal],
+		writeDeny: fixture.profile.writeDeny ?? [],
+	});
+	if (!found.ok) throw new Error(found.reason);
+	return found.paths;
+}
+
+/** Plant a protected file after the profile compiled, as the agent's own earlier work would. */
+function plant(fixture: Fixture, relative: string): string {
+	const path = join(fixture.workspace, relative);
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, PROTECTED_ORIGINAL);
+	return path;
+}
+
+function unchanged(path: string, r: ShellOutcome): ScenarioResult {
+	let now: string | undefined;
+	try {
+		now = readFileSync(path, "utf8");
+	} catch {
+		now = undefined;
+	}
+	return {
+		ok: now === PROTECTED_ORIGINAL,
+		detail:
+			now === PROTECTED_ORIGINAL
+				? `unchanged (exit ${r.exitCode})`
+				: `CHANGED a protected file: ${JSON.stringify(now?.slice(0, 40))}; ${r.output.slice(0, 160)}`,
+	};
+}
+
+SCENARIOS.push(
+	{
+		id: "W1",
+		title: "an unjudged command cannot rewrite a hook-manager file through a variable (#64)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const hook = plant(fixture, ".husky/pre-commit");
+			const r = await sh(`f=.husky/pre-commit; echo x > "$f"; echo y > .husky/post-checkout`, {
+				protectWrites: protectedFor(fixture),
+			});
+			const result = unchanged(hook, r);
+			let created = false;
+			try {
+				statSync(join(fixture.workspace, ".husky", "post-checkout"));
+				created = true;
+			} catch {}
+			return created ? { ok: false, detail: "CREATED a new file in .husky" } : result;
+		},
+	},
+	{
+		id: "W2",
+		title: "an unjudged command cannot rewrite AGENTS.md from another interpreter (#64)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const agents = plant(fixture, "AGENTS.md");
+			const r = await sh(`python3 -c "open('AGENTS.md','w').write('x')" 2>/dev/null || sh -c 'echo x > AGENTS.md'`, {
+				protectWrites: protectedFor(fixture),
+			});
+			return unchanged(agents, r);
+		},
+	},
+	{
+		id: "W3",
+		title: "an unjudged command cannot add a pi extension below a .pi created since start (#64)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			// Not in the session profile: it did not exist when that compiled.
+			const settings = plant(fixture, "nested/.pi/settings.json");
+			const r = await sh(
+				"d=nested/.pi/extensions; mkdir -p $d && echo x > $d/e.ts; echo x > nested/.pi/settings.json",
+				{ protectWrites: protectedFor(fixture) },
+			);
+			let created = false;
+			try {
+				statSync(join(fixture.workspace, "nested", ".pi", "extensions", "e.ts"));
+				created = true;
+			} catch {}
+			return created ? { ok: false, detail: "CREATED an extension in .pi" } : unchanged(settings, r);
+		},
+	},
+	{
+		id: "W4",
+		title: "an unjudged command cannot rewrite the config of a repository created since start (#64)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const repo = join(fixture.workspace, "later");
+			const init = spawnSync("git", ["init", "-q", repo], { encoding: "utf8" });
+			if (init.status !== 0) throw new Error(init.stderr);
+			const config = join(repo, ".git", "config");
+			const before = readFileSync(config, "utf8");
+			const r = await sh(
+				`g=git; $g init -q later; $g -c safe.directory='*' -C later config core.fsmonitor 'touch /tmp/x'`,
+				{
+					protectWrites: protectedFor(fixture),
+				},
+			);
+			const after = readFileSync(config, "utf8");
+			return {
+				ok: after === before,
+				detail: after === before ? `unchanged (exit ${r.exitCode})` : "CHANGED .git/config of a later repository",
+			};
+		},
+	},
+	{
+		id: "W5",
+		title: "a user-global protected pattern is held read-only like a built-in one (#64)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const main = plant(fixture, "infra/main.tf");
+			const r = await sh(`t=infra/main.tf; echo x >> "$t"`, { protectWrites: protectedFor(fixture, ["infra/**"]) });
+			return unchanged(main, r);
+		},
+	},
+	{
+		id: "W7",
+		title: "an unjudged command cannot write through a symlink inside a protected directory (#64)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			plant(fixture, ".husky/pre-commit");
+			const target = plant(fixture, "scripts/hook.sh");
+			symlinkSync(join("..", "scripts", "hook.sh"), join(fixture.workspace, ".husky", "pre-push"));
+			const r = await sh(`p=.husky/pre-push; echo x > "$p"`, { protectWrites: protectedFor(fixture) });
+			return unchanged(target, r);
+		},
+	},
+	{
+		id: "W8",
+		title: "an unjudged command cannot move, remove or recreate a protected path or its directory (#64)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const files = [
+				plant(fixture, "AGENTS.md"),
+				plant(fixture, ".husky/pre-commit"),
+				plant(fixture, ".github/workflows/ci.yml"),
+			];
+			const r = await sh(
+				"mv AGENTS.md a.bak; echo x > AGENTS.md; rm -f .husky/pre-commit; mv .husky h2; " +
+					"mv .github gh2; rm -rf .github; mkdir -p .github/workflows && echo x > .github/workflows/ci.yml",
+				{ protectWrites: protectedFor(fixture) },
+			);
+			for (const file of files) {
+				const result = unchanged(file, r);
+				if (!result.ok) return { ok: false, detail: `${file.slice(fixture.workspace.length + 1)}: ${result.detail}` };
+			}
+			return { ok: true, detail: `all three unchanged at their paths (exit ${r.exitCode})` };
+		},
+	},
+	{
+		id: "W6",
+		title: "with its protected paths write-denied, an unjudged command still writes ordinary files (#64)",
+		surface: "bash",
+		expectation: "allowed",
+		falsifiableByNoop: false,
+		falsifiabilityNote: "An allowed row is meant to pass with or without a sandbox.",
+		async run({ sh, fixture }) {
+			plant(fixture, "AGENTS.md");
+			plant(fixture, ".husky/pre-commit");
+			plant(fixture, "infra/main.tf");
+			const protectWrites = protectedFor(fixture, ["infra/**"]);
+			// The same shapes as W1, W2 and W5, aimed at ordinary files.
+			const r = await sh(
+				`f=notes/todo.txt; mkdir -p notes && echo ok > "$f"; ` +
+					`python3 -c "open('out.txt','w').write('ok')" 2>/dev/null || sh -c 'echo ok > out.txt'; ` +
+					`t=src/main.tf; echo ok >> "$t"; cat AGENTS.md`,
+				{ protectWrites },
+			);
+			const wrote = ["notes/todo.txt", "out.txt", "src/main.tf"].every((path) => {
+				try {
+					return readFileSync(join(fixture.workspace, path), "utf8").includes("ok");
+				} catch {
+					return false;
+				}
+			});
+			const readable = r.output.includes("PROTECTED-ORIGINAL-CONTENT");
+			return {
+				ok: wrote && readable && protectWrites.length >= 3,
+				detail:
+					wrote && readable
+						? `ordinary writes and reads work (${protectWrites.length} paths denied)`
+						: `BROKE ordinary work: wrote=${wrote} readable=${readable}; ${r.output.slice(0, 200)}`,
+			};
+		},
+	},
+);
 
 /** A valid 1x1 PNG, for the image-detection row. */
 const PNG_1X1 = Buffer.from(
