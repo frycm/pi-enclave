@@ -138,6 +138,7 @@ describe("parseDocument", () => {
 			["sandbox.grantableWriteRoots", { sandbox: { grantableWriteRoots: [] } }],
 			["rules.skipReview", { rules: { skipReview: [] } }],
 			["rules.onUncertain", { rules: { onUncertain: "ask" } }],
+			["rules.protectedHold", { rules: { protectedHold: "unapproved" } }],
 			["review.environment", { review: { environment: ["x"] } }],
 			["review.hard_deny", { review: { hard_deny: ["x"] } }],
 			["review.soft_deny", { review: { soft_deny: ["x"] } }],
@@ -174,6 +175,16 @@ describe("parseDocument", () => {
 			expect(result.document.patch?.rules?.onUncertain).toBe("sandbox");
 			expect(errorKeys(parse({ rules: { onUncertain: "allow" } }))).toEqual(["rules.onUncertain"]);
 			expect(errorKeys(parse({ rules: { onUncertain: true } }))).toEqual(["rules.onUncertain"]);
+		});
+
+		it("parses rules.protectedHold in a user-global file and rejects other values (#72)", () => {
+			const result = parse({ rules: { protectedHold: "unapproved" } });
+			if (!result.ok) throw new Error("expected success");
+			expect(result.document.patch?.rules?.protectedHold).toBe("unapproved");
+			for (const value of ["always", "off", "none", "all"]) {
+				expect(errorKeys(parse({ rules: { protectedHold: value } }))).toEqual(["rules.protectedHold"]);
+			}
+			expect(errorKeys(parse({ rules: { protectedHold: true } }))).toEqual(["rules.protectedHold"]);
 		});
 
 		it("lets a user-global file set everything a project may not", () => {

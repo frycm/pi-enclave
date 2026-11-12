@@ -804,7 +804,7 @@ configuration only at user-global scope. Broker and egress fields are rejected.
 |---|---|---|---|
 | Built-in defaults | package | — | — |
 | User global | `~/.pi/agent/enclave.json` | Everything: profiles, backend, reviewer model, `rules`, the whole `review` rulebook, tool allowlist | — |
-| Project local (untracked) | `.pi/enclave.local.json` | Select a profile, add writable roots *inside* the repo, add `rules.deny` / `rules.ask`, add protected paths, raise `review.trigger` | Touch `rules.skipReview` or `rules.onUncertain` or **any of the four prose lists** `review.environment` / `hard_deny` / `soft_deny` / `allow`, change the reviewer, disable the sandbox |
+| Project local (untracked) | `.pi/enclave.local.json` | Select a profile, add writable roots *inside* the repo, add `rules.deny` / `rules.ask`, add protected paths, raise `review.trigger` | Touch `rules.skipReview`, `rules.onUncertain` or `rules.protectedHold` or **any of the four prose lists** `review.environment` / `hard_deny` / `soft_deny` / `allow`, change the reviewer, disable the sandbox |
 | Project shared (tracked) | `.pi/enclave.json` | Add `rules.deny` / `rules.ask`, add protected paths, raise `review.trigger` | Change backend or image, relax policy, or set any of the four prose lists; ignored entirely if the project is not trusted |
 | Environment | `PI_ENCLAVE_*` (three variables, listed below) | Force attendance off; select an *already-defined, narrower* profile; disable auto mode | Name a model, backend or any value not already defined in user-global config; relax anything |
 
@@ -830,6 +830,7 @@ the result must satisfy `effective ⊑ incoming` under a partial order defined p
 | `rules.deny` / `rules.ask` / `rules.protectedPaths.*` | Superset |
 | `rules.skipReview` | Subset — user-global only; any project-file entry rejects the file |
 | `rules.onUncertain` | `ask ⊑ sandbox` — user-global only; a project file that sets it is rejected (#18) |
+| `rules.protectedHold` | `unapproved ⊑ unjudged` — user-global only; a project file that sets it is rejected (#72) |
 | `attended.mode` | May be kept or turned `off`, never switched to another mode |
 | `attended.confirmTimeoutMs` / `queueTimeoutMs` | May only go down (#30) |
 | `attended.notify` / `headlessTrust` | User-global only; a project file that sets either is rejected (#28, #30) |
@@ -905,6 +906,14 @@ the protected name. The target itself is not: with `AGENTS.md -> docs/ai/instruc
 through a chain such as `notes.md -> AGENTS.md -> …` is judged by every name on it). When a protected name is a symlink, add its target to
 `rules.protectedPaths` as well. A `git rm` or `git mv` with a pathspec L1 cannot list (`:/`,
 `:!src`, `--pathspec-from-file`) asks.
+
+A pattern of one segment (`**/AGENTS.md`, `**/Dockerfile`, `**/CLAUDE.md`) is not looked for
+below a directory operand: `rm -rf docs`, `mv docs d2` and `git rm -r svc` are allowed at L1
+when `docs/AGENTS.md` or `svc/Dockerfile` exists (`rm docs/AGENTS.md` asks). That removes or
+moves an instruction or build file without changing what it says, and asking for it would
+make `rm -rf node_modules` ask whenever any installed package ships an `AGENTS.md` or a
+`Dockerfile`. With `rules.protectedHold: "unapproved"` ([below](#what-the-reviewer-may-clear))
+the sandbox holds these files for such a command instead.
 
 These are asks, whichever list names the pattern. A directory too large to look through
 (200,000 entries) asks as well. Some ordinary work asks as a result: `rm -rf node_modules` and
@@ -1021,6 +1030,7 @@ git -c core.fsmonitor=false -c core.hooksPath=/dev/null --no-pager status --igno
         "ask":  ["$defaults", "git push *", "gh pr create *"],
         "skipReview": [],
         "onUncertain": "ask",
+        "protectedHold": "unjudged",
         "protectedPaths": { "deny": ["$defaults"], "ask": ["infra/**", ".github/workflows/**"] }
       },
       "review": {
@@ -1438,7 +1448,7 @@ Dockerfiles, compose files, `.pi` and `.agents` created since the session starte
 A directory whose contents a pattern covers is denied whole, so nothing new can be created
 inside it either, and everything it holds is checked as below; a symlink inside it is held
 through its target. The deny lasts for that one call, on bubblewrap, Seatbelt and the container
-backend alike (conformance rows W1 to W5 and W7 to W10, with a control row (W6) that the same commands still
+backend alike (conformance rows W1 to W5 and W7 to W11, with a control row (W6) that the same commands still
 write ordinary files and a falsifiability run that shows the rows fail without the deny).
 A command a person approved, at the terminal or with `pi-enclave approve` while a queued
 session waits, was judged, and runs under the session profile as before.
@@ -1503,6 +1513,28 @@ What remains:
 - A repository's own `rules.ask` pattern for a command spelling L1 cannot read is enforced
   only as well as the parser reads the command; the protected-path deny covers paths, not
   command patterns.
+
+**Protected paths for every unapproved command.** `rules.protectedHold` (user-global only) chooses which sandboxed bash calls get that per-call
+deny. `"unjudged"` (the default) is the above: only commands nobody judged. `"unapproved"`
+holds the protected paths for **every bash call no person approved**: an L1 allow, a
+`rules.skipReview` match and a reviewer allow of a command L1 read, as well as the unjudged
+ones. A command a person approved is not held. It covers what L1 reads and still lets
+through: `rm -rf docs` or `mv docs d2` with a `docs/AGENTS.md`, programs that rewrite files
+L1 does not see as targets (`git apply`, `git checkout ref -- .`, `git stash pop`), and a
+spelling of a protected route L1 misjudges (conformance row W11, with the falsifiability run
+above). The other tools (`read`, `write`, `edit`, `grep`) are judged by path at L1 and are
+not held.
+
+The cost is the walk above on every bash call instead of only the unjudged ones: about 3 µs
+per entry, run twice per call (30 ms per walk for 5,000 entries, 95 ms for 20,000 and 470 ms
+for a 100,000-entry `node_modules`, measured on the development container), so a workspace
+with a large `node_modules` adds about a second to every bash call. The refusals are the
+ones above as well, now for ordinary commands: past 200,000 entries, a protected file with a
+hard link the walk cannot account for, or a replaceable link on the way to a protected
+target, the gate asks a person (a refusal on a headless or deterministic run), and
+`npm install` running `husky` fails. Ordinary commands that only write ordinary files run as
+before (row W6). The [tripwire](#files-loaded-outside-the-sandbox-19) still counts a
+protected change against the turn only when the turn ran an unjudged command.
 
 **Deterministic mode** has no reviewer, so `rules.onUncertain` (user-global only) chooses
 what happens to an unreadable command instead: `"ask"` (the default) sends it to a person,
@@ -2250,7 +2282,7 @@ Where the open #13 issues go:
 
 | Issue | Place |
 | --- | --- |
-| #72 L1: a protected path changed through a directory operand or a second hard link (reopened; item 4 waits for Martin, the L1 leftovers are listed in its latest comment) | Before Checkpoint C |
+| #72 L1: a protected path changed through a directory operand or a second hard link (reopened; the L1 leftovers merged in #77; item 4 is the opt-in `rules.protectedHold: "unapproved"`) | Before Checkpoint C |
 | #73 protected-path walk follow-ups (writable links on the way, cost inside denied directories, fewer hard-link refusals) | With or just before #72, before Checkpoint C |
 | #68 site-specific corpus cases, then labelled pairs from the audit log | After Checkpoint C, part 1 then part 2 |
 | #70 approval queue follow-ups, flood control first | After Checkpoint C |

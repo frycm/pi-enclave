@@ -1651,6 +1651,27 @@ SCENARIOS.push(
 		},
 	},
 	{
+		id: "W11",
+		title:
+			'under protectedHold "unapproved", a readable command cannot remove or move a directory holding a protected file (#72)',
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			// L1 allows these: `docs` is an ordinary name, and `**/AGENTS.md` names
+			// only the file. The hold is what keeps docs/AGENTS.md in place.
+			const files = [plant(fixture, "docs/AGENTS.md"), plant(fixture, "pkg/sub/AGENTS.md")];
+			const r = await sh("rm -rf docs; mv pkg p2; mkdir -p pkg/sub && echo x > pkg/sub/AGENTS.md", {
+				protectWrites: protectedFor(fixture),
+			});
+			for (const file of files) {
+				const result = unchanged(file, r);
+				if (!result.ok) return { ok: false, detail: `${file.slice(fixture.workspace.length + 1)}: ${result.detail}` };
+			}
+			return { ok: true, detail: `both unchanged at their paths (exit ${r.exitCode})` };
+		},
+	},
+	{
 		id: "W6",
 		title: "with its protected paths write-denied, an unjudged command still writes ordinary files (#64)",
 		surface: "bash",

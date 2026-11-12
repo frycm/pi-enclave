@@ -523,6 +523,65 @@ describe("the gate", () => {
 			expect(decision.reason).toContain("cannot all be write-denied for it (the walk went past its bound)");
 		},
 	);
+
+	describe('under rules.protectedHold: "unapproved" (#72)', () => {
+		const held = (mode: "sandbox" | "reviewer", issue?: string) => {
+			const d = deps(mode, issue);
+			d.profile.rules.protectedHold = "unapproved";
+			return d;
+		};
+
+		it.each(["rm -rf docs", "mv docs d2", "git status --short"])(
+			"holds a command L1 read and allowed: %s",
+			async (command) => {
+				const decision = await call(command, held("sandbox"));
+				expect(decision).toMatchObject({ outcome: "allow", held: true, block: false });
+				expect(decision.unjudged).toBeUndefined();
+			},
+		);
+
+		it("holds a reviewer allow of a command L1 read, and an unjudged one stays unjudged", async () => {
+			expect(await call("git status --short", held("reviewer"))).toMatchObject({ outcome: "review-allow", held: true });
+			const unparsed = await call(`f=AGENTS.md; echo x > "$f"`, held("reviewer"));
+			expect(unparsed).toMatchObject({ outcome: "review-allow", unjudged: true });
+			expect(unparsed.held).toBeUndefined();
+		});
+
+		it("holds a skipReview allow", async () => {
+			const d = held("sandbox");
+			d.profile.rules.skipReview = ["bash(make *)"];
+			expect(await call("make test", d)).toMatchObject({ outcome: "skip-review", held: true });
+		});
+
+		it("asks a person when the protected paths cannot all be denied", async () => {
+			const decision = await call("rm -rf docs", held("sandbox", "the walk went past its bound"));
+			expect(decision.outcome).toBe("ask-denied");
+			expect(decision.reason).toContain("cannot all be write-denied for it (the walk went past its bound)");
+		});
+
+		it("does not hold a command a person approved", async () => {
+			const d = held("sandbox");
+			d.profile.rules.ask = [...d.profile.rules.ask, "bash(rm *)"];
+			const decision = await call("rm -rf docs", { ...d, escalator: { confirm: async () => true } });
+			expect(decision.outcome).toBe("ask-approved");
+			expect(decision.held).toBeUndefined();
+		});
+
+		it("does not hold a tool other than bash", async () => {
+			const decision = await decide(
+				{ toolName: "read", toolCallId: "r1", input: { path: "README.md" } },
+				held("sandbox"),
+			);
+			expect(decision.outcome).toBe("allow");
+			expect(decision.held).toBeUndefined();
+		});
+
+		it("holds nothing by default", async () => {
+			const decision = await call("rm -rf docs", deps("sandbox", "the walk went past its bound"));
+			expect(decision.outcome).toBe("allow");
+			expect(decision.held).toBeUndefined();
+		});
+	});
 });
 
 describe("the tripwire on every protected pattern", () => {

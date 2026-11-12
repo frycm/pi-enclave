@@ -507,6 +507,27 @@ describe("an unjudged command's protected paths (#64)", () => {
 		}
 	});
 
+	it('are denied for a command L1 read too under rules.protectedHold: "unapproved" (#72)', async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			plant();
+			mkdirSync(join(ws, "docs"));
+			writeFileSync(join(ws, "docs", "AGENTS.md"), "original\n");
+			const s = await session((profile) => {
+				profile.rules.protectedHold = "unapproved";
+			});
+			const gate = await s.call("t1", "rm -rf docs");
+			expect(gate?.block).not.toBe(true);
+			expect(mocks.runs).toHaveLength(1);
+			expect(mocks.runs[0]?.protectWrites).toEqual(
+				expect.arrayContaining([join(ws, "AGENTS.md"), join(ws, ".husky"), join(ws, "docs", "AGENTS.md")]),
+			);
+			await s.flush();
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
 	it("are not denied for a command L1 could read", async () => {
 		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 		try {

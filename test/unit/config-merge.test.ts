@@ -31,6 +31,16 @@ describe("narrowerOrEqual", () => {
 		expect(fields(narrowerOrEqual(sandboxed, base()))).toEqual(["rules.onUncertain"]);
 	});
 
+	// #72: "unapproved" holds protected paths for more calls, so it is the
+	// narrower setting and a profile may not drop back to "unjudged".
+	it("orders rules.protectedHold: unapproved is narrower than unjudged", () => {
+		const held = applyPatch(base(), { rules: { protectedHold: "unapproved" } }, { ...OPTIONS, source: "user_global" });
+		expect(held.rules.protectedHold).toBe("unapproved");
+		expect(base().rules.protectedHold).toBe("unjudged");
+		expect(narrowerOrEqual(held, base())).toEqual([]);
+		expect(fields(narrowerOrEqual(base(), held))).toEqual(["rules.protectedHold"]);
+	});
+
 	describe("writable roots", () => {
 		// Containment rather than set membership is what makes "a project may add
 		// roots inside the repo" fall out of the order instead of needing a

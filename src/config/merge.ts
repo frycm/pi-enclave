@@ -195,6 +195,9 @@ export function narrowerOrEqual(a: EffectiveProfile, b: EffectiveProfile): Order
 	if (a.rules.onUncertain === "sandbox" && b.rules.onUncertain !== "sandbox") {
 		fail("rules.onUncertain", 'cannot let unparsed commands run without a person ("sandbox") below user-global');
 	}
+	if (a.rules.protectedHold === "unjudged" && b.rules.protectedHold === "unapproved") {
+		fail("rules.protectedHold", 'cannot stop holding protected paths for every unapproved command ("unapproved")');
+	}
 
 	if (TRIGGER_RANK[a.review.trigger] < TRIGGER_RANK[b.review.trigger]) {
 		fail("review.trigger", `cannot lower the review trigger from "${b.review.trigger}" to "${a.review.trigger}"`);
@@ -445,6 +448,7 @@ export function applyPatch(base: EffectiveProfile, patch: ProfilePatch, options:
 			next.rules.skipReview = mergeList("replace", next.rules.skipReview, rules.skipReview);
 		}
 		if (rules.onUncertain !== undefined) next.rules.onUncertain = rules.onUncertain;
+		if (rules.protectedHold !== undefined) next.rules.protectedHold = rules.protectedHold;
 		if (rules.protectedPaths) {
 			const protectedPaths = rules.protectedPaths;
 			if (protectedPaths.deny) {

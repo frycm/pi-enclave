@@ -195,9 +195,17 @@ export interface RulesSettings {
 	 * recorded as such; only while the network is off. User-global only.
 	 */
 	onUncertain: UncertainMode;
+	/**
+	 * Which sandboxed bash calls run with every existing `protectedPaths` match
+	 * write-denied at L2 for that call (#64, #72). `unjudged`: only those nobody
+	 * judged. `unapproved`: every one no person approved, so a command L1 read
+	 * and allowed is held too. User-global only.
+	 */
+	protectedHold: ProtectedHold;
 }
 
 export type UncertainMode = "ask" | "sandbox";
+export type ProtectedHold = "unjudged" | "unapproved";
 
 /**
  * The prose rulebook rendered into the isolated reviewer's prompt. Nothing

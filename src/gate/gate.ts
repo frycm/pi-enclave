@@ -76,6 +76,12 @@ export interface GateDecision {
 	 * Its protected paths are write-denied for the call (#64).
 	 */
 	unjudged?: true;
+	/**
+	 * `rules.protectedHold: "unapproved"` (#72): a bash command L1 or the
+	 * reviewer let run without a person also runs with its protected paths
+	 * write-denied for the call.
+	 */
+	held?: true;
 }
 
 /**
@@ -386,7 +392,7 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 	// skipReview is an explicit user-global allow verdict for ordinary calls. A
 	// capability still crosses L2 and therefore never takes this route.
 	if (evaluation.verdict === "skipReview" && !action.capability) {
-		return finish(action, event, deps, {
+		return release(action, event, deps, evaluation, toolSource, {
 			outcome: "skip-review",
 			block: false,
 			matches: evaluation.matches,
@@ -426,7 +432,7 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 		return escalate(action, event, deps, evaluation, toolSource, askReason);
 	}
 
-	return finish(action, event, deps, {
+	return release(action, event, deps, evaluation, toolSource, {
 		outcome: evaluation.verdict === "skipReview" ? "skip-review" : "allow",
 		block: false,
 		matches: evaluation.matches,
@@ -546,7 +552,7 @@ async function reviewDecision(
 		const issue = deps.unjudgedWriteIssue?.(action);
 		if (issue) return escalate(action, event, deps, evaluation, toolSource, `${explanation}; ${unprotectable(issue)}`);
 	}
-	return finish(action, event, deps, {
+	return release(action, event, deps, evaluation, toolSource, {
 		outcome: "review-allow",
 		...(unjudged ? { unjudged: true as const } : {}),
 		block: false,
@@ -586,6 +592,27 @@ async function escalate(
 
 function unprotectable(issue: string): string {
 	return `the protected paths it could change cannot all be write-denied for it (${issue}), so a person decides`;
+}
+
+/**
+ * Let a call run without a person. Under `rules.protectedHold: "unapproved"`
+ * a bash call is held like an unjudged one: its protected paths are
+ * write-denied for it, and when they cannot all be, a person decides.
+ */
+async function release(
+	action: CanonicalAction,
+	event: GateEvent,
+	deps: GateDeps,
+	evaluation: Evaluation,
+	toolSource: string | undefined,
+	partial: Omit<GateDecision, "action">,
+): Promise<GateDecision> {
+	if (partial.unjudged || deps.profile.rules.protectedHold !== "unapproved" || action.tool !== "bash") {
+		return finish(action, event, deps, partial);
+	}
+	const issue = deps.unjudgedWriteIssue?.(action);
+	if (issue) return escalate(action, event, deps, evaluation, toolSource, unprotectable(issue));
+	return finish(action, event, deps, { ...partial, held: true });
 }
 
 /** Register the already-frozen action. Only reached on a permit. */
