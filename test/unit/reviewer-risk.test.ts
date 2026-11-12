@@ -41,7 +41,8 @@ describe("deterministic reviewer risk", () => {
 	});
 	it.each([
 		"rm -rf ../build",
-		"rm -rf ~/x",
+		// Not under the test home: on macOS /home resolves into /System, a critical tree.
+		"rm -rf /srv/other/x",
 		"rm",
 		"chmod +x run.sh",
 		"dd if=/dev/zero of=disk.img bs=1M count=1",

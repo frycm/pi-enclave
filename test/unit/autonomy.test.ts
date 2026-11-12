@@ -15,7 +15,11 @@ import { buildReviewerPrompt, reviewerRulebook } from "../../src/reviewer/prompt
 import { IsolatedReviewer } from "../../src/reviewer/reviewer.ts";
 import { ASK_DENIED_TARGET, DEV_TASK_CROSSING, DEV_TASK_IN_SANDBOX } from "../harness/dev-task.ts";
 
-const OPTIONS = { cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" };
+// Not /home: on macOS it is an automount, and resolving each protected path
+// under a missing /home/u waits on the automounter (seconds per lookup). Every
+// profile here is fresh, so nothing is cached between decisions.
+const HOME = "/nonexistent-home/u";
+const OPTIONS = { cwd: "/work", home: HOME, tmp: "/tmp", agentDir: `${HOME}/.pi/agent` };
 
 type Mode = "deterministic" | "sandbox" | "reviewer";
 
@@ -57,7 +61,7 @@ async function outcome(
 		{
 			profile,
 			cwd: "/work",
-			home: "/home/u",
+			home: HOME,
 			lock: new ActionLock(),
 			owned: OWNED_TOOLS,
 			...(reviewer ? { reviewer } : {}),
@@ -138,7 +142,7 @@ describe("the #18 table, unattended", () => {
 	it("runs a sandboxed-uncertain command unblocked, not adverse, and says why", async () => {
 		const decision = await decide(
 			{ toolName: "bash", toolCallId: "c1", input: { command: "npm test" } },
-			{ profile: profileFor("sandbox"), cwd: "/work", home: "/home/u", lock: new ActionLock(), owned: OWNED_TOOLS },
+			{ profile: profileFor("sandbox"), cwd: "/work", home: HOME, lock: new ActionLock(), owned: OWNED_TOOLS },
 		);
 		expect(decision).toMatchObject({ outcome: "sandboxed-uncertain", block: false, adverse: false });
 		expect(decision.reason).toContain("script-runner");
