@@ -84,6 +84,9 @@ export async function qualifyContainer(
 		writableRoots: [workspace],
 		readableRoots: [outside],
 		readDeny: [join(workspace, "secrets")],
+		// The write-grant row widens one call to `outside`, which is outside the
+		// workspace and so must be a grantable write root (#21).
+		grantableWriteRoots: [outside],
 		writeDeny: [join(workspace, ".git", "config"), join(workspace, ".git", "hooks")],
 		network: "off",
 		allowPty: true,

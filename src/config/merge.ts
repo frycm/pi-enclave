@@ -26,6 +26,7 @@
  * **Nothing is clamped.** A violation rejects the whole file and names the
  * field. A clamped value is one the user believes they set.
  */
+import { dirname } from "node:path";
 import { canonical, isUnder, normalizePath } from "../backend/paths.ts";
 import type { DefaultProfileOptions } from "./defaults.ts";
 import { defaultProfile, enclaveStateDir } from "./defaults.ts";
@@ -128,6 +129,14 @@ export function narrowerOrEqual(a: EffectiveProfile, b: EffectiveProfile): Order
 	// from mentioning the field at all; this also keeps the partial order complete
 	// for programmatically constructed profiles and persisted snapshots.
 	subsetOf("sandbox.grantableReadDeny", a.sandbox.grantableReadDeny ?? [], b.sandbox.grantableReadDeny ?? [], fail);
+	// The same for write widening (#21): a less trusted source may only remove
+	// grantable write roots, and project files may not mention the field.
+	subsetOf(
+		"sandbox.grantableWriteRoots",
+		a.sandbox.grantableWriteRoots ?? [],
+		b.sandbox.grantableWriteRoots ?? [],
+		fail,
+	);
 
 	if (a.sandbox.network.mode !== b.sandbox.network.mode) {
 		fail("sandbox.network.mode", `cannot change the network mode from "${b.sandbox.network.mode}"`);
@@ -328,6 +337,11 @@ export function applyPatch(base: EffectiveProfile, patch: ProfilePatch, options:
 			const expanded = sandbox.grantableReadDeny.map(expand);
 			track("sandbox.grantableReadDeny", expanded);
 			next.sandbox.grantableReadDeny = mergeList("replace", next.sandbox.grantableReadDeny ?? [], expanded);
+		}
+		if (sandbox.grantableWriteRoots) {
+			const expanded = sandbox.grantableWriteRoots.map(expand);
+			track("sandbox.grantableWriteRoots", expanded);
+			next.sandbox.grantableWriteRoots = mergeList("replace", next.sandbox.grantableWriteRoots ?? [], expanded);
 		}
 		if (sandbox.network) {
 			if (sandbox.network.mode !== undefined) next.sandbox.network.mode = sandbox.network.mode;
@@ -560,6 +574,70 @@ export function fold(documents: readonly ConfigDocument[], options: FoldOptions)
 		}
 	}
 
+	// pi's agent directory holds the trust roots themselves: enclave.json (this
+	// policy), trust.json, settings.json, and the extensions and packages pi
+	// loads at start. A writable root that overlaps it either way would let the
+	// agent rewrite the policy for every later session (#21). The state
+	// directory check above covers the containing case with its own message;
+	// this one also covers a root inside the agent directory.
+	{
+		const agentDir = dirname(stateDir);
+		for (const root of current.sandbox.writableRoots) {
+			if (isUnder(stateDir, root) || isUnder(canonical(stateDir), canonical(root))) continue;
+			const overlaps =
+				isUnder(agentDir, root) ||
+				isUnder(root, agentDir) ||
+				isUnder(canonical(agentDir), canonical(root)) ||
+				isUnder(canonical(root), canonical(agentDir));
+			if (!overlaps) continue;
+			errors.push({
+				source: "builtin",
+				field: "sandbox.writableRoots",
+				message:
+					`"${root}" overlaps pi's agent directory (${agentDir}), which holds pi-enclave's policy (enclave.json), ` +
+					"trust.json, settings.json and the extensions pi loads, so the sandboxed agent could rewrite them.\n" +
+					"    Fix it by removing the entry, or by moving pi's agent directory (PI_CODING_AGENT_DIR) elsewhere.",
+			});
+		}
+	}
+
+	// Write capabilities outside the workspace are opt-in (#21). An entry that
+	// intersects a never-grantable target either way is a configuration mistake:
+	// one on or below it can never grant anything, and one that contains it
+	// (`~`, `/home`, `~/.config`, `/var`, `/`) would leave the built-in list as
+	// the only thing between an approval and the trust roots. The list is a
+	// backstop -- the validator still checks every target -- not the boundary.
+	for (const grantable of current.sandbox.grantableWriteRoots ?? []) {
+		const target = canonical(grantable);
+		if (target === "/") {
+			errors.push({
+				source: "user_global",
+				field: "sandbox.grantableWriteRoots",
+				message: '"/" can never be a grantable write root.',
+			});
+			continue;
+		}
+		const protectedEntry = current.sandbox.protectedWrite.find((entry) => {
+			const path = canonical(entry.path);
+			return (
+				isUnder(target, path) ||
+				isUnder(grantable, entry.path) ||
+				isUnder(path, target) ||
+				isUnder(entry.path, grantable)
+			);
+		});
+		if (!protectedEntry) continue;
+		const below = isUnder(target, canonical(protectedEntry.path)) || isUnder(grantable, protectedEntry.path);
+		errors.push({
+			source: "user_global",
+			field: "sandbox.grantableWriteRoots",
+			message: below
+				? `"${grantable}" is on or below never-grantable write target ${protectedEntry.path}: ${protectedEntry.reason}.`
+				: `"${grantable}" contains never-grantable write target ${protectedEntry.path} (${protectedEntry.reason}). ` +
+					"List the specific directories a capability may write instead, such as a data or build directory.",
+		});
+	}
+
 	// The same kind of invariant for the per-user scratch base. Configuration
 	// written for earlier versions listed "$TMPDIR" as a writable root, and
 	// `$TMPDIR` now expands to this base, so an old file would otherwise open
@@ -658,6 +736,7 @@ function recordBuiltinProvenance(provenance: Provenance, profile: EffectiveProfi
 	recordProvenance(provenance, "sandbox.writableRoots", profile.sandbox.writableRoots, "builtin");
 	recordProvenance(provenance, "sandbox.readDeny", profile.sandbox.readDeny, "builtin");
 	recordProvenance(provenance, "sandbox.grantableReadDeny", profile.sandbox.grantableReadDeny, "builtin");
+	recordProvenance(provenance, "sandbox.grantableWriteRoots", profile.sandbox.grantableWriteRoots, "builtin");
 	recordProvenance(provenance, "sandbox.network.allowHosts", profile.sandbox.network.allowHosts, "builtin");
 	recordProvenance(provenance, "sandbox.env.passthrough", profile.sandbox.env.passthrough, "builtin");
 	recordProvenance(provenance, "sandbox.env.envDeny", profile.sandbox.env.envDeny, "builtin");

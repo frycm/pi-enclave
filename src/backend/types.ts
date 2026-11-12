@@ -62,6 +62,13 @@ export interface Profile {
 	selfHosted?: readonly string[];
 	/** Absolute paths that may not be read, even though reads are otherwise open. */
 	readDeny: readonly string[];
+	/**
+	 * User-global roots below which a one-shot write capability may be granted
+	 * (#21). Absent or empty: nothing outside the workspace.
+	 */
+	grantableWriteRoots?: readonly string[];
+	/** Paths no write capability may reach, with the reason (#21). Built in. */
+	protectedWrite?: readonly { path: string; reason: string }[];
 	/** The explicitly selected scratch path exposed to children as TMPDIR. */
 	tmpDir?: string;
 	/**

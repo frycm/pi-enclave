@@ -1,5 +1,5 @@
 import { resolveCapabilityTarget } from "../backend/capability.ts";
-import { canonical, isUnderAny, normalizePath } from "../backend/paths.ts";
+import { canonical, isUnder, isUnderAny, normalizePath } from "../backend/paths.ts";
 import type { EffectiveProfile } from "../config/types.ts";
 import type { CanonicalAction } from "../policy/canonical.ts";
 import type { EffectiveReview, ModelReview, ReviewAuthorization, ReviewEvidence, ReviewRisk } from "./types.ts";
@@ -32,10 +32,26 @@ function destructiveShell(action: CanonicalAction): boolean {
 	);
 }
 
-function criticalWriteTarget(path: string): boolean {
+function criticalWriteTarget(path: string, profile: EffectiveProfile): boolean {
 	const normalized = normalizePath(path);
 	if (normalized === "/" || canonical(normalized) === "/") return true;
-	return isUnderAny(normalized, CRITICAL_TREES);
+	if (isUnderAny(normalized, CRITICAL_TREES)) return true;
+	// The never-grantable write list (#21): the trust boundary itself. Matched
+	// as written and canonical, both ways; the canonical spellings are resolved
+	// once per profile, because this runs for every write path of every action.
+	return protectedSpellings(profile).some((entry) => isUnder(normalized, entry) || isUnder(entry, normalized));
+}
+
+const SPELLINGS = new WeakMap<object, readonly string[]>();
+
+function protectedSpellings(profile: EffectiveProfile): readonly string[] {
+	const list = profile.sandbox.protectedWrite;
+	let spellings = SPELLINGS.get(list);
+	if (!spellings) {
+		spellings = [...new Set(list.flatMap((entry) => [normalizePath(entry.path), canonical(entry.path)]))];
+		SPELLINGS.set(list, spellings);
+	}
+	return spellings;
 }
 
 /**
@@ -67,11 +83,11 @@ export function minimumRisk(action: CanonicalAction, profile: EffectiveProfile):
 		const value = action.capability.value;
 		const critical =
 			broadCapability(value) ||
-			criticalWriteTarget(resolveCapabilityTarget(action.cwd, value)) ||
+			criticalWriteTarget(resolveCapabilityTarget(action.cwd, value), profile) ||
 			action.paths.some((path) => isUnderAny(path.resolved, profile.sandbox.readDeny));
 		raise(critical ? "critical" : "high");
 	}
-	if (action.paths.some((path) => path.writes && criticalWriteTarget(path.resolved))) raise("critical");
+	if (action.paths.some((path) => path.writes && criticalWriteTarget(path.resolved, profile))) raise("critical");
 	if (destructiveShell(action)) raise("high");
 	if (action.tool === "write" || action.tool === "edit" || action.paths.some((path) => path.writes)) raise("medium");
 	// An opaque or otherwise non-confident command needs a person or an exact

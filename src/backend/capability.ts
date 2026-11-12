@@ -43,16 +43,68 @@ export function capabilityIntersects(target: string, roots: readonly string[]): 
 	return undefined;
 }
 
+/** What a write capability may reach (#21). */
+export interface WriteCapabilityBoundary {
+	/** The workspace the action runs in. A target below it is grantable. */
+	cwd: string;
+	/** User-global `sandbox.grantableWriteRoots`. */
+	grantableRoots: readonly string[];
+	/** Never grantable, whoever approves, with the reason shown in the refusal. */
+	protectedTargets: readonly { path: string; reason: string }[];
+}
+
+/**
+ * Why a write capability to `target` is not grantable, or undefined.
+ *
+ * Two rules. A protected target -- one that intersects, either way, a path in
+ * the built-in never-grantable list -- is refused whatever else is configured.
+ * Otherwise the target must be below the workspace or below a user-global
+ * `grantableWriteRoots` entry; with that list empty, nothing outside the
+ * workspace is grantable.
+ */
+export function writeCapabilityBoundaryIssue(target: string, boundary: WriteCapabilityBoundary): string | undefined {
+	const resolvedTarget = canonical(target);
+	for (const entry of boundary.protectedTargets) {
+		if (capabilityIntersects(resolvedTarget, [entry.path])) {
+			return (
+				`pi-enclave: refusing write capability ${resolvedTarget}: it intersects ${entry.path}, and ${entry.reason}.\n` +
+				"  It is on the built-in never-grantable write list, so no approval can lift it."
+			);
+		}
+	}
+	const inside = [boundary.cwd, ...boundary.grantableRoots].some(
+		(root) => isUnder(target, root) || isUnder(resolvedTarget, canonical(root)),
+	);
+	if (!inside) {
+		return (
+			`pi-enclave: refusing write capability ${resolvedTarget}: it is outside the workspace and outside every ` +
+			`sandbox.grantableWriteRoots entry (${boundary.grantableRoots.join(", ") || "none configured"}).\n` +
+			"  Only the user-global configuration can make a path outside the workspace grantable; no approval can."
+		);
+	}
+	return undefined;
+}
+
 /**
  * Return the safe canonical target or throw before a prompt or sandbox wrap.
  *
  * An allow-write bind beneath a Linux read-deny tmpfs re-exposes that host
  * subtree. A grant touching a host PATH directory can also create the next
  * `which`/helper that SRT runs in the privileged parent. Both are immutable
- * boundaries, not things a one-shot capability may lift.
+ * boundaries, not things a one-shot capability may lift, and so are the
+ * built-in never-grantable write targets and anything outside the workspace
+ * and the user-global grantable write roots (#21).
  */
 export function validateWriteCapability(profile: Profile, cwd: string, value: string): string {
 	const target = resolveCapabilityTarget(cwd, value);
+	// First, so a refusal names why the target is sensitive rather than only
+	// the denial it also happens to intersect.
+	const boundaryIssue = writeCapabilityBoundaryIssue(target, {
+		cwd,
+		grantableRoots: profile.grantableWriteRoots ?? [],
+		protectedTargets: profile.protectedWrite ?? [],
+	});
+	if (boundaryIssue) throw new Error(boundaryIssue);
 	const denied = [...profile.readDeny, ...(profile.writeDeny ?? [])];
 	const overlap = capabilityIntersects(target, denied);
 	if (overlap) {

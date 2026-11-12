@@ -19,6 +19,7 @@ const LIST_PATHS = [
 	"sandbox.writableRoots",
 	"sandbox.readDeny",
 	"sandbox.grantableReadDeny",
+	"sandbox.grantableWriteRoots",
 	"sandbox.env.passthrough",
 	"sandbox.env.envDeny",
 	"rules.deny",
@@ -40,6 +41,8 @@ function listAt(profile: EffectiveProfile, path: string): readonly string[] {
 			return profile.sandbox.readDeny;
 		case "sandbox.grantableReadDeny":
 			return profile.sandbox.grantableReadDeny;
+		case "sandbox.grantableWriteRoots":
+			return profile.sandbox.grantableWriteRoots;
 		case "sandbox.env.passthrough":
 			return profile.sandbox.env.passthrough;
 		case "sandbox.env.envDeny":

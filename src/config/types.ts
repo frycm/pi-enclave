@@ -49,6 +49,12 @@ export const SOURCE_LABELS: Record<SourceId, string> = {
 // ---------------------------------------------------------------------------
 
 export type ReviewTrigger = "boundary" | "mutating" | "all";
+/** See `protectedWriteTargets` in defaults.ts. */
+export interface ProtectedWriteTarget {
+	path: string;
+	reason: string;
+}
+
 export type CapabilityMode = "none" | "reviewed";
 export type HostExecMode = "never" | "human";
 export type AttendedMode = "tui" | "rpc" | "off";
@@ -76,6 +82,17 @@ export interface SandboxSettings {
 	readDeny: string[];
 	/** User-global read-deny entries that a reviewed action may lift once. */
 	grantableReadDeny: string[];
+	/**
+	 * User-global roots below which a one-shot write capability may be granted
+	 * (#21). Empty by default: then no write capability outside the workspace is
+	 * grantable at all, which is the right default for an unattended server.
+	 */
+	grantableWriteRoots: string[];
+	/**
+	 * Built-in, immutable: paths no write capability may reach, with the reason.
+	 * Not read from any configuration file.
+	 */
+	protectedWrite: readonly ProtectedWriteTarget[];
 	network: NetworkSettings;
 	/** May the agent request a one-shot capability (which goes to L3, or to L4 without one)? */
 	capabilities: CapabilityMode;
@@ -205,7 +222,7 @@ export interface EffectiveProfile {
 
 /** A partially-specified contribution from one file. */
 export interface ProfilePatch {
-	sandbox?: Partial<Omit<SandboxSettings, "network" | "env">> & {
+	sandbox?: Partial<Omit<SandboxSettings, "network" | "env" | "protectedWrite">> & {
 		network?: Partial<NetworkSettings>;
 		env?: Partial<EnvSettings>;
 	};

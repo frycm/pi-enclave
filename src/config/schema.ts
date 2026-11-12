@@ -52,6 +52,8 @@ export type ParseResult = { ok: true; document: ConfigDocument } | { ok: false; 
 const PROJECT_FORBIDDEN: Record<string, string> = {
 	"sandbox.backend": "container images, engines and host mounts are user-global only.",
 	"sandbox.grantableReadDeny": "grantableReadDeny authorizes one-shot read widening and is therefore user-global only.",
+	"sandbox.grantableWriteRoots":
+		"grantableWriteRoots authorizes one-shot write widening outside the workspace and is therefore user-global only.",
 	"rules.skipReview": "skipReview is an allow verdict: it bypasses review entirely. User-global only.",
 	"review.environment": "prose rulebook entries are user-global only; a repository must not reach the reviewer prompt.",
 	"review.hard_deny": "prose rulebook entries are user-global only; a repository must not reach the reviewer prompt.",
@@ -73,6 +75,7 @@ const SANDBOX_KEYS = [
 	"writableRoots",
 	"readDeny",
 	"grantableReadDeny",
+	"grantableWriteRoots",
 	"network",
 	"capabilities",
 	"hostExec",
@@ -410,6 +413,14 @@ class ParseContext {
 		if ("grantableReadDeny" in body) {
 			const deny = this.list(join(prefix, "grantableReadDeny"), body.grantableReadDeny, "sandbox.grantableReadDeny");
 			if (deny) out.grantableReadDeny = deny;
+		}
+		if ("grantableWriteRoots" in body) {
+			const roots = this.list(
+				join(prefix, "grantableWriteRoots"),
+				body.grantableWriteRoots,
+				"sandbox.grantableWriteRoots",
+			);
+			if (roots) out.grantableWriteRoots = roots;
 		}
 		if ("network" in body) {
 			const network = this.object(join(prefix, "network"), body.network);

@@ -22,6 +22,12 @@ function profile(edit: (p: EffectiveProfile) => void = () => {}): EffectiveProfi
 
 const YES: Escalator = { confirm: async () => true };
 
+/** Write capabilities outside the workspace need user-global grantable roots (#21). */
+const grantableWrites = () =>
+	profile((p) => {
+		p.sandbox.grantableWriteRoots = ["/etc", "/srv", "/home/u"];
+	});
+
 function fakeReviewer(
 	result:
 		| Omit<Extract<ReviewerResult, { ok: true }>, "evidence">["review"]
@@ -108,7 +114,7 @@ describe("the gate", () => {
 			const decision = await gate(
 				"bash",
 				{ command: "printf x > /etc/hosts", allow_write: "/etc/hosts" },
-				{ escalator: YES },
+				{ escalator: YES, profile: grantableWrites() },
 			);
 			expect(decision.outcome).toBe("ask-approved");
 		});
@@ -117,7 +123,7 @@ describe("the gate", () => {
 			const decision = await gate(
 				"bash",
 				{ command: "touch /work/output", allow_write: "/srv/unrelated" },
-				{ escalator: YES },
+				{ escalator: YES, profile: grantableWrites() },
 			);
 			expect(decision.outcome).toBe("deny");
 			expect(decision.reason).toContain("does not cover a concrete write");
@@ -129,6 +135,7 @@ describe("the gate", () => {
 				"bash",
 				{ command: "cat /home/u/.ssh/id_ed25519", allow_write: "/home/u/.ssh/out" },
 				{
+					profile: grantableWrites(),
 					escalator: {
 						confirm: async () => {
 							asked = true;
@@ -1008,6 +1015,15 @@ describe("checkTool", () => {
 
 	it("treats a bare grant on a tool it cannot sandbox as reviewed (#22)", () => {
 		const disposition = checkTool({ tool: "deploy", tools: { allow: { deploy: {} } }, owned: OWNED_TOOLS });
+		expect(disposition.allowed && disposition.reviewed).toBe(true);
+	});
+
+	it("lets reviewed win when a programmatic grant carries both flags", () => {
+		const disposition = checkTool({
+			tool: "deploy",
+			tools: { allow: { deploy: { readOnly: true, reviewed: true } } },
+			owned: OWNED_TOOLS,
+		});
 		expect(disposition.allowed && disposition.reviewed).toBe(true);
 	});
 

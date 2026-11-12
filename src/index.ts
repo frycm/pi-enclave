@@ -68,6 +68,7 @@ import {
 	collectCodeRoots,
 	extensionArguments,
 	formatCodeRootProblems,
+	protectLoadedCode,
 	resolveDependencyEntries,
 } from "./gate/code-roots.ts";
 import { decide, type GateDecision } from "./gate/gate.ts";
@@ -943,6 +944,10 @@ export default function (pi: ExtensionAPI): void {
 			return;
 		}
 		if (loaded.profile.sandbox.allowSelfHosting) profile = applySelfHosting(profile, codeCheck);
+		// Every loaded code root is a trust root for write capabilities too
+		// (#21): a one-shot write to pi-enclave's package, its node_modules or
+		// pi's own package runs the agent's code in the pi process next start.
+		profile = protectLoadedCode(profile, loadedCode);
 		ownershipError = undefined;
 
 		// The state directory is opened before anything is recorded, and a
