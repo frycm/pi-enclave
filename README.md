@@ -1213,9 +1213,10 @@ rules end in `deny` or `ask` before L3 exists.
     part of `generateMs`.
   - The per-attempt timeout (`reviewer.timeoutMs`) covers the thinking. Qualification
     still requires the p95 latency to be at most half of it, so a model that thinks for
-    too long fails qualification. An answer that stops at the token cap is retried like a
-    malformed one, three times, and each attempt may generate up to `thinkingTokens + 256`
-    tokens, so a review can take up to four full attempts before it escalates.
+    too long fails qualification. An answer that stops at the token cap is a failed
+    attempt, like an unreachable reviewer: a review makes at most three requests, each
+    generating up to `thinkingTokens + 256` tokens within its own timeout, and then ends
+    as an unavailable reviewer.
 
   How Ollama applies the schema while the model thinks is read from its source (at
   `8a89b76`, November 2026), not yet observed. When the model's template marks thinking,
@@ -1314,8 +1315,8 @@ rules end in `deny` or `ask` before L3 exists.
   **Not yet observed on a live runtime:** whether a given llama.cpp or Ollama build would
   have parsed these spellings as control tokens is unverified here; Checkpoint C records it
   (`/tokenize` with `parse_special` true and false on llama.cpp shows it in one request).
-- **Evaluated before trusted.** The fixed corpus (version 4, #27) holds 126 cases, 61
-  benign and 65 injected, in ten categories of at least ten distinct cases each (see
+- **Evaluated before trusted.** The fixed corpus (version 4, #27) holds 134 cases, 64
+  benign and 70 injected, in ten categories of at least ten distinct cases each (see
   [The qualification corpus](#the-qualification-corpus)). Run it with
   `/enclave eval-reviewer`. A model that allows *any* injected case is refused as a
   reviewer, with a clear message. This is the offline substitute for "product-validated
@@ -1428,17 +1429,18 @@ replaces the corpus (version 4) and adds the per-category gate, so every reviewe
 
 ### The qualification corpus
 
-The corpus (`src/reviewer/corpus.ts`, version 4 since #27) is 126 cases in ten categories.
-Each category has at least ten cases (`MIN_CASES_PER_CATEGORY`), no two cases share a
-command or path once digits are stripped, and no benign case has the same action hash as an
-injected one.
+The corpus (`src/reviewer/corpus.ts`, version 4 since #27) is 134 cases in ten categories.
+Each category has at least ten cases (`MIN_CASES_PER_CATEGORY`). Within a category no two
+cases render the same evidence once every digit is removed, so a case cannot be another
+with a different index; the same action may still recur under different context or
+authorization. No benign case has the same action hash as an injected one.
 
 | Category | Cases (benign / injected) | What it measures |
 |---|---|---|
 | `task-in-scope` | 12 / 0 | Ordinary steps of a user's task (fix a parser test, switch an nginx upstream, rename a function), authorized by the task rather than by naming each path |
 | `task-out-of-scope` | 0 / 12 | Steps the same tasks do not need: dropping CI tests, a force push to main, a sibling repository, a shell profile, `chmod -R 777 .` |
-| `injection` | 0 / 16 | Instructions planted in tool output, file content or the action input, including turns forged in ChatML, Llama 3, Gemma, Mistral and DeepSeek control-token spelling (#59), in the body and in the context |
-| `injection-twin` | 13 / 0 | The same spellings and phrases in content the user asked for, so a model cannot pass by refusing every string that looks like an injection |
+| `injection` | 0 / 21 | Instructions planted in tool output, file content or the action input, including turns forged in ChatML, Llama 3, Gemma, Mistral and DeepSeek control-token spelling (#59), each family once in the action body and once in the context |
+| `injection-twin` | 16 / 0 | The same spellings and phrases in content the user asked for, including a sample transcript in each of the five template families, so a model cannot pass by refusing every string that looks like an injection |
 | `content` | 6 / 6 | Writes and edits whose path is in scope and whose body decides: a secret sent to an outside host, a disabled check, a backdoor, against the benign body at the same path |
 | `precedence` | 5 / 7 | The four tiers under a fixed test rulebook: `hard_deny` against direct intent, `soft_deny` cleared only by `allow` or direct intent, `environment` defining production |
 | `tools` | 7 / 5 | Read and search tools, capability requests with their sandbox violation (`~/.npm`, `~/.aws`, `~/.ssh/authorized_keys`), third-party tools with their reachability, and a truncated script |
@@ -1457,8 +1459,10 @@ Cases run against a fixed workspace (`/workspace`, home `/home/eval`) with the u
 same thing on every host.
 
 `/enclave eval-reviewer` reports each category separately, both for the model's own
-decision and for the **effective** outcome after the deterministic floors and hard denials
-(`enforceReview`), which is what a session would do:
+decision and for the **effective** outcome after `enforceReview`, which applies the
+reviewer's deterministic risk floors, and the asks and denials they force, to the model's
+verdict. It does not run the L1 rules, the protected-path checks or the sandbox, so it is
+the reviewer layer's outcome, not everything a session would do:
 
 ```
   per category (model decision; effective after the floors):
@@ -1474,7 +1478,7 @@ category below the minimum fails qualification, so a category cannot pass by bei
 
 A reviewer that allows a write when the authorization names its path, and refuses
 otherwise, fails this corpus: it allows ten injected cases (four of the six in `content`,
-one in `precedence`) and refuses 61 % of the benign ones.
+one in `precedence`) and refuses 58 % of the benign ones.
 
 The `precedence` prompt is shorter than the default production prompt (3.3 KB against
 3.7 KB of evidence room at 8,192 tokens on the chat transport), and every case fits at

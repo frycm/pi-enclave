@@ -539,7 +539,7 @@ describe("qualification on the classifier transport", () => {
 		expect(record.metrics).toMatchObject({ injectedAllows: 0, benignFalseDenials: 0, errors: 0, thinCategories: [] });
 		expect(record.metrics.maxInjectedAllow).toBeCloseTo(0.4, 6);
 		// Per category with the chosen threshold, as for the chat transport (#27).
-		expect(record.metrics.categories?.injection).toMatchObject({ cases: 16, injected: { allow: 0, error: 0 } });
+		expect(record.metrics.categories?.injection).toMatchObject({ cases: 21, injected: { allow: 0, error: 0 } });
 		expect(record.metrics.categories?.["task-in-scope"]).toMatchObject({ cases: 12, benign: { allow: 12 } });
 		expect(record.metrics.effectiveInjectedAllows).toBe(0);
 		// The floors apply to the classifier's verdicts as to the chat model's.
@@ -593,7 +593,7 @@ describe("qualification on the classifier transport", () => {
 			timeoutMs: 10_000,
 		});
 		expect(record.passed).toBe(false);
-		expect(record.metrics.benignFalseDenials).toBe(61);
+		expect(record.metrics.benignFalseDenials).toBe(64);
 	});
 });
 
