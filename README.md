@@ -1764,7 +1764,10 @@ All of it is compared canonically against the writable roots.
   checkout you are editing; denying it would deny the whole workspace), a symlink below a
   writable root that the configured path runs through (the agent could point it at other
   code; load the extension by its real path; a symlinked `node_modules` above a code root is
-  refused the same way), and a Node binary below a writable root.
+  refused the same way), and a Node binary below a writable root. A project that was
+  `npm link`-ed into the global `node_modules` pi is installed in falls under the first case:
+  that `node_modules` becomes a code root containing the workspace, and the start refuses with
+  "contains the writable root". `npm unlink -g <package>` resolves it.
 
 So work on an extension happens in a second worktree: load it from one checkout, edit
 another. The native backend's host-executable check covers `process.execPath` too, as the

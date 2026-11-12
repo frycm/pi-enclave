@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { encodeFrame, FrameDecoder, HEADER_BYTES, MAX_FRAME_BYTES } from "../../src/fs/protocol.ts";
 
 describe("frame encoding", () => {
@@ -70,5 +70,49 @@ describe("FrameDecoder", () => {
 		const [message] = decoder.push(encodeFrame({ id: 1, ok: true, result: bytes.toString("base64") }));
 		const back = Buffer.from((message as { result: string }).result, "base64");
 		expect(back.equals(bytes)).toBe(true);
+	});
+
+	it("copies a frame split across many chunks once, not once per chunk", () => {
+		// Joining on every chunk made a 31 MB frame cost seconds to decode.
+		const frame = encodeFrame({ id: 1, ok: true, result: "z".repeat(1_000_000) });
+		const decoder = new FrameDecoder();
+		const concat = vi.spyOn(Buffer, "concat");
+		const out: unknown[] = [];
+		try {
+			for (let i = 0; i < frame.length; i += 4096) out.push(...decoder.push(frame.subarray(i, i + 4096)));
+			const copied = concat.mock.results.reduce((sum, r) => sum + (r.value as Buffer).length, 0);
+			expect(copied).toBeLessThanOrEqual(frame.length);
+		} finally {
+			concat.mockRestore();
+		}
+		expect(out).toHaveLength(1);
+		expect((out[0] as { result: string }).result).toHaveLength(1_000_000);
+		expect(decoder.pending).toBe(0);
+	});
+
+	it("decodes frames fed one byte at a time, headers included", () => {
+		const frames = Buffer.concat([
+			encodeFrame({ id: 1, result: "a" }),
+			encodeFrame({ id: 2, result: "" }),
+			encodeFrame({ id: 3 }),
+		]);
+		const decoder = new FrameDecoder();
+		const out: unknown[] = [];
+		for (let i = 0; i < frames.length; i++) {
+			out.push(...decoder.push(frames.subarray(i, i + 1)));
+			if (i === 2) expect(decoder.pending).toBe(3);
+		}
+		expect(out).toEqual([{ id: 1, result: "a" }, { id: 2, result: "" }, { id: 3 }]);
+		expect(decoder.pending).toBe(0);
+	});
+
+	it("keeps the bytes of the next frame that arrive with the end of this one", () => {
+		const a = encodeFrame({ id: 1, result: "first" });
+		const b = encodeFrame({ id: 2, result: "second" });
+		const decoder = new FrameDecoder();
+		expect(decoder.push(a.subarray(0, 5))).toEqual([]);
+		expect(decoder.push(Buffer.concat([a.subarray(5), b.subarray(0, 2)]))).toEqual([{ id: 1, result: "first" }]);
+		expect(decoder.pending).toBe(2);
+		expect(decoder.push(b.subarray(2))).toEqual([{ id: 2, result: "second" }]);
 	});
 });

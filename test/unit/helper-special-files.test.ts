@@ -155,4 +155,52 @@ describe("a helper that stops answering (#35)", () => {
 		expect(await fs.exists(root)).toBe(true);
 		expect(spawnHelper).toHaveBeenCalledTimes(1);
 	});
+
+	it("is kept while it is still sending, as when the pong queues behind a large frame", async () => {
+		const root = workspace();
+		// Answers the first request with a large frame written slowly, the
+		// way a big readFile drains through a pipe, then answers the ping that
+		// queued behind it, then everything else at once.
+		const busy = [
+			`const send = (m) => { const b = Buffer.from(JSON.stringify(m)); const h = Buffer.alloc(4); h.writeUInt32BE(b.length, 0); return Buffer.concat([h, b]); };`,
+			`process.stdout.write(send({ ready: true, protocol: 3 }));`,
+			`let held = Buffer.alloc(0); let draining = false; const queued = [];`,
+			`process.stdin.on("data", (chunk) => {`,
+			`  held = Buffer.concat([held, chunk]);`,
+			`  while (held.length >= 4 && held.length >= 4 + held.readUInt32BE(0)) {`,
+			`    const request = JSON.parse(held.subarray(4, 4 + held.readUInt32BE(0)).toString());`,
+			`    held = held.subarray(4 + held.readUInt32BE(0));`,
+			`    if (request.op === "cancel") continue;`,
+			`    const reply = send({ id: request.id, ok: true, result: request.op === "readFile" ? "x".repeat(400000) : request.op === "ping" ? "pong" : true });`,
+			`    if (request.op !== "readFile") { if (draining) queued.push(reply); else process.stdout.write(reply); continue; }`,
+			`    draining = true; let at = 0; const piece = Math.ceil(reply.length / 20);`,
+			`    const timer = setInterval(() => {`,
+			`      process.stdout.write(reply.subarray(at, at + piece)); at += piece;`,
+			`      if (at >= reply.length) { clearInterval(timer); draining = false; for (const q of queued.splice(0)) process.stdout.write(q); }`,
+			`    }, 60);`,
+			`  }`,
+			`});`,
+		].join("\n");
+		const spawnHelper = vi.fn(() => spawn(process.execPath, ["-e", busy], { stdio: ["pipe", "pipe", "pipe"] }));
+		const fs = new HelperFsClient({
+			compiled: {
+				backend: "seatbelt",
+				profile: { mode: "workspace-write", writableRoots: [root], readDeny: [], network: "off", allowPty: false },
+				describe: () => "unsandboxed test helper",
+			},
+			spawnHelper: spawnHelper as never,
+			callTimeoutMs: 200,
+			livenessGraceMs: 200,
+		});
+		clients.push(fs);
+
+		// The frame takes about 1.2 s; the call gives up at 0.2 s and the
+		// ping's grace period would end at 0.4 s.
+		await expect(fs.readFile(join(root, "big.txt"))).rejects.toThrow(/timed out/);
+		await new Promise((resolve) => setTimeout(resolve, 1_500));
+		const first = spawnHelper.mock.results[0]?.value as { signalCode: string | null };
+		expect(first.signalCode).toBeNull();
+		expect(await fs.exists(root)).toBe(true);
+		expect(spawnHelper).toHaveBeenCalledTimes(1);
+	});
 });
