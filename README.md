@@ -549,13 +549,25 @@ evaluation on top of one.
 > [!WARNING]
 > **Tools pi-enclave does not own.** Tools registered by other extensions execute in the pi
 > process with the user's privileges and never touch the sandbox. In auto mode the policy
-> layer therefore **denies any tool not in `tools.allow`**. Allowlisted tools may be
-> declared `readOnly: true` or `reviewed: true`. Whenever L3 sees such an unsandboxed tool,
-> even a model `allow` still requires L4. An explicit `reviewed` grant always takes that
-> route with a qualified model and goes directly to L4 in deterministic mode. A grant may pin `source` to the `sourceInfo.path` pi reports for the
+> layer therefore **denies any tool not in `tools.allow`**. A grant on such a tool is
+> `reviewed` unless it says `readOnly: true`: a bare `{}` means the same as
+> `reviewed: true`, whatever `review.trigger` is (see the table below). Whenever L3 sees an
+> unsandboxed tool, even a model `allow` still requires L4. A grant may pin `source` to the `sourceInfo.path` pi reports for the
 > registering extension — without a pin, a tool name is not an identity, and whichever
-> extension loads first inherits the grant. This is the honest answer until pi core offers
+> extension loads first inherits the grant, so session start warns about an unpinned
+> grant. This is the honest answer until pi core offers
 > a sandbox hook for tool execution — see [core changes](#core-changes-to-propose-to-pi).
+>
+> | `tools.allow` grant | Owned tool (`bash`, `read`, `edit`, `write`, `grep`, `find`, `ls`) | Any other tool (MCP, codemode, PowerShell, extensions) |
+> | --- | --- | --- |
+> | `{}` | Runs in the sandbox; reviewed as mutating when `review.trigger` asks for it | **Reviewed**: always a person. A reviewer may veto or recommend, never admit. |
+> | `{ "reviewed": true }` | Same as `{}` (the sandbox applies whatever the grant says) | Same as `{}` for this tool |
+> | `{ "readOnly": true }` | Runs in the sandbox; treated as read-only by the `mutating` trigger | **Runs outside the sandbox with no review and no person.** Use it only for a tool you know to be read-only; session start warns when the tool declares `readOnlyHint: false` or `destructiveHint: true`. |
+>
+> The other route that runs a tool outside the sandbox without a person is a user-global
+> `rules.skipReview` pattern naming it. `/enclave status` lists every such route under
+> `unsandboxed:`. The tool's declared `ToolAnnotations` are shown in the approval dialog
+> and never widen a grant, since the tool's author writes them.
 >
 > **Pi 1.1 includes MCP, codemode and PowerShell.** They are outside enclave's owned
 > tool set and denied by default. Deferred tools and codemode child calls pass through

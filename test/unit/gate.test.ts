@@ -4,7 +4,7 @@ import type { EffectiveProfile } from "../../src/config/types.ts";
 import { ActionLock, decide, type Escalator, type GateDecision } from "../../src/gate/gate.ts";
 import { assertJsonLike, freezeToolInput, LockViolation } from "../../src/gate/lock.ts";
 import { checkOwnership } from "../../src/gate/ownership.ts";
-import { checkTool } from "../../src/gate/tools.ts";
+import { checkTool, describeDeclaredHints, grantWarnings, unsandboxedPermits } from "../../src/gate/tools.ts";
 import { canonicalize } from "../../src/policy/canonical.ts";
 import { buildReviewEvidence } from "../../src/reviewer/evidence.ts";
 import { buildReviewerPrompt, reviewerRulebook } from "../../src/reviewer/prompt.ts";
@@ -582,7 +582,10 @@ describe("the gate", () => {
 			expect(decision.reason).toContain("not in tools.allow");
 		});
 
-		it("allows one that is listed", async () => {
+		// #22: a bare grant on a tool outside the sandbox used to be the most
+		// permissive grant in deterministic mode. It is listed, so a person may
+		// approve it, but it no longer runs without one.
+		it("allows one that is listed once a person approves it", async () => {
 			const decision = await gate(
 				"deploy",
 				{ env: "prod" },
@@ -590,9 +593,76 @@ describe("the gate", () => {
 					profile: profile((p) => {
 						p.tools.allow.deploy = {};
 					}),
+					escalator: YES,
 				},
 			);
 			expect(decision.block).toBe(false);
+			expect(decision.outcome).toBe("ask-approved");
+		});
+
+		describe("a grant on a tool outside the sandbox means the same in every trigger mode (#22)", () => {
+			const allowReviewer = () =>
+				fakeReviewer({
+					decision: "allow",
+					risk: "low",
+					reason: "looks fine",
+					modelRisk: "low",
+					minimumRisk: "low",
+					authorizationCovers: false,
+				});
+			const modes = [
+				{ mode: "deterministic", reviewer: false, trigger: "mutating" },
+				{ mode: "boundary", reviewer: true, trigger: "boundary" },
+				{ mode: "mutating", reviewer: true, trigger: "mutating" },
+			] as const;
+			const grants = [
+				{ name: "{}", grant: {}, outcome: "ask-denied" },
+				{ name: '{"reviewed":true}', grant: { reviewed: true }, outcome: "ask-denied" },
+				{ name: '{"readOnly":true}', grant: { readOnly: true }, outcome: "allow" },
+			] as const;
+			const cases = modes.flatMap((m) => grants.map((g) => ({ ...m, ...g })));
+
+			it.each(cases)("mcp__x__deploy $name under $mode => $outcome", async (c) => {
+				const reviewer = allowReviewer();
+				const decision = await gate(
+					"mcp__x__deploy",
+					{ env: "prod" },
+					{
+						profile: profile((p) => {
+							p.tools.allow.mcp__x__deploy = { ...c.grant };
+							p.review.trigger = c.trigger;
+							if (c.reviewer) p.reviewer.model = "ollama/reviewer";
+						}),
+						...(c.reviewer ? { reviewer } : {}),
+					},
+				);
+				expect(decision.outcome).toBe(c.outcome);
+				if (c.outcome === "ask-denied") expect(decision.reason).toContain("outside the sandbox");
+			});
+
+			it("reaches a person for a bare grant, whichever mode, and runs once they approve", async () => {
+				for (const m of modes) {
+					const decision = await gate(
+						"mcp__x__deploy",
+						{},
+						{
+							profile: profile((p) => {
+								p.tools.allow.mcp__x__deploy = {};
+								p.review.trigger = m.trigger;
+								if (m.reviewer) p.reviewer.model = "ollama/reviewer";
+							}),
+							...(m.reviewer ? { reviewer: allowReviewer() } : {}),
+							escalator: YES,
+						},
+					);
+					expect(decision.outcome, m.mode).toBe("ask-approved");
+				}
+			});
+
+			it("keeps a bare grant on an owned tool on the sandboxed path", async () => {
+				const decision = await gate("write", { path: "/work/a.txt", content: "x" });
+				expect(decision.outcome).toBe("allow");
+			});
 		});
 
 		it("withholds an otherwise allowed tool at the final unsandboxed boundary", async () => {
@@ -934,6 +1004,74 @@ describe("checkTool", () => {
 			owned: OWNED_TOOLS,
 		});
 		expect(disposition.allowed && disposition.reviewed).toBe(true);
+	});
+
+	it("treats a bare grant on a tool it cannot sandbox as reviewed (#22)", () => {
+		const disposition = checkTool({ tool: "deploy", tools: { allow: { deploy: {} } }, owned: OWNED_TOOLS });
+		expect(disposition.allowed && disposition.reviewed).toBe(true);
+	});
+
+	it("leaves an explicit readOnly grant on a tool it cannot sandbox unreviewed", () => {
+		const disposition = checkTool({
+			tool: "deploy",
+			tools: { allow: { deploy: { readOnly: true } } },
+			owned: OWNED_TOOLS,
+		});
+		expect(disposition.allowed && disposition.reviewed).toBe(false);
+	});
+
+	it("warns about a readOnly grant the tool contradicts, and about an unpinned grant (#22)", () => {
+		const warnings = grantWarnings(
+			{
+				allow: {
+					bash: {},
+					wipe: { readOnly: true, source: "/ext/w.ts" },
+					peek: { readOnly: true, source: "/ext/p.ts" },
+					deploy: {},
+				},
+			},
+			[
+				{ name: "wipe", annotations: { readOnlyHint: false, destructiveHint: true } },
+				{ name: "peek", annotations: { readOnlyHint: true } },
+				{ name: "deploy", sourceInfo: { path: "/ext/deploy.ts" } },
+			],
+			OWNED_TOOLS,
+		);
+		expect(warnings).toHaveLength(2);
+		expect(warnings[0]).toContain('"wipe" readOnly');
+		expect(warnings[0]).toContain("readOnlyHint: false and destructiveHint: true");
+		expect(warnings[1]).toContain('"deploy" has no source pin');
+		expect(warnings[1]).toContain('"/ext/deploy.ts"');
+	});
+
+	it("never widens on a declared hint", () => {
+		// A tool that calls itself read-only gets no different treatment.
+		const disposition = checkTool({ tool: "peek", tools: { allow: { peek: {} } }, owned: OWNED_TOOLS });
+		expect(disposition.allowed && disposition.reviewed).toBe(true);
+		expect(grantWarnings({ allow: { peek: { source: "/p" } } }, [{ name: "peek" }], OWNED_TOOLS)).toEqual([]);
+	});
+
+	it("shows the declared hints of a tool outside the sandbox to the approver", () => {
+		const registered = [{ name: "wipe", annotations: { readOnlyHint: false, destructiveHint: true } }];
+		expect(describeDeclaredHints("wipe", registered, OWNED_TOOLS)).toContain(
+			"readOnlyHint: false, destructiveHint: true",
+		);
+		expect(describeDeclaredHints("other", registered, OWNED_TOOLS)).toContain("declares no read-only");
+		expect(describeDeclaredHints("bash", [{ name: "bash", annotations: {} }], OWNED_TOOLS)).toBeUndefined();
+	});
+
+	it("lists readOnly grants and skipReview patterns as unsandboxed permits", () => {
+		expect(
+			unsandboxedPermits(
+				{ allow: { bash: {}, read: { readOnly: true }, Search: { readOnly: true }, deploy: {}, ship: {} } },
+				["bash(ls)", "deploy(preview)", "DEPLOY", "not a pattern("],
+				OWNED_TOOLS,
+			),
+		).toEqual([
+			{ tool: "Search", via: "readOnly grant" },
+			{ tool: "deploy", via: "skipReview deploy(preview)" },
+			{ tool: "deploy", via: "skipReview DEPLOY" },
+		]);
 	});
 
 	it("fails a configured source pin closed when the runtime source is absent", () => {

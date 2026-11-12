@@ -542,7 +542,8 @@ function evaluate(action: CanonicalAction, deps: GateDeps): Evaluation {
  * - An L1 `ask` match: the user said so.
  * - A capability request: widening the sandbox is a boundary crossing by
  *   definition, and with no reviewer the only thing above L1 is L4.
- * - A `reviewed: true` grant on a tool pi-enclave cannot sandbox.
+ * - A grant on a tool pi-enclave cannot sandbox that is not `readOnly: true`
+ *   (`reviewed: true`, or a bare `{}`, which means the same there; #22).
  * - A shell command the tokenizer could not follow. The rules were matched
  *   against a guess, so a `deny` may not have fired; asking is the only honest
  *   response to "I do not know what this command does".
@@ -563,7 +564,7 @@ function needsHumanWithoutReview(action: CanonicalAction, reviewed: boolean, has
 	if (reviewed) {
 		return hasReviewer
 			? undefined
-			: `"${action.tool}" is marked reviewed, and there is no reviewer in deterministic mode`;
+			: `"${action.tool}" runs outside the sandbox and its grant is not readOnly, so a person decides (there is no reviewer in deterministic mode)`;
 	}
 	if (action.shell && !action.confident) {
 		return `the command could not be parsed with confidence (${action.shell.markers.join(", ")}), so the pattern rules were matched against a guess`;

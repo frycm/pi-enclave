@@ -38,6 +38,11 @@ export interface EscalationEvent {
 
 export interface ConfirmEscalatorOptions {
 	reachability?: (action: CanonicalAction) => ToolReachability | undefined;
+	/**
+	 * What the tool declares about itself (pi's `ToolAnnotations`), shown to the
+	 * approver. Written by the tool's author, so it informs and never decides.
+	 */
+	declaredHints?: (action: CanonicalAction) => string | undefined;
 	ui: () => ConfirmUI | undefined;
 	/** Re-evaluated per escalation: a channel can be lost mid-session. */
 	attendance: () => AttendanceState;
@@ -52,6 +57,8 @@ export function createConfirmEscalator(options: ConfirmEscalatorOptions): Escala
 		async confirm(action, reason, toolSource) {
 			const reachability = options.reachability?.(action);
 			if (reachability) reason = `${reason}\n${describeReachability(reachability)}`;
+			const hints = options.declaredHints?.(action);
+			if (hints) reason = `${reason}\n${hints}`;
 			const attendance = options.attendance();
 			const ui = options.ui();
 
