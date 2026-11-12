@@ -466,7 +466,9 @@ describe("an unjudged command's protected paths (#64)", () => {
 		}
 	});
 
-	it("are looked for under a write capability's target too (#73)", async () => {
+	// Bash write capabilities are refused on macOS (Seatbelt cannot reap an
+	// escaped child), so there is no such call to protect there.
+	it.skipIf(process.platform === "darwin")("are looked for under a write capability's target too (#73)", async () => {
 		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 		const granted = realpathSync(mkdtempSync(join(tmpdir(), "enclave-granted-")));
 		try {
