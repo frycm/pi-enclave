@@ -1169,13 +1169,17 @@ rules end in `deny` or `ask` before L3 exists.
   A remote `openai-completions` model gets no schema, since support differs between
   providers, and relies on the parser alone. An answer the parser refuses judged nothing,
   so it is treated like an unreachable reviewer: retried with the next seed (three
-  attempts in all, the fallback model on the last), then the action goes to a person. It
-  no longer denies the action and ends the agent's turn, and it is not an adverse event
-  for the breaker; a person's no still is. Identity is checked four times per review, not
-  eighteen (below). When a reviewer is configured, the session start loads its Ollama
-  model with the configured context (a chat request with no messages, which generates
-  nothing), so the first review's timeout is not spent loading it; the load is abandoned
-  at shutdown. Each review's audit `timing` record shows one `decision` stage per
+  attempts in all, the fallback model on the last), then the action goes to a person,
+  and is approved or denied there. It used to deny the action outright. When nobody can
+  answer (attendance `off`, or a headless run), the ask is denied, which ends the agent's
+  turn and counts as an adverse event for the breaker, exactly as for an unreachable
+  reviewer; the escalation path itself is #18 and #30. Identity is checked four times per
+  review, not eighteen (below). When a reviewer is configured, the session start loads its
+  Ollama model with the configured context (a chat request with no messages, which
+  generates nothing), so the first review's timeout is not spent loading it; the load is
+  abandoned at shutdown. Ollama unloads an idle model after five minutes by default, so
+  set `OLLAMA_KEEP_ALIVE` (for example `30m`, or `-1` to keep it loaded) on the Ollama
+  service if reviews are further apart than that. Each review's audit `timing` record shows one `decision` stage per
   attempt, with Ollama's prompt token counts, its load time and the number of identity
   calls. Thinking stays off (`think: false`): a thinking budget would have to be a
   qualified setting of its own, and how Ollama combines it with a schema is not yet
@@ -2300,9 +2304,10 @@ human-only decisions remain authoritative.
 
 ### Built
 
-- **An isolated two-stage reviewer** (one constrained request since #25). It uses an
-  explicit `provider/model-id`, no session context or tools, a one-token authorization
-  plausibility stage and a fixed-order strict JSON decision. Output size, reason length, retries, context size and timeout are bounded;
+- **An isolated reviewer.** It uses an explicit `provider/model-id`, no session context or
+  tools, and one schema-constrained request whose fixed-order strict JSON answer gives the
+  authorization judgement before the decision (#25; Phase 3 shipped it as a one-token
+  authorization stage followed by the decision). Output size, reason length, retries, context size and timeout are bounded;
   invalid structured output is retried, then escalates to a person (#25).
 - **Provenance-labelled, bounded evidence.** Only direct TUI/RPC user input can be
   authorization. Prior assistant tool inputs are untrusted context; assistant prose, tool

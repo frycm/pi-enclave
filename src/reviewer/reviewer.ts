@@ -175,6 +175,8 @@ export class IsolatedReviewer implements ActionReviewer {
 		const rendered = renderReviewEvidence(evidence);
 		let lastError = "reviewer unavailable";
 		let lastInvalid: string | undefined;
+		let invalidAttempts = 0;
+		let failedAttempts = 0;
 		const maxAttempts = this.options.maxAttempts ?? REVIEWER_MAX_ATTEMPTS;
 		const seed = this.options.seed ?? REVIEWER_SEED;
 
@@ -220,8 +222,13 @@ export class IsolatedReviewer implements ActionReviewer {
 				// A malformed answer judged nothing, like a transport failure: try
 				// again with the next seed, and after the last attempt a person
 				// decides (#25). It never becomes a verdict.
-				if (error instanceof ReviewerOutputError) lastInvalid = `${completion.name}: ${error.message}`;
-				else lastError = `${completion.name}: ${(error as Error).message}`;
+				if (error instanceof ReviewerOutputError) {
+					invalidAttempts++;
+					lastInvalid = `${completion.name}: ${error.message}`;
+				} else {
+					failedAttempts++;
+					lastError = `${completion.name}: ${(error as Error).message}`;
+				}
 			} finally {
 				timer.dispose();
 			}
@@ -229,7 +236,11 @@ export class IsolatedReviewer implements ActionReviewer {
 		}
 
 		if (lastInvalid !== undefined) {
-			return invalidOutput(`reviewer output was invalid in ${maxAttempts} attempt(s) (${lastInvalid})`, evidence);
+			const failed = failedAttempts > 0 ? `; ${failedAttempts} failed (${lastError})` : "";
+			return invalidOutput(
+				`reviewer output was invalid in ${invalidAttempts} of ${maxAttempts} attempts (${lastInvalid})${failed}`,
+				evidence,
+			);
 		}
 		return {
 			ok: false,

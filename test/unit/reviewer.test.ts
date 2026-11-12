@@ -178,8 +178,21 @@ describe("isolated reviewer", () => {
 			},
 		};
 		const result = await reviewer(completion).review({ action: action(), trigger: "mutating" });
-		expect(result).toMatchObject({ ok: false, kind: "invalid-output", reason: expect.stringContaining("3 attempt") });
+		expect(result).toMatchObject({
+			ok: false,
+			kind: "invalid-output",
+			reason: expect.stringContaining("invalid in 3 of 3 attempts"),
+		});
 		expect(seeds).toEqual([REVIEWER_SEED, REVIEWER_SEED + 1, REVIEWER_SEED + 2]);
+	});
+
+	it("counts malformed attempts apart from failed ones (#25)", async () => {
+		const completion = scripted("primary", [new Error("offline"), "yes", new Error("timeout")]);
+		const result = await reviewer(completion).review({ action: action(), trigger: "mutating" });
+		expect(result).toMatchObject({ ok: false, kind: "invalid-output" });
+		if (result.ok) return;
+		expect(result.reason).toContain("invalid in 1 of 3 attempts");
+		expect(result.reason).toContain("2 failed (primary: timeout)");
 	});
 
 	it("takes a valid verdict that follows a malformed one (#25)", async () => {

@@ -532,7 +532,14 @@ describe("the gate", () => {
 			expect(approved).toMatchObject({ outcome: "ask-approved", block: false, adverse: false, asked: true });
 			expect(approved.terminate).toBeUndefined();
 			// A person's no is still a no, and ends the turn like any declined ask.
-			await expect(run(false)).resolves.toMatchObject({ outcome: "ask-denied", asked: true });
+			// Unattended, the escalator answers no, so this is also what an
+			// unattended or headless run gets, as for an unreachable reviewer.
+			await expect(run(false)).resolves.toMatchObject({
+				outcome: "ask-denied",
+				asked: true,
+				terminate: true,
+				adverse: true,
+			});
 		});
 
 		it("turns exhausted availability errors into an ask", async () => {
