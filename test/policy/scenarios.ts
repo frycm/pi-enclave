@@ -18,7 +18,17 @@
  * attendance and the record lifecycle, none of which involve the kernel --
  * that is Phase 1's suite, which still runs unchanged.
  */
-import { chmodSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	linkSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -419,9 +429,20 @@ async function ancestorScenario(world: World, mode: "real" | "operands-only"): P
 		"r2/readme.md",
 		"infra/main.tf",
 		".husky/pre-commit",
+		"docs/ai/instructions.md",
+		"scripts/hook.sh",
+		"lv/readme.md",
+		"px/extensions/readme.md",
 	]) {
 		put(path);
 	}
+	mkdirSync(join(ws, "empty"));
+	// Protected names that are symlinks to ordinary ones.
+	symlinkSync("docs/ai/instructions.md", join(ws, "AGENTS.md"));
+	symlinkSync("../scripts/hook.sh", join(ws, ".husky/pre-push"));
+	mkdirSync(join(ws, "l"));
+	symlinkSync("../lv", join(ws, "l/.vscode"));
+	symlinkSync("px", join(ws, ".pi"));
 	// What `cp -al .github gh-backup` and `cp -al deploy d5` leave.
 	mkdirSync(join(ws, "gh-backup", "workflows"), { recursive: true });
 	linkSync(join(ws, ".github/workflows/ci.yml"), join(ws, "gh-backup/workflows/ci.yml"));
@@ -455,6 +476,23 @@ async function ancestorScenario(world: World, mode: "real" | "operands-only"): P
 		["bash", { command: "mv infra i2" }],
 		["bash", { command: "ln .github/workflows/ci.yml x.yml" }],
 		["write", { path: "AGENTS.md", content: "x" }],
+		// Review round 1: copies of a directory's contents, symlinks into place,
+		// protected names that are symlinks, and `git mv`/`git rm`.
+		["bash", { command: "cp -r s/. .github/" }],
+		["bash", { command: "cp -a d/. deploy" }],
+		["bash", { command: "ln -s empty r2/.vscode" }],
+		["bash", { command: "ln -s empty r2/.github" }],
+		["bash", { command: "echo x > AGENTS.md" }],
+		["edit", { path: "AGENTS.md", oldText: "x", newText: "y" }],
+		["bash", { command: "rm AGENTS.md" }],
+		["bash", { command: "mv AGENTS.md x.md" }],
+		["write", { path: "l/.vscode/tasks.json", content: "{}" }],
+		["bash", { command: "echo x > .husky/pre-push" }],
+		["write", { path: ".pi/extensions/e.ts", content: "x" }],
+		["bash", { command: "git mv .github gh4" }],
+		["bash", { command: "git mv gh2 r2/.github" }],
+		["bash", { command: "git mv deploy d9" }],
+		["bash", { command: "git rm -r .github" }],
 	];
 	const allows: [string, Record<string, unknown>][] = [
 		["bash", { command: "mkdir -p s2/workflows" }],
@@ -464,6 +502,11 @@ async function ancestorScenario(world: World, mode: "real" | "operands-only"): P
 		["bash", { command: "cp -r src src2" }],
 		["bash", { command: "mkdir -p dist && cp -r src dist/" }],
 		["write", { path: "docs/readme.md", content: "x" }],
+		["bash", { command: "cp -r src/. src3" }],
+		["bash", { command: "ln -s src r2/src-link" }],
+		["bash", { command: "echo x > docs/ai/notes.md" }],
+		["bash", { command: "git mv docs d4" }],
+		["bash", { command: "git rm -r build" }],
 	];
 	const asked = (toolName: string, input: Record<string, unknown>) => {
 		if (mode === "real") {

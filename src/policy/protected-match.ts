@@ -91,6 +91,8 @@ class Found extends Error {
 
 /** Commands whose operands this module reads by role. */
 type Role = {
+	/** `cp`, `mv`, `ln`, `rm` or `rmdir`; `git mv` and `git rm` read as `mv` and `rm`. */
+	name: string;
 	sources: string[];
 	destination?: string;
 	removes: boolean;
@@ -99,6 +101,8 @@ type Role = {
 	noTargetDirectory?: true;
 	/** `-t`: the destination is a directory to go into. */
 	intoDirectory?: true;
+	/** `ln -s`: the link aliases whatever the source holds later, not only now. */
+	symbolic?: true;
 };
 
 /** Option letters of `cp`, `mv` and `ln` that take a separate value. */
@@ -106,7 +110,14 @@ const VALUE_OPTIONS: Record<string, string> = { cp: "St", mv: "St", ln: "St" };
 
 /** Sources and destination of a `cp`, `mv`, `ln`, `rm` or `rmdir`, or undefined for anything else. */
 function roles(command: SimpleCommand): Role | undefined {
-	const name = command.name.slice(command.name.lastIndexOf("/") + 1);
+	let name = command.name.slice(command.name.lastIndexOf("/") + 1);
+	let args = command.args;
+	// `git mv` and `git rm` take the same operands as `mv` and `rm`. Git's
+	// global options make a command unreadable, so the subcommand comes first.
+	if (name === "git" && (args[0] === "mv" || args[0] === "rm")) {
+		name = args[0];
+		args = args.slice(1);
+	}
 	if (!["cp", "mv", "ln", "rm", "rmdir"].includes(name)) return undefined;
 	const operands: string[] = [];
 	let target: string | undefined;
@@ -114,8 +125,8 @@ function roles(command: SimpleCommand): Role | undefined {
 	let symbolic = false;
 	let noTargetDirectory = false;
 	let endOfOptions = false;
-	for (let i = 0; i < command.args.length; i++) {
-		const arg = command.args[i] as string;
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i] as string;
 		if (endOfOptions || arg === "-" || !arg.startsWith("-")) {
 			operands.push(arg);
 			continue;
@@ -126,7 +137,7 @@ function roles(command: SimpleCommand): Role | undefined {
 		}
 		if (arg.startsWith("--")) {
 			const [flag, value] = arg.split("=", 2) as [string, string | undefined];
-			if (flag === "--target-directory") target = value ?? command.args[++i];
+			if (flag === "--target-directory") target = value ?? args[++i];
 			else if (flag === "--link") links = true;
 			else if (flag === "--no-target-directory") noTargetDirectory = true;
 			else if (flag === "--symbolic" || flag === "--symbolic-link") symbolic = true;
@@ -144,22 +155,26 @@ function roles(command: SimpleCommand): Role | undefined {
 			if (letter === "s") symbolic = true;
 			if (letter === "T") noTargetDirectory = true;
 			if ((VALUE_OPTIONS[name] ?? "").includes(letter)) {
-				const value = letters.slice(j + 1) || command.args[++i];
+				const value = letters.slice(j + 1) || args[++i];
 				if (letter === "t") target = value;
 				break;
 			}
 		}
 	}
-	if (name === "rm" || name === "rmdir") return { sources: operands, removes: true, links: false };
+	if (name === "rm" || name === "rmdir") return { name, sources: operands, removes: true, links: false };
 	if (name === "ln" && symbolic) links = false;
-	const removes = name === "mv";
-	if (target !== undefined) return { sources: operands, destination: target, removes, links, intoDirectory: true };
-	if (operands.length < 2) return { sources: operands, removes, links };
+	const base = {
+		name,
+		removes: name === "mv",
+		links,
+		...(name === "ln" && symbolic ? { symbolic: true as const } : {}),
+	};
+	if (target !== undefined) return { ...base, sources: operands, destination: target, intoDirectory: true };
+	if (operands.length < 2) return { ...base, sources: operands };
 	return {
+		...base,
 		sources: operands.slice(0, -1),
 		destination: operands.at(-1) as string,
-		removes,
-		links,
 		...(noTargetDirectory ? { noTargetDirectory: true as const } : {}),
 	};
 }
@@ -182,8 +197,15 @@ export function protectedMatches(
 	// repository where the agent has to look at what it may not change.
 	for (const path of action.paths) {
 		if (!path.writes) continue;
-		const pattern = matchesPathPattern(patterns, path.resolved, options.cwd);
-		if (pattern) matches.push({ list: "ask", pattern, target: path.resolved });
+		// Both names: a write through `AGENTS.md -> docs/ai/instructions.md`
+		// changes AGENTS.md, and `rm`/`mv` act on the link itself.
+		for (const target of new Set([path.resolved, path.typed])) {
+			const pattern = matchesPathPattern(patterns, target, options.cwd);
+			if (pattern) {
+				matches.push({ list: "ask", pattern, target });
+				break;
+			}
+		}
 	}
 	if (list !== "ask") return matches;
 	try {
@@ -280,7 +302,7 @@ function derivedMatches(action: CanonicalAction, options: ProtectedMatchOptions)
 		const role = roles(command);
 		if (!role || ancestors.length === 0) {
 			// The hard-link check of a copy's destination needs no patterns.
-			if (role?.destination !== undefined && name === "cp") cpDestination(role);
+			if (role?.destination !== undefined && role.name === "cp") cpDestination(role);
 			continue;
 		}
 		const sources = role.sources.map(resolve);
@@ -293,21 +315,26 @@ function derivedMatches(action: CanonicalAction, options: ProtectedMatchOptions)
 				});
 			}
 		}
-		if (role.destination === undefined || name === "rm" || name === "rmdir") continue;
+		if (role.destination === undefined || role.name === "rm" || role.name === "rmdir") continue;
 		const destination = resolve(role.destination);
-		for (const source of sources) {
+		for (const [index, source] of sources.entries()) {
+			// `s/.` copies what `s` holds, not `s`: into the destination itself.
+			const contents = /(?:^|\/)\.\/*$/.test(role.sources[index] as string);
 			// What the copy or move would create: `dest/name/rel` when it goes
 			// inside an existing directory, `dest/rel` when it takes that name.
 			// When an earlier command may create the directory, both.
-			const inside = role.intoDirectory || (!role.noTargetDirectory && (severalCommands || isDir(destination)));
-			const replaces = !role.intoDirectory && (role.noTargetDirectory || severalCommands || !isDir(destination));
+			const inside =
+				!contents && (role.intoDirectory || (!role.noTargetDirectory && (severalCommands || isDir(destination))));
+			const replaces =
+				contents || (!role.intoDirectory && (role.noTargetDirectory || severalCommands || !isDir(destination)));
 			const created = (rel: string) => [
 				...(replaces ? [join(destination, rel)] : []),
 				...(inside ? [join(destination, basename(source), rel)] : []),
 			];
 			for (const path of created("")) {
 				if (matcher(path)) found(firstMatch("", path), path);
-				if (severalCommands || !exists(source)) {
+				// A symlink aliases whatever is written below its source later.
+				if (severalCommands || role.symbolic || !exists(source)) {
 					const pattern = couldHold(relative(options.cwd, path) || ".", ancestors);
 					if (pattern) found(pattern, path);
 				}
@@ -320,7 +347,7 @@ function derivedMatches(action: CanonicalAction, options: ProtectedMatchOptions)
 				});
 			}
 		}
-		if (name === "cp") cpDestination(role);
+		if (role.name === "cp") cpDestination(role);
 	}
 
 	function cpDestination(role: Role) {

@@ -2,7 +2,7 @@
  * #72: L1's protected-path matching for patterns with an ordinary ancestor.
  * The table of the issue is policy row P16; these are the parts of it.
  */
-import { linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -143,6 +143,146 @@ describe("a copy or move into place", () => {
 		expect(bash("mv g .github")).toEqual([]);
 		expect(bash("mkdir -p g/workflows && mv g .github")).not.toEqual([]);
 		expect(bash("mkdir -p dist && cp -r g dist/")).toEqual([]);
+	});
+});
+
+describe("a copy of a directory's contents", () => {
+	it.each([
+		["cp -r s/. .github/", "s/workflows/ci.yml", ".github"],
+		["cp -a s/. .github", "s/workflows/ci.yml", ".github"],
+		["cp -R s/. .github", "s/workflows/ci.yml", ".github"],
+		["cp -r s/./ .github/", "s/workflows/ci.yml", ".github"],
+		["cp -r prod2/. deploy/prod", "prod2/a.yml", "deploy/prod"],
+		["cp -r prod2/. deploy/prod", "prod2/a.yml", undefined],
+	])("asks for what %s puts into the destination itself", (command, source, existing) => {
+		put(source);
+		if (existing) mkdirSync(join(ws, existing), { recursive: true });
+		expect(bash(command)).not.toEqual([]);
+	});
+
+	it("reads `.` alone as the contents of the working directory", () => {
+		put("workflows/ci.yml");
+		mkdirSync(join(ws, "sub", ".github"), { recursive: true });
+		expect(bash("cp -r . sub/.github")).not.toEqual([]);
+	});
+
+	it("allows a contents copy that creates nothing protected", () => {
+		put("s/workflows/ci.yml");
+		mkdirSync(join(ws, "backup"));
+		expect(bash("cp -r s/. backup/")).toEqual([]);
+		// The contents of `.github` land as `backup/workflows`, not `backup/.github`.
+		put(".github/workflows/ci.yml");
+		expect(bash("cp -r .github/. backup/")).toEqual([]);
+	});
+
+	it("does not read a name that only ends in a dot as its contents", () => {
+		put("g./workflows/ci.yml");
+		mkdirSync(join(ws, ".github"));
+		expect(bash("cp -r g. .github")).toEqual([]);
+	});
+});
+
+describe("a symlink into place", () => {
+	beforeEach(() => mkdirSync(join(ws, "v")));
+
+	it.each(["ln -s v .vscode", "ln -s g .github", "ln -s dreal deploy", "ln -sT v .vscode", "ln -s -- v .vscode"])(
+		"asks for %s whatever its source holds now, since a later write goes through it",
+		(command) => {
+			expect(bash(command)).not.toEqual([]);
+		},
+	);
+
+	it("allows a symlink whose name could hold nothing protected", () => {
+		expect(bash("ln -s v vv")).toEqual([]);
+		expect(bash("ln -s v docs")).toEqual([]);
+	});
+
+	it("keeps judging a hard link by what its source holds", () => {
+		put("v2/readme.md");
+		expect(bash("ln v2/readme.md .vscode")).toEqual([]);
+	});
+});
+
+describe("a protected name that is a symlink", () => {
+	beforeEach(() => {
+		put("docs/ai/instructions.md");
+		symlinkSync("docs/ai/instructions.md", join(ws, "AGENTS.md"));
+		put("v/readme.md");
+		symlinkSync("v", join(ws, ".vscode"));
+		put("scripts/hook.sh");
+		mkdirSync(join(ws, ".husky"));
+		symlinkSync("../scripts/hook.sh", join(ws, ".husky", "pre-push"));
+	});
+
+	it.each([
+		"echo x > AGENTS.md",
+		"rm AGENTS.md",
+		"mv AGENTS.md x.md",
+		"echo x > .husky/pre-push",
+		"echo '{}' > .vscode/tasks.json",
+	])("asks for %s by the name as written", (command) => {
+		expect(bash(command)).not.toEqual([]);
+	});
+
+	it("asks for the write and edit tools", () => {
+		expect(asks("write", { path: "AGENTS.md", content: "x" })).toEqual([
+			expect.objectContaining({ pattern: "**/AGENTS.md", target: join(ws, "AGENTS.md") }),
+		]);
+		expect(asks("edit", { path: "AGENTS.md", oldText: "x", newText: "y" })).not.toEqual([]);
+		expect(asks("write", { path: ".vscode/tasks.json", content: "{}" })).not.toEqual([]);
+	});
+
+	it("does not ask for the target written by its own name", () => {
+		expect(bash("echo x > docs/ai/instructions.md")).toEqual([]);
+	});
+
+	it("still asks for an ordinary name that leads to a protected one", () => {
+		put("sub/AGENTS.md");
+		symlinkSync("sub/AGENTS.md", join(ws, "notes.md"));
+		expect(bash("echo x > notes.md")).not.toEqual([]);
+	});
+
+	it("is denied by name on the deny list too", () => {
+		put("px/extensions/readme.md");
+		symlinkSync("px", join(ws, ".pi"));
+		const action = canonicalize({
+			tool: "write",
+			input: { path: ".pi/extensions/e.ts", content: "x" },
+			cwd: ws,
+			home: HOME,
+			profileName: "dev",
+		});
+		expect(protectedMatches(action, RULES.deny, "deny", { cwd: ws, home: HOME, rules: RULES })).not.toEqual([]);
+	});
+});
+
+describe("git mv and git rm", () => {
+	beforeEach(() => {
+		put(".github/workflows/ci.yml");
+		put("gh2/workflows/ci.yml");
+		put("deploy/prod/a.yml");
+		put("docs/readme.md");
+	});
+
+	it.each([
+		"git mv .github gh3",
+		"git mv gh2 r/.github",
+		"git mv -f -k -v deploy d9",
+		"git mv -- .github gh3",
+		"git rm -r .github",
+		"git rm -rf -q -- deploy",
+		"git rm -r -n --cached .github",
+	])("reads %s like mv or rm", (command) => {
+		expect(bash(command)).not.toEqual([]);
+	});
+
+	it.each(["git mv docs d3", "git rm -r docs", "git status", "git log -- .github"])("allows %s", (command) => {
+		expect(bash(command)).toEqual([]);
+	});
+
+	it("does not read the subcommand as an operand", () => {
+		put("rm/.github/workflows/ci.yml");
+		expect(bash("git rm -r docs")).toEqual([]);
 	});
 });
 
