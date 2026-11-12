@@ -126,22 +126,40 @@ function linkTarget(path: string, replaceable: (link: string) => boolean): strin
 	throw new Unprotectable(`${path} is a chain of more than 40 symlinks`);
 }
 
-/** The first symlink on `path`, as a component or the path itself, that `replaceable` accepts. */
+/**
+ * The first symlink met while resolving `path`, as a component or the path
+ * itself, that `replaceable` accepts. A link that is not replaceable is
+ * followed, so the links its own target passes through are checked too.
+ */
 function linkOnTheWay(path: string, replaceable: (link: string) => boolean): string | undefined {
-	const parts = path.split("/").filter(Boolean);
-	let prefix = "";
-	for (const part of parts) {
-		prefix = `${prefix}/${part}`;
+	let pending = path.split("/").filter(Boolean);
+	// Built from components that are not links, so always canonical.
+	let resolved = "/";
+	let hops = 0;
+	while (pending.length > 0) {
+		const part = pending.shift() as string;
+		if (part === ".") continue;
+		if (part === "..") {
+			resolved = dirname(resolved);
+			continue;
+		}
+		const next = join(resolved, part);
 		let stats: ReturnType<typeof lstatSync>;
 		try {
-			stats = lstatSync(prefix);
+			stats = lstatSync(next);
 		} catch {
 			// Missing from here on: nothing below can be a link yet.
 			return undefined;
 		}
-		if (!stats.isSymbolicLink()) continue;
-		const location = join(canonical(dirname(prefix)), part);
-		if (replaceable(location)) return location;
+		if (!stats.isSymbolicLink()) {
+			resolved = next;
+			continue;
+		}
+		if (replaceable(next)) return next;
+		if (++hops > 40) throw new Unprotectable(`${path} passes through more than 40 symlinks`);
+		const target = readlinkSync(next);
+		if (target.startsWith("/")) resolved = "/";
+		pending = [...target.split("/").filter(Boolean), ...pending];
 	}
 	return undefined;
 }

@@ -1617,6 +1617,29 @@ SCENARIOS.push(
 		},
 	},
 	{
+		id: "W10",
+		title: "an unjudged command cannot make a second name for a protected file and write through it (#73)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const files = [plant(fixture, "AGENTS.md"), plant(fixture, ".husky/pre-commit")];
+			mkdirSync(join(fixture.workspace, "notes"), { recursive: true });
+			const protectWrites = protectedFor(fixture);
+			// From the shell, and with link(2) from another interpreter.
+			const r = await sh(
+				"ln AGENTS.md notes/x && echo y > notes/x; ln .husky/pre-commit notes/h && echo y >> notes/h; " +
+					`python3 -c "import os; os.link('AGENTS.md', 'notes/p'); open('notes/p', 'w').write('z')"`,
+				{ protectWrites },
+			);
+			for (const file of files) {
+				const result = unchanged(file, r);
+				if (!result.ok) return { ok: false, detail: `${file.slice(fixture.workspace.length + 1)}: ${result.detail}` };
+			}
+			return { ok: true, detail: `both unchanged (exit ${r.exitCode}): ${r.output.slice(0, 160)}` };
+		},
+	},
+	{
 		id: "W6",
 		title: "with its protected paths write-denied, an unjudged command still writes ordinary files (#64)",
 		surface: "bash",

@@ -80,7 +80,7 @@ import { describeTally, emptyTally, recordLayer } from "./gate/layers.ts";
 import { ActionLock } from "./gate/lock.ts";
 import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
 import { answerProjectTrust } from "./gate/project-trust.ts";
-import { protectedEntryMatcher, protectedWriteTargets } from "./gate/protected-writes.ts";
+import { type ProtectedWrites, protectedEntryMatcher, protectedWriteTargets } from "./gate/protected-writes.ts";
 import { PROVENANCE_ENTRY_TYPE, ProvenanceTracker } from "./gate/provenance.ts";
 import { toolReachability } from "./gate/reachability.ts";
 import { checkTool, describeDeclaredHints, grantWarnings } from "./gate/tools.ts";
@@ -289,12 +289,24 @@ export default function (pi: ExtensionAPI): void {
 	let unjudgedInTurn = false;
 	/** Tool calls the gate let run unjudged; their protected paths are write-denied (#64). */
 	const unjudgedCalls = new Set<string>();
-	/** Every existing path `rules.protectedPaths` names, for one unjudged call (#64). */
-	const protectedTargets = () => {
+	/**
+	 * Every existing path `rules.protectedPaths` names, for one unjudged call
+	 * (#64), under the roots that call can write: a write capability adds its
+	 * target for that call, so the walk looks there too (#73).
+	 */
+	const protectedTargets = (action: import("./policy/canonical.ts").CanonicalAction): ProtectedWrites => {
 		const backendProfile = compiled?.profile ?? profile;
 		const rules = effective?.rules.protectedPaths;
+		let capabilityRoot: string | undefined;
+		if (action.capability?.kind === "write") {
+			try {
+				capabilityRoot = validateWriteCapability(backendProfile, action.cwd, action.capability.value);
+			} catch (error) {
+				return { ok: false, reason: (error as Error).message };
+			}
+		}
 		return protectedWriteTargets({
-			writableRoots: backendProfile.writableRoots,
+			writableRoots: [...backendProfile.writableRoots, ...(capabilityRoot ? [capabilityRoot] : [])],
 			workspace: cwd,
 			patterns: rules ? [...rules.deny, ...rules.ask] : [],
 			writeDeny: backendProfile.writeDeny ?? [],
@@ -649,7 +661,7 @@ export default function (pi: ExtensionAPI): void {
 		protectWrites: (action) => {
 			const toolCallId = callOfAction.get(action);
 			if (toolCallId === undefined || !unjudgedCalls.has(toolCallId)) return undefined;
-			const found = protectedTargets();
+			const found = protectedTargets(action);
 			if (!found.ok) {
 				throw new Error(
 					`pi-enclave: this command was not judged by anyone, and its protected paths cannot all be ` +
@@ -908,8 +920,8 @@ export default function (pi: ExtensionAPI): void {
 					}
 				},
 				breakerOpen: breakerBlocks,
-				unjudgedWriteIssue: () => {
-					const found = protectedTargets();
+				unjudgedWriteIssue: (action) => {
+					const found = protectedTargets(action);
 					return found.ok ? undefined : found.reason;
 				},
 				// With an execution check the third-party call is asked again when it

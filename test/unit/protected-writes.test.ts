@@ -221,6 +221,36 @@ describe("finding the protected paths of an unjudged command", () => {
 			expect(!found.ok && found.reason).toContain(`resolves through ${join(ws, "tools", "current")}`);
 		});
 
+		it("follows a link it cannot replace to the links its target passes through", () => {
+			// AGENTS.md -> <outside>/hop/agents.md, <outside>/hop -> <ws>/cur, cur -> v1:
+			// hop is outside the roots, but `ln -sfn v2 cur` still retargets AGENTS.md.
+			const outside = realpathSync(mkdtempSync(join(tmpdir(), "enclave-hop-")));
+			try {
+				put("v1/agents.md");
+				put("v2/agents.md");
+				symlinkSync("v1", join(ws, "cur"));
+				symlinkSync(join(ws, "cur"), join(outside, "hop"));
+				symlinkSync(join(outside, "hop", "agents.md"), join(ws, "AGENTS.md"));
+				const found = targets();
+				expect(found.ok).toBe(false);
+				expect(!found.ok && found.reason).toContain(`resolves through ${join(ws, "cur")}`);
+			} finally {
+				rmSync(outside, { recursive: true, force: true });
+			}
+		});
+
+		it("follows a session-denied middle link to what its target passes through", () => {
+			put(".husky/pre-commit");
+			put("v1/hook.sh");
+			symlinkSync("v1", join(ws, "cur"));
+			mkdirSync(join(ws, "locked"));
+			symlinkSync(join("..", "cur", "hook.sh"), join(ws, "locked", "middle"));
+			symlinkSync(join("..", "locked", "middle"), join(ws, ".husky", "pre-push"));
+			const found = targets({ writeDeny: [join(ws, "locked")] });
+			expect(found.ok).toBe(false);
+			expect(!found.ok && found.reason).toContain(`resolves through ${join(ws, "cur")}`);
+		});
+
 		it("accepts a chain through a link the session already denies", () => {
 			const hook = put("scripts/hook.sh");
 			put(".husky/pre-commit");

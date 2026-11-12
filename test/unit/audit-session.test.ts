@@ -150,9 +150,9 @@ async function session(edit: (profile: EffectiveProfile) => void = () => {}) {
 	} as unknown as ExtensionContext;
 	await handlers.get("session_start")?.({}, context);
 	const auditPath = join(agentDir, "enclave", "audit", "s1.jsonl");
-	const call = async (id: string, command: string) => {
+	const call = async (id: string, command: string, extra: Record<string, unknown> = {}) => {
 		const gate = (await handlers.get("tool_call")?.(
-			{ toolName: "bash", toolCallId: id, input: { command } },
+			{ toolName: "bash", toolCallId: id, input: { command, ...extra } },
 			context,
 		)) as {
 			block?: boolean;
@@ -161,7 +161,7 @@ async function session(edit: (profile: EffectiveProfile) => void = () => {}) {
 		if (gate?.block) return gate;
 		let isError = false;
 		try {
-			await tools.get("bash")?.execute(id, { command }, undefined, undefined, context);
+			await tools.get("bash")?.execute(id, { command, ...extra }, undefined, undefined, context);
 		} catch {
 			isError = true;
 		}
@@ -463,6 +463,45 @@ describe("an unjudged command's protected paths (#64)", () => {
 		} finally {
 			stderr.mockRestore();
 			rmSync(store, { recursive: true, force: true });
+		}
+	});
+
+	it("are looked for under a write capability's target too (#73)", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		const granted = realpathSync(mkdtempSync(join(tmpdir(), "enclave-granted-")));
+		try {
+			plant();
+			// A second name of AGENTS.md, and a protected file, only under the target.
+			linkSync(join(ws, "AGENTS.md"), join(granted, "agents-copy.md"));
+			writeFileSync(join(granted, "CLAUDE.md"), "original\n");
+			const s = await session((profile) => {
+				profile.reviewer.model = "ollama/reviewer";
+				profile.review.trigger = "mutating";
+				profile.sandbox.grantableWriteRoots = [granted];
+			});
+			// Unparsed (the variable), with one write L1 sees under the target.
+			// A write capability is high risk, so the reviewer's allow stands only
+			// with the person's direct approval of this exact action.
+			const command = `echo ok > ${join(granted, "out.txt")}; ${unparsed}`;
+			const first = await s.call("t0", command, { allow_write: granted });
+			expect(first?.block).toBe(true);
+			const hash = s.records().find((entry) => entry.kind === "decision" && entry.outcome === "ask-denied")?.hash;
+			expect(hash).toBeDefined();
+			const approval = `approve ${hash}`;
+			await s.handlers.get("input")?.({ text: approval, source: "interactive" }, s.context);
+			await s.handlers.get("before_agent_start")?.({ messageType: "user", prompt: approval }, s.context);
+			await s.handlers.get("message_start")?.({ message: { role: "user", content: approval } }, s.context);
+			const gate = await s.call("t1", command, { allow_write: granted });
+			expect(gate?.block, gate?.reason).not.toBe(true);
+			expect(mocks.runs).toHaveLength(1);
+			expect(mocks.runs[0]?.writeCapability).toBe(granted);
+			expect(mocks.runs[0]?.protectWrites).toEqual(
+				expect.arrayContaining([join(ws, "AGENTS.md"), join(granted, "agents-copy.md"), join(granted, "CLAUDE.md")]),
+			);
+			await s.flush();
+		} finally {
+			stderr.mockRestore();
+			rmSync(granted, { recursive: true, force: true });
 		}
 	});
 

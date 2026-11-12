@@ -1421,7 +1421,7 @@ Dockerfiles, compose files, `.pi` and `.agents` created since the session starte
 A directory whose contents a pattern covers is denied whole, so nothing new can be created
 inside it either, and everything it holds is checked as below; a symlink inside it is held
 through its target. The deny lasts for that one call, on bubblewrap, Seatbelt and the container
-backend alike (conformance rows W1 to W6, with a control row that the same commands still
+backend alike (conformance rows W1 to W5 and W7 to W10, with a control row (W6) that the same commands still
 write ordinary files and a falsifiability run that shows the rows fail without the deny).
 A command a person approved, at the terminal or with `pi-enclave approve` while a queued
 session waits, was judged, and runs under the session profile as before.
@@ -1429,7 +1429,9 @@ session waits, was judged, and runs under the session profile as before.
 A protected file, or a file inside a denied directory, with a second hard link has its other
 names denied as well (a read-only bind holds a name, not an inode): the walk looks for them by
 device and inode across the writable roots, `.git` included, and a name it does not find there
-is outside them, where the command cannot write anyway (conformance row W9).
+is outside them, where the command cannot write anyway (conformance row W9). A new name made
+during the call (`ln AGENTS.md notes/x`, or `os.link` from Python) cannot reach a denied file
+either (row W10).
 
 The call is **not run unjudged** when the walk cannot vouch for it: past 200,000 entries
 (the walk, what the denied directories hold, and the search for other hard-link names
