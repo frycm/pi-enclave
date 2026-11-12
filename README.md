@@ -1438,6 +1438,8 @@ Behaviour under failure, for `attended: off`:
   one refused, and an approval stays pending.
 - With `audit.syslog: true`, a mirror that stops (no `logger`, or `logger` failing) prints to
   stderr and shows `AUDIT SYSLOG STOPPED`. Under `audit.required` it counts as not recording.
+  `logger` reports a failure when it exits, after the call it was sent for, so the refusal
+  starts with the next call.
 - `audit.sessionMaxMb` (default 100) bounds one session's file. At the cap the log writes one
   last `audit` record saying so and stops, which counts as a failure for `audit.required`.
 - Retention's size budget never deletes a session holding a `breaker`, `violation` or
