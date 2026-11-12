@@ -18,7 +18,6 @@ import { realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import type { ClassifierAnswer, ClassifierApi, ClassifierModel, ClassifierResult } from "@earendil-works/pi-ai";
 import { classify as llamaCppClassify } from "@earendil-works/pi-ai/api/llama-cpp-classify";
-import { classify as systemOneClassify } from "@earendil-works/pi-ai/api/typesafe-system-one";
 import { type ModelRegistry, VERSION } from "@earendil-works/pi-coding-agent";
 import { parseReviewerModelReference } from "../config/reviewer-model.ts";
 import { digest, type Endpoint, endpoint, isLoopback } from "./model.ts";
@@ -28,8 +27,14 @@ import type { ClassifierThresholds } from "./types.ts";
 export type ClassifierRuntimeModel = ClassifierModel<ClassifierApi>;
 
 export const LLAMA_PROVIDER = "llama.cpp";
-/** Chat GGUFs read through next-token label probabilities, and native decision models. */
-export const LLAMA_CLASSIFIER_APIS = ["llama-cpp-classify", "typesafe-system-one"] as const;
+/**
+ * Chat GGUFs read through next-token label probabilities. Native decision
+ * models (`typesafe-system-one`, llama.cpp's `/v1/systemone`) are refused for
+ * now (#17): the server builds their prompt, so pi-enclave can neither size the
+ * evidence to it nor check that the server read it whole. Its `usage` is a sum
+ * over a number of tasks the client does not know.
+ */
+export const LLAMA_CLASSIFIER_APIS = ["llama-cpp-classify"] as const;
 
 /** Values the router changes on every spawn of the same model; everything else is bound. */
 const VOLATILE_ARGS = new Set(["--port", "--log-colors"]);
@@ -216,6 +221,12 @@ function requireLlamaClassifier(model: ClassifierRuntimeModel): void {
 			`the classifier reviewer transport supports ${LLAMA_PROVIDER} models only; ${model.provider} is not supported`,
 		);
 	}
+	if (model.api === "typesafe-system-one") {
+		fail(
+			`llama.cpp model ${model.id} is a decision model (System One); a reviewer must be a chat GGUF read through llama-cpp-classify, ` +
+				"because pi-enclave cannot size the evidence to a prompt the server builds or check that it was read whole",
+		);
+	}
 	if (!(LLAMA_CLASSIFIER_APIS as readonly string[]).includes(model.api)) {
 		fail(`unsupported llama.cpp classifier API ${JSON.stringify(model.api)}`);
 	}
@@ -296,7 +307,11 @@ export async function reviewerClassifierDigest(
 
 // --- requests ----------------------------------------------------------------
 
-/** No tokenizer averages this many bytes a token; a count below it means part of the prompt was not read. */
+/**
+ * Real text does not average this many bytes a token, so a count below it
+ * means part of the prompt was not read. A long run of one repeated character
+ * can tokenize more densely; that fails closed as an unavailable reviewer.
+ */
 const MAX_BYTES_PER_TOKEN = 16;
 
 /**
@@ -342,12 +357,11 @@ async function classifySnapshot(
 	request: ClassifyRequest,
 	nCtx: number,
 ): Promise<Record<string, ClassifierAnswer>> {
-	const run = target.model.api === "typesafe-system-one" ? systemOneClassify : llamaCppClassify;
-	const result: ClassifierResult = await run(
+	const result: ClassifierResult = await llamaCppClassify(
 		target.model,
 		{ state: request.state, questions: request.questions },
 		{
-			// System One requires a key; llama.cpp ignores one it was not started with.
+			// llama.cpp ignores a key it was not started with.
 			apiKey: target.apiKey ?? "local",
 			headers: target.headers,
 			signal: request.signal,

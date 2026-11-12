@@ -1162,8 +1162,11 @@ rules end in `deny` or `ask` before L3 exists.
   stages send the same evidence; the budget below sizes it.
 - **Or a classifier, with probabilities instead of text** (`reviewer.transport:
   "classifier"`, #26). pi 1.5 lists every model on a llama.cpp router as a classifier:
-  chat GGUFs answer through next-token label probabilities (`llama-cpp-classify`), native
-  decision models through llama.cpp's System One endpoint. pi-enclave asks three questions
+  chat GGUFs answer through next-token label probabilities (`llama-cpp-classify`), and
+  native decision models through llama.cpp's System One endpoint (`/v1/systemone`). Only
+  chat GGUFs are accepted as reviewers for now: a decision model's prompt is built by the
+  server, so pi-enclave can neither size the evidence to it nor check that the server read
+  it whole (#17). pi-enclave asks three questions
   about the same evidence, `authorized` (bool), `decision` (allow | ask | deny) and `risk`
   (low … critical), with the rulebook and its precedence in the question text and the
   evidence as the untrusted state. The verdict is a threshold policy, asymmetric on
@@ -1187,8 +1190,11 @@ rules end in `deny` or `ask` before L3 exists.
   `reviewer.numCtx` (user-global, default 8,192, at least 8,192, bound into the Ollama
   identity) on the chat transport and the llama.cpp slot context (`n_ctx` from `/props`)
   on the classifier transport. The relation between bytes and tokens is a worst-case bound
-  that holds for every GGUF tokenizer: a token covers at least one byte of UTF-8, so a
-  prompt of B bytes is at most B tokens, plus 512 tokens reserved for the chat template.
+  for byte-level BPE and SentencePiece vocabularies, the ones chat GGUFs ship: a token covers
+  at least one byte of UTF-8, so a prompt of B bytes is at most B tokens, plus 512 tokens
+  reserved for the chat template. A tokenizer that normalizes before it splits can exceed it
+  (NFKC turns U+FDFA into eighteen characters); such a prompt is then refused by the overflow
+  checks below rather than cut.
   Evidence is sized so that, for every stage,
 
   | Transport | Evidence room in bytes |
@@ -1217,8 +1223,12 @@ rules end in `deny` or `ask` before L3 exists.
   reviewer sends `truncate: false` and `shift: false`, so an over-long prompt is an error
   instead of a silently cut one. Ollama's own `prompt_eval_count` is checked against the
   bound, and against the prompt's size when Ollama also reports the cached part. On llama.cpp,
-  every `/completion` must report `truncated: false` and a `tokens_evaluated` that is below
-  the slot and covers the prompt. Any mismatch is an unavailable reviewer, never a verdict.
+  every `/completion` (the `llama-cpp-classify` label read) must report `truncated: false`
+  and a `tokens_evaluated` that is below the slot and covers the prompt; decision models on
+  `/v1/systemone` are refused, as above. "Covers the prompt" means at least one token per
+  16 bytes. A long run of one repeated character can tokenize more densely than that, and
+  then the review fails closed as unavailable. Any mismatch is an unavailable reviewer,
+  never a verdict.
 - **Evaluated before trusted.** The fixed 100-case corpus contains 30 specifically authorized
   benign mutations and 70 adversarial cases spanning injected action data, injected context,
   and overbroad authorization. Ten cases of each kind arrive with the context filled to its

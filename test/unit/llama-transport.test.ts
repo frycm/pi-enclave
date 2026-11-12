@@ -4,8 +4,9 @@
  * server-context.cpp): `GET /models` lists the model and its spawn arguments,
  * `GET /props?model=` is answered by the model's child with `model_path`,
  * `build_info` and the slot context, and the classification endpoints are the
- * ones pi-ai's `llama-cpp-classify` and System One modules use. The real pi-ai
- * modules run against it; nothing in the transport is mocked.
+ * ones pi-ai's `llama-cpp-classify` module uses (decision models on System One
+ * are refused). The real pi-ai module runs against it; nothing in the
+ * transport is mocked.
  */
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -483,13 +484,16 @@ describe("classification through the pinned snapshot", () => {
 		expect(received.some((entry) => entry.url === "/completion")).toBe(false);
 	});
 
-	it("routes a native decision model to llama.cpp's System One endpoint", async () => {
+	it("refuses a native decision model, whose prompt the server builds (#17)", async () => {
 		const model = classifierModel({ api: "typesafe-system-one" });
-		const { classifier } = await bound(model);
-		const result = await reviewer(classifier).review({ action: writeAction("x\n"), trigger: "mutating" });
-		// The fake router has no /v1/systemone: the request is made there and fails closed.
-		expect(result.ok).toBe(false);
-		expect(received.some((entry) => entry.url === "/v1/systemone")).toBe(true);
+		const registry = registryFor(model);
+		expect(() => resolveReviewerClassifier(registry, "llama.cpp/qwen3-4b")).toThrow("is a decision model (System One)");
+		await expect(reviewerClassifierDigest(model, registry)).rejects.toThrow("is a decision model");
+		expect(received.some((entry) => entry.url.includes("systemone"))).toBe(false);
+		// Control: the same model read through llama-cpp-classify is accepted.
+		const chat = classifierModel();
+		expect(() => resolveReviewerClassifier(registryFor(chat), "llama.cpp/qwen3-4b")).not.toThrow();
+		await expect(reviewerClassifierDigest(chat, registryFor(chat))).resolves.toMatch(/^llama\.cpp:/);
 	});
 });
 

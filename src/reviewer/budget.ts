@@ -3,11 +3,13 @@
  *
  * The evidence used to be bounded in bytes (32 KiB) and the context in tokens
  * (4,096), with nothing relating the two. The relation used here is a
- * worst-case bound that holds for every tokenizer a GGUF model ships with:
- * a token covers at least one byte of UTF-8 (byte-level BPE, SentencePiece
- * with byte fallback, or one <unk> per character without it). So a prompt of
- * B bytes is at most B tokens, plus what the chat template adds around it,
- * which is the fixed reserve below. Evidence is sized so that
+ * worst-case bound for byte-level BPE and SentencePiece vocabularies, the
+ * ones chat GGUFs ship: a token covers at least one byte of UTF-8 (a byte,
+ * a byte-fallback token, or one <unk> per character). So a prompt of B bytes
+ * is at most B tokens, plus what the chat template adds around it, which is
+ * the fixed reserve below. A tokenizer that normalizes first (NFKC expands
+ * U+FDFA to eighteen characters) can exceed it; the runtimes' overflow checks
+ * then refuse the prompt instead of cutting it. Evidence is sized so that
  *
  *   system bytes + evidence bytes + template reserve + output tokens <= context
  *

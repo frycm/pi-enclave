@@ -180,7 +180,8 @@ export function refusesOverlongPrompts(version: string): boolean {
 /**
  * When Ollama reports cached prompt tokens, its count is the whole prompt, and a
  * count far below the request's size means part of it was never read. No
- * tokenizer in use averages this many bytes a token on JSON evidence.
+ * tokenizer in use averages this many bytes a token on JSON evidence; a long
+ * run of one repeated character can, and then the review fails closed.
  */
 const MAX_BYTES_PER_TOKEN = 16;
 
