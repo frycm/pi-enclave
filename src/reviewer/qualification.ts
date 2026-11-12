@@ -3,6 +3,12 @@ import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ReviewerTransportKind } from "../config/types.ts";
 import { checkSecureFile } from "../state/dir.ts";
+import {
+	CLASSIFIER_ALLOW_CEILING,
+	CLASSIFIER_ALLOW_FLOOR,
+	CLASSIFIER_DENY_THRESHOLD,
+	CLASSIFIER_TEMPERATURE,
+} from "./probabilities.ts";
 import type { ClassifierThresholds } from "./types.ts";
 
 export const QUALIFICATION_VERSION = 2;
@@ -23,6 +29,12 @@ export interface QualificationBinding {
 	 * reverse (#26). Absent means chat: records written before #26 have none.
 	 */
 	transport?: ReviewerTransportKind;
+	/**
+	 * Classifier transport only: the running pi version. pi-ai's classifier
+	 * module owns the system prompt, the prompt layout and the label readout,
+	 * so a pi update changes what the model reads without any pi-enclave change.
+	 */
+	piVersion?: string;
 	modelDigest: string;
 	promptHash: string;
 	corpusHash: string;
@@ -71,14 +83,17 @@ function isProbability(value: unknown): value is number {
 	return isFiniteNumber(value) && value >= 0 && value <= 1;
 }
 
-function isThresholds(value: unknown): value is ClassifierThresholds {
+/** The values qualification can choose, checked again on read; the temperature is the one sampling binds. */
+function isThresholds(value: unknown, sampling: Partial<ReviewerSampling> | undefined): value is ClassifierThresholds {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const thresholds = value as Partial<ClassifierThresholds>;
 	return (
 		isProbability(thresholds.allow) &&
-		isProbability(thresholds.deny) &&
-		isFiniteNumber(thresholds.temperature) &&
-		thresholds.temperature > 0
+		thresholds.allow >= CLASSIFIER_ALLOW_FLOOR &&
+		thresholds.allow <= CLASSIFIER_ALLOW_CEILING &&
+		thresholds.deny === CLASSIFIER_DENY_THRESHOLD &&
+		thresholds.temperature === CLASSIFIER_TEMPERATURE &&
+		sampling?.temperature === CLASSIFIER_TEMPERATURE
 	);
 }
 
@@ -94,7 +109,9 @@ export function isQualificationRecord(value: unknown): value is QualificationRec
 	return (
 		record.version === QUALIFICATION_VERSION &&
 		(record.transport === undefined || record.transport === "chat" || record.transport === "classifier") &&
-		(record.transport === "classifier" ? isThresholds(record.thresholds) : record.thresholds === undefined) &&
+		(record.transport === "classifier"
+			? isThresholds(record.thresholds, sampling) && typeof record.piVersion === "string" && record.piVersion !== ""
+			: record.thresholds === undefined && record.piVersion === undefined) &&
 		typeof record.model === "string" &&
 		typeof record.modelDigest === "string" &&
 		typeof record.promptHash === "string" &&
@@ -147,6 +164,12 @@ export function readQualification(directory: string, expected: QualificationBind
 		return {
 			ok: false,
 			reason: `${path} qualifies the ${recordTransport(value)} transport, not ${recordTransport(expected)}`,
+		};
+	}
+	if (value.piVersion !== expected.piVersion) {
+		return {
+			ok: false,
+			reason: `qualified on pi ${value.piVersion ?? "(none)"}, running pi ${expected.piVersion ?? "(none)"}; pi's classifier prompt may have changed`,
 		};
 	}
 	for (const key of ["model", "modelDigest", "promptHash", "corpusHash"] as const) {

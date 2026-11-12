@@ -1,5 +1,6 @@
 import type { EffectiveProfile } from "../config/types.ts";
 import { reviewerCorpus, reviewerCorpusHash } from "./corpus.ts";
+import { classifierRuntimeVersion } from "./llama.ts";
 import {
 	CLASSIFIER_ALLOW_CEILING,
 	CLASSIFIER_DENY_THRESHOLD,
@@ -50,6 +51,7 @@ export function qualificationBinding(options: EvalReviewerOptions): Qualificatio
 		return {
 			model: options.model,
 			transport: "classifier",
+			piVersion: classifierRuntimeVersion(),
 			modelDigest: options.modelDigest,
 			promptHash: options.prompt.classifier.promptHash,
 			corpusHash,

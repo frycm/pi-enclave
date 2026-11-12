@@ -12,7 +12,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { type ModelRegistry, VERSION } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { defaultProfile } from "../../src/config/defaults.ts";
 import { canonicalize } from "../../src/policy/canonical.ts";
@@ -48,6 +48,8 @@ let port: number;
 let scenario: Scenario;
 let onCompletion: (() => void) | undefined;
 let redirect: boolean;
+let extraArgs: string[];
+let autoloads: string[];
 let received: { url: string; authorization?: string; body: Record<string, unknown> }[];
 
 // A vocabulary in which every answer label is one token, as in real chat models.
@@ -83,6 +85,8 @@ beforeEach(async () => {
 	nCtx = 8192;
 	port = 41_001;
 	redirect = false;
+	extraArgs = [];
+	autoloads = [];
 	onCompletion = undefined;
 	received = [];
 	// allow / ask / deny ; low / medium / high / critical
@@ -113,7 +117,16 @@ beforeEach(async () => {
 							id: "qwen3-4b",
 							status: {
 								value: status,
-								args: ["/opt/llama/llama-server", "--model", gguf, "--port", String(port), "--ctx-size", String(nCtx)],
+								args: [
+									"/opt/llama/llama-server",
+									"--model",
+									gguf,
+									"--port",
+									String(port),
+									"--ctx-size",
+									String(nCtx),
+									...extraArgs,
+								],
 							},
 							architecture: { input_modalities: ["text"], output_modalities: ["text"] },
 							source: "models_dir",
@@ -122,6 +135,7 @@ beforeEach(async () => {
 				}),
 			);
 		} else if (url.pathname === "/props") {
+			autoloads.push(url.searchParams.get("autoload") ?? "(default)");
 			res.end(
 				JSON.stringify(
 					url.searchParams.get("model") === "qwen3-4b"
@@ -236,7 +250,10 @@ describe("llama.cpp identity without Ollama", () => {
 		await expect(reviewerClassifierDigest(model, registry)).resolves.toBe(identity);
 		// Nothing outside the router: no Ollama endpoints were asked.
 		expect(received.every((entry) => !entry.url.includes("/api/"))).toBe(true);
-		expect(received.some((entry) => entry.url === "/props?model=qwen3-4b")).toBe(true);
+		expect(received.some((entry) => entry.url.startsWith("/props?model=qwen3-4b"))).toBe(true);
+		// As pi's own client asks: never load a model as a side effect of the identity check.
+		expect(autoloads.length).toBeGreaterThan(0);
+		expect(autoloads.every((value) => value === "false")).toBe(true);
 		expect(received.every((entry) => entry.authorization === "Bearer router-key")).toBe(true);
 	});
 
@@ -256,6 +273,77 @@ describe("llama.cpp identity without Ollama", () => {
 		const identity = await reviewerClassifierDigest(model, registry);
 		writeFileSync(gguf, "GGUF fake weights v2");
 		await expect(reviewerClassifierDigest(model, registry)).resolves.not.toBe(identity);
+	});
+
+	it("binds a load flag that follows a volatile flag", async () => {
+		const model = classifierModel();
+		const registry = registryFor(model);
+		extraArgs = ["--log-colors", "--jinja"];
+		const jinja = await reviewerClassifierDigest(model, registry);
+		extraArgs = ["--log-colors", "--no-jinja"];
+		await expect(reviewerClassifierDigest(model, registry)).resolves.not.toBe(jinja);
+		// The volatile flag's own value is still left out.
+		extraArgs = ["--log-colors", "on", "--jinja"];
+		const on = await reviewerClassifierDigest(model, registry);
+		extraArgs = ["--log-colors", "off", "--jinja"];
+		await expect(reviewerClassifierDigest(model, registry)).resolves.toBe(on);
+		expect(on).toBe(jinja);
+	});
+
+	it.each([
+		["--lora", "adapter.gguf"],
+		["--lora-scaled", "adapter.gguf:0.5"],
+		["--control-vector", "vector.gguf"],
+		["--control-vector-scaled", "vector.gguf:0.8"],
+		["--mmproj", "mmproj.gguf"],
+		["-md", "draft.gguf"],
+		["--spec-draft-model", "draft.gguf"],
+		["--hf-repo-draft", "user/draft"],
+	])("refuses a model loaded with %s, whose weights are not hashed", async (flag, value) => {
+		const model = classifierModel();
+		extraArgs = [flag, join(directory, value)];
+		await expect(reviewerClassifierDigest(model, registryFor(model))).rejects.toThrow(
+			`is loaded with ${flag}, whose weights pi-enclave does not hash`,
+		);
+		extraArgs = [`${flag}=${join(directory, value)}`];
+		await expect(reviewerClassifierDigest(model, registryFor(model))).rejects.toThrow(`is loaded with ${flag}`);
+	});
+
+	it("would otherwise miss a changed adapter: an argument is bound as its text only", async () => {
+		// Falsifiability control for the refusal above. A file named in the load
+		// arguments (here through a flag that loads no weights) can change while
+		// every input to the digest stays the same; only the GGUF is hashed. So
+		// an adapter would keep the old qualification if it were not refused.
+		const adapter = join(directory, "adapter.gguf");
+		writeFileSync(adapter, "adapter v1");
+		const model = classifierModel();
+		const registry = registryFor(model);
+		extraArgs = ["--slot-save-path", adapter];
+		const before = await reviewerClassifierDigest(model, registry);
+		writeFileSync(adapter, "adapter v2");
+		await expect(reviewerClassifierDigest(model, registry)).resolves.toBe(before);
+		writeFileSync(gguf, "GGUF fake weights v2");
+		await expect(reviewerClassifierDigest(model, registry)).resolves.not.toBe(before);
+		extraArgs = ["--lora", adapter];
+		await expect(reviewerClassifierDigest(model, registry)).rejects.toThrow("does not hash");
+	});
+
+	it("refuses a model whose load arguments the router does not report", async () => {
+		const model = classifierModel();
+		extraArgs = [];
+		const registry = registryFor(model);
+		await expect(reviewerClassifierDigest(model, registry)).resolves.toMatch(/^llama\.cpp:/);
+		const original = server.listeners("request")[0] as (...args: unknown[]) => void;
+		server.removeAllListeners("request");
+		server.on("request", (req, res) => {
+			if (req.url === "/models") {
+				res.setHeader("Content-Type", "application/json");
+				res.end(JSON.stringify({ data: [{ id: "qwen3-4b", status: { value: "loaded" } }] }));
+				return;
+			}
+			original(req, res);
+		});
+		await expect(reviewerClassifierDigest(model, registry)).rejects.toThrow("did not report the load arguments");
 	});
 
 	it("does not take the catalog's context window into the identity", async () => {
@@ -394,7 +482,12 @@ describe("qualification on the classifier transport", () => {
 			completion: classifier,
 			timeoutMs: 10_000,
 		});
-		expect(record).toMatchObject({ passed: true, transport: "classifier", promptHash: PROMPT.classifier.promptHash });
+		expect(record).toMatchObject({
+			passed: true,
+			transport: "classifier",
+			piVersion: VERSION,
+			promptHash: PROMPT.classifier.promptHash,
+		});
 		expect(record.sampling.trials).toBe(1);
 		expect(record.metrics).toMatchObject({ injectedAllows: 0, benignFalseDenials: 0, errors: 0 });
 		expect(record.metrics.maxInjectedAllow).toBeCloseTo(0.4, 6);

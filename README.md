@@ -1199,7 +1199,7 @@ quantization keeps its badge forever. A qualification is a record bound to:
 | Bound to | Why |
 |---|---|
 | **Model identity** — Ollama manifest digest and runtime version from the effective inference endpoint, plus model/routing configuration; for llama.cpp, the SHA-256 of the GGUF file (every shard) the router reports it loaded, hashed by pi itself, plus the server build, slot context, chat-template hash and the model's load arguments; remote models use a descriptor digest over the effective registry/auth configuration | A model/configuration, endpoint or adapter change invalidates qualification. A remote provider cannot expose a weights digest, so deployments must choose an immutable versioned model ID; moving aliases remain a stated residual risk |
-| **Transport** — `chat` or `classifier`, and for the classifier the thresholds qualification chose | A model qualified as a chat reviewer is never used as a classifier, or the reverse; a threshold is only meaningful for the model and prompt it was chosen on |
+| **Transport** — `chat` or `classifier`, and for the classifier the thresholds qualification chose and the running pi version | A model qualified as a chat reviewer is never used as a classifier, or the reverse; a threshold is only meaningful for the model and prompt it was chosen on. The classifier's system prompt, prompt layout and label readout belong to pi-ai, so a pi update requires a new (cheap) classifier qualification |
 | **Prompt version** — hash of the reviewer system prompt, the evidence schema, and the effective `review.*` rulebook as printed by `/enclave rules config` | Any prompt edit *or rulebook edit* invalidates every prior result. Custom prose is exactly as untested as a new prompt; a re-run on an unchanged model is cheap and cached per hash |
 | **Corpus version** — hash of the eval corpus | Adding cases must force re-qualification |
 | **Sampling parameters** — `temperature`, `seed`, max tokens, and enforced Ollama `num_ctx` (remote context is recorded as provider-managed) | Reproducibility without claiming unsupported request settings |
@@ -1214,10 +1214,16 @@ llama.cpp (classifier transport only) is identified from the router itself: `GET
 must list the model as loaded or sleeping (load it with `/llama`), and `GET /props?model=`
 reports the GGUF path, build and slot context of the child that serves it. The router must
 be on loopback and the GGUF readable by the pi user, otherwise the reviewer is refused with
-that reason rather than trusted by name. The digest is cached per process by device, inode,
-size, mtime and ctime, so only the first check of a session reads the whole file (a few
-seconds for a 4B model). Records written before #26 have no `transport` field and are read
-as chat qualifications.
+that reason rather than trusted by name. A model loaded with further weights (`--lora`,
+`--control-vector`, their `-scaled` forms, `--mmproj` or a draft model) is refused too,
+because only the GGUF is hashed and those files would be bound by their path alone; serve
+the reviewer without them (`--no-mmproj` for a model directory with a projector). The digest
+is cached per process by device, inode, size, mtime and ctime, so only the first check of a
+session reads the whole file (a few seconds for a 4B model). The GGUF is hashed from disk,
+not from the router's memory: after replacing a GGUF, reload the model before
+`/enclave eval-reviewer`, or the record binds the new file to an evaluation of the old
+weights. Records written before #26 have no `transport` field and are read as chat
+qualifications.
 
 High-risk authorization uses the complete action and the newest complete direct instruction,
 separately from bounded model evidence. Commands and paths retain their case. Conditional,

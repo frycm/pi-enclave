@@ -3,9 +3,12 @@ import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ClassifierAnswer } from "@earendil-works/pi-ai";
+import { VERSION } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { defaultProfile } from "../../src/config/defaults.ts";
 import { canonicalize } from "../../src/policy/canonical.ts";
+import { qualificationBinding } from "../../src/reviewer/eval.ts";
+import { classifierRuntimeVersion } from "../../src/reviewer/llama.ts";
 import {
 	CLASSIFIER_ALLOW_CEILING,
 	CLASSIFIER_ALLOW_FLOOR,
@@ -182,12 +185,17 @@ describe("qualification records bind the transport", () => {
 		createdAt: new Date(0).toISOString(),
 	};
 
+	const classifierRecord: QualificationRecord = {
+		...chat,
+		transport: "classifier",
+		piVersion: "1.5.2",
+		thresholds: THRESHOLDS,
+	};
+
 	it("needs thresholds for a classifier record and none for a chat record", () => {
-		expect(isQualificationRecord({ ...chat, transport: "classifier", thresholds: THRESHOLDS })).toBe(true);
-		expect(isQualificationRecord({ ...chat, transport: "classifier" })).toBe(false);
-		expect(isQualificationRecord({ ...chat, transport: "classifier", thresholds: { ...THRESHOLDS, allow: 2 } })).toBe(
-			false,
-		);
+		expect(isQualificationRecord(classifierRecord)).toBe(true);
+		expect(isQualificationRecord({ ...chat, transport: "classifier", piVersion: "1.5.2" })).toBe(false);
+		expect(isQualificationRecord({ ...classifierRecord, thresholds: { ...THRESHOLDS, allow: 2 } })).toBe(false);
 		expect(isQualificationRecord({ ...chat, thresholds: THRESHOLDS })).toBe(false);
 		expect(isQualificationRecord({ ...chat, transport: "completion" })).toBe(false);
 	});
@@ -203,5 +211,65 @@ describe("qualification records bind the transport", () => {
 			ok: false,
 			reason: expect.stringContaining("qualifies the chat transport, not classifier"),
 		});
+	});
+
+	it("checks the thresholds on read against what qualification can choose", () => {
+		for (const thresholds of [
+			{ ...THRESHOLDS, allow: 0.05 },
+			{ ...THRESHOLDS, allow: CLASSIFIER_ALLOW_FLOOR - 0.001 },
+			{ ...THRESHOLDS, allow: CLASSIFIER_ALLOW_CEILING + 0.001 },
+			{ ...THRESHOLDS, deny: 0.9 },
+			{ ...THRESHOLDS, temperature: 7 },
+		]) {
+			expect(isQualificationRecord({ ...classifierRecord, thresholds })).toBe(false);
+		}
+		// The thresholds' temperature is the one the sampling binds.
+		expect(
+			isQualificationRecord({ ...classifierRecord, sampling: { ...classifierRecord.sampling, temperature: 0.5 } }),
+		).toBe(false);
+		for (const allow of [CLASSIFIER_ALLOW_FLOOR, 0.95, CLASSIFIER_ALLOW_CEILING]) {
+			expect(isQualificationRecord({ ...classifierRecord, thresholds: { ...THRESHOLDS, allow } })).toBe(true);
+		}
+	});
+
+	it("binds the pi version for the classifier, whose prompt pi-ai owns", () => {
+		expect(isQualificationRecord({ ...classifierRecord, piVersion: undefined })).toBe(false);
+		expect(isQualificationRecord({ ...chat, piVersion: "1.5.2" })).toBe(false);
+		const directory = mkdtempSync(join(tmpdir(), "pi-enclave-version-"));
+		directories.push(directory);
+		chmodSync(directory, 0o700);
+		writeQualification(directory, classifierRecord);
+		expect(readQualification(directory, classifierRecord)).toMatchObject({ ok: true });
+		expect(readQualification(directory, { ...classifierRecord, piVersion: "1.5.3" })).toMatchObject({
+			ok: false,
+			reason: expect.stringContaining("qualified on pi 1.5.2, running pi 1.5.3"),
+		});
+	});
+
+	it("takes the running pi version into the classifier binding, and refuses without one", () => {
+		const binding = qualificationBinding({
+			model: "llama.cpp/qwen3-4b",
+			modelDigest: "llama.cpp:sha256:abc",
+			profile: PROFILE,
+			prompt: PROMPT,
+			completion: classifier(answers()),
+			timeoutMs: 1_000,
+		});
+		expect(binding.piVersion).toBe(VERSION);
+		expect(typeof VERSION).toBe("string");
+		for (const missing of [null, "", 152]) {
+			expect(() => classifierRuntimeVersion(missing)).toThrow("pi did not report its version");
+		}
+		// The chat transport's prompt is pi-enclave's own; a pi update does not touch it.
+		expect(
+			qualificationBinding({
+				model: "ollama/reviewer",
+				modelDigest: "ollama:sha256:abc",
+				profile: PROFILE,
+				prompt: PROMPT,
+				completion: { name: "ollama/reviewer", numCtx: 8192, complete: async () => "1" },
+				timeoutMs: 1_000,
+			}).piVersion,
+		).toBeUndefined();
 	});
 });

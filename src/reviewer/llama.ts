@@ -19,7 +19,7 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import type { ClassifierAnswer, ClassifierApi, ClassifierModel, ClassifierResult } from "@earendil-works/pi-ai";
 import { classify as llamaCppClassify } from "@earendil-works/pi-ai/api/llama-cpp-classify";
 import { classify as systemOneClassify } from "@earendil-works/pi-ai/api/typesafe-system-one";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { type ModelRegistry, VERSION } from "@earendil-works/pi-coding-agent";
 import { parseReviewerModelReference } from "../config/reviewer-model.ts";
 import { digest, type Endpoint, endpoint, isLoopback } from "./model.ts";
 import type { ClassifyRequest, ReviewerClassifier } from "./reviewer.ts";
@@ -41,6 +41,18 @@ export interface ResolvedReviewerClassifier {
 
 function fail(message: string): never {
 	throw new Error(`pi-enclave: ${message}`);
+}
+
+/**
+ * The pi version a classifier qualification binds: pi-ai's classifier module
+ * owns the system prompt, the layout of state and question, and the label
+ * readout. Without a version nothing would notice a change, so none is refused.
+ */
+export function classifierRuntimeVersion(version: unknown = VERSION): string {
+	if (typeof version !== "string" || version === "") {
+		fail("pi did not report its version; a classifier reviewer qualification must bind it");
+	}
+	return version;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -68,14 +80,57 @@ async function routerJson(
 	return value;
 }
 
-function stableArgs(args: unknown): string[] {
-	if (!Array.isArray(args) || !args.every((arg) => typeof arg === "string")) return [];
+/**
+ * Load arguments that add weights beside the GGUF (llama.cpp `common/arg.cpp`).
+ * Only the GGUF is hashed, so these would be bound by their path alone, and a
+ * new adapter at the same path would keep the old qualification. LoRA scales
+ * can also change at runtime (`POST /lora-adapters`) with no argument change.
+ * A reviewer is served without them. Projectors and draft models do not change
+ * a text prompt's next-token probabilities, but they are weights all the same.
+ */
+const WEIGHT_ARGS = new Set([
+	"--lora",
+	"--lora-scaled",
+	"--control-vector",
+	"--control-vector-scaled",
+	"-mm",
+	"--mmproj",
+	"-mmu",
+	"--mmproj-url",
+	"-md",
+	"--model-draft",
+	"--spec-draft-model",
+	"-hfd",
+	"-hfrd",
+	"--hf-repo-draft",
+	"--spec-draft-hf",
+]);
+
+function flagName(arg: string): string {
+	return arg.split("=")[0] ?? arg;
+}
+
+function loadArgs(id: string, args: unknown): string[] {
+	if (!Array.isArray(args) || !args.every((arg) => typeof arg === "string")) {
+		fail(`the llama.cpp router did not report the load arguments of ${id}`);
+	}
+	const extra = args.find((arg) => WEIGHT_ARGS.has(flagName(arg)));
+	if (extra) {
+		fail(
+			`llama.cpp model ${id} is loaded with ${flagName(extra)}, whose weights pi-enclave does not hash; ` +
+				"serve the reviewer model without adapters, control vectors, projectors (--no-mmproj) or draft models",
+		);
+	}
+	return args;
+}
+
+function stableArgs(args: readonly string[]): string[] {
 	const out: string[] = [];
 	for (let index = 0; index < args.length; index++) {
 		const arg = args[index] as string;
-		const flag = arg.split("=")[0] ?? arg;
-		if (VOLATILE_ARGS.has(flag)) {
-			if (!arg.includes("=")) index++;
+		if (VOLATILE_ARGS.has(flagName(arg))) {
+			// A flag's value is the next token unless that token is the next flag.
+			if (!arg.includes("=") && !(args[index + 1] ?? "-").startsWith("-")) index++;
 			continue;
 		}
 		out.push(arg);
@@ -184,7 +239,9 @@ async function classifierDigest(target: Endpoint<ClassifierRuntimeModel>, signal
 	if (status !== "loaded" && status !== "sleeping") {
 		fail(`llama.cpp model ${model.id} is ${String(status)}; load it with /llama before reviewing`);
 	}
-	const props = await routerJson(target, `/props?model=${encodeURIComponent(model.id)}`, signal);
+	const args = loadArgs(model.id, entry.status.args);
+	// As pi's own client does: a model unloaded since /models is refused, not loaded by the check.
+	const props = await routerJson(target, `/props?model=${encodeURIComponent(model.id)}&autoload=false`, signal);
 	const settings = isRecord(props.default_generation_settings) ? props.default_generation_settings : {};
 	const nCtx = settings.n_ctx;
 	if (typeof props.model_path !== "string" || props.model_path === "none" || props.model_path === "") {
@@ -209,7 +266,7 @@ async function classifierDigest(target: Endpoint<ClassifierRuntimeModel>, signal
 		chatTemplate: createHash("sha256")
 			.update(typeof props.chat_template === "string" ? props.chat_template : "")
 			.digest("hex"),
-		args: stableArgs(entry.status.args),
+		args: stableArgs(args),
 		architecture: isRecord(entry.architecture) ? entry.architecture : null,
 	})}`;
 }
