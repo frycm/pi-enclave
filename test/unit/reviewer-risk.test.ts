@@ -32,6 +32,7 @@ describe("deterministic reviewer risk", () => {
 		"rm -f build/x",
 		"rm -rf dist",
 		"git checkout -b feature",
+		"git checkout main",
 		"git restore README.md",
 		"git reset --hard HEAD~1",
 		"truncate -s 0 log.txt",
@@ -63,6 +64,11 @@ describe("deterministic reviewer risk", () => {
 		// A protected operand the parser does not read as a write target.
 		"git checkout -- AGENTS.md",
 		"git restore .github/workflows/ci.yml",
+		// The whole workspace without naming it.
+		"git checkout -f",
+		"git checkout --force main",
+		"git restore :/",
+		"git restore ':(top)src'",
 	])("keeps a destructive command the sandbox does not bound at high: %j", (command) => {
 		expect(minimumRisk(action(command), PROFILE)).toBe("high");
 	});

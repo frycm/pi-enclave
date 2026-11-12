@@ -72,9 +72,16 @@ function destructiveShellRisk(action: CanonicalAction, profile: EffectiveProfile
 			// (`git checkout -- AGENTS.md`), so each operand is checked as one too:
 			// `git checkout .` discards the whole workspace.
 			const operands = command.args.slice(1).filter((arg) => arg !== "--" && !arg.startsWith("-"));
+			// `git checkout -f` discards every local change, with or without an
+			// operand; a pathspec with magic (`:/`, `:(top)`) is not a path at all.
+			const forced =
+				command.args[0] === "checkout" &&
+				command.args.slice(1).some((arg) => arg === "--force" || /^-[a-zA-Z]*f/.test(arg));
 			if (
 				!inRoots(action.cwd) ||
 				!writesBounded ||
+				forced ||
+				operands.some((operand) => operand.startsWith(":")) ||
 				!operands.every((operand) => boundedTarget(resolve(action.cwd, operand)))
 			)
 				bounded = false;

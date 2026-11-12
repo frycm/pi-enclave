@@ -42,6 +42,25 @@ vi.mock("../../src/backend/select.ts", () => ({
 		report: { ok: true, platform: "linux", backend: "bwrap", piVersion: "1.5.2", checks: [] },
 	}),
 }));
+// A named reviewer answers allow/low to everything; with "none" the real setup runs.
+vi.mock("../../src/reviewer/setup.ts", async (original) => {
+	const actual = await original<typeof import("../../src/reviewer/setup.ts")>();
+	const { buildReviewerPrompt, reviewerRulebook } = await import("../../src/reviewer/prompt.ts");
+	return {
+		...actual,
+		prepareQualifiedReviewer: async (profile: EffectiveProfile, ...rest: unknown[]) =>
+			profile.reviewer.model === "none"
+				? (actual.prepareQualifiedReviewer as (...args: unknown[]) => unknown)(profile, ...rest)
+				: {
+						prompt: buildReviewerPrompt(reviewerRulebook(profile.review, new Map(), profile.rules)),
+						primary: {
+							name: "always-allow",
+							numCtx: 8_192,
+							complete: async () => '{"authorized":false,"decision":"allow","risk":"low","reason":"fine"}',
+						},
+					},
+	};
+});
 // The code-root check reads pi's real install; this suite is about the log.
 vi.mock("../../src/gate/code-roots.ts", async (original) => ({
 	...(await original<typeof import("../../src/gate/code-roots.ts")>()),
@@ -218,6 +237,42 @@ describe("a session's audit trail (#37)", () => {
 			await s.flush();
 			const hits = s
 				.records()
+				.filter((entry) => entry.kind === "violation" && entry.source === "tripwire")
+				.map((entry) => [entry.op, entry.adverse]);
+			expect(hits).toEqual([
+				["created", false],
+				["modified", true],
+			]);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	// The reviewer half of the same backstop: a reviewer allow of an unparsed
+	// command is unjudged by any rule; one of a command L1 read is not.
+	it("counts a changed project file after a reviewer allowed an unparsed command", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			const s = await session((profile) => {
+				profile.reviewer.model = "ollama/reviewer";
+				profile.review.trigger = "mutating";
+			});
+			const turn = async (index: number, id: string, command: string, content: string) => {
+				mocks.onRun = () => writeFileSync(join(ws, "AGENTS.md"), content);
+				await s.handlers.get("turn_start")?.({ turnIndex: index }, s.context);
+				await s.call(id, command);
+				await s.handlers.get("turn_end")?.({ turnIndex: index }, { ...s.context, abort: () => {} });
+			};
+			// Control: the reviewer allows a command L1 read (confident).
+			await turn(1, "t1", "rm -f build/x", "one");
+			await turn(2, "t2", "npm test", "two");
+			await s.flush();
+			const all = s.records();
+			expect(all.filter((entry) => entry.kind === "decision").map((entry) => [entry.command, entry.outcome])).toEqual([
+				["rm -f build/x", "review-allow"],
+				["npm test", "review-allow"],
+			]);
+			const hits = all
 				.filter((entry) => entry.kind === "violation" && entry.source === "tripwire")
 				.map((entry) => [entry.op, entry.adverse]);
 			expect(hits).toEqual([

@@ -1309,7 +1309,7 @@ that the paragraphs after the table spell out.
 |---|---|
 | An unreadable bash command, while the sandbox has no network and the call carries no capability | The same command where the sandbox would not contain it (a profile with network, a capability) |
 | `rm`, `chmod`, `chown`, `truncate` whose every target, as the parser reads it, is a path inside the writable roots and not a protected path (`chmod +x run.sh` has no parsed target yet, so it stays `high`) | The same outside the writable roots; on a writable root or above one (`rm -rf .`, `rm -rf src/..`); on or above a `rules.protectedPaths` match (`.git`, `.pi`, `rm -rf .github`, …); with no path operand; and `dd` |
-| `git checkout`, `restore`, `reset`, `clean` run inside the writable roots, on ordinary operands | The same on a protected or whole-workspace operand (`git checkout -- AGENTS.md`, `git checkout .`); `git push`, `gh … -X DELETE`, `kill`, `pkill`, `killall` |
+| `git checkout`, `restore`, `reset`, `clean` run inside the writable roots, on ordinary operands | The same on a protected or whole-workspace operand (`git checkout -- AGENTS.md`, `git checkout .`, `git restore :/`) and `git checkout -f`; `git push`, `gh … -X DELETE`, `kill`, `pkill`, `killall` |
 | A `write` or `edit` of any length to an ordinary workspace path (the body is summarized) | A truncated bash command; writes to a never-grantable tree (`critical`, always denied) |
 | | Anything an L1 `rules.ask` pattern matches (`git push *`, `git reset --hard*`, …) or `rules.deny` denies; these never reach the reviewer |
 
@@ -1336,8 +1336,8 @@ and not a path that does not exist yet (a new `.pi`, a nested repository). After
 configuration, agent directory and project file, and in a turn that ran an unparsed command
 nobody was asked about (`sandboxed-uncertain`, or a reviewer allow of one) a changed project
 file counts against the turn like a denial, so repeated changes open the breaker. The
-user-global `protectedPaths` entries outside that list (workflows, Dockerfiles, `infra/**`)
-are not watched by the tripwire: for those an unreadable command is judged by the reviewer
+`protectedPaths` entries outside that list, built-in (workflows, Dockerfiles) or user-global
+(`infra/**`), are not watched by the tripwire: for those an unreadable command is judged by the reviewer
 alone, or by nobody under `onUncertain: "sandbox"`. A repository's own ask rule for a
 spelling L1 cannot read is likewise enforced only as well as the parser reads the command.
 
