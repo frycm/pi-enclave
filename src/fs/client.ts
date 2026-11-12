@@ -98,6 +98,8 @@ export class HelperFsClient implements FsClient {
 	private readonly pending = new Map<number, Pending>();
 	private sequence = 0;
 	private restarts = 0;
+	/** Bytes each helper has sent, so a liveness check can tell a busy helper from a stuck one. */
+	private readonly received = new WeakMap<ChildProcessWithoutNullStreams, number>();
 	private disposed = false;
 
 	constructor(private readonly options: FsClientOptions) {}
@@ -126,6 +128,7 @@ export class HelperFsClient implements FsClient {
 			}, READY_TIMEOUT_MS);
 
 			child.stdout.on("data", (chunk: Buffer) => {
+				this.received.set(child, (this.received.get(child) ?? 0) + chunk.length);
 				let messages: unknown[];
 				try {
 					messages = decoder.push(chunk);
@@ -257,16 +260,32 @@ export class HelperFsClient implements FsClient {
 	private checkAlive(child: ChildProcessWithoutNullStreams): void {
 		if (this.child !== child) return;
 		const id = ++this.sequence;
-		const timer = setTimeout(() => {
+		const graceMs = this.options.livenessGraceMs ?? LIVENESS_GRACE_MS;
+		let seen = this.received.get(child) ?? 0;
+		const expire = () => {
+			const pending = this.pending.get(id);
+			if (this.child !== child) {
+				this.pending.delete(id);
+				return;
+			}
+			// The pong queues behind whatever the helper is already writing, such
+			// as a large file for the call that just timed out. Output still
+			// arriving is proof of life, so give it another grace period. This
+			// does not keep any call waiting: each still fails at its own timeout.
+			const now = this.received.get(child) ?? 0;
+			if (now !== seen && pending) {
+				seen = now;
+				pending.timer = setTimeout(expire, graceMs);
+				return;
+			}
 			this.pending.delete(id);
-			if (this.child !== child) return;
 			this.child = undefined;
 			this.ready = undefined;
 			this.failAll(new Error("pi-enclave: the filesystem helper stopped responding and was replaced"));
 			child.stdin.destroy();
 			child.kill("SIGKILL");
-		}, this.options.livenessGraceMs ?? LIVENESS_GRACE_MS);
-		this.pending.set(id, { resolve: () => {}, reject: () => {}, timer });
+		};
+		this.pending.set(id, { resolve: () => {}, reject: () => {}, timer: setTimeout(expire, graceMs) });
 		try {
 			this.send(child, encodeFrame({ op: "ping", id }));
 		} catch {

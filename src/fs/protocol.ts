@@ -126,30 +126,61 @@ export function encodeFrame(message: unknown): Buffer {
  * file.
  */
 export class FrameDecoder {
-	private buffer: Buffer = Buffer.alloc(0);
+	// Chunks are kept as they arrive and joined once per frame. Joining on every
+	// chunk copied everything held so far each time: quadratic in the frame, so
+	// a 31 MB readFile spent seconds here while the helper had long finished.
+	private chunks: Buffer[] = [];
+	private size = 0;
 
 	/** Feed bytes; returns every complete message they finished. */
 	push(chunk: Buffer): unknown[] {
-		this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
+		if (chunk.length > 0) {
+			this.chunks.push(chunk);
+			this.size += chunk.length;
+		}
 		const messages: unknown[] = [];
 
-		while (this.buffer.length >= HEADER_BYTES) {
-			const length = this.buffer.readUInt32BE(0);
+		while (this.size >= HEADER_BYTES) {
+			const length = this.peekLength();
 			if (length > MAX_FRAME_BYTES) {
 				throw new Error(`pi-enclave: frame header claims ${length} bytes, above the ${MAX_FRAME_BYTES} limit`);
 			}
-			if (this.buffer.length < HEADER_BYTES + length) break;
+			if (this.size < HEADER_BYTES + length) break;
 
-			const payload = this.buffer.subarray(HEADER_BYTES, HEADER_BYTES + length);
-			this.buffer = this.buffer.subarray(HEADER_BYTES + length);
-			messages.push(JSON.parse(payload.toString("utf8")));
+			const frame = this.take(HEADER_BYTES + length);
+			messages.push(JSON.parse(frame.toString("utf8", HEADER_BYTES)));
 		}
 
 		return messages;
 	}
 
+	/** The length in the next header, which may itself be split across chunks. */
+	private peekLength(): number {
+		const first = this.chunks[0] as Buffer;
+		if (first.length >= HEADER_BYTES) return first.readUInt32BE(0);
+		const header = Buffer.alloc(HEADER_BYTES);
+		let filled = 0;
+		for (const chunk of this.chunks) {
+			filled += chunk.copy(header, filled, 0, Math.min(chunk.length, HEADER_BYTES - filled));
+			if (filled === HEADER_BYTES) break;
+		}
+		return header.readUInt32BE(0);
+	}
+
+	/** Remove and return the first `bytes` held, copying only when they span chunks. */
+	private take(bytes: number): Buffer {
+		let count = 0;
+		let joined = 0;
+		while (joined < bytes) joined += (this.chunks[count++] as Buffer).length;
+		const span = count === 1 ? (this.chunks[0] as Buffer) : Buffer.concat(this.chunks.slice(0, count), joined);
+		const rest = span.subarray(bytes);
+		this.chunks.splice(0, count, ...(rest.length > 0 ? [rest] : []));
+		this.size -= bytes;
+		return span.subarray(0, bytes);
+	}
+
 	/** Bytes held but not yet forming a complete frame. */
 	get pending(): number {
-		return this.buffer.length;
+		return this.size;
 	}
 }
