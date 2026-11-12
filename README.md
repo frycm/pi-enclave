@@ -354,6 +354,14 @@ installs are elsewhere) fails as if the files were missing; add its root to
 `sandbox.readableRoots`. Changing from `allowlist` to `open`, and adding readable roots,
 are user-global only; a project may switch to `allowlist`.
 
+Git runs without the user's global configuration in `allowlist` mode (`GIT_CONFIG_GLOBAL` is
+set to `/dev/null`), because the home directory is not readable and git refuses to start on a
+configuration file it can see but not read. Commits then need an identity in the repository's
+own config, or `~/.gitconfig` (or `~/.config/git`) in `sandbox.readableRoots`, which turns the
+override off. On macOS the `/var` and `/tmp` links are readable by name, so paths spelled
+through them (the workspace under `$TMPDIR`, for one) resolve; what they point at is not
+opened by this.
+
 ```json
 { "sandbox": { "readMode": "allowlist", "readableRoots": ["/opt/toolchains", "/srv/app/shared"] } }
 ```

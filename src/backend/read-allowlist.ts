@@ -31,7 +31,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { canonical, isUnder, isUnderAny } from "./paths.ts";
-import type { Profile } from "./types.ts";
+import type { ChildEnv, Profile } from "./types.ts";
 
 /** Readable on every Linux host: the runtime, its configuration and its libraries. */
 export const LINUX_SYSTEM_READ_ROOTS = [
@@ -68,6 +68,17 @@ export const DARWIN_SYSTEM_READ_ROOTS = [
 	"/Applications/Xcode.app",
 	"/opt/homebrew",
 ] as const;
+
+/**
+ * macOS's top-level links into /private. Following a link is a read of the
+ * link itself, and Seatbelt only lets metadata reads through on directories,
+ * so with these denied every path spelled through them -- the workspace under
+ * `$TMPDIR` (`/var/folders/...`), anything in /tmp -- fails with EPERM even
+ * when its target is allowed. Each is allowed by its own name and never
+ * resolved: `/var` matches only the link (nothing real lives under that
+ * spelling), whereas `/private/var` would expose everything behind it.
+ */
+export const DARWIN_SYSTEM_READ_LINKS = ["/var", "/tmp"] as const;
 
 export interface ReadAllowlistInput {
 	profile: Pick<Profile, "writableRoots" | "readAllow" | "readDeny">;
@@ -151,7 +162,35 @@ export function allowlistReadRoots(input: ReadAllowlistInput): string[] {
 			out.push(spelling);
 		}
 	}
+	if (input.platform === "darwin") {
+		for (const link of DARWIN_SYSTEM_READ_LINKS) {
+			if (!seen.has(link) && !denied.some((entry) => isUnder(link, entry))) out.push(link);
+		}
+	}
 	return out;
+}
+
+/**
+ * The environment a sandboxed command runs with in allowlist mode.
+ *
+ * Git refuses to run when its user configuration exists but cannot be read,
+ * and Seatbelt answers a denied read with EPERM rather than ENOENT, so on
+ * macOS every git command would die on `~/.gitconfig`. Unless the user made
+ * their git configuration readable with `sandbox.readableRoots`, git is told
+ * there is none -- which is also what it sees on Linux, where a denied home
+ * is an empty directory.
+ */
+export function withAllowlistGitConfig(
+	profile: Pick<Profile, "readMode" | "readAllow" | "writableRoots">,
+	env: ChildEnv,
+	home = homedir(),
+): ChildEnv {
+	if (profile.readMode !== "allowlist" || env.GIT_CONFIG_GLOBAL !== undefined) return env;
+	const readable = [...(profile.readAllow ?? []), ...profile.writableRoots];
+	const xdg = env.XDG_CONFIG_HOME && isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : join(home, ".config");
+	const userConfig = [join(home, ".gitconfig"), join(xdg, "git", "config")];
+	if (userConfig.some((path) => isUnderAny(path, readable))) return env;
+	return { ...env, GIT_CONFIG_GLOBAL: "/dev/null" };
 }
 
 /**

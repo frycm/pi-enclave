@@ -9,6 +9,7 @@ import {
 	allowlistReadRoots,
 	LINUX_SYSTEM_READ_ROOTS,
 	outsideReadAllowlist,
+	withAllowlistGitConfig,
 	withReadCapability,
 } from "../../src/backend/read-allowlist.ts";
 import { toSrtConfig } from "../../src/backend/srt.ts";
@@ -111,6 +112,42 @@ describe("the read allowlist", () => {
 		expect(out).toContain("/System");
 		expect(out).toContain("/Library");
 		expect(out).not.toContain("/lib64");
+	});
+
+	it("lets the /var and /tmp links be followed on macOS without opening what is behind them", () => {
+		const out = roots({
+			platform: "darwin",
+			home: "/Users/u",
+			path: "/usr/bin",
+			resolve: (path) => (path === "/var" || path === "/tmp" ? `/private${path}` : path),
+		});
+		expect(out).toContain("/var");
+		expect(out).toContain("/tmp");
+		expect(out).not.toContain("/private/var");
+		expect(out).not.toContain("/private/tmp");
+		expect(roots()).not.toContain("/var");
+	});
+});
+
+describe("git in allowlist mode", () => {
+	const profile = { readMode: "allowlist" as const, readAllow: ["/usr"], writableRoots: ["/home/u/work/app"] };
+
+	it("tells git there is no user configuration it cannot read", () => {
+		expect(withAllowlistGitConfig(profile, { PATH: "/usr/bin" }, HOME)).toEqual({
+			PATH: "/usr/bin",
+			GIT_CONFIG_GLOBAL: "/dev/null",
+		});
+	});
+
+	it("leaves git alone when its configuration is readable, already chosen, or in open mode", () => {
+		const readable = { ...profile, readAllow: ["/usr", "/home/u/.gitconfig"] };
+		expect(withAllowlistGitConfig(readable, {}, HOME)).toEqual({});
+		const xdg = { ...profile, readAllow: ["/home/u/.config/git"] };
+		expect(withAllowlistGitConfig(xdg, {}, HOME)).toEqual({});
+		expect(withAllowlistGitConfig(profile, { GIT_CONFIG_GLOBAL: "/etc/gitconfig.ci" }, HOME)).toEqual({
+			GIT_CONFIG_GLOBAL: "/etc/gitconfig.ci",
+		});
+		expect(withAllowlistGitConfig({ ...profile, readMode: "open" }, {}, HOME)).toEqual({});
 	});
 });
 

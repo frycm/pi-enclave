@@ -43,7 +43,7 @@ import {
 	timeoutNote,
 } from "./limits.ts";
 import { canonical, isUnder } from "./paths.ts";
-import { allowlistReadRoots, withReadCapability } from "./read-allowlist.ts";
+import { allowlistReadRoots, withAllowlistGitConfig, withReadCapability } from "./read-allowlist.ts";
 import { SessionScratch } from "./scratch.ts";
 import { checkUnixSocketBlocking } from "./self-test.ts";
 import {
@@ -733,6 +733,7 @@ export class SrtBackend implements SandboxBackend {
 		try {
 			exitCode = await this.spawnSandboxed(argv, {
 				...request,
+				env: withAllowlistGitConfig(compiled.profile, request.env),
 				signal: stop.signal,
 				onData: (chunk) => {
 					if (!cap.push(chunk)) stop.abort();
