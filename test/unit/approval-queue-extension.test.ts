@@ -108,7 +108,13 @@ interface Tool {
 
 /** A notify command that leaves one file per notification, outside the workspace. */
 const notified = () => join(root, "notified");
-const NOTIFY = () => ["/bin/sh", "-c", `mkdir -p '${notified()}' && cat > '${notified()}'/"$ENCLAVE_NONCE"`];
+// Written under a temporary name and renamed, so a test that sees the file
+// never reads it half-written.
+const NOTIFY = () => [
+	"/bin/sh",
+	"-c",
+	`mkdir -p '${notified()}' && cat > '${notified()}'/".$ENCLAVE_NONCE" && mv '${notified()}'/".$ENCLAVE_NONCE" '${notified()}'/"$ENCLAVE_NONCE"`,
+];
 
 async function session(mode: "queue" | "off", signal?: AbortSignal) {
 	vi.resetModules();

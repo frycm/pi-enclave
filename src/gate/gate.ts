@@ -21,7 +21,7 @@ import { canonical as canonicalPath, isUnder } from "../backend/paths.ts";
 import type { EffectiveProfile } from "../config/types.ts";
 import { type CanonicalAction, canonicalize, describeAction } from "../policy/canonical.ts";
 import { type Evaluation, evaluateRules, type RuleMatch } from "../policy/match.ts";
-import { matchesPathPattern } from "../policy/paths.ts";
+import { protectedMatches } from "../policy/protected-match.ts";
 import { reviewerTrigger } from "../reviewer/classifier.ts";
 import type { ActionReviewer, EffectiveReview, ReviewerResult, ReviewerTrigger } from "../reviewer/types.ts";
 import { ActionLock, freezeToolInput } from "./lock.ts";
@@ -618,19 +618,13 @@ function canonical(event: GateEvent, deps: GateDeps): CanonicalAction {
 
 function evaluate(action: CanonicalAction, deps: GateDeps): Evaluation {
 	return evaluateRules(action, deps.profile.rules, {
-		// Only writes are escalated by protectedPaths. A read of `infra/main.tf`
-		// is not the thing the rule is about, and escalating it would make the
-		// list unusable in any repository where the agent has to look at what it
-		// is not allowed to change.
-		protectedMatcher: (patterns) => {
-			const matches: RuleMatch[] = [];
-			for (const path of action.paths) {
-				if (!path.writes) continue;
-				const pattern = matchesPathPattern(patterns, path.resolved, deps.cwd);
-				if (pattern) matches.push({ list: "ask", pattern, target: path.resolved });
-			}
-			return matches;
-		},
+		// Writes only, and what a directory operand or a hard link reaches (#72).
+		protectedMatcher: (patterns, list) =>
+			protectedMatches(action, patterns, list, {
+				cwd: deps.cwd,
+				home: deps.home,
+				rules: deps.profile.rules.protectedPaths,
+			}),
 	});
 }
 

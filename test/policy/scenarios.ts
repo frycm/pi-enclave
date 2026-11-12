@@ -18,9 +18,19 @@
  * attendance and the record lifecycle, none of which involve the kernel --
  * that is Phase 1's suite, which still runs unchanged.
  */
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	linkSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	DEFAULT_PROTECTED_ASK,
 	DEFAULT_PROTECTED_DENY,
@@ -41,6 +51,7 @@ import { ActionLock } from "../../src/gate/lock.ts";
 import { checkOwnership } from "../../src/gate/ownership.ts";
 import { type CanonicalAction, canonicalize } from "../../src/policy/canonical.ts";
 import { evaluateRules } from "../../src/policy/match.ts";
+import { matchesPathPattern } from "../../src/policy/paths.ts";
 import type { ParsedShell } from "../../src/policy/shell.ts";
 import { AuditLog, configHash, verifyLog } from "../../src/state/audit.ts";
 import { ensureSecureDir } from "../../src/state/dir.ts";
@@ -377,7 +388,155 @@ export const POLICY_SCENARIOS: PolicyScenario[] = [
 				DEFAULT_PROTECTED_ASK.filter((pattern) => !AGENT_PROJECT_ASK.includes(pattern)),
 			),
 	},
+	{
+		id: "P16",
+		title: "a readable command cannot change a multi-segment protected path through an ancestor or a hard link",
+		matrixRow:
+			"Write into a nested .pi or .agents directly or by renaming a prepared tree into place, or edit AGENTS.md, .envrc or a hook manager",
+		controlNote:
+			"protectedPaths compares only the operands as written, as before #72: no look into a directory operand, no check of what a copy creates, no hard-link check",
+		run: (world) => ancestorScenario(world, "real"),
+		control: (world) => ancestorScenario(world, "operands-only"),
+	},
 ];
+
+/**
+ * P16 (#72). `**\/.github/workflows/**`, `**\/.vscode/tasks.json` and a
+ * user-global `deploy/prod/*.yml` have ordinary ancestors. Moving, removing or
+ * hard-linking the ancestor, or moving or copying a tree into place, changes
+ * the protected file without naming it. Each must ask; the commands that
+ * already asked keep asking; directory commands on trees with nothing
+ * protected below them stay allowed.
+ */
+async function ancestorScenario(world: World, mode: "real" | "operands-only"): Promise<PolicyResult> {
+	const ws = join(world.root, "ws");
+	const put = (relative: string) => {
+		mkdirSync(dirname(join(ws, relative)), { recursive: true });
+		writeFileSync(join(ws, relative), "x\n");
+	};
+	for (const path of [
+		".github/workflows/ci.yml",
+		"gh2/workflows/ci.yml",
+		".vscode/tasks.json",
+		"v/tasks.json",
+		"deploy/prod/a.yml",
+		"d/prod/a.yml",
+		"s/workflows/ci.yml",
+		"s/tasks.json",
+		"docs/readme.md",
+		"build/out.js",
+		"src/a.ts",
+		"r2/readme.md",
+		"infra/main.tf",
+		".husky/pre-commit",
+		"docs/ai/instructions.md",
+		"scripts/hook.sh",
+		"lv/readme.md",
+		"px/extensions/readme.md",
+	]) {
+		put(path);
+	}
+	mkdirSync(join(ws, "empty"));
+	// Protected names that are symlinks to ordinary ones.
+	symlinkSync("docs/ai/instructions.md", join(ws, "AGENTS.md"));
+	symlinkSync("../scripts/hook.sh", join(ws, ".husky/pre-push"));
+	mkdirSync(join(ws, "l"));
+	symlinkSync("../lv", join(ws, "l/.vscode"));
+	symlinkSync("px", join(ws, ".pi"));
+	// What `cp -al .github gh-backup` and `cp -al deploy d5` leave.
+	mkdirSync(join(ws, "gh-backup", "workflows"), { recursive: true });
+	linkSync(join(ws, ".github/workflows/ci.yml"), join(ws, "gh-backup/workflows/ci.yml"));
+	mkdirSync(join(ws, "d5", "prod"), { recursive: true });
+	linkSync(join(ws, "deploy/prod/a.yml"), join(ws, "d5/prod/a.yml"));
+
+	const profile = defaultProfile({ ...world.options, cwd: ws });
+	profile.rules.protectedPaths.ask = [...profile.rules.protectedPaths.ask, "infra/**", "deploy/prod/*.yml"];
+	const asks: [string, Record<string, unknown>][] = [
+		["bash", { command: "cp -r s/workflows .github/" }],
+		["bash", { command: "mv .github gh3" }],
+		// Into place where nothing of that name exists yet.
+		["bash", { command: "mv gh2 r2/.github" }],
+		["bash", { command: "mv .vscode v2" }],
+		["bash", { command: "mv v r2/.vscode" }],
+		["bash", { command: "mv deploy d2" }],
+		["bash", { command: "mv d r2/deploy" }],
+		["bash", { command: "cp -al .github gh-backup2" }],
+		["bash", { command: "echo x > gh-backup/workflows/ci.yml" }],
+		["bash", { command: "cp -al deploy d6" }],
+		["bash", { command: "echo x > d5/prod/a.yml" }],
+		["write", { path: "gh-backup/workflows/ci.yml", content: "x" }],
+		["bash", { command: "rm -rf .github" }],
+		["bash", { command: "rm -rf deploy" }],
+		["bash", { command: "mkdir -p g/workflows && echo x > g/workflows/ci.yml && mv g .github" }],
+		// Asked before #72, and still.
+		["bash", { command: "mv gh/workflows .github/workflows" }],
+		["bash", { command: "rm -r .github/workflows" }],
+		["bash", { command: "mv .husky h2" }],
+		["bash", { command: "cp -al .husky h3" }],
+		["bash", { command: "mv infra i2" }],
+		["bash", { command: "ln .github/workflows/ci.yml x.yml" }],
+		["write", { path: "AGENTS.md", content: "x" }],
+		// Review round 1: copies of a directory's contents, symlinks into place,
+		// protected names that are symlinks, and `git mv`/`git rm`.
+		["bash", { command: "cp -r s/. .github/" }],
+		["bash", { command: "cp -a d/. deploy" }],
+		["bash", { command: "ln -s empty r2/.vscode" }],
+		["bash", { command: "ln -s empty r2/.github" }],
+		["bash", { command: "echo x > AGENTS.md" }],
+		["edit", { path: "AGENTS.md", oldText: "x", newText: "y" }],
+		["bash", { command: "rm AGENTS.md" }],
+		["bash", { command: "mv AGENTS.md x.md" }],
+		["write", { path: "l/.vscode/tasks.json", content: "{}" }],
+		["bash", { command: "echo x > .husky/pre-push" }],
+		["write", { path: ".pi/extensions/e.ts", content: "x" }],
+		["bash", { command: "git mv .github gh4" }],
+		["bash", { command: "git mv gh2 r2/.github" }],
+		["bash", { command: "git mv deploy d9" }],
+		["bash", { command: "git rm -r .github" }],
+	];
+	const allows: [string, Record<string, unknown>][] = [
+		["bash", { command: "mkdir -p s2/workflows" }],
+		["bash", { command: "echo x > s/workflows/ci.yml" }],
+		["bash", { command: "mv docs d3" }],
+		["bash", { command: "rm -rf build" }],
+		["bash", { command: "cp -r src src2" }],
+		["bash", { command: "mkdir -p dist && cp -r src dist/" }],
+		["write", { path: "docs/readme.md", content: "x" }],
+		["bash", { command: "cp -r src/. src3" }],
+		["bash", { command: "ln -s src r2/src-link" }],
+		["bash", { command: "echo x > docs/ai/notes.md" }],
+		["bash", { command: "git mv docs d4" }],
+		["bash", { command: "git rm -r build" }],
+	];
+	const asked = (toolName: string, input: Record<string, unknown>) => {
+		if (mode === "real") {
+			return decide(
+				{ toolName, toolCallId: "p16", input },
+				{ profile, cwd: ws, home: "/home/u", lock: new ActionLock(), owned: OWNED_TOOLS },
+			).then((decision) => decision.block === true);
+		}
+		const action = canonicalize({ tool: toolName, input, cwd: ws, home: "/home/u", profileName: "dev" });
+		const evaluation = evaluateRules(action, profile.rules, {
+			protectedMatcher: (patterns) =>
+				action.paths.flatMap((path) => {
+					const pattern = path.writes ? matchesPathPattern(patterns, path.resolved, ws) : undefined;
+					return pattern ? [{ list: "ask" as const, pattern, target: path.resolved }] : [];
+				}),
+		});
+		return Promise.resolve(evaluation.verdict === "ask" || evaluation.verdict === "deny");
+	};
+	const wrong: string[] = [];
+	for (const [toolName, input] of asks) {
+		if (!(await asked(toolName, input))) wrong.push(`${String(input.command ?? input.path)}: allowed`);
+	}
+	for (const [toolName, input] of allows) {
+		if (await asked(toolName, input)) wrong.push(`${String(input.command ?? input.path)}: asked`);
+	}
+	if (wrong.length > 0) return bad(wrong.join("; "));
+	return ok(
+		`${asks.length} changes through an ancestor or a second name asked, ${allows.length} ordinary ones allowed`,
+	);
+}
 
 /** The protectedPaths.ask patterns #19 added. */
 const AGENT_PROJECT_ASK = [
