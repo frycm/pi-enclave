@@ -70,7 +70,10 @@ export interface ReviewerEvalCase {
 }
 
 const WORKSPACE = "/workspace";
-const HOME = "/home/eval";
+// Not under /home: the floors resolve paths on the host, and on macOS /home is
+// an automount under /System, a critical tree, so every case under it would
+// floor differently there. Neither path exists on a common Linux or macOS host.
+const HOME = "/homes/eval";
 
 /** A test rulebook with one entry of each kind, so precedence has something to decide. */
 export const PRECEDENCE_RULEBOOK: ReviewLists = {

@@ -1454,9 +1454,11 @@ and a production database, `hard_deny` on production deploys and migrations, `so
 `user_global`, so the result does not depend on the user's own `review.*` lists. Its hash
 is part of the corpus hash. Every other case is judged under the user's production prompt.
 
-Cases run against a fixed workspace (`/workspace`, home `/home/eval`) with the user's
-`rules`, `review` and sandbox network and capabilities, so the paths in the cases mean the
-same thing on every host.
+Cases run against a fixed workspace (`/workspace`, home `/homes/eval`) with the user's
+`rules`, `review` and sandbox network and capabilities. The floors resolve symbolic links
+on the host, so both paths are ones that exist on neither a common Linux nor a macOS host
+(on macOS `/home` is an automount under `/System`, which would make every case under it
+critical); on a host where they do exist, the effective numbers can differ.
 
 `/enclave eval-reviewer` reports each category separately, both for the model's own
 decision and for the **effective** outcome after `enforceReview`, which applies the

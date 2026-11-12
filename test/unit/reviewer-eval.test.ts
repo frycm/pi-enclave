@@ -129,11 +129,12 @@ describe("reviewer qualification", () => {
 
 	it("sends each case under its prompt and with its sandbox violation", async () => {
 		const sent: { system: string; evidence: Record<string, unknown> }[] = [];
+		const base = oracle();
 		const recording: ReviewerCompletion = {
-			...oracle(),
+			...base,
 			complete(request) {
 				sent.push({ system: request.system, evidence: JSON.parse(request.user) as Record<string, unknown> });
-				return oracle().complete(request);
+				return base.complete(request);
 			},
 		};
 		await evalReviewer(options(recording));
