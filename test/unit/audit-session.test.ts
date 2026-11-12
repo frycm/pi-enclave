@@ -4,7 +4,7 @@
  * `executed` record follows each allowed call, a `!` command is recorded, and
  * `audit.required` stops the session when the log stops.
  */
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -438,6 +438,31 @@ describe("an unjudged command's protected paths (#64)", () => {
 			await s.flush();
 		} finally {
 			stderr.mockRestore();
+		}
+	});
+
+	it("run unjudged when a protected file's other name is outside the writable roots, and deny one inside (#73)", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		const store = realpathSync(mkdtempSync(join(tmpdir(), "enclave-store-")));
+		try {
+			plant();
+			// As a pnpm store outside the workspace leaves an installed package's file.
+			linkSync(join(ws, "AGENTS.md"), join(store, "AGENTS.md"));
+			mkdirSync(join(ws, "notes"));
+			linkSync(join(ws, ".husky", "pre-commit"), join(ws, "notes", "hook-copy"));
+			const s = await session((profile) => {
+				profile.rules.onUncertain = "sandbox";
+			});
+			const gate = await s.call("t1", unparsed);
+			expect(gate?.block).not.toBe(true);
+			expect(mocks.runs).toHaveLength(1);
+			const denied = mocks.runs[0]?.protectWrites ?? [];
+			expect(denied).toEqual(expect.arrayContaining([join(ws, "AGENTS.md"), join(ws, "notes", "hook-copy")]));
+			expect(denied.some((path) => path.startsWith(store))).toBe(false);
+			await s.flush();
+		} finally {
+			stderr.mockRestore();
+			rmSync(store, { recursive: true, force: true });
 		}
 	});
 

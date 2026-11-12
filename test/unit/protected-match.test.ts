@@ -236,6 +236,12 @@ describe("a destination reached through a symlink", () => {
 		expect(bash(command)).not.toEqual([]);
 	});
 
+	it("is judged by where an ordinary name leads too", () => {
+		mkdirSync(join(ws, ".vscode2", ".vscode"), { recursive: true });
+		symlinkSync(join(".vscode2", ".vscode"), join(ws, "x"));
+		expect(bash("cp t/tasks.json x/")).not.toEqual([]);
+	});
+
 	it("allows what creates nothing protected under either name", () => {
 		expect(bash("cp t/readme.md .vscode/")).toEqual([]);
 		expect(bash("cp -r t r/.github/")).toEqual([]);
@@ -282,6 +288,12 @@ describe("a protected name that is a symlink", () => {
 		symlinkSync("AGENTS.md", join(ws, "notes.md"));
 		const result = tool === "bash" ? bash(target) : asks("write", { path: target, content: "x" });
 		expect(result).toEqual([expect.objectContaining({ pattern: "**/AGENTS.md", target: join(ws, "AGENTS.md") })]);
+	});
+
+	it("asks for a longer chain whose protected name is further along", () => {
+		symlinkSync("AGENTS.md", join(ws, "b"));
+		symlinkSync("b", join(ws, "a"));
+		expect(bash("echo x > a")).not.toEqual([]);
 	});
 
 	it("still asks for an ordinary name that leads to a protected one", () => {

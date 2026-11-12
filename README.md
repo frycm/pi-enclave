@@ -1426,15 +1426,27 @@ write ordinary files and a falsifiability run that shows the rows fail without t
 A command a person approved, at the terminal or with `pi-enclave approve` while a queued
 session waits, was judged, and runs under the session profile as before.
 
+A protected file, or a file inside a denied directory, with a second hard link has its other
+names denied as well (a read-only bind holds a name, not an inode): the walk looks for them by
+device and inode across the writable roots, `.git` included, and a name it does not find there
+is outside them, where the command cannot write anyway (conformance row W9).
+
 The call is **not run unjudged** when the walk cannot vouch for it: past 200,000 entries
-(the walk and what the denied directories hold together), when a protected file, or a file
-inside a denied directory, has a second hard link (a read-only bind holds a name, not an
-inode, so the other name could still be written, wherever it is), or when a protected
+(the walk, what the denied directories hold, and the search for other hard-link names
+together), when a directory cannot be read during that search, when a protected
 symlink points at a target in a writable root that does not exist yet (writing through it
-would create the target).
+would create the target), when a protected symlink resolves through another symlink, or a
+symlinked directory, that the command could replace (`.husky/pre-push -> ../middle` with
+`middle -> scripts/hook.sh`, or a target below `tools/current -> v1`), or when a protected
+symlink points at a directory that holds the link or a whole writable root (`infra/self -> ..`
+would make the workspace read-only for the call; the message names the link).
 The gate then asks a person, and if that happens between the gate and the call, the command
-is refused. The walk costs about 8 µs per entry; it skips the inside of every `.git`
-directory, and it runs twice per unjudged call (at the gate and just before the call).
+is refused. The walk costs about 3 µs per entry (about 4 µs with an anchored user-global pattern
+such as `infra/**`), and about 5 µs per entry inside a denied directory: 410 ms for 150,000
+files, 890 ms with 40,000 more inside `infra/**`. It skips the inside of every `.git`
+directory, and it runs twice per unjudged call (at the gate and just before the call). The
+search for other hard-link names runs only when a protected file has one, and costs about
+one more walk.
 
 What remains:
 
@@ -1452,8 +1464,8 @@ What remains:
   large to fingerprint (16,384 entries, such as a user-global `vendor/**`) is reported as
   unverifiable at every check, and counts only once, when it first appears.
 - **A protected symlink** is protected through its target when the target is inside a
-  writable root; the link itself can be replaced by a regular file, which the tripwire
-  reports.
+  writable root, and every link on the way to the target is in a place the command cannot
+  write; the link itself can be replaced by a regular file, which the tripwire reports.
 - **A directory a pattern names only by itself** (`**/build`, or the built-in `**/.git` of a
   repository created since start) is not denied whole, since that would hold its contents,
   which the pattern leaves ordinary. It can be renamed or removed; a repository's `config`
@@ -1463,8 +1475,8 @@ What remains:
   regenerates a Dockerfile cannot either, and `npm ci` cannot remove or replace an installed
   package that ships an `AGENTS.md` or a Dockerfile, since the patterns match at any depth,
   `node_modules` included, as they do at L1. A pnpm workspace hard-links each package file
-  from its store, so one installed package that ships such a file makes every unjudged call
-  ask, or be refused on a headless run. Approve such a command, or run it yourself.
+  from its store; when the store is outside the writable roots its names are left alone, and
+  when it is inside them they are denied too. Approve such a command, or run it yourself.
 - **Everything else in the writable roots** is the agent's to change, as it is for a readable
   command: source files, build scripts, `package.json` scripts that a later `npm test` run
   outside the sandbox would execute. A writable workspace is one whose build files the

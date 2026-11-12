@@ -15,7 +15,7 @@
  * sandbox at all.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type {
@@ -1594,6 +1594,26 @@ SCENARIOS.push(
 				if (!result.ok) return { ok: false, detail: `${file.slice(fixture.workspace.length + 1)}: ${result.detail}` };
 			}
 			return { ok: true, detail: `all three unchanged at their paths (exit ${r.exitCode})` };
+		},
+	},
+	{
+		id: "W9",
+		title: "an unjudged command cannot write a protected file through another hard link to it (#73)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const agents = plant(fixture, "AGENTS.md");
+			mkdirSync(join(fixture.workspace, "notes"), { recursive: true });
+			const other = join(fixture.workspace, "notes", "agents-copy.md");
+			linkSync(agents, other);
+			const protectWrites = protectedFor(fixture);
+			if (!protectWrites.includes(other)) {
+				return { ok: false, detail: `the other name is not denied: ${JSON.stringify(protectWrites)}` };
+			}
+			// Both forms: a write in place, and appending through the other name.
+			const r = await sh(`n=notes/agents-copy.md; echo x > "$n"; echo y >> "$n"`, { protectWrites });
+			return unchanged(agents, r);
 		},
 	},
 	{

@@ -100,10 +100,20 @@ export function protectedEntryMatcher(
  * Where a symlink leads, following a chain of links, even when the last
  * target does not exist (`canonical` stops at a dangling link).
  */
-function linkTarget(path: string): string {
+function linkTarget(path: string, replaceable: (link: string) => boolean): string {
 	let current = path;
 	for (let hops = 0; hops < 40; hops++) {
-		const next = canonical(resolve(dirname(current), readlinkSync(current)));
+		const lexical = resolve(dirname(current), readlinkSync(current));
+		// A bind holds the final target, not the links on the way to it: one
+		// the command could replace would point the protected name elsewhere.
+		const link = linkOnTheWay(lexical, replaceable);
+		if (link !== undefined) {
+			throw new Unprotectable(
+				`${path} is a protected symlink that resolves through ${link}, a symlink this command could replace; ` +
+					"point the protected link straight at its target",
+			);
+		}
+		const next = canonical(lexical);
 		let stats: ReturnType<typeof lstatSync> | undefined;
 		try {
 			stats = lstatSync(next);
@@ -114,6 +124,26 @@ function linkTarget(path: string): string {
 		current = next;
 	}
 	throw new Unprotectable(`${path} is a chain of more than 40 symlinks`);
+}
+
+/** The first symlink on `path`, as a component or the path itself, that `replaceable` accepts. */
+function linkOnTheWay(path: string, replaceable: (link: string) => boolean): string | undefined {
+	const parts = path.split("/").filter(Boolean);
+	let prefix = "";
+	for (const part of parts) {
+		prefix = `${prefix}/${part}`;
+		let stats: ReturnType<typeof lstatSync>;
+		try {
+			stats = lstatSync(prefix);
+		} catch {
+			// Missing from here on: nothing below can be a link yet.
+			return undefined;
+		}
+		if (!stats.isSymbolicLink()) continue;
+		const location = join(canonical(dirname(prefix)), part);
+		if (replaceable(location)) return location;
+	}
+	return undefined;
 }
 
 /** Why the walk cannot vouch for the protected paths. */
@@ -156,11 +186,26 @@ export function protectedWriteTargets(options: ProtectedWritesOptions): Protecte
 	}
 
 	const held = new Set<string>();
+	const heldDirectories = new Set<string>();
 	const seen = new Set<string>();
+	/** Protected files with another name, by device and inode. */
+	const linked = new Map<string, string>();
 	const writable = (path: string) =>
 		roots.some((root) => isUnder(path, root)) && !denied.some((deny) => isUnder(path, deny));
+	const insideHeld = (path: string) => {
+		for (let dir = dirname(path); dir !== dirname(dir); dir = dirname(dir)) {
+			if (heldDirectories.has(dir)) return true;
+		}
+		return false;
+	};
+	// A link inside a directory held for the call cannot be replaced either.
+	const replaceable = (link: string) => writable(link) && !insideHeld(link);
 
-	const hold = (path: string): void => {
+	/**
+	 * `canonicalParent`: `path` is an entry of a directory already resolved,
+	 * so unless it is a symlink it is its own canonical path.
+	 */
+	const hold = (path: string, canonicalParent = false): void => {
 		let stats: ReturnType<typeof lstatSync>;
 		try {
 			stats = lstatSync(path);
@@ -169,9 +214,18 @@ export function protectedWriteTargets(options: ProtectedWritesOptions): Protecte
 			return;
 		}
 		if (stats.isSymbolicLink()) {
-			const target = linkTarget(path);
+			const target = linkTarget(path, replaceable);
 			// Outside every writable root, or already denied: not writable anyway.
 			if (!writable(target)) return;
+			const location = canonicalParent ? path : join(canonical(dirname(path)), basename(path));
+			// Back into a directory already held (`.husky/loop -> .`) changes nothing.
+			const wider = isUnder(location, target) || roots.some((root) => isUnder(root, target));
+			if (wider && !heldDirectories.has(target)) {
+				throw new Unprotectable(
+					`${path} is a protected symlink to ${target}, which holds ${isUnder(location, target) ? "the link itself" : "a whole writable root"}; ` +
+						"holding it would make all of it read-only for this command, so remove the link or point it elsewhere",
+				);
+			}
 			if (!existsSync(target)) {
 				throw new Unprotectable(
 					`${path} is a protected symlink to ${target}, which does not exist yet, so writing through it would create it`,
@@ -180,20 +234,18 @@ export function protectedWriteTargets(options: ProtectedWritesOptions): Protecte
 			hold(target);
 			return;
 		}
-		const resolved = canonical(path);
+		const resolved = canonicalParent ? path : canonical(path);
 		if (!writable(resolved)) return;
 		if (stats.isFile()) {
-			if (stats.nlink > 1) {
-				throw new Unprotectable(
-					`${path} is protected and has ${stats.nlink} hard links, so another name for it could still be written`,
-				);
-			}
+			// Its other names are found after the walk, and held as well.
+			if (stats.nlink > 1) linked.set(`${stats.dev}:${stats.ino}`, resolved);
 			held.add(resolved);
 			return;
 		}
 		if (!stats.isDirectory() || seen.has(resolved)) return;
 		seen.add(resolved);
 		held.add(resolved);
+		heldDirectories.add(resolved);
 		let entries: string[];
 		try {
 			entries = readdirSync(resolved);
@@ -208,7 +260,7 @@ export function protectedWriteTargets(options: ProtectedWritesOptions): Protecte
 						"configure a narrower sandbox.writableRoots",
 				);
 			}
-			hold(join(resolved, name));
+			hold(join(resolved, name), true);
 		}
 	};
 
@@ -225,11 +277,58 @@ export function protectedWriteTargets(options: ProtectedWritesOptions): Protecte
 				if (existsSync(inner) && matches(inner, name === "hooks" ? "dir" : "file")) hold(inner);
 			}
 		}
+		if (linked.size > 0) holdOtherNames();
 	} catch (error) {
 		if (error instanceof Unprotectable) return { ok: false, reason: error.message };
 		throw error;
 	}
+
+	/**
+	 * Every other name of a protected file with more than one, under the
+	 * writable roots. A name not found there is outside them, where the
+	 * command cannot write anyway; a directory that cannot be read refuses.
+	 */
+	function holdOtherNames() {
+		const unscanned: string[] = [];
+		try {
+			scanRoots(options.writableRoots, {
+				match: (_name, kind, path) => {
+					visited++;
+					if (kind !== "file") return false;
+					const stats = lstatSync(path, { throwIfNoEntry: false });
+					if (stats === undefined || stats.nlink < 2) return false;
+					if (!linked.has(`${stats.dev}:${stats.ino}`)) return false;
+					const name = canonical(path);
+					if (writable(name)) held.add(name);
+					return false;
+				},
+				maxEntries: Math.max(0, limit - visited),
+				unscanned,
+			});
+		} catch (error) {
+			if (error instanceof PersistenceScanError) {
+				throw new Unprotectable(
+					`a protected file has more than one name, and the other names cannot all be found: ${error.message}`,
+				);
+			}
+			throw error;
+		}
+		if (unscanned.length > 0) {
+			throw new Unprotectable(
+				`a protected file has more than one name, and ${unscanned[0]} cannot be read to look for the others`,
+			);
+		}
+	}
 	// A path inside another one adds nothing.
+	// By ancestors, not by pairs: a held directory can hold many thousands.
 	const sorted = [...held].sort((a, b) => a.length - b.length);
-	return { ok: true, paths: sorted.filter((path, i) => !sorted.slice(0, i).some((outer) => isUnder(path, outer))) };
+	const kept = new Set<string>();
+	const covered = (path: string) => {
+		for (let dir = dirname(path); ; dir = dirname(dir)) {
+			if (kept.has(dir)) return true;
+			if (dir === dirname(dir)) return false;
+		}
+	};
+	for (const path of sorted) if (!covered(path)) kept.add(path);
+	return { ok: true, paths: [...kept] };
 }
