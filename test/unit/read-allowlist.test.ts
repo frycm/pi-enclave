@@ -115,10 +115,13 @@ describe("the read allowlist", () => {
 });
 
 describe("the SRT configuration in allowlist mode", () => {
+	// No link on the way to the deny entry, so its canonical spelling is the
+	// same on Linux and on macOS (where /home and /tmp are links).
+	const secret = "/pi-enclave-test-root/u/.ssh";
 	const base: Profile = {
 		mode: "workspace-write",
 		writableRoots: ["/tmp/ws"],
-		readDeny: ["/home/u/.ssh"],
+		readDeny: [secret],
 		network: "off",
 		allowPty: true,
 	};
@@ -126,7 +129,7 @@ describe("the SRT configuration in allowlist mode", () => {
 	it("denies / and lets the allowlist back in, with the deny list still applied", () => {
 		const config = toSrtConfig({ ...base, readMode: "allowlist", readAllow: ["/usr", "/tmp/ws"] }, false, "linux");
 		expect(config.filesystem.denyRead[0]).toBe("/");
-		expect(config.filesystem.denyRead).toContain("/home/u/.ssh");
+		expect(config.filesystem.denyRead).toContain(secret);
 		expect(config.filesystem.allowRead).toEqual(["/usr", "/tmp/ws"]);
 	});
 
@@ -137,10 +140,10 @@ describe("the SRT configuration in allowlist mode", () => {
 	});
 
 	it("adds a read capability's target to the allowlist as well as lifting its deny", () => {
-		const granted = withReadCapability({ ...base, readMode: "allowlist", readAllow: ["/usr"] }, "/home/u/.ssh");
+		const granted = withReadCapability({ ...base, readMode: "allowlist", readAllow: ["/usr"] }, secret);
 		expect(granted.readDeny).toEqual([]);
-		expect(granted.readAllow).toEqual(["/usr", "/home/u/.ssh"]);
-		const open = withReadCapability(base, "/home/u/.ssh");
+		expect(granted.readAllow).toEqual(["/usr", secret]);
+		const open = withReadCapability(base, secret);
 		expect(open.readAllow).toBeUndefined();
 	});
 });
