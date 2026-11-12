@@ -2,10 +2,10 @@ import type { ClassifierAnswer, ClassifierQuestion, JsonObject } from "@earendil
 import type { EffectiveProfile } from "../config/types.ts";
 import { chatFits, classifierFits, ReviewerBudgetError } from "./budget.ts";
 import { buildReviewEvidence, renderReviewEvidence } from "./evidence.ts";
-import { parseReviewerOutput, ReviewerOutputError } from "./output.ts";
+import { parseReviewerOutput, REVIEW_OUTPUT_SCHEMA, ReviewerOutputError } from "./output.ts";
 import { parseReviewProbabilities, reviewFromProbabilities } from "./probabilities.ts";
 import { enforceReview } from "./risk.ts";
-import { ReviewerTelemetry, type ReviewerTelemetrySummary } from "./telemetry.ts";
+import { ReviewerTelemetry, type ReviewerTelemetrySummary, type RuntimeReport } from "./telemetry.ts";
 import type {
 	ActionReviewer,
 	BuildEvidenceOptions,
@@ -21,6 +21,8 @@ export const REVIEWER_MAX_ATTEMPTS = 3;
 export const REVIEWER_MAX_TOKENS = 256;
 export const REVIEWER_TEMPERATURE = 0;
 export const REVIEWER_SEED = 31_337;
+/** How long a warm-up may take to load the model at session start (#25). */
+export const REVIEWER_WARM_TIMEOUT_MS = 300_000;
 /** The default Ollama context (`reviewer.numCtx`), in tokens (#17). */
 export const REVIEWER_NUM_CTX = 8_192;
 
@@ -32,8 +34,12 @@ export interface CompletionRequest {
 	temperature: number;
 	seed: number;
 	numCtx: number;
-	/** Observation only; no output bytes or authorization flow through this callback. */
+	/** A JSON schema the runtime constrains the answer to, where it can (#25). */
+	schema?: Record<string, unknown>;
+	/** Observation only; no output bytes or authorization flow through these callbacks. */
 	onFirstOutput?: () => void;
+	onIdentityCall?: () => void;
+	onRuntime?: (report: RuntimeReport) => void;
 }
 
 /** A model-specific transport. It returns only assistant text and carries no tools or session context. */
@@ -43,6 +49,12 @@ export interface ReviewerCompletion {
 	/** null means provider-managed context; a number is enforced by the transport. */
 	readonly numCtx?: number | null;
 	complete(request: CompletionRequest): Promise<string>;
+	/**
+	 * Loads the model ahead of the first review, so its load time does not count
+	 * against that review's timeout (#25). The answer is not read; failures are
+	 * ignored, and the review that follows checks identity as always.
+	 */
+	warm?(signal: AbortSignal): Promise<void>;
 }
 
 export interface ClassifyRequest {
@@ -162,6 +174,7 @@ export class IsolatedReviewer implements ActionReviewer {
 		}
 		const rendered = renderReviewEvidence(evidence);
 		let lastError = "reviewer unavailable";
+		let lastInvalid: string | undefined;
 		const maxAttempts = this.options.maxAttempts ?? REVIEWER_MAX_ATTEMPTS;
 		const seed = this.options.seed ?? REVIEWER_SEED;
 
@@ -186,17 +199,10 @@ export class IsolatedReviewer implements ActionReviewer {
 							}),
 						),
 					);
-					try {
-						probabilities = parseReviewProbabilities(answers);
-					} catch (error) {
-						if (error instanceof ReviewerOutputError) return invalidOutput(error.message, evidence);
-						throw error;
-					}
+					probabilities = parseReviewProbabilities(answers);
 					model = reviewFromProbabilities(probabilities, completion.thresholds);
 				} else {
-					const chat = await this.chatReview(completion, rendered, timer, telemetry, attempt, seed);
-					if ("invalid" in chat) return invalidOutput(chat.invalid, evidence);
-					model = chat.model;
+					model = await this.chatReview(completion, rendered, timer, telemetry, attempt, seed);
 				}
 				const currentEvidence =
 					typeof this.options.evidence === "function" ? this.options.evidence(request) : this.options.evidence;
@@ -211,13 +217,20 @@ export class IsolatedReviewer implements ActionReviewer {
 					...(probabilities ? { probabilities } : {}),
 				};
 			} catch (error) {
-				lastError = `${completion.name}: ${(error as Error).message}`;
+				// A malformed answer judged nothing, like a transport failure: try
+				// again with the next seed, and after the last attempt a person
+				// decides (#25). It never becomes a verdict.
+				if (error instanceof ReviewerOutputError) lastInvalid = `${completion.name}: ${error.message}`;
+				else lastError = `${completion.name}: ${(error as Error).message}`;
 			} finally {
 				timer.dispose();
 			}
 			if (attempt + 1 < maxAttempts) await this.delay(backoff(attempt));
 		}
 
+		if (lastInvalid !== undefined) {
+			return invalidOutput(`reviewer output was invalid in ${maxAttempts} attempt(s) (${lastInvalid})`, evidence);
+		}
 		return {
 			ok: false,
 			kind: "unavailable",
@@ -226,7 +239,7 @@ export class IsolatedReviewer implements ActionReviewer {
 		};
 	}
 
-	/** The two-stage chat protocol: a one-token authorization gate, then the JSON verdict. */
+	/** One chat request: one prompt evaluation, its answer constrained by the schema where the runtime can (#25). */
 	private async chatReview(
 		completion: ReviewerCompletion,
 		rendered: string,
@@ -234,44 +247,24 @@ export class IsolatedReviewer implements ActionReviewer {
 		telemetry: ReviewerTelemetry,
 		attempt: number,
 		seed: number,
-	): Promise<{ model: ModelReview } | { invalid: string }> {
-		const gate = await telemetry.measure("authorization", attempt + 1, timer.signal, (onFirstOutput) =>
+	): Promise<ModelReview> {
+		const text = await telemetry.measure("decision", attempt + 1, timer.signal, (onFirstOutput, observer) =>
 			timer.wait(
 				completion.complete({
-					system: this.options.prompt.authorizationSystem,
-					user: rendered,
-					signal: timer.signal,
-					maxTokens: 1,
-					temperature: REVIEWER_TEMPERATURE,
-					seed: seed + attempt,
-					numCtx: completion.numCtx ?? REVIEWER_NUM_CTX,
-					onFirstOutput,
-				}),
-			),
-		);
-		if (gate !== "0" && gate !== "1") {
-			return { invalid: `authorization stage returned ${JSON.stringify(gate)} instead of 0 or 1` };
-		}
-
-		const text = await telemetry.measure("decision", attempt + 1, timer.signal, (onFirstOutput) =>
-			timer.wait(
-				completion.complete({
-					system: this.options.prompt.decisionSystem[gate],
+					system: this.options.prompt.system,
 					user: rendered,
 					signal: timer.signal,
 					maxTokens: REVIEWER_MAX_TOKENS,
 					temperature: REVIEWER_TEMPERATURE,
 					seed: seed + attempt,
 					numCtx: completion.numCtx ?? REVIEWER_NUM_CTX,
+					schema: REVIEW_OUTPUT_SCHEMA,
 					onFirstOutput,
+					onIdentityCall: observer.identityCall,
+					onRuntime: observer.runtime,
 				}),
 			),
 		);
-		try {
-			return { model: parseReviewerOutput(text) };
-		} catch (error) {
-			if (error instanceof ReviewerOutputError) return { invalid: error.message };
-			throw error;
-		}
+		return parseReviewerOutput(text);
 	}
 }

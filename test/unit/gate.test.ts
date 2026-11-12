@@ -421,8 +421,8 @@ describe("the gate", () => {
 				prompt: buildReviewerPrompt(reviewerRulebook(configured.review, new Map())),
 				primary: {
 					name: "always-allow",
-					async complete(request) {
-						return request.maxTokens === 1 ? "0" : '{"decision":"allow","risk":"low","reason":"fine"}';
+					async complete() {
+						return '{"authorized":false,"decision":"allow","risk":"low","reason":"fine"}';
 					},
 				},
 				timeoutMs: 1_000,
@@ -440,8 +440,8 @@ describe("the gate", () => {
 				prompt: buildReviewerPrompt(reviewerRulebook(configured.review, new Map())),
 				primary: {
 					name: "always-allow",
-					async complete(request) {
-						return request.maxTokens === 1 ? "0" : '{"decision":"allow","risk":"low","reason":"fine"}';
+					async complete() {
+						return '{"authorized":false,"decision":"allow","risk":"low","reason":"fine"}';
 					},
 				},
 				timeoutMs: 1_000,
@@ -509,25 +509,30 @@ describe("the gate", () => {
 			expect(reviewer.calls).toBe(1);
 		});
 
-		it("fails closed without retrying or escalating invalid output", async () => {
-			let asked = false;
-			const decision = await gate(
-				"bash",
-				{ command: "touch output.txt" },
-				{
-					profile: reviewProfile(),
-					reviewer: fakeReviewer({ failure: "invalid-output" }),
-					escalator: {
-						confirm: async () => {
-							asked = true;
-							return true;
+		it("escalates invalid output instead of denying and ending the turn (#25)", async () => {
+			const run = async (answer: boolean) => {
+				let asked = false;
+				const decision = await gate(
+					"bash",
+					{ command: "touch output.txt" },
+					{
+						profile: reviewProfile(),
+						reviewer: fakeReviewer({ failure: "invalid-output" }),
+						escalator: {
+							confirm: async () => {
+								asked = true;
+								return answer;
+							},
 						},
 					},
-				},
-			);
-			expect(decision.outcome).toBe("review-deny");
-			expect(decision.terminate).toBe(true);
-			expect(asked).toBe(false);
+				);
+				return { ...decision, asked };
+			};
+			const approved = await run(true);
+			expect(approved).toMatchObject({ outcome: "ask-approved", block: false, adverse: false, asked: true });
+			expect(approved.terminate).toBeUndefined();
+			// A person's no is still a no, and ends the turn like any declined ask.
+			await expect(run(false)).resolves.toMatchObject({ outcome: "ask-denied", asked: true });
 		});
 
 		it("turns exhausted availability errors into an ask", async () => {

@@ -1,8 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { defaultProfile } from "../../src/config/defaults.ts";
 import { canonicalize } from "../../src/policy/canonical.ts";
+import { REVIEW_OUTPUT_SCHEMA } from "../../src/reviewer/output.ts";
 import { buildReviewerPrompt, reviewerRulebook } from "../../src/reviewer/prompt.ts";
-import { IsolatedReviewer, type ReviewerCompletion } from "../../src/reviewer/reviewer.ts";
+import {
+	type CompletionRequest,
+	IsolatedReviewer,
+	REVIEWER_MAX_TOKENS,
+	REVIEWER_SEED,
+	type ReviewerCompletion,
+	type ReviewerTransport,
+} from "../../src/reviewer/reviewer.ts";
 import { ReviewerTelemetry, type ReviewerTelemetrySummary } from "../../src/reviewer/telemetry.ts";
 
 const PROFILE = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
@@ -32,7 +40,7 @@ function scripted(name: string, outputs: Array<string | Error>): ReviewerComplet
 	};
 }
 
-function reviewer(primary: ReviewerCompletion, fallback?: ReviewerCompletion) {
+function reviewer(primary: ReviewerTransport, fallback?: ReviewerCompletion) {
 	return new IsolatedReviewer({
 		profile: PROFILE,
 		prompt: PROMPT,
@@ -53,7 +61,7 @@ describe("isolated reviewer", () => {
 			async complete(request) {
 				request.onFirstOutput?.();
 				if (++calls === 1) throw new Error("PRIVATE_PROVIDER_DETAIL");
-				return request.maxTokens === 1 ? "0" : '{"decision":"deny","risk":"high","reason":"PRIVATE_MODEL_OUTPUT"}';
+				return '{"authorized":false,"decision":"deny","risk":"high","reason":"PRIVATE_MODEL_OUTPUT"}';
 			},
 		};
 		const result = await new IsolatedReviewer({
@@ -68,8 +76,7 @@ describe("isolated reviewer", () => {
 		expect(result.ok).toBe(true);
 		expect(seen).toHaveLength(1);
 		expect(seen[0]?.stages.map((stage) => [stage.stage, stage.attempt, stage.outcome])).toEqual([
-			["authorization", 1, "error"],
-			["authorization", 2, "ok"],
+			["decision", 1, "error"],
 			["decision", 2, "ok"],
 		]);
 		expect(
@@ -121,15 +128,30 @@ describe("isolated reviewer", () => {
 		);
 	});
 
-	it("runs the one-token authorization stage before the strict verdict", async () => {
-		const completion = scripted("primary", ["0", '{"decision":"allow","risk":"low","reason":"routine output"}']);
+	it("asks for the verdict in one request, constrained by the output schema (#25)", async () => {
+		const requests: CompletionRequest[] = [];
+		const completion: ReviewerCompletion = {
+			name: "primary",
+			async complete(request) {
+				requests.push(request);
+				return '{"authorized":false,"decision":"allow","risk":"low","reason":"routine output"}';
+			},
+		};
 		const result = await reviewer(completion).review({ action: action(), trigger: "mutating" });
-		expect(result).toMatchObject({ ok: true, review: { decision: "allow", risk: "medium" } });
-		expect(completion.calls).toBe(2);
+		expect(result).toMatchObject({
+			ok: true,
+			review: { decision: "allow", risk: "medium" },
+			modelReview: { authorized: false },
+		});
+		expect(requests).toHaveLength(1);
+		expect(requests[0]).toMatchObject({ system: PROMPT.system, maxTokens: REVIEWER_MAX_TOKENS });
+		expect(requests[0]?.schema).toBe(REVIEW_OUTPUT_SCHEMA);
 	});
 
 	it("builds live evidence for the exact request being reviewed", async () => {
-		const completion = scripted("primary", ["0", '{"decision":"allow","risk":"low","reason":"routine output"}']);
+		const completion = scripted("primary", [
+			'{"authorized":false,"decision":"allow","risk":"low","reason":"routine output"}',
+		]);
 		const proposed = action();
 		let observedHash: string | undefined;
 		const result = await new IsolatedReviewer({
@@ -146,27 +168,55 @@ describe("isolated reviewer", () => {
 		expect(observedHash).toBe(proposed.hash);
 	});
 
-	it("does not retry malformed authorization output", async () => {
-		const completion = scripted("primary", ["yes"]);
+	it("retries malformed output with the next seed, then reports it as invalid (#25)", async () => {
+		const seeds: number[] = [];
+		const completion: ReviewerCompletion = {
+			name: "primary",
+			async complete(request) {
+				seeds.push(request.seed);
+				return '```json\n{"authorized":false,"decision":"deny","risk":"high","reason":"x"}\n```';
+			},
+		};
 		const result = await reviewer(completion).review({ action: action(), trigger: "mutating" });
-		expect(result).toMatchObject({ ok: false, kind: "invalid-output" });
-		expect(completion.calls).toBe(1);
+		expect(result).toMatchObject({ ok: false, kind: "invalid-output", reason: expect.stringContaining("3 attempt") });
+		expect(seeds).toEqual([REVIEWER_SEED, REVIEWER_SEED + 1, REVIEWER_SEED + 2]);
 	});
 
-	it("does not re-prompt a malformed structured verdict", async () => {
-		const completion = scripted("primary", ["0", "```json\n{}\n```"]);
+	it("takes a valid verdict that follows a malformed one (#25)", async () => {
+		const completion = scripted("primary", [
+			" 0",
+			'{"authorized":false,"decision":"deny","risk":"high","reason":"deletes the build"}',
+		]);
 		const result = await reviewer(completion).review({ action: action(), trigger: "mutating" });
-		expect(result).toMatchObject({ ok: false, kind: "invalid-output" });
+		expect(result).toMatchObject({ ok: true, modelReview: { decision: "deny" } });
 		expect(completion.calls).toBe(2);
+	});
+
+	it("gives a malformed classifier answer the same retries (#25)", async () => {
+		let calls = 0;
+		const result = await reviewer({
+			kind: "classifier",
+			name: "fake/classifier",
+			numCtx: 16_384,
+			thresholds: { allow: 0.9, deny: 0.5, temperature: 1 },
+			classify: async () => {
+				calls++;
+				return {};
+			},
+		}).review({ action: action(), trigger: "mutating" });
+		expect(result).toMatchObject({ ok: false, kind: "invalid-output" });
+		expect(calls).toBe(3);
 	});
 
 	it("retries transient failures and uses an explicit fallback only on the last attempt", async () => {
 		const primary = scripted("primary", [new Error("offline"), new Error("offline")]);
-		const fallback = scripted("fallback", ["0", '{"decision":"ask","risk":"medium","reason":"needs confirmation"}']);
+		const fallback = scripted("fallback", [
+			'{"authorized":false,"decision":"ask","risk":"medium","reason":"needs confirmation"}',
+		]);
 		const result = await reviewer(primary, fallback).review({ action: action(), trigger: "mutating" });
 		expect(result).toMatchObject({ ok: true, review: { decision: "ask" } });
 		expect(primary.calls).toBe(2);
-		expect(fallback.calls).toBe(2);
+		expect(fallback.calls).toBe(1);
 	});
 
 	it("returns an unavailable failure after three bounded attempts", async () => {
@@ -199,10 +249,9 @@ it("rejects authorization revoked while the model is in flight", async () => {
 	];
 	const primary: ReviewerCompletion = {
 		name: "fixture",
-		async complete(request) {
-			if (request.maxTokens === 1) return "1";
+		async complete() {
 			authorization.push({ provenance: "direct", channel: "interactive", text: "Do not run rm -rf build" });
-			return '{"decision":"allow","risk":"low","reason":"stale authorization"}';
+			return '{"authorized":true,"decision":"allow","risk":"low","reason":"stale authorization"}';
 		},
 	};
 	const result = await new IsolatedReviewer({

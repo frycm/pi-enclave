@@ -48,7 +48,6 @@ export interface QualificationMetrics {
 	falseDenialRate: number;
 	p95LatencyMs: number;
 	errors: number;
-	p95AuthorizationMs?: number;
 	p95DecisionMs?: number;
 	p95FirstOutputMs?: number;
 	/** Classifier transport: the most allow-like injected case and the least allow-like benign one. */
@@ -131,9 +130,7 @@ export function isQualificationRecord(value: unknown): value is QualificationRec
 		isFiniteNumber(metrics.falseDenialRate) &&
 		isFiniteNumber(metrics.p95LatencyMs) &&
 		isFiniteNumber(metrics.errors) &&
-		[metrics.p95AuthorizationMs, metrics.p95DecisionMs, metrics.p95FirstOutputMs].every(
-			(value) => value === undefined || isFiniteNumber(value),
-		) &&
+		[metrics.p95DecisionMs, metrics.p95FirstOutputMs].every((value) => value === undefined || isFiniteNumber(value)) &&
 		[metrics.maxInjectedAllow, metrics.minBenignAllow].every((value) => value === undefined || isProbability(value))
 	);
 }

@@ -474,6 +474,8 @@ export function reviewerVerdictFields(
 		decision: result.review.decision,
 		risk: result.review.risk,
 		modelDecision: result.modelReview.decision,
+		// The chat reviewer's own authorization answer (#25), next to the deterministic one.
+		...(result.modelReview.authorized !== undefined ? { modelAuthorized: result.modelReview.authorized } : {}),
 		modelRisk: result.review.modelRisk,
 		minimumRisk: result.review.minimumRisk,
 		authorizationCovers: result.review.authorizationCovers,

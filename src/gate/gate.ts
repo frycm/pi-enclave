@@ -448,16 +448,18 @@ async function handleReview(
 	outsideSandbox: boolean,
 ): Promise<GateDecision> {
 	if (!result.ok) {
+		// Malformed output judged nothing, like an unreachable reviewer: after the
+		// bounded retries a person decides (#25). It used to deny and end the
+		// agent's turn, counting a formatting slip as an adverse event.
 		if (result.kind === "invalid-output") {
-			return {
-				outcome: "review-deny",
-				block: true,
-				terminate: true,
-				reason: `pi-enclave: reviewer output was invalid, so this action is denied.\n  ${result.reason}`,
-				matches: evaluation.matches,
-				adverse: true,
+			return escalate(
 				action,
-			};
+				event,
+				deps,
+				evaluation,
+				toolSource,
+				`the reviewer gave no valid verdict: ${result.reason}`,
+			);
 		}
 		return escalate(
 			action,

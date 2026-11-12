@@ -10,8 +10,10 @@ import {
 	resolveReviewerModel,
 	reviewerModelDigest,
 } from "../../src/reviewer/model.ts";
+import { REVIEW_OUTPUT_SCHEMA } from "../../src/reviewer/output.ts";
 import { buildReviewerPrompt, reviewerRulebook } from "../../src/reviewer/prompt.ts";
 import { type CompletionRequest, IsolatedReviewer, REVIEWER_NUM_CTX } from "../../src/reviewer/reviewer.ts";
+import type { ReviewerTelemetrySummary } from "../../src/reviewer/telemetry.ts";
 
 let server: Server;
 let baseUrl: string;
@@ -22,6 +24,8 @@ let redirect: boolean;
 let version: string;
 let promptCounts: Record<string, number>;
 let received: Array<{ url: string; body: Record<string, unknown>; authorization?: string }>;
+let answer: string;
+const VERDICT = '{"authorized":false,"decision":"allow","risk":"low","reason":"routine change"}';
 
 beforeEach(async () => {
 	manifest = "a".repeat(64);
@@ -31,6 +35,7 @@ beforeEach(async () => {
 	version = "0.13.0";
 	promptCounts = { prompt_eval_count: 12 };
 	received = [];
+	answer = VERDICT;
 	server = createServer(async (req, res) => {
 		const chunks = [];
 		for await (const chunk of req) chunks.push(chunk);
@@ -53,9 +58,7 @@ beforeEach(async () => {
 			res.end(JSON.stringify({ models: [{ name: "reviewer:latest", digest: manifest, context_length: context }] }));
 		else if (req.url?.endsWith("/api/chat")) {
 			if (mutateDuringChat) manifest = "b".repeat(64);
-			// Stage one reads one token; stage two returns a verdict.
-			const content =
-				body.options?.num_predict === 1 ? "1" : '{"decision":"allow","risk":"low","reason":"routine change"}';
+			const content = answer;
 			res.end(JSON.stringify({ done: true, message: { role: "assistant", content }, ...promptCounts }));
 		} else {
 			res.writeHead(404);
@@ -107,7 +110,7 @@ describe("Ollama endpoint, manifest and effective context binding", () => {
 	it("uses the auth-resolved inference endpoint, native options and no session/tools", async () => {
 		const { model, registry, request, resolved } = fixture();
 		const identity = await reviewerModelDigest(model, registry);
-		await expect(bindReviewerCompletion(resolved, identity).complete(request)).resolves.toBe("1");
+		await expect(bindReviewerCompletion(resolved, identity).complete(request)).resolves.toBe(VERDICT);
 		const chat = received.find((entry) => entry.url.endsWith("/api/chat"));
 		expect(chat).toMatchObject({
 			url: "/proxy/api/chat",
@@ -223,7 +226,7 @@ describe("prompt overflow fails closed (#17)", () => {
 		await expect(resolved.completion.complete(long)).rejects.toThrow("part of the prompt was not read");
 		// Control: the same prompt with a plausible count goes through.
 		promptCounts = { prompt_eval_count: 300, prompt_eval_cached_count: 200 };
-		await expect(resolved.completion.complete(long)).resolves.toBe("1");
+		await expect(resolved.completion.complete(long)).resolves.toBe(VERDICT);
 	});
 });
 
@@ -270,4 +273,126 @@ it("escalates instead of allowing when Ollama reports fewer prompt tokens than i
 	// The same verdict over a prompt Ollama only partly read goes to the user.
 	promptCounts = { prompt_eval_count: 4, prompt_eval_cached_count: 8 };
 	await expect(run()).resolves.toEqual({ outcome: "ask-denied", asked: true });
+});
+
+describe("one constrained request per review (#25)", () => {
+	const profile = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
+	profile.reviewer.model = "ollama/reviewer";
+	profile.review.trigger = "mutating";
+	const prompt = buildReviewerPrompt(reviewerRulebook(profile.review, new Map()));
+	const proposed = {
+		toolName: "bash",
+		toolCallId: "c1",
+		input: { command: "touch output.txt" },
+	};
+
+	async function bound() {
+		const { model, registry } = fixture();
+		context = REVIEWER_NUM_CTX;
+		promptCounts = { prompt_eval_count: 900, prompt_eval_cached_count: 0, load_duration: 2_500_000_000 };
+		const resolved = resolveReviewerModel(registry, "ollama/reviewer");
+		return { resolved, completion: bindReviewerCompletion(resolved, await reviewerModelDigest(model, registry)) };
+	}
+
+	async function review(maxAttempts = 3) {
+		const { completion } = await bound();
+		const metrics: ReviewerTelemetrySummary[] = [];
+		received = [];
+		let asked = false;
+		const decision = await decide(proposed, {
+			profile,
+			cwd: "/work",
+			home: "/home/u",
+			lock: new ActionLock(),
+			owned: OWNED_TOOLS,
+			reviewer: new IsolatedReviewer({
+				profile,
+				prompt,
+				primary: completion,
+				timeoutMs: 2_000,
+				maxAttempts,
+				evidence: { attended: "off" },
+				delay: async () => {},
+				onTelemetry: (summary) => metrics.push(summary),
+			}),
+			escalator: {
+				confirm: async () => {
+					asked = true;
+					return false;
+				},
+			},
+		});
+		return { outcome: decision.outcome, terminate: decision.terminate, asked, metrics };
+	}
+
+	it("sends the verdict schema as Ollama's format, keys in the parser's order", async () => {
+		await expect(review()).resolves.toMatchObject({ outcome: "review-allow", asked: false });
+		const chats = received.filter((entry) => entry.url.endsWith("/api/chat"));
+		expect(chats).toHaveLength(1);
+		expect(chats[0]?.body.format).toEqual(REVIEW_OUTPUT_SCHEMA);
+		const format = chats[0]?.body.format as { properties: Record<string, unknown>; required: string[] };
+		expect(Object.keys(format.properties)).toEqual(["authorized", "decision", "risk", "reason"]);
+		expect(format.required).toEqual(["authorized", "decision", "risk", "reason"]);
+		expect(chats[0]?.body).toMatchObject({ messages: [{ content: prompt.system }, {}] });
+	});
+
+	it.each([
+		["fenced", `\`\`\`json\n${VERDICT}\n\`\`\``],
+		["reordered", '{"decision":"allow","authorized":false,"risk":"low","reason":"routine change"}'],
+		["without authorized", '{"decision":"allow","risk":"low","reason":"routine change"}'],
+		["followed by prose", `${VERDICT}\nAllowed because it is routine.`],
+	])("never accepts a %s answer, even one that says allow", async (_label, text) => {
+		answer = text;
+		const result = await review();
+		expect(result).toMatchObject({ outcome: "ask-denied", asked: true });
+		// Retried with the next seeds, then a person decided.
+		expect(received.filter((entry) => entry.url.endsWith("/api/chat")).map((entry) => entry.body.options)).toEqual([
+			expect.objectContaining({ seed: 31_337 }),
+			expect.objectContaining({ seed: 31_338 }),
+			expect.objectContaining({ seed: 31_339 }),
+		]);
+	});
+
+	it("evaluates the prompt once and checks identity four times per review", async () => {
+		const { metrics } = await review();
+		const chats = received.filter((entry) => entry.url.endsWith("/api/chat"));
+		const identity = received.filter((entry) => /\/api\/(tags|version|ps)$/.test(entry.url));
+		expect(chats).toHaveLength(1);
+		expect(identity.map((entry) => entry.url.slice(entry.url.lastIndexOf("/") + 1))).toEqual([
+			"tags",
+			"version",
+			"ps",
+			"tags",
+		]);
+		expect(metrics).toHaveLength(1);
+		expect(metrics[0]?.stages).toEqual([
+			expect.objectContaining({
+				stage: "decision",
+				attempt: 1,
+				outcome: "ok",
+				identityCalls: 4,
+				promptTokens: 900,
+				cachedPromptTokens: 0,
+				loadMs: 2_500,
+			}),
+		]);
+	});
+
+	it("still refuses a model whose weights change during the one request", async () => {
+		mutateDuringChat = true;
+		const result = await review(1);
+		expect(result).toMatchObject({ outcome: "ask-denied", asked: true });
+	});
+
+	it("loads the model with the configured context at session start, generating nothing", async () => {
+		const { resolved } = await bound();
+		received = [];
+		await resolved.completion.warm?.(AbortSignal.timeout(2_000));
+		expect(received).toEqual([
+			expect.objectContaining({
+				url: "/proxy/api/chat",
+				body: { model: "reviewer", messages: [], stream: false, options: { num_ctx: REVIEWER_NUM_CTX } },
+			}),
+		]);
+	});
 });

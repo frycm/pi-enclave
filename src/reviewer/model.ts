@@ -6,6 +6,7 @@ import { parseReviewerModelReference } from "../config/reviewer-model.ts";
 import { stableSerialize } from "../policy/canonical.ts";
 import { chatPromptBound } from "./budget.ts";
 import { type CompletionRequest, REVIEWER_NUM_CTX, type ReviewerCompletion } from "./reviewer.ts";
+import type { RuntimeReport } from "./telemetry.ts";
 
 export type RuntimeModel = NonNullable<ReturnType<ModelRegistry["find"]>>;
 export interface ResolvedReviewerModel {
@@ -91,7 +92,9 @@ async function ollamaJson(
 	method: string,
 	signal: AbortSignal,
 	body?: unknown,
+	onIdentityCall?: () => void,
 ): Promise<Record<string, unknown>> {
+	if (method !== "chat") onIdentityCall?.();
 	const response = await fetch(nativeUrl(target.model.baseUrl, method), {
 		method: body === undefined ? "GET" : "POST",
 		headers: { ...target.headers, "Content-Type": "application/json" },
@@ -119,28 +122,47 @@ function modelEntry(value: Record<string, unknown>, id: string): Record<string, 
 		: undefined;
 }
 
-async function manifest(target: Endpoint, signal: AbortSignal): Promise<string> {
-	const entry = modelEntry(await ollamaJson(target, "tags", signal), target.model.id);
+async function manifest(target: Endpoint, signal: AbortSignal, onIdentityCall?: () => void): Promise<string> {
+	const entry = modelEntry(await ollamaJson(target, "tags", signal, undefined, onIdentityCall), target.model.id);
 	const value = typeof entry?.digest === "string" ? entry.digest.replace(/^sha256:/, "") : "";
 	if (!/^[0-9a-f]{64}$/.test(value))
 		throw new Error("pi-enclave: Ollama did not report an exact model manifest digest");
 	return value;
 }
 
-/** Identity includes inference routing and model configuration, never the CLI's server. */
-async function endpointDigest(target: Endpoint, signal: AbortSignal, numCtx: number): Promise<string> {
+/** What the Ollama server says about the model, fetched once per request (#25). */
+interface OllamaIdentity {
+	modelManifest: string;
+	version: string;
+}
+
+async function ollamaIdentity(
+	target: Endpoint,
+	signal: AbortSignal,
+	onIdentityCall?: () => void,
+): Promise<OllamaIdentity> {
+	const modelManifest = await manifest(target, signal, onIdentityCall);
+	const version = await ollamaJson(target, "version", signal, undefined, onIdentityCall);
+	if (typeof version.version !== "string") throw new Error("pi-enclave: Ollama did not report its runtime version");
+	if (!refusesOverlongPrompts(version.version)) {
+		throw new Error(
+			`pi-enclave: Ollama ${version.version} silently truncates a prompt longer than num_ctx; the reviewer needs ${OLLAMA_MIN_VERSION.join(".")} or later, which can refuse it instead (#17)`,
+		);
+	}
+	return { modelManifest, version: version.version };
+}
+
+/**
+ * Identity includes inference routing and model configuration, never the CLI's
+ * server. Pure: the Ollama part is passed in, so a check after the request can
+ * recompute it from a fresh endpoint snapshot without asking the server again.
+ */
+function identityDigest(target: Endpoint, numCtx: number, ollama?: OllamaIdentity): string {
 	const model = target.model;
 	const descriptor = { model: target.model, headers: target.headers, auth: target.authIdentity, transport: 4 };
 	if (model.provider === "ollama") {
-		const modelManifest = await manifest(target, signal);
-		const version = await ollamaJson(target, "version", signal);
-		if (typeof version.version !== "string") throw new Error("pi-enclave: Ollama did not report its runtime version");
-		if (!refusesOverlongPrompts(version.version)) {
-			throw new Error(
-				`pi-enclave: Ollama ${version.version} silently truncates a prompt longer than num_ctx; the reviewer needs ${OLLAMA_MIN_VERSION.join(".")} or later, which can refuse it instead (#17)`,
-			);
-		}
-		return `ollama:sha256:${digest({ ...descriptor, modelManifest, version: version.version, numCtx })}`;
+		if (!ollama) throw new Error("pi-enclave: internal error: Ollama identity missing");
+		return `ollama:sha256:${digest({ ...descriptor, modelManifest: ollama.modelManifest, version: ollama.version, numCtx })}`;
 	}
 	if (isLoopback(target.model.baseUrl))
 		throw new Error(
@@ -153,12 +175,22 @@ async function endpointDigest(target: Endpoint, signal: AbortSignal, numCtx: num
 	return `cloud:sha256:${digest(descriptor)}`;
 }
 
+async function endpointDigest(
+	target: Endpoint,
+	signal: AbortSignal,
+	numCtx: number,
+	onIdentityCall?: () => void,
+): Promise<{ digest: string; ollama?: OllamaIdentity }> {
+	const ollama = target.model.provider === "ollama" ? await ollamaIdentity(target, signal, onIdentityCall) : undefined;
+	return { digest: identityDigest(target, numCtx, ollama), ...(ollama ? { ollama } : {}) };
+}
+
 export async function reviewerModelDigest(
 	model: RuntimeModel,
 	registry?: ModelRegistry,
 	numCtx: number = REVIEWER_NUM_CTX,
 ): Promise<string> {
-	return endpointDigest(await endpoint(model, registry), AbortSignal.timeout(10_000), numCtx);
+	return (await endpointDigest(await endpoint(model, registry), AbortSignal.timeout(10_000), numCtx)).digest;
 }
 
 /** The first Ollama release whose /api/chat takes `truncate` and `shift` (ollama/ollama#12582). */
@@ -213,8 +245,12 @@ function checkPromptCount(response: Record<string, unknown>, request: Completion
 	}
 }
 
-async function completeOllama(target: Endpoint, request: CompletionRequest): Promise<string> {
-	const before = await manifest(target, request.signal);
+/**
+ * One chat request, checked by two identity calls after it (#25): the loaded
+ * model and its context (`ps`), and the manifest again (`tags`). The caller
+ * made the two before it (`tags`, `version`), so a review costs four.
+ */
+async function completeOllama(target: Endpoint, request: CompletionRequest, before: OllamaIdentity): Promise<string> {
 	const response = await ollamaJson(target, "chat", request.signal, {
 		model: target.model.id,
 		messages: [
@@ -226,6 +262,8 @@ async function completeOllama(target: Endpoint, request: CompletionRequest): Pro
 		// Fail instead of dropping part of the prompt or the context (#17).
 		truncate: false,
 		shift: false,
+		// A grammar from the schema: the answer can only be the verdict object (#25).
+		...(request.schema ? { format: request.schema } : {}),
 		options: {
 			temperature: request.temperature,
 			seed: request.seed,
@@ -233,11 +271,14 @@ async function completeOllama(target: Endpoint, request: CompletionRequest): Pro
 			num_predict: request.maxTokens,
 		},
 	});
-	const loaded = modelEntry(await ollamaJson(target, "ps", request.signal), target.model.id);
+	const loaded = modelEntry(
+		await ollamaJson(target, "ps", request.signal, undefined, request.onIdentityCall),
+		target.model.id,
+	);
 	if (
-		loaded?.digest !== before ||
+		loaded?.digest !== before.modelManifest ||
 		loaded.context_length !== request.numCtx ||
-		(await manifest(target, request.signal)) !== before
+		(await manifest(target, request.signal, request.onIdentityCall)) !== before.modelManifest
 	) {
 		throw new Error("pi-enclave: Ollama model identity or effective context changed; requalification required");
 	}
@@ -251,12 +292,49 @@ async function completeOllama(target: Endpoint, request: CompletionRequest): Pro
 		throw new Error("pi-enclave: invalid isolated Ollama completion");
 	}
 	checkPromptCount(response, request);
+	request.onRuntime?.(runtimeReport(response));
 	request.onFirstOutput?.();
 	return message.content;
 }
 
-async function completeSnapshot(target: Endpoint, request: CompletionRequest): Promise<string> {
-	if (target.model.provider === "ollama") return completeOllama(target, request);
+function count(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/** Ollama's counts and its load time (reported in nanoseconds), for telemetry only. */
+function runtimeReport(response: Record<string, unknown>): RuntimeReport {
+	const promptTokens = count(response.prompt_eval_count);
+	const cachedPromptTokens = count(response.prompt_eval_cached_count);
+	const load = count(response.load_duration);
+	return {
+		...(promptTokens !== undefined ? { promptTokens } : {}),
+		...(cachedPromptTokens !== undefined ? { cachedPromptTokens } : {}),
+		...(load !== undefined ? { loadMs: load / 1e6 } : {}),
+	};
+}
+
+/**
+ * Loads the reviewer model with the configured context: Ollama loads a model
+ * for a chat request with no messages and generates nothing (#25).
+ */
+async function warmOllama(target: Endpoint, numCtx: number, signal: AbortSignal): Promise<void> {
+	await ollamaJson(target, "chat", signal, {
+		model: target.model.id,
+		messages: [],
+		stream: false,
+		options: { num_ctx: numCtx },
+	});
+}
+
+async function completeSnapshot(
+	target: Endpoint,
+	request: CompletionRequest,
+	ollama: OllamaIdentity | undefined,
+): Promise<string> {
+	if (target.model.provider === "ollama") {
+		if (!ollama) throw new Error("pi-enclave: internal error: Ollama identity missing");
+		return completeOllama(target, request, ollama);
+	}
 	if (isLoopback(target.model.baseUrl) || target.model.api !== "openai-completions")
 		throw new Error("pi-enclave: unsupported reviewer identity or sampling adapter");
 	// Invoke the pinned adapter with the exact checked endpoint/auth snapshot.
@@ -309,16 +387,20 @@ export function resolveReviewerModel(
 		throw new Error(`pi-enclave: reviewer model ${reference} has no configured provider authentication`);
 	const completeBound = async (request: CompletionRequest, expected?: string): Promise<string> => {
 		const target = await endpoint(model, registry);
-		const actual = await endpointDigest(target, request.signal, numCtx);
-		if (expected !== undefined && actual !== expected)
+		const before = await endpointDigest(target, request.signal, numCtx, request.onIdentityCall);
+		if (expected !== undefined && before.digest !== expected)
 			throw new Error("pi-enclave: reviewer identity changed; requalification required");
-		const result = await completeSnapshot(target, request);
-		if (
-			(await endpointDigest(target, request.signal, numCtx)) !== actual ||
-			(await reviewerModelDigest(model, registry, numCtx)) !== actual
-		)
+		// The Ollama path re-reads the loaded model and the manifest after the request.
+		const result = await completeSnapshot(target, request, before.ollama);
+		// The configuration and auth as they are now, against the same server
+		// answers: one review asks the server four times, not eighteen (#25).
+		if (identityDigest(await endpoint(model, registry), numCtx, before.ollama) !== before.digest)
 			throw new Error("pi-enclave: reviewer identity changed during completion; requalification required");
 		return result;
+	};
+	const warm = async (signal: AbortSignal): Promise<void> => {
+		if (model.provider !== "ollama") return;
+		await warmOllama(await endpoint(model, registry), numCtx, signal);
 	};
 	return {
 		model,
@@ -327,6 +409,7 @@ export function resolveReviewerModel(
 			name: reference,
 			numCtx: model.provider === "ollama" ? numCtx : null,
 			complete: (request) => completeBound(request),
+			...(model.provider === "ollama" ? { warm } : {}),
 		},
 	};
 }

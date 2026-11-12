@@ -3,11 +3,30 @@ import { type ModelReview, REVIEW_DECISIONS, REVIEW_RISKS } from "./types.ts";
 export const MAX_REVIEW_OUTPUT_BYTES = 4_096;
 export const MAX_REVIEW_REASON_CHARS = 500;
 
-// Exact top-level grammar: fixed keys, fixed order, string values only, no
-// duplicate/extra fields and no Markdown fence. The reason capture is a JSON
-// string literal, so JSON.parse remains responsible for escape decoding.
+/**
+ * The verdict as a JSON schema (#25). Ollama turns it into a grammar, so a
+ * model can only emit this object, with the keys in this order: it commits to
+ * `authorized` before `decision`, which is what the separate authorization
+ * stage used to do. The parser below still checks every answer; the schema
+ * makes a correct one likely, never trusted.
+ */
+export const REVIEW_OUTPUT_SCHEMA = {
+	type: "object",
+	properties: {
+		authorized: { type: "boolean" },
+		decision: { type: "string", enum: [...REVIEW_DECISIONS] },
+		risk: { type: "string", enum: [...REVIEW_RISKS] },
+		reason: { type: "string", minLength: 1, maxLength: MAX_REVIEW_REASON_CHARS },
+	},
+	required: ["authorized", "decision", "risk", "reason"],
+	additionalProperties: false,
+} as const;
+
+// Exact top-level grammar: fixed keys, fixed order, no duplicate/extra fields
+// and no Markdown fence. The reason capture is a JSON string literal, so
+// JSON.parse remains responsible for escape decoding.
 const REVIEW_OUTPUT =
-	/^\s*\{\s*"decision"\s*:\s*"(allow|deny|ask)"\s*,\s*"risk"\s*:\s*"(low|medium|high|critical)"\s*,\s*"reason"\s*:\s*("(?:\\["\\/bfnrt]|\\u[0-9a-fA-F]{4}|[^"\\])*")\s*\}\s*$/;
+	/^\s*\{\s*"authorized"\s*:\s*(true|false)\s*,\s*"decision"\s*:\s*"(allow|deny|ask)"\s*,\s*"risk"\s*:\s*"(low|medium|high|critical)"\s*,\s*"reason"\s*:\s*("(?:\\["\\/bfnrt]|\\u[0-9a-fA-F]{4}|[^"\\])*")\s*\}\s*$/;
 
 function hasDisplayControlCharacter(value: string): boolean {
 	for (const character of value) {
@@ -38,10 +57,10 @@ export function parseReviewerOutput(text: string): ModelReview {
 	const match = REVIEW_OUTPUT.exec(text);
 	if (!match) {
 		throw new ReviewerOutputError(
-			'expected exactly {"decision":"allow|deny|ask","risk":"low|medium|high|critical","reason":"..."}',
+			'expected exactly {"authorized":true|false,"decision":"allow|deny|ask","risk":"low|medium|high|critical","reason":"..."}',
 		);
 	}
-	const [, decision, risk, reasonLiteral] = match;
+	const [, authorized, decision, risk, reasonLiteral] = match;
 	if (!decision || !REVIEW_DECISIONS.includes(decision as ModelReview["decision"])) {
 		throw new ReviewerOutputError("unknown decision");
 	}
@@ -59,6 +78,7 @@ export function parseReviewerOutput(text: string): ModelReview {
 		throw new ReviewerOutputError("reason contains terminal or bidirectional control characters");
 	}
 	return {
+		authorized: authorized === "true",
 		decision: decision as ModelReview["decision"],
 		risk: risk as ModelReview["risk"],
 		reason,
