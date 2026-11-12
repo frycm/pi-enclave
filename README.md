@@ -650,6 +650,9 @@ evaluation on top of one.
 | Ask the human | `ctx.ui.confirm(title, message)`, `ctx.mode`, `ctx.hasUI` | Attended escalation, gated by the explicit [attendance contract](#attendance-is-a-setting-not-an-inference) — `hasUI` alone is only used to decide *whether a dialog can be drawn*, never whether a human is present. |
 | Steer after a breaker trip | `pi.sendMessage(…, { deliverAs: "steer" })`, `ctx.abort()` | Tell the agent the *outcome* is off-limits, not just the command. |
 | Persistence | Session entries, `session_start` / `session_shutdown` | The per-session approval table and breaker state survive resume; a bypass never does. |
+| Offer only what the gate allows | `getActiveTools`, `setActiveTools` | In auto mode, tools outside `tools.allow` (or registered by a source other than the grant's pin) are taken out of the set declared to the model at session start and before every prompt, which is when an MCP server that connected in the meantime has its tools judged (#28). Not on `mcp_servers_change`: handling that event makes an extension the one that connects MCP servers, and would silence pi's report that nothing does. A small model then does not call `codemode` or an MCP tool only to be refused, and three such refusals do not trip the breaker. The gate still enforces; a tool pi-enclave hid is put back when a later policy allows it, and one pi or the user deactivated stays off. |
+| Project trust | `on("project_trust")` | In auto mode, a headless run (print, json, or rpc before any handshake) answers **no** for a project not listed in the user-global `attended.headlessTrust`, whatever pi's trust store says: its `.pi` settings, MCP servers, extensions, skills and prompts would run in or configure the pi process outside the sandbox, in a directory the agent can write. A "no" also means pi-enclave's own project files (`.pi/enclave.json`, `.pi/enclave.local.json`) are not applied, so a project file that narrows the policy or picks a profile has no effect in a headless run unless the project is listed. The TUI leaves the question to pi's prompt and warns, on stderr above that prompt at startup, with the list of what trusting would load. If deciding fails, a headless run answers no rather than fall back to the trust store. Only a user-global pi-enclave sees the question. `--approve` and `--no-approve` decide before any extension is asked, and the first extension to answer yes or no wins, so a user-global extension loaded earlier outranks this one. |
+| Turn bookkeeping | `on("turn_start")`, `on("turn_end")` | The tool registry is read once per turn instead of per call. At turn end the lock table is swept: an entry for a call a later extension's `tool_call` handler blocked never gets a `tool_result`, and would otherwise wait for the next direct message. |
 | Commands and status | `registerCommand`, status line | `/enclave status\|backend\|violations\|rules\|audit\|pending`, plus the `pi-enclave` binary for anything that happens outside a session. The footer shows backend, mode, attendance in force, breaker state and counts. There is deliberately **no** runtime `on`/`off` toggle: a switch that changes the trust model mid-session is exactly what the lock and the audit log exist to prevent. |
 
 > [!WARNING]
@@ -673,7 +676,20 @@ evaluation on top of one.
 > The other route that runs a tool outside the sandbox without a person is a user-global
 > `rules.skipReview` pattern naming it. `/enclave status` lists every such route under
 > `unsandboxed:`. The tool's declared `ToolAnnotations` are shown in the approval dialog
-> and never widen a grant, since the tool's author writes them.
+> and never widen a grant, since the tool's author writes them. They do narrow one: while
+> `network.mode` is `off`, a `readOnly` grant on a tool that declares `openWorldHint: true`
+> (it reaches the web or another open system, from the pi process) is reviewed instead, and
+> session start says so (#28).
+>
+> **Known extensions.** Recommended grants, pinned to the path `/enclave status` and the
+> session-start warning report for the installed extension:
+>
+> | Extension | Tool | Grant | Why |
+> | --- | --- | --- | --- |
+> | pi-muninn | `journal_search`, `journal_read`, `journal_context` | `{ "readOnly": true, "source": "<pi-muninn path>" }` | Read the journal; they run in the pi process but change nothing. |
+> | pi-muninn | `journal_note` | `{ "reviewed": true, "source": "<pi-muninn path>" }` | Writes to the journal, which later sessions read as context. |
+>
+> pi-huginn is the intended first client of the [RPC attendance handshake](#attendance-is-a-setting-not-an-inference).
 >
 > **Pi 1.1 includes MCP, codemode and PowerShell.** They are outside enclave's owned
 > tool set and denied by default. Deferred tools and codemode child calls pass through
@@ -1301,6 +1317,7 @@ an **explicit contract**:
 attended: {
   mode: "tui" | "rpc" | "off";   // no "auto"
   confirmTimeoutMs: number;      // default 300 000; 0 is not allowed
+  headlessTrust: string[];       // #28: projects a headless run may load pi resources from; user-global only
 }
 ```
 

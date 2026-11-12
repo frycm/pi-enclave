@@ -241,6 +241,13 @@ export interface BreakerSettings {
 export interface AttendedSettings {
 	mode: AttendedMode;
 	confirmTimeoutMs: number;
+	/**
+	 * Project directories whose pi resources (`.pi` settings, MCP servers,
+	 * extensions, skills, prompts) a headless run may load (#28). Elsewhere
+	 * pi-enclave answers pi's project-trust question "no" in print, json and
+	 * rpc mode, whatever pi's own trust store says. User-global only.
+	 */
+	headlessTrust: string[];
 }
 
 export type ReadMode = "open" | "allowlist";

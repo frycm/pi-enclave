@@ -484,7 +484,7 @@ export const DEFAULT_REVIEWER: ReviewerSettings = { model: "none", timeoutMs: 30
 /** Guardian's numbers, which are the only ones with field evidence behind them. */
 export const DEFAULT_BREAKER: BreakerSettings = { consecutive: 3, window: [10, 50] };
 
-export const DEFAULT_ATTENDED: AttendedSettings = { mode: "off", confirmTimeoutMs: 300_000 };
+export const DEFAULT_ATTENDED: AttendedSettings = { mode: "off", confirmTimeoutMs: 300_000, headlessTrust: [] };
 
 export const DEFAULT_AUDIT: AuditSettings = {
 	retentionDays: 30,
@@ -561,7 +561,7 @@ export function defaultProfile(options: DefaultProfileOptions): EffectiveProfile
 		tools: defaultTools(),
 		reviewer: { ...DEFAULT_REVIEWER },
 		breaker: { ...DEFAULT_BREAKER, window: [...DEFAULT_BREAKER.window] },
-		attended: { ...DEFAULT_ATTENDED },
+		attended: { ...DEFAULT_ATTENDED, headlessTrust: [] },
 		audit: { ...DEFAULT_AUDIT },
 	};
 }

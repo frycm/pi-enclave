@@ -248,7 +248,8 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
  */
 export const BASH_PROMPT_GUIDELINES: string[] = [
 	"Commands run inside an OS-enforced sandbox.",
-	"- You can write inside the workspace and the temporary directory, and read most of the filesystem.",
+	"- You can write inside the workspace and the temporary directory. What you can read depends on the read mode:",
+	"  most of the filesystem, or only the system, the workspace and the configured toolchain.",
 	"- Writes elsewhere, reads of credential stores, and all network access are refused by the kernel.",
 	"- A refusal is not something you can retry your way past, and sudo is not available.",
 	"- When a refusal is detected it is reported after the command output as 'sandbox denied:'.",
@@ -258,6 +259,8 @@ export const BASH_PROMPT_GUIDELINES: string[] = [
 	"- Commands without a timeout are killed after a default limit; pass a timeout in seconds for long builds or tests.",
 	"  Commands that wait for input or follow a file (tail -f, watch, interactive prompts) never finish; stdin is empty.",
 	"- Very large output, files, process counts and memory are also limited; redirect big output to a file.",
+	"- When output is truncated, the 'Full output' file it names is written outside the sandbox and may not be",
+	"  readable from it (a container, or the read allowlist). Redirect big output to a file in the workspace instead.",
 	"- On some platforms a denied read is reported as a missing file. If a path you expect to exist",
 	"  appears absent and it looks like a credential location, treat it as denied rather than missing.",
 ];

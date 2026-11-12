@@ -87,6 +87,8 @@ export function isReviewedGrant(tool: string, grant: ToolGrant, owned: readonly 
 export interface DeclaredHints {
 	readOnlyHint?: boolean;
 	destructiveHint?: boolean;
+	/** The tool reaches the web or another open system: a network path outside the sandbox. */
+	openWorldHint?: boolean;
 }
 
 /** The part of pi's `ToolInfo` the grant checks read. */
@@ -107,6 +109,7 @@ export function grantWarnings(
 	tools: ToolsSettings,
 	registered: readonly RegisteredToolInfo[],
 	owned: readonly string[],
+	networkMode = "off",
 ): string[] {
 	const warnings: string[] = [];
 	for (const [name, grant] of Object.entries(tools.allow)) {
@@ -122,6 +125,12 @@ export function grantWarnings(
 						"It runs outside the sandbox with no review or approval. Use reviewed: true unless you are sure.",
 				);
 			}
+		}
+		if (grant.readOnly === true && networkMode === "off" && info?.annotations?.openWorldHint === true) {
+			warnings.push(
+				`pi-enclave: tools.allow marks "${name}" readOnly, but the tool declares openWorldHint: true, ` +
+					"a network path outside the sandbox while network.mode is off. Its calls are reviewed instead.",
+			);
 		}
 		if (grant.source === undefined) {
 			warnings.push(
@@ -182,6 +191,7 @@ export function describeDeclaredHints(
 	const parts: string[] = [];
 	if (hints?.readOnlyHint !== undefined) parts.push(`readOnlyHint: ${hints.readOnlyHint}`);
 	if (hints?.destructiveHint !== undefined) parts.push(`destructiveHint: ${hints.destructiveHint}`);
+	if (hints?.openWorldHint !== undefined) parts.push(`openWorldHint: ${hints.openWorldHint}`);
 	return parts.length > 0
 		? `  the tool declares ${parts.join(", ")} (its author's claim; it runs outside the sandbox)`
 		: `  the tool declares no read-only or destructive hint; it runs outside the sandbox`;

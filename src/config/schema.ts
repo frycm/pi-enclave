@@ -63,6 +63,8 @@ const PROJECT_FORBIDDEN: Record<string, string> = {
 	reviewer: "the reviewer is immutable below user-global.",
 	breaker: "breaker thresholds are immutable below user-global.",
 	audit: "audit settings are immutable below user-global.",
+	"attended.headlessTrust":
+		"headlessTrust decides which projects' pi resources an unattended run loads and is therefore user-global only.",
 	"sandbox.env": "the child environment is user-global only: a project cannot add a variable.",
 	profiles: "only a user-global file may define profiles; a project file may select one.",
 };
@@ -704,7 +706,7 @@ class ParseContext {
 	private attended(prefix: string, raw: unknown): ProfilePatch["attended"] | undefined {
 		const body = this.object(prefix, raw);
 		if (!body) return undefined;
-		this.rejectUnknown(prefix, body, ["mode", "confirmTimeoutMs"]);
+		this.rejectUnknown(prefix, body, ["mode", "confirmTimeoutMs", "headlessTrust"]);
 
 		const out: NonNullable<ProfilePatch["attended"]> = {};
 		if ("mode" in body) {
@@ -716,6 +718,10 @@ class ParseContext {
 			// wearing a dialog, and it would show as "attended" in the status line.
 			const timeout = this.integer(join(prefix, "confirmTimeoutMs"), body.confirmTimeoutMs, 1_000, 3_600_000);
 			if (timeout !== undefined) out.confirmTimeoutMs = timeout;
+		}
+		if ("headlessTrust" in body) {
+			const projects = this.list(join(prefix, "headlessTrust"), body.headlessTrust, "attended.headlessTrust");
+			if (projects) out.headlessTrust = projects;
 		}
 		return out;
 	}
