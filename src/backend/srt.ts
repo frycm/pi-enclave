@@ -31,6 +31,7 @@ import { HelperFsClient } from "../fs/client.ts";
 import type { BackendName } from "../probe.ts";
 import { hostExecutableSafety, hostRuntimeSafety, resolveSeccompHelper, whichSync } from "../probe-host.ts";
 import { shellCapabilityIssue, validateReadCapability, validateWriteCapability } from "./capability.ts";
+import { effectiveTimeout, freeSpaceIssue, limitPrefix, OutputCap, timeoutNote } from "./limits.ts";
 import { canonical, isUnder } from "./paths.ts";
 import { SessionScratch } from "./scratch.ts";
 import { checkUnixSocketBlocking } from "./self-test.ts";
@@ -662,8 +663,16 @@ export class SrtBackend implements SandboxBackend {
 			? toSrtConfig(customProfile, this.weakened, process.platform, this.hostTools)
 			: undefined;
 
+		// Resource limits (#24): set by the sandboxed shell before the command,
+		// a default and a maximum wall-clock limit, and an output cap.
+		const limits = compiled.profile.limits;
+		const writable = [...compiled.profile.writableRoots, ...(this.scratch ? [this.scratch.path] : [])];
+		const lowDisk = freeSpaceIssue(writable, limits);
+		const prefix = limitPrefix(limits, process.platform, lowDisk !== undefined);
+		const timeout = effectiveTimeout(request.timeout, limits);
+
 		const { argv } = await SandboxManager.wrapWithSandboxArgv(
-			request.command,
+			`${prefix}${request.command}`,
 			"/bin/bash",
 			customConfig as never,
 			request.signal,
@@ -671,7 +680,37 @@ export class SrtBackend implements SandboxBackend {
 			{ commandId: request.commandId, commandText: request.command },
 		);
 
-		const exitCode = await this.spawnSandboxed(argv, request);
+		const cap = new OutputCap(limits?.maxOutputMb, request.onData);
+		const stop = new AbortController();
+		const onOuterAbort = () => stop.abort();
+		if (request.signal?.aborted) stop.abort();
+		request.signal?.addEventListener("abort", onOuterAbort, { once: true });
+		let exitCode: number | null;
+		try {
+			exitCode = await this.spawnSandboxed(argv, {
+				...request,
+				signal: stop.signal,
+				onData: (chunk) => {
+					if (!cap.push(chunk)) stop.abort();
+				},
+				...(timeout ? { timeout: timeout.seconds } : {}),
+			});
+		} catch (error) {
+			const message = (error as Error).message;
+			if (cap.exceeded && !request.signal?.aborted && message === "aborted") {
+				exitCode = null;
+			} else {
+				if (timeout && limits && message.startsWith("timeout:")) {
+					const note = timeoutNote(timeout, limits);
+					if (note) request.onData?.(Buffer.from(note, "utf8"));
+				}
+				throw error;
+			}
+		} finally {
+			request.signal?.removeEventListener("abort", onOuterAbort);
+		}
+		if (cap.exceeded && limits) request.onData?.(Buffer.from(cap.note(limits.maxOutputMb), "utf8"));
+		if (lowDisk) request.onData?.(Buffer.from(`\n${lowDisk}\n`, "utf8"));
 		const violations = await this.drainViolations(request.commandId);
 		return { exitCode, violations };
 	}

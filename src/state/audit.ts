@@ -240,6 +240,8 @@ export function configFields(
 		reviewer: profile.reviewer.model,
 		trigger: profile.review.trigger,
 		writableRoots: profile.sandbox.writableRoots,
+		// Resource limits (#24), so a run that was killed can be read against them.
+		limits: profile.sandbox.limits,
 		rules: {
 			deny: profile.rules.deny.length,
 			ask: profile.rules.ask.length,

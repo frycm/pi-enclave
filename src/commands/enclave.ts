@@ -13,6 +13,8 @@
  * not started, an unsupported host: each shows in the one-line summary, not just
  * in the detailed report nobody opens.
  */
+
+import { describeLimits } from "../backend/limits.ts";
 import type { BackendName, CompiledProfile, Profile, Violation } from "../backend/types.ts";
 import { OWNED_TOOLS } from "../config/defaults.ts";
 import { renderConfig, renderDefaults } from "../config/render.ts";
@@ -125,6 +127,7 @@ export function renderStatus(state: EnclaveState): string {
 		`profile:    ${profile.mode}, network ${profile.network}, pty ${profile.allowPty ? "on" : "off"}`,
 		`writable:   ${profile.writableRoots.join(", ") || "(nothing)"}`,
 		`read-deny:  ${profile.readDeny.length} path(s)`,
+		`limits:     ${describeLimits(profile.limits, state.backendName, process.platform)}`,
 		`violations: ${state.violations.length} this session`,
 		`coverage:   ${COVERAGE_NOTE}`,
 	);

@@ -23,6 +23,14 @@ import { hostExecutableSafety } from "../../probe-host.ts";
 import { ensureSecureDir } from "../../state/dir.ts";
 import { validateBashTimeout } from "../../tools/bash.ts";
 import { validateReadCapability, validateWriteCapability } from "../capability.ts";
+import {
+	DEFAULT_CONTAINER_LIMITS,
+	effectiveTimeout,
+	freeSpaceIssue,
+	limitPrefix,
+	OutputCap,
+	timeoutNote,
+} from "../limits.ts";
 import { canonical, isUnder } from "../paths.ts";
 import { materializeWriteDenyAnchors } from "../srt.ts";
 import type {
@@ -161,6 +169,7 @@ export class ContainerBackend implements SandboxBackend {
 		);
 		const sharedSources = [
 			"../capability.ts",
+			"../limits.ts",
 			"../paths.ts",
 			"../srt.ts",
 			"../../fs/client.ts",
@@ -290,6 +299,7 @@ export class ContainerBackend implements SandboxBackend {
 			throw new Error(`pi-enclave: cwd is not exposed to the container: ${cwd}`);
 		const name = `pi-enclave-${randomUUID()}`;
 		const profile = prepared.profile;
+		const containerLimits = profile.limits?.container ?? DEFAULT_CONTAINER_LIMITS;
 		const env = {
 			...buildChildEnv(inputEnv, {
 				passthrough: profile.envPassthrough ?? [],
@@ -316,10 +326,11 @@ export class ContainerBackend implements SandboxBackend {
 			"--ipc=private",
 			this.name === "docker" ? "--pid=" : "--pid=private",
 			"--cgroupns=private",
-			"--pids-limit=256",
-			"--memory=512m",
-			"--cpus=2",
-			"--shm-size=32m",
+			// Configurable since #24; the defaults are the values used before.
+			`--pids-limit=${containerLimits.pids}`,
+			`--memory=${containerLimits.memoryMb}m`,
+			`--cpus=${containerLimits.cpus}`,
+			`--shm-size=${containerLimits.shmMb}m`,
 			"--no-healthcheck",
 			"--log-driver=none",
 			"--user",
@@ -327,7 +338,7 @@ export class ContainerBackend implements SandboxBackend {
 			"--workdir",
 			cwd,
 			"--entrypoint=/usr/bin/env",
-			"--tmpfs=/tmp:rw,nosuid,nodev,size=128m,mode=1777",
+			`--tmpfs=/tmp:rw,nosuid,nodev,size=${containerLimits.tmpMb}m,mode=1777`,
 		];
 		if (this.name === "podman")
 			create.push(
@@ -392,6 +403,9 @@ export class ContainerBackend implements SandboxBackend {
 
 	async run(compiled: CompiledProfile, request: RunRequest): Promise<RunResult> {
 		validateBashTimeout(request.timeout);
+		const limits = this.prepared(compiled).profile.limits;
+		const timeout = effectiveTimeout(request.timeout, limits);
+		const lowDisk = freeSpaceIssue(this.prepared(compiled).profile.writableRoots, limits);
 		let prepared = this.prepared(compiled);
 		if (request.writeCapability && request.readCapability)
 			throw new Error("pi-enclave: only one capability is allowed per invocation");
@@ -413,22 +427,51 @@ export class ContainerBackend implements SandboxBackend {
 		const child = this.start(
 			prepared,
 			request.cwd,
-			["/bin/bash", "--noprofile", "--norc", "-c", `mkdir -p /tmp/claude; ${request.command}`],
+			[
+				"/bin/bash",
+				"--noprofile",
+				"--norc",
+				"-c",
+				// stdin is the supervisor's control channel, so it is never closed;
+				// the command gets /dev/null instead, so a program that waits for
+				// input fails at once (#24). Then the resource limits.
+				`exec </dev/null; mkdir -p /tmp/claude; ${limitPrefix(limits, "linux", lowDisk !== undefined)}${request.command}`,
+			],
 			request.env,
 		);
 		let cancelled = false;
+		let timedOut = false;
 		const cancel = () => {
 			cancelled = true;
 			child.kill("SIGTERM");
 		};
 		request.signal?.addEventListener("abort", cancel, { once: true });
 		if (request.signal?.aborted) cancel();
-		const timer = request.timeout === undefined ? undefined : setTimeout(cancel, request.timeout * 1000);
-		child.stdout.on("data", (chunk: Buffer) => request.onData?.(chunk));
-		child.stderr.on("data", (chunk: Buffer) => request.onData?.(chunk));
+		const timer =
+			timeout === undefined
+				? undefined
+				: setTimeout(() => {
+						timedOut = true;
+						cancel();
+					}, timeout.seconds * 1000);
+		const cap = new OutputCap(limits?.maxOutputMb, request.onData);
+		const forward = (chunk: Buffer) => {
+			if (!cap.push(chunk) && !cancelled) cancel();
+		};
+		child.stdout.on("data", forward);
+		child.stderr.on("data", forward);
 		try {
 			const exitCode = await this.children.get(child);
 			if (this.failure) throw this.failure;
+			if (timedOut && timeout && !request.signal?.aborted) {
+				const note = limits ? timeoutNote(timeout, limits) : undefined;
+				if (note) request.onData?.(Buffer.from(note, "utf8"));
+				// The same shape as the native backend and pi's own shell, so pi
+				// reports "Command timed out after N seconds".
+				throw new Error(`timeout:${timeout.seconds}`);
+			}
+			if (cap.exceeded && limits) request.onData?.(Buffer.from(cap.note(limits.maxOutputMb), "utf8"));
+			if (lowDisk) request.onData?.(Buffer.from(`\n${lowDisk}\n`, "utf8"));
 			return { exitCode: cancelled ? null : (exitCode ?? null), violations: [] };
 		} finally {
 			clearTimeout(timer);

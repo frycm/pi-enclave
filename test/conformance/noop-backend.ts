@@ -64,6 +64,10 @@ export class NoopBackend implements SandboxBackend {
 
 			const timer =
 				request.timeout === undefined ? undefined : setTimeout(() => child.kill("SIGKILL"), request.timeout * 1000);
+			// Honouring the caller's signal is not a boundary; it only keeps a row
+			// that the control fails (the limit rows, #24) from hanging the run.
+			const onAbort = () => child.kill("SIGKILL");
+			request.signal?.addEventListener("abort", onAbort, { once: true });
 
 			child.on("error", (error) => {
 				if (timer) clearTimeout(timer);
@@ -71,6 +75,7 @@ export class NoopBackend implements SandboxBackend {
 			});
 			child.on("close", (exitCode) => {
 				if (timer) clearTimeout(timer);
+				request.signal?.removeEventListener("abort", onAbort);
 				// No profile, so no denials are ever observed.
 				resolve({ exitCode, violations: [] });
 			});

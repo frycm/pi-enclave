@@ -512,6 +512,7 @@ export default function (pi: ExtensionAPI): void {
 			return backend;
 		},
 		getCompiled: requireCompiled,
+		userCommand: true,
 		onViolations: (found) => recordViolations(found, false),
 		guard: () => {
 			if (effective?.auto && breakerBlocks()) {

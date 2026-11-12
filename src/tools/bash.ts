@@ -131,6 +131,12 @@ export interface EnclaveBashOptions {
 	 * the only place left to stop it. Throwing refuses the command.
 	 */
 	guard?: (command: string) => CanonicalAction | undefined;
+	/**
+	 * A command a person typed (`!`/`!!`), rather than the agent's tool call.
+	 * The default timeout is for a model that forgot one (#24); a person who
+	 * starts `!npm run dev` is there to stop it, so it gets the maximum instead.
+	 */
+	userCommand?: boolean;
 }
 
 /**
@@ -179,7 +185,11 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 				...(action?.capability?.kind === "read" ? { readCapability: action.capability.value } : {}),
 				onData: execOptions.onData,
 				...(execOptions.signal ? { signal: execOptions.signal } : {}),
-				...(execOptions.timeout !== undefined ? { timeout: execOptions.timeout } : {}),
+				...(execOptions.timeout !== undefined
+					? { timeout: execOptions.timeout }
+					: options.userCommand && compiled.profile.limits
+						? { timeout: compiled.profile.limits.maxTimeoutSec }
+						: {}),
 			});
 
 			const violations = [...result.violations];
@@ -239,6 +249,9 @@ export const BASH_PROMPT_GUIDELINES: string[] = [
 	"- If a required write is denied, retry the exact command with allow_write set to that exact path and explain why.",
 	"- If a configured, grantable read denial blocks the command, retry with allow_read set to that exact denied root.",
 	"  Capability requests are reviewed, apply to one action only, and may still be refused.",
+	"- Commands without a timeout are killed after a default limit; pass a timeout in seconds for long builds or tests.",
+	"  Commands that wait for input or follow a file (tail -f, watch, interactive prompts) never finish; stdin is empty.",
+	"- Very large output, files, process counts and memory are also limited; redirect big output to a file.",
 	"- On some platforms a denied read is reported as a missing file. If a path you expect to exist",
 	"  appears absent and it looks like a credential location, treat it as denied rather than missing.",
 ];

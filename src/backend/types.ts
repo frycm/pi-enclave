@@ -67,6 +67,11 @@ export interface Profile {
 	 * (#21). Absent or empty: nothing outside the workspace.
 	 */
 	grantableWriteRoots?: readonly string[];
+	/**
+	 * Resource limits for shell commands (#24). Absent only for profiles built
+	 * by hand (tests, the benchmark); `toBackendProfile` always sets them.
+	 */
+	limits?: ResourceLimits;
 	/** Paths no write capability may reach, with the reason (#21). Built in. */
 	protectedWrite?: readonly { path: string; reason: string }[];
 	/** The explicitly selected scratch path exposed to children as TMPDIR. */
@@ -159,6 +164,19 @@ export interface Violation {
 
 /** A complete environment for the child. Nothing outside this map is inherited. */
 export type ChildEnv = Readonly<Record<string, string>>;
+
+/** See `LimitsSettings` in the configuration types. */
+export interface ResourceLimits {
+	defaultTimeoutSec: number;
+	maxTimeoutSec: number;
+	maxOutputMb: number;
+	fileSizeMb: number;
+	openFiles: number;
+	processes: number;
+	memoryMb: number;
+	minFreeDiskMb: number;
+	container: { pids: number; memoryMb: number; cpus: number; shmMb: number; tmpMb: number };
+}
 
 export interface RunRequest {
 	command: string;
