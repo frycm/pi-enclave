@@ -78,7 +78,9 @@ export function checkTool(options: ToolCheckOptions): ToolDisposition {
  */
 export function isReviewedGrant(tool: string, grant: ToolGrant, owned: readonly string[]): boolean {
 	if (owned.includes(tool)) return false;
-	return grant.readOnly !== true;
+	// `reviewed` wins over `readOnly` if both ever arrive: the schema rejects
+	// the pair today, and a programmatic profile must not read as the wider one.
+	return grant.reviewed === true || grant.readOnly !== true;
 }
 
 /** Hints a tool declares about itself, with the meaning of MCP tool annotations. */

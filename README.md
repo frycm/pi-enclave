@@ -296,6 +296,7 @@ interface SandboxProfile {
   writeDeny: string[];       // protected persistence paths inside writable roots
   readDeny: string[];        // ~/.ssh, ~/.aws, ~/.gnupg, ~/.pi/**/auth*, keychains…
   grantableReadDeny: string[]; // user-global subset eligible for one-shot allow_read
+  grantableWriteRoots: string[]; // user-global roots below which allow_write is grantable outside the workspace (#21)
   readAllow?: string[];      // custom mode only
   network: { mode: "off" | "proxy"; allowHosts: string[]; allowLocalPorts: number[] };
   capabilities: "none" | "reviewed";  // may the agent request a one-shot Capability (→ L3)?
@@ -668,6 +669,7 @@ the result must satisfy `effective ⊑ incoming` under a partial order defined p
 | `sandbox.writableRoots` | Subset, after resolution, and every added root must be inside the workspace |
 | `sandbox.readDeny` | Superset |
 | `sandbox.grantableReadDeny` | Subset — user-global only, and every entry must exactly match a non-built-in `readDeny` entry |
+| `sandbox.grantableWriteRoots` | Subset — user-global only; never `/` or on/below a [never-grantable write target](#the-capability-retry-hatch) |
 | `sandbox.network.allowHosts` | Subset; `mode` may go `proxy → off`, never the reverse |
 | `sandbox.capabilities` / `hostExec` | `none ⊑ reviewed`, `never ⊑ human`; may only move left. `human` is reserved and rejected throughout v1. |
 | `sandbox.allowSelfHosting` | `false ⊑ true`; only the user-global file can turn it on (#36) |
@@ -1085,9 +1087,9 @@ When a command fails on a sandbox violation, the agent sees this appended to the
 
 ```
 <sandbox_violation backend="seatbelt">
-  denied: file-write /Users/m/.zshrc
+  denied: file-write /srv/build/report.txt
   hint: if this write is required for the task, retry with
-        allow_write="/Users/m/.zshrc" and state why; it will be reviewed.
+        allow_write="/srv/build/report.txt" and state why; it will be reviewed.
 </sandbox_violation>
 ```
 
@@ -1107,6 +1109,40 @@ over Linux's read-deny tmpfs, while granting an ancestor would lift the whole bo
 gate rejects read-deny intersections before asking, and both the in-session backend and the
 standalone approver repeat the complete read/write-deny check. A grant that could create or
 replace any executable in a host `PATH` directory is refused for the same reason.
+
+**Write targets that are never grantable (#21).** Some files define the trust boundary
+itself, and one approval of a request that looks like "let me fix a setting" must not hand
+them over. A write capability that intersects any of these, in either direction, is refused
+before any prompt, by the gate, by the in-session backend and by the standalone approver,
+and the refusal says why the target is sensitive:
+
+- pi's agent directory as a whole (`~/.pi/agent`, or `PI_CODING_AGENT_DIR`) and `~/.pi`:
+  pi-enclave's own policy (`enclave.json`), `settings.json`, `trust.json`, `models.json`,
+  `extensions/`, `packages/`, `skills/`, `prompts/`;
+- every code root the pi process loaded (#36): pi, pi-enclave, its `node_modules`, other
+  extensions;
+- shell and login startup files (`~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zshrc`,
+  `~/.zshenv`, `~/.zprofile`, the csh/ksh/X session files, `~/.pam_environment`,
+  `~/.envrc`, `$XDG_CONFIG_HOME/fish`, `$XDG_CONFIG_HOME/environment.d`);
+- Git's user configuration (`~/.gitconfig`, `$XDG_CONFIG_HOME/git`);
+- user services and autostart (`$XDG_CONFIG_HOME/systemd`, `~/.local/share/systemd`,
+  `$XDG_CONFIG_HOME/autostart`, `~/Library/LaunchAgents`) and the crontab spools;
+- conventional user `PATH` directories whether or not they are on `PATH` now
+  (`~/.local/bin`, `~/bin`, `~/.cargo/bin`, `~/go/bin`, `~/.npm-global`, `~/.deno/bin`,
+  `~/.bun/bin`);
+- editor startup files (`~/.vimrc`, `~/.vim`, `$XDG_CONFIG_HOME/nvim`, `~/.emacs`,
+  `~/.emacs.d`).
+
+Credentials (`~/.ssh` and friends) are covered by the read-deny check above. The list is
+built in and not configurable, and the write-side risk floor is `critical` for any of it.
+
+**Outside the workspace, writes are opt-in.** A write capability must target a path below
+the working directory or below a user-global `sandbox.grantableWriteRoots` entry. With the
+list empty, which is the default, no write capability outside the workspace is grantable at
+all: the right default for an unattended server. Project files cannot mention the field, a
+less trusted source can only remove entries, and `"/"` or an entry on or below a
+never-grantable target is refused at load. Independently, no writable root may overlap pi's
+agent directory, and `enclave.json` and `trust.json` there are write-denied in L2 by name.
 
 Widening is invocation-scoped: SRT receives a `customConfig` on the one shell
 `wrapWithSandboxArgv` call, and a file-tool read capability uses an ephemeral helper created
@@ -1130,8 +1166,8 @@ must require a verified L4 decision, and must never reuse the Phase-4 network `h
 capability.
 
 The reviewer is also shown the *capability*, not just the command, and the capability is
-part of the locked hash: an `allow` for `allow_write=/Users/m/.zshrc` cannot be replayed for
-`allow_write=/Users/m/.ssh/authorized_keys`.
+part of the locked hash: an `allow` for `allow_write=/srv/build/report.txt` cannot be replayed for
+`allow_write=/srv/build/deploy.sh`.
 
 Phase 3 does not cache verdicts. A later cache requires the complete canonical input,
 tool-registration identity, direct-authorization evidence, model/prompt/corpus/config

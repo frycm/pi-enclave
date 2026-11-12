@@ -367,6 +367,27 @@ export function formatCodeRootProblems(check: CodeRootCheck, allowSelfHosting: b
 }
 
 /**
+ * The profile with every loaded code root on the never-grantable write list (#21).
+ *
+ * A one-shot write capability to pi-enclave's package, its node_modules or
+ * pi's own package would run the agent's code in the pi process at the next
+ * start, which is the same trust-root problem as a write below a writable root.
+ */
+export function protectLoadedCode(profile: Profile, roots: readonly CodeRoot[]): Profile {
+	if (roots.length === 0) return profile;
+	return {
+		...profile,
+		protectedWrite: [
+			...(profile.protectedWrite ?? []),
+			...roots.map((root) => ({
+				path: root.path,
+				reason: `pi loads code from it (${root.from}) in its own process, outside the sandbox`,
+			})),
+		],
+	};
+}
+
+/**
  * The profile with every exposed root write-denied, and recorded for
  * `/enclave status`. Only called with the opt-in.
  */

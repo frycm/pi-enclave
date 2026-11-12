@@ -11,6 +11,7 @@
 import { spawnSync } from "node:child_process";
 import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { canonical, isUnder } from "../backend/paths.ts";
 import type { Profile } from "../backend/types.ts";
 import { buildChildEnv } from "../env/child-env.ts";
@@ -118,14 +119,26 @@ function isBareGitMetadata(path: string): boolean {
 }
 
 /** Everything the sandbox is told, and nothing else. */
-export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: string): Profile {
+export function toBackendProfile(
+	effective: EffectiveProfile,
+	workspaceRoot: string,
+	agentDir: string = getAgentDir(),
+): Profile {
 	// These paths execute code in the privileged Pi process on a later launch.
 	// Keep them read-only in L2 rather than relying on shell-path inference.
 	// `.pi` is materialized by the trusted parent because bwrap cannot mount a
 	// read-only denial over a path that does not exist yet.
 	const projectState = join(workspaceRoot, ".pi");
 	const gitDir = join(workspaceRoot, ".git");
-	const writeDeny = [projectState, ...effective.sandbox.readDeny];
+	// pi-enclave's own policy and pi's trust store, named explicitly so the
+	// invariant does not depend on them being outside every writable root
+	// (fold() also refuses a root that overlaps the agent directory; #21).
+	const writeDeny = [
+		projectState,
+		join(agentDir, "enclave.json"),
+		join(agentDir, "trust.json"),
+		...effective.sandbox.readDeny,
+	];
 	const materializeWriteDeny = [projectState];
 	const materializeWriteDenyFiles: string[] = [];
 	const writableRoots = effective.sandbox.writableRoots.map(canonical);
@@ -683,6 +696,8 @@ export function toBackendProfile(effective: EffectiveProfile, workspaceRoot: str
 		materializeWriteDeny: [...new Set(materializeWriteDeny)],
 		materializeWriteDenyFiles: [...new Set(materializeWriteDenyFiles)],
 		readDeny: [...effective.sandbox.readDeny],
+		grantableWriteRoots: [...effective.sandbox.grantableWriteRoots],
+		protectedWrite: effective.sandbox.protectedWrite.map((entry) => ({ ...entry })),
 		network: effective.sandbox.network.mode,
 		allowPty: effective.sandbox.allowPty,
 		envPassthrough: [...effective.sandbox.env.passthrough],
@@ -708,7 +723,7 @@ export interface DevProfileOptions extends DefaultProfileOptions {
  * through `loadConfig` instead.
  */
 export function createDevProfile(options: DevProfileOptions): Profile {
-	const profile = toBackendProfile(defaultProfile(options), options.cwd);
+	const profile = toBackendProfile(defaultProfile(options), options.cwd, options.agentDir);
 	if (options.allowPty !== undefined) profile.allowPty = options.allowPty;
 	return profile;
 }

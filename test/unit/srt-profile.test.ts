@@ -111,7 +111,13 @@ describe("sandbox profile authority", () => {
 	});
 
 	it("refuses write capabilities that could re-expose a read-denied subtree", () => {
-		const base = { ...profile(["/work"]), readDeny: ["/home/u/.ssh"], writeDeny: ["/work/.pi"] };
+		const base = {
+			...profile(["/work"]),
+			readDeny: ["/home/u/.ssh"],
+			writeDeny: ["/work/.pi"],
+			// Outside the workspace only below a grantable root (#21).
+			grantableWriteRoots: ["/home/u", "/srv"],
+		};
 		for (const target of ["/home/u/.ssh", "/home/u/.ssh/out", "/home/u", "/work/.pi/cache"]) {
 			expect(() => validateWriteCapability(base, "/work", target), target).toThrow(/immutable denied path/);
 		}

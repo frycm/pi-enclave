@@ -16,7 +16,7 @@
  * they act -- see `lock.ts` for why that second check is not redundant.
  */
 
-import { capabilityIntersects, resolveCapabilityTarget } from "../backend/capability.ts";
+import { capabilityIntersects, resolveCapabilityTarget, writeCapabilityBoundaryIssue } from "../backend/capability.ts";
 import { canonical as canonicalPath, isUnder } from "../backend/paths.ts";
 import type { EffectiveProfile } from "../config/types.ts";
 import { type CanonicalAction, canonicalize, describeAction } from "../policy/canonical.ts";
@@ -254,6 +254,24 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 			};
 		}
 		const target = resolveCapabilityTarget(action.cwd, action.capability.value);
+		// The never-grantable list and the grantable roots (#21), checked here as
+		// well as in the backend's validator so the refusal comes before any
+		// prompt whatever the wiring supplies.
+		const boundaryIssue = writeCapabilityBoundaryIssue(target, {
+			cwd: action.cwd,
+			grantableRoots: profile.sandbox.grantableWriteRoots,
+			protectedTargets: profile.sandbox.protectedWrite,
+		});
+		if (boundaryIssue) {
+			return {
+				outcome: "deny",
+				block: true,
+				reason: `${boundaryIssue}\n  This boundary is not grantable by approval.`,
+				matches: evaluation.matches,
+				adverse: true,
+				action,
+			};
+		}
 		const denied = capabilityIntersects(target, profile.sandbox.readDeny);
 		if (denied) {
 			return {

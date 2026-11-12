@@ -100,8 +100,13 @@ function approve(options: Omit<ApproveOptions, "reloadCurrent"> & { reloadCurren
 	return approvePending({ ...options, reloadCurrent: options.reloadCurrent ?? (() => options.current) });
 }
 
-function record(tool: string, input: Record<string, unknown>) {
-	const p = profile();
+/** Write capabilities outside the workspace need user-global grantable roots (#21). */
+const grantableWrites = (p: EffectiveProfile) => {
+	p.sandbox.grantableWriteRoots = ["/etc", "/srv", TEST_HOME];
+};
+
+function record(tool: string, input: Record<string, unknown>, edit: (p: EffectiveProfile) => void = () => {}) {
+	const p = profile(edit);
 	return writePending({
 		stateRoot,
 		sessionId: SESSION,
@@ -439,7 +444,7 @@ describe("approving a record", () => {
 	// writable root, or the approval reaches the same denial.
 	it("applies an approved write capability as a one-shot writable root", async () => {
 		const backend = new RecordingBackend();
-		const p = profile();
+		const p = profile(grantableWrites);
 		const rec = writePending({
 			stateRoot,
 			sessionId: SESSION,
@@ -458,7 +463,7 @@ describe("approving a record", () => {
 		const result = await approve({
 			record: rec,
 			stateRoot,
-			current: profile(),
+			current: profile(grantableWrites),
 			home: TEST_HOME,
 			io: io().make(true),
 			backend,
@@ -472,9 +477,9 @@ describe("approving a record", () => {
 		const backend = new RecordingBackend();
 		const channel = io();
 		const result = await approve({
-			record: record("bash", { command: "touch /work/output", allow_write: "/srv/unrelated" }),
+			record: record("bash", { command: "touch /work/output", allow_write: "/srv/unrelated" }, grantableWrites),
 			stateRoot,
-			current: profile(),
+			current: profile(grantableWrites),
 			home: TEST_HOME,
 			io: channel.make(true),
 			backend,
@@ -490,12 +495,16 @@ describe("approving a record", () => {
 		const backend = new RecordingBackend();
 		const channel = io();
 		const result = await approve({
-			record: record("bash", {
-				command: `cat ${join(TEST_HOME, ".ssh", "id_ed25519")}`,
-				allow_write: join(TEST_HOME, ".ssh", "out"),
-			}),
+			record: record(
+				"bash",
+				{
+					command: `cat ${join(TEST_HOME, ".ssh", "id_ed25519")}`,
+					allow_write: join(TEST_HOME, ".ssh", "out"),
+				},
+				grantableWrites,
+			),
 			stateRoot,
-			current: profile(),
+			current: profile(grantableWrites),
 			home: TEST_HOME,
 			io: channel.make(true),
 			backend,

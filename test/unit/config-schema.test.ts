@@ -134,6 +134,7 @@ describe("parseDocument", () => {
 
 		it.each([
 			["sandbox.grantableReadDeny", { sandbox: { grantableReadDeny: [] } }],
+			["sandbox.grantableWriteRoots", { sandbox: { grantableWriteRoots: [] } }],
 			["rules.skipReview", { rules: { skipReview: [] } }],
 			["review.environment", { review: { environment: ["x"] } }],
 			["review.hard_deny", { review: { hard_deny: ["x"] } }],

@@ -19,6 +19,7 @@ import type {
 	AuditSettings,
 	BreakerSettings,
 	EffectiveProfile,
+	ProtectedWriteTarget,
 	ReviewerSettings,
 	ToolsSettings,
 } from "./types.ts";
@@ -83,6 +84,95 @@ export function defaultReadDeny(
 			...configRoots.map((root) => join(root, "claude")),
 		]),
 	];
+}
+
+/**
+ * Paths a one-shot write capability may never target, whoever approves it (#21).
+ *
+ * The write-side counterpart of the immutable built-in read denials. Each one is
+ * part of the trust boundary itself: pi-enclave's policy, code pi loads at the
+ * next start, or code the user's own shell, Git, login session or service
+ * manager runs outside any sandbox. One approval of a request that looks like
+ * "let me fix a setting" must not hand any of that over. Credentials (`~/.ssh`
+ * and friends) are covered separately, through `readDeny`.
+ *
+ * Not configurable, and checked whether or not the path exists: creating the
+ * file is the attack.
+ */
+export function protectedWriteTargets(
+	home = homedir(),
+	agentDir = getAgentDir(),
+	env: Readonly<Record<string, string | undefined>> = process.env,
+): ProtectedWriteTarget[] {
+	const xdgConfig = env.XDG_CONFIG_HOME;
+	const configRoots = [join(home, ".config")];
+	if (xdgConfig && isAbsolute(xdgConfig)) configRoots.push(xdgConfig);
+	const policy = "it holds pi's configuration, including pi-enclave's own policy and the code pi loads at start";
+	const shell = "the user's shell or login session runs it outside any sandbox";
+	const git = "Git reads it outside the sandbox, and aliases, hooks, core.fsmonitor or core.sshCommand there run code";
+	const service = "the user's service manager or desktop session starts what it lists, outside any sandbox";
+	const bin = "it is a conventional user PATH directory, so a file there runs as a command outside the sandbox";
+	const editor = "the editor runs it when the user next opens a file";
+	const targets: ProtectedWriteTarget[] = [
+		// pi's agent directory as a whole: enclave.json, settings.json, trust.json,
+		// models.json, extensions/, packages/, skills/, prompts/, themes/.
+		{ path: agentDir, reason: policy },
+		{ path: join(home, ".pi"), reason: policy },
+		...[
+			".bashrc",
+			".bash_profile",
+			".bash_login",
+			".bash_logout",
+			".profile",
+			".zshrc",
+			".zshenv",
+			".zprofile",
+			".zlogin",
+			".zlogout",
+			".cshrc",
+			".tcshrc",
+			".login",
+			".kshrc",
+			".mkshrc",
+			".xprofile",
+			".xinitrc",
+			".xsession",
+			".xsessionrc",
+			".pam_environment",
+			".envrc",
+			".inputrc",
+		].map((name) => ({ path: join(home, name), reason: shell })),
+		...configRoots.flatMap((root) => [
+			{ path: join(root, "fish"), reason: shell },
+			{ path: join(root, "environment.d"), reason: shell },
+			{ path: join(root, "git"), reason: git },
+			{ path: join(root, "systemd"), reason: service },
+			{ path: join(root, "autostart"), reason: service },
+			{ path: join(root, "nvim"), reason: editor },
+		]),
+		{ path: join(home, ".gitconfig"), reason: git },
+		{ path: join(home, "Library", "LaunchAgents"), reason: service },
+		{ path: join(home, ".local", "share", "systemd"), reason: service },
+		{ path: join(home, ".local", "bin"), reason: bin },
+		{ path: join(home, "bin"), reason: bin },
+		{ path: join(home, ".cargo", "bin"), reason: bin },
+		{ path: join(home, "go", "bin"), reason: bin },
+		{ path: join(home, ".npm-global"), reason: bin },
+		{ path: join(home, ".deno", "bin"), reason: bin },
+		{ path: join(home, ".bun", "bin"), reason: bin },
+		{ path: join(home, ".vimrc"), reason: editor },
+		{ path: join(home, ".vim"), reason: editor },
+		{ path: join(home, ".emacs"), reason: editor },
+		{ path: join(home, ".emacs.d"), reason: editor },
+		// Crontab spools. Usually root-owned, listed so a misconfigured host does
+		// not depend on that.
+		...["/var/spool/cron", "/var/spool/cron/crontabs", "/var/at/tabs", "/usr/lib/cron/tabs"].map((path) => ({
+			path,
+			reason: "cron runs what it lists as the user, outside any sandbox",
+		})),
+	];
+	const seen = new Set<string>();
+	return targets.filter((target) => !seen.has(target.path) && seen.add(target.path) !== undefined);
 }
 
 /** pi-enclave's own state directory: audit log, pending records, attendance secret. */
@@ -301,6 +391,8 @@ export function defaultProfile(options: DefaultProfileOptions): EffectiveProfile
 			writableRoots: [cwd],
 			readDeny: [...defaultReadDeny(home, agentDir, env), join(cwd, ".pi", "mcp.json")],
 			grantableReadDeny: [],
+			grantableWriteRoots: [],
+			protectedWrite: protectedWriteTargets(home, agentDir, env),
 			network: { mode: "off", allowHosts: [] },
 			capabilities: "reviewed",
 			hostExec: "never",
@@ -349,6 +441,8 @@ export function defaultListFor(listPath: string, options: DefaultProfileOptions)
 			return base.sandbox.writableRoots;
 		case "sandbox.network.allowHosts":
 			return base.sandbox.network.allowHosts;
+		case "sandbox.grantableWriteRoots":
+			return base.sandbox.grantableWriteRoots;
 		case "rules.deny":
 			return base.rules.deny;
 		case "rules.ask":
