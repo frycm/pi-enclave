@@ -17,7 +17,13 @@
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { CompiledProfile, ResourceLimits, SandboxBackend, ViolationKind } from "../../src/backend/types.ts";
+import type {
+	CompiledProfile,
+	Profile,
+	ResourceLimits,
+	SandboxBackend,
+	ViolationKind,
+} from "../../src/backend/types.ts";
 import { SandboxDenied } from "../../src/backend/types.ts";
 import { buildChildEnv } from "../../src/env/child-env.ts";
 import { createReadOperations } from "../../src/tools/file-ops.ts";
@@ -1170,6 +1176,20 @@ SCENARIOS.push(
 );
 
 /**
+ * The fixture's profile in read-allowlist mode (#23). The container suite
+ * mounts `fixture.outside` through `readableRoots` for its open-mode rows;
+ * here the only readable roots are the ones the row names.
+ */
+function allowlistProfile(
+	fixture: Fixture,
+	readAllow: readonly string[] = [],
+	readDeny: readonly string[] = [],
+): Profile {
+	const { readableRoots: _openModeMounts, ...profile } = fixture.profile;
+	return { ...profile, readDeny: [...profile.readDeny, ...readDeny], readMode: "allowlist", readAllow };
+}
+
+/**
  * Run one command under the fixture's profile in read-allowlist mode (#23),
  * with `readAllow` as the configured readable roots.
  */
@@ -1179,12 +1199,7 @@ async function runAllowlisted(
 	readAllow: readonly string[] = [],
 	extra: { cwd?: string; readDeny?: readonly string[] } = {},
 ): Promise<LimitedRun> {
-	const compiled = await backend.compile({
-		...fixture.profile,
-		readDeny: [...fixture.profile.readDeny, ...(extra.readDeny ?? [])],
-		readMode: "allowlist",
-		readAllow,
-	});
+	const compiled = await backend.compile(allowlistProfile(fixture, readAllow, extra.readDeny));
 	const chunks: Buffer[] = [];
 	const started = Date.now();
 	try {
@@ -1290,7 +1305,7 @@ SCENARIOS.push(
 		expectation: "denied",
 		falsifiableByNoop: true,
 		async run({ backend, fixture }) {
-			const compiled = await backend.compile({ ...fixture.profile, readMode: "allowlist", readAllow: [] });
+			const compiled = await backend.compile(allowlistProfile(fixture));
 			try {
 				const content = await backend.fs(compiled).readFile(fixture.outsideFile);
 				const read = content.toString("utf8").includes(OUTSIDE_FILE_CONTENT);
@@ -1331,7 +1346,7 @@ SCENARIOS.push(
 			const r = await runAllowlisted(ctx, ["cat ok.txt", ...checks.map(([command]) => command)].join("; "));
 			const expected = ["workspace content", ...checks.map(([, marker]) => marker)];
 			const missing = expected.filter((marker) => !r.output.includes(marker));
-			const compiled = await backend.compile({ ...fixture.profile, readMode: "allowlist", readAllow: [] });
+			const compiled = await backend.compile(allowlistProfile(fixture));
 			let helper = "";
 			try {
 				helper = (await backend.fs(compiled).readFile(join(fixture.workspace, "ok.txt"))).toString("utf8");
