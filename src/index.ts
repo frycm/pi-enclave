@@ -74,6 +74,7 @@ import {
 	protectLoadedCode,
 	resolveDependencyEntries,
 } from "./gate/code-roots.ts";
+import { createExecutionCheck, hasExecutionWrapper } from "./gate/execution.ts";
 import { decide, type GateDecision } from "./gate/gate.ts";
 import { describeTally, emptyTally, recordLayer } from "./gate/layers.ts";
 import { ActionLock } from "./gate/lock.ts";
@@ -305,6 +306,8 @@ export default function (pi: ExtensionAPI): void {
 	// from running its remaining calls, not just the next turn's.
 	const breakerBlocks = () => breaker.open || breaker.pendingOpen(currentTurn);
 	const lock = new ActionLock({ breakerOpen: breakerBlocks });
+	/** Whether pi re-checks every tool at the moment it runs (#29). */
+	const executionCheck = hasExecutionWrapper(pi);
 
 	/**
 	 * L4. Rebuilt from live state on every call rather than captured, because a
@@ -513,6 +516,7 @@ export default function (pi: ExtensionAPI): void {
 		...(sessionId !== undefined ? { sessionId } : {}),
 		...(tripwireLedger ? { tripwireLedger } : {}),
 		loadedCode: loadedCode.map((root) => root.path),
+		executionCheck,
 		breaker: { open: breaker.open, consecutive: breaker.state.consecutive, limit: effective?.breaker.consecutive ?? 3 },
 		layers: { ...layers },
 		// A configuration refusal and an ownership refusal are both "auto mode
@@ -907,8 +911,10 @@ export default function (pi: ExtensionAPI): void {
 					const found = protectedTargets();
 					return found.ok ? undefined : found.reason;
 				},
+				// With an execution check the third-party call is asked again when it
+				// runs, so it need not be kept out of the batch in advance (#29).
 				withholdBeforeExecution: () =>
-					shouldWithholdNonOwnedSibling(breaker, queuedOwnedCall, ownedTool)
+					!executionCheck && shouldWithholdNonOwnedSibling(breaker, queuedOwnedCall, ownedTool)
 						? "pi-enclave: this third-party tool is withheld because an earlier sandboxed call in the same batch could open the denial circuit breaker at runtime."
 						: undefined,
 				onDecision: (result) => {
@@ -981,6 +987,28 @@ export default function (pi: ExtensionAPI): void {
 		}
 		return { block: true, reason: decision.reason ?? "denied", ...(decision.terminate ? { terminate: true } : {}) };
 	});
+
+	/**
+	 * The execution-boundary check (#29), only on a pi that offers
+	 * `pi.wrapToolExecution` (the frycm/pi prototype). Upstream pi 1.5.2 does
+	 * not, and there the batch withholding above stays in force.
+	 */
+	if (executionCheck) {
+		pi.wrapToolExecution(
+			createExecutionCheck({
+				lock,
+				owned: OWNED_TOOLS,
+				refusal: () => {
+					if (configError) return configError;
+					if (!report.ok) return formatProbeReport(report);
+					if (ownershipError) return ownershipError;
+					if (!effective) return "pi-enclave: no policy is loaded yet, so nothing may run.";
+					return requiredAuditIssue();
+				},
+				passThrough: () => effective?.auto === false,
+			}),
+		);
+	}
 
 	// ---------------------------------------------------------------------
 	// Turn lifecycle: a batch is a turn, and a turn contributes one strike.
