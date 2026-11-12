@@ -1373,29 +1373,38 @@ ask, built-in, user-global or from the project file: `AGENTS.md`, `CLAUDE.md`, `
 Dockerfiles, compose files, `.pi` and `.agents` created since the session started, the
 `config` and `hooks` of a repository created since then, and an entry such as `infra/**`.
 A directory whose contents a pattern covers is denied whole, so nothing new can be created
-inside it either. The deny lasts for that one call, on bubblewrap, Seatbelt and the container
+inside it either, and everything it holds is checked as below; a symlink inside it is held
+through its target. The deny lasts for that one call, on bubblewrap, Seatbelt and the container
 backend alike (conformance rows W1 to W6, with a control row that the same commands still
 write ordinary files and a falsifiability run that shows the rows fail without the deny).
 A command a person approved, at the terminal or with `pi-enclave approve` while a queued
 session waits, was judged, and runs under the session profile as before.
 
-The call is **not run unjudged** when the walk cannot vouch for it: past 200,000 entries, or
-when a protected file has a second hard link (another name for it could still be written).
+The call is **not run unjudged** when the walk cannot vouch for it: past 200,000 entries
+(the walk and what the denied directories hold together), when a protected file, or a file
+inside a denied directory, has a second hard link (a read-only bind holds a name, not an
+inode, so the other name could still be written, wherever it is), or when a protected
+symlink points at a target in a writable root that does not exist yet (writing through it
+would create the target).
 The gate then asks a person, and if that happens between the gate and the call, the command
 is refused. The walk costs about 8 µs per entry; it skips the inside of every `.git`
 directory, and it runs twice per unjudged call (at the gate and just before the call).
 
 What remains:
 
-- **A protected name that does not exist yet** cannot be denied: bubblewrap and the
-  container backend can only bind over an existing path. Creating `AGENTS.md`, a new
+- **A protected name that does not exist yet** is not denied. Bubblewrap and the container
+  backend bind over an existing path, so denying it would mean creating a placeholder, as
+  the session profile does for `.pi` and `.agents`; for these names that would leave empty
+  `AGENTS.md`, `.envrc` and `Dockerfile` files in the repository. Creating `AGENTS.md`, a new
   `.github/workflows/x.yml` in a repository without that directory, a nested repository
   (`$g init sub`) or a new `.envrc` is still possible. The
   [tripwire](#files-loaded-outside-the-sandbox-19) watches every `rules.protectedPaths`
   entry for this, built-in and user-global (workflows, Dockerfiles and `infra/**` too,
   since #64), reports a new or changed one at the end of the turn, and in a turn that ran an
   unjudged command counts it against the turn like a denial, so repeated changes open the
-  breaker. That is detection after the write, not prevention.
+  breaker. That is detection after the write, not prevention. A protected directory too
+  large to fingerprint (16,384 entries, such as a user-global `vendor/**`) is reported as
+  unverifiable at every check, and counts only once, when it first appears.
 - **A protected symlink** is protected through its target when the target is inside a
   writable root; the link itself can be replaced by a regular file, which the tripwire
   reports.
@@ -1407,7 +1416,9 @@ What remains:
   `npm install` whose `prepare` script runs `husky` cannot write `.husky/`, a build that
   regenerates a Dockerfile cannot either, and `npm ci` cannot remove or replace an installed
   package that ships an `AGENTS.md` or a Dockerfile, since the patterns match at any depth,
-  `node_modules` included, as they do at L1. Approve such a command, or run it yourself.
+  `node_modules` included, as they do at L1. A pnpm workspace hard-links each package file
+  from its store, so one installed package that ships such a file makes every unjudged call
+  ask, or be refused on a headless run. Approve such a command, or run it yourself.
 - **Everything else in the writable roots** is the agent's to change, as it is for a readable
   command: source files, build scripts, `package.json` scripts that a later `npm test` run
   outside the sandbox would execute. A writable workspace is one whose build files the

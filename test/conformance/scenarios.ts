@@ -1559,6 +1559,44 @@ SCENARIOS.push(
 		},
 	},
 	{
+		id: "W7",
+		title: "an unjudged command cannot write through a symlink inside a protected directory (#64)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			plant(fixture, ".husky/pre-commit");
+			const target = plant(fixture, "scripts/hook.sh");
+			symlinkSync(join("..", "scripts", "hook.sh"), join(fixture.workspace, ".husky", "pre-push"));
+			const r = await sh(`p=.husky/pre-push; echo x > "$p"`, { protectWrites: protectedFor(fixture) });
+			return unchanged(target, r);
+		},
+	},
+	{
+		id: "W8",
+		title: "an unjudged command cannot move, remove or recreate a protected path or its directory (#64)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const files = [
+				plant(fixture, "AGENTS.md"),
+				plant(fixture, ".husky/pre-commit"),
+				plant(fixture, ".github/workflows/ci.yml"),
+			];
+			const r = await sh(
+				"mv AGENTS.md a.bak; echo x > AGENTS.md; rm -f .husky/pre-commit; mv .husky h2; " +
+					"mv .github gh2; rm -rf .github; mkdir -p .github/workflows && echo x > .github/workflows/ci.yml",
+				{ protectWrites: protectedFor(fixture) },
+			);
+			for (const file of files) {
+				const result = unchanged(file, r);
+				if (!result.ok) return { ok: false, detail: `${file.slice(fixture.workspace.length + 1)}: ${result.detail}` };
+			}
+			return { ok: true, detail: `all three unchanged at their paths (exit ${r.exitCode})` };
+		},
+	},
+	{
 		id: "W6",
 		title: "with its protected paths write-denied, an unjudged command still writes ordinary files (#64)",
 		surface: "bash",

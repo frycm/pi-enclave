@@ -125,9 +125,73 @@ describe("finding the protected paths of an unjudged command", () => {
 		const target = put("notes/instructions.txt");
 		symlinkSync(join("notes", "instructions.txt"), join(ws, "CLAUDE.md"));
 		expect(targets()).toEqual({ ok: true, paths: [target] });
-		// A dangling one has nothing to deny yet; creating its target is the tripwire's.
+		// A dangling one would create its target when written through.
 		symlinkSync("missing.md", join(ws, "AGENTS.md"));
-		expect(targets()).toEqual({ ok: true, paths: [target] });
+		const found = targets();
+		expect(found.ok).toBe(false);
+		expect(!found.ok && found.reason).toContain("does not exist yet, so writing through it would create it");
+	});
+
+	// Review of #71: a read-only bind holds a name, not an inode, so what a
+	// directory denied whole holds is looked at too.
+	describe("inside a directory denied whole", () => {
+		it("refuses a file with another name outside it, as `cp -al .github gh-backup` leaves", () => {
+			const ci = put(".github/workflows/ci.yml");
+			mkdirSync(join(ws, "gh-backup", "workflows"), { recursive: true });
+			linkSync(ci, join(ws, "gh-backup", "workflows", "ci.yml"));
+			const found = targets();
+			expect(found.ok).toBe(false);
+			expect(!found.ok && found.reason).toMatch(/ci\.yml is protected and has 2 hard links/);
+		});
+
+		it("holds a symlink through its target", () => {
+			const hook = put("scripts/hook.sh");
+			put(".husky/pre-commit");
+			symlinkSync(join("..", "scripts", "hook.sh"), join(ws, ".husky", "pre-push"));
+			expect(targets()).toEqual({ ok: true, paths: [join(ws, ".husky"), hook] });
+		});
+
+		it("refuses a symlink whose target does not exist yet", () => {
+			put(".husky/pre-commit");
+			symlinkSync(join("..", "scripts", "missing.sh"), join(ws, ".husky", "pre-push"));
+			const found = targets();
+			expect(found.ok).toBe(false);
+			expect(!found.ok && found.reason).toContain("would create it");
+		});
+
+		it("follows a symlink back into itself once", () => {
+			put(".husky/pre-commit");
+			symlinkSync(".", join(ws, ".husky", "loop"));
+			expect(targets()).toEqual({ ok: true, paths: [join(ws, ".husky")] });
+		});
+
+		it("counts what it holds against the bound", () => {
+			for (let i = 0; i < 20; i++) put(`.husky/h${i}`);
+			// The walk for names sees one entry; the look inside sees twenty.
+			const found = targets({ maxEntries: 10 });
+			expect(found.ok).toBe(false);
+			expect(!found.ok && found.reason).toContain("more than 10 entries");
+			expect(targets({ maxEntries: 25 }).ok).toBe(true);
+		});
+
+		it("shares one bound between the walk for names and the look inside", () => {
+			for (let i = 0; i < 8; i++) put(`src/f${i}`);
+			for (let i = 0; i < 5; i++) put(`.husky/h${i}`);
+			// Ten for the walk (src, its eight files, .husky) and five inside.
+			expect(targets({ maxEntries: 14 }).ok).toBe(false);
+			expect(targets({ maxEntries: 15 }).ok).toBe(true);
+		});
+
+		it("accepts a symlink to a missing target outside the writable roots", () => {
+			put(".husky/pre-commit");
+			const outside = join(realpathSync(tmpdir()), "enclave-missing-target", "hook.sh");
+			symlinkSync(outside, join(ws, ".husky", "pre-push"));
+			expect(targets()).toEqual({ ok: true, paths: [join(ws, ".husky")] });
+			// The same through a chain whose middle link is inside the workspace.
+			symlinkSync(outside, join(ws, "middle"));
+			symlinkSync(join("..", "middle"), join(ws, ".husky", "pre-merge"));
+			expect(targets()).toEqual({ ok: true, paths: [join(ws, ".husky")] });
+		});
 	});
 
 	it("does not walk Git metadata, but adds the config and hooks of a repository it finds", () => {
@@ -312,6 +376,23 @@ describe("the tripwire on every protected pattern", () => {
 		expect(hits.every((hit) => countsAgainstTurn(hit, true))).toBe(true);
 		expect(hits.some((hit) => countsAgainstTurn(hit, false))).toBe(false);
 	});
+
+	// Review of #71: a protected directory past the fingerprint budget is
+	// unverifiable at every check, changed or not, so it counts only once.
+	it("counts an unverifiable protected directory once, when it appears, and only when unjudged", () => {
+		const vendor = join(ws, "vendor");
+		mkdirSync(vendor);
+		for (let i = 0; i < 17_000; i++) writeFileSync(join(vendor, `f${i}`), "");
+		const tripwire = watch([...PATTERNS, "vendor/**"]);
+		for (let turn = 0; turn < 3; turn++) {
+			const hits = tripwire.check();
+			expect(hits).toEqual([expect.objectContaining({ path: vendor, change: "unverifiable", kind: "project" })]);
+			expect(hits.some((hit) => countsAgainstTurn(hit, true))).toBe(false);
+		}
+		const appeared = { path: vendor, change: "unverifiable", kind: "project", appeared: true } as const;
+		expect(countsAgainstTurn(appeared, true)).toBe(true);
+		expect(countsAgainstTurn(appeared, false)).toBe(false);
+	}, 30_000);
 
 	it("does not report an ordinary file, or Git metadata as a project file", () => {
 		// Even when an entry covers Git's own metadata: that is the Git surface's.

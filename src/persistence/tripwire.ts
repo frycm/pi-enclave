@@ -43,15 +43,17 @@ export interface TripwireHit {
  * they count only when `unjudged`: the turn ran a command no rule could read
  * that nobody asked about (`sandboxed-uncertain`, or a reviewer allow of an
  * unparsed command, #18), so no protected-path rule saw what it wrote. An
- * entry too large to fingerprint is reported at every
- * check, so it counts only when it first appears; otherwise padding a
+ * entry too large to fingerprint, a protected directory included (#64), is
+ * reported at every check, so it counts only when it first appears; otherwise padding a
  * planted `.pi` with files would avoid the strike a small one gets, and an
  * existing one would trip the breaker by itself. A surface that cannot be
  * read at all (no kind) always counts.
  */
 export function countsAgainstTurn(hit: TripwireHit, unjudged = false): boolean {
+	if (hit.change === "unverifiable" && hit.kind !== undefined) {
+		return hit.appeared === true && (hit.kind !== "project" || unjudged);
+	}
 	if (hit.kind === "project") return unjudged;
-	if (hit.change === "unverifiable" && hit.kind !== undefined) return hit.appeared === true;
 	return true;
 }
 

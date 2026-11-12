@@ -10,26 +10,28 @@
  *
  * What it cannot do, and the README says so:
  *
- * - **A name that does not exist yet** cannot be denied: bubblewrap binds
- *   over an existing path, and the container backend mounts one. Creating
- *   `AGENTS.md` or `.github/workflows/x.yml` is left to the tripwire, which
- *   watches every protected pattern and counts a hit in an unjudged turn.
+ * - **A name that does not exist yet** is not denied: bubblewrap and the
+ *   container backend bind over an existing path, so denying it would mean
+ *   creating a placeholder, as the session profile does for `.pi`, and that
+ *   would leave empty `AGENTS.md`, `.envrc` and `Dockerfile` files in the
+ *   repository. Creating one is left to the tripwire, which watches every
+ *   protected pattern and counts a hit in an unjudged turn.
  * - **Git metadata** is not walked, which `.git/objects` would make too
  *   expensive. The session profile write-denies the config and hooks of every
  *   repository it found when it compiled; for one created since, its
  *   `.git/config` and `.git/hooks` are added here when a pattern names them.
  *   A gitfile (a linked worktree or submodule checkout) is the tripwire's.
  * - **A symlink** is protected through its target when the target is inside
- *   a writable root; the link itself can still be replaced, which the
- *   tripwire reports.
+ *   a writable root; a link matched by its own name can still be replaced,
+ *   which the tripwire reports. One inside a denied directory cannot.
  *
  * A file with more than one hard link cannot be protected, since another name
- * for it may be writable, and a walk past its bound cannot vouch for what it
- * did not see. Either way the call is not run unjudged: the gate asks a
+ * for it may be writable; a symlink to a target that does not exist yet would
+ * create it; and a walk past its bound cannot vouch for what it did not see. Either way the call is not run unjudged: the gate asks a
  * person instead, and at execution time the command is refused.
  */
-import { existsSync, lstatSync } from "node:fs";
-import { basename, join } from "node:path";
+import { existsSync, lstatSync, readdirSync, readlinkSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { canonical, isUnder } from "../backend/paths.ts";
 import { PersistenceScanError, scanRoots } from "../persistence/scan.ts";
 import { globToRegExp, pathCandidates } from "../policy/paths.ts";
@@ -94,16 +96,51 @@ export function protectedEntryMatcher(
 	return (path, kind) => (kind === "dir" ? matches(join(path, CHILD)) : matches(path));
 }
 
-/** Every existing path a protected pattern names, under the writable roots. */
+/**
+ * Where a symlink leads, following a chain of links, even when the last
+ * target does not exist (`canonical` stops at a dangling link).
+ */
+function linkTarget(path: string): string {
+	let current = path;
+	for (let hops = 0; hops < 40; hops++) {
+		const next = canonical(resolve(dirname(current), readlinkSync(current)));
+		let stats: ReturnType<typeof lstatSync> | undefined;
+		try {
+			stats = lstatSync(next);
+		} catch {
+			return next;
+		}
+		if (!stats.isSymbolicLink()) return next;
+		current = next;
+	}
+	throw new Unprotectable(`${path} is a chain of more than 40 symlinks`);
+}
+
+/** Why the walk cannot vouch for the protected paths. */
+class Unprotectable extends Error {}
+
+/**
+ * Every existing path a protected pattern names, under the writable roots.
+ *
+ * A read-only bind holds a name, not an inode, so everything a denied path
+ * holds is looked at too (as `validateHookTree` does for the session's Git
+ * hooks): a file with another name refuses, and a symlink is held through its
+ * target. A symlink whose target does not exist yet inside a writable root
+ * refuses as well, since writing through it would create that target.
+ */
 export function protectedWriteTargets(options: ProtectedWritesOptions): ProtectedWrites {
 	if (options.patterns.length === 0) return { ok: true, paths: [] };
 	const roots = options.writableRoots.map(canonical);
 	const denied = (options.writeDeny ?? []).map(canonical);
 	const matches = protectedEntryMatcher(options.patterns, options.workspace);
+	const limit = options.maxEntries ?? PROTECTED_WALK_LIMIT;
+	// One bound for the whole call: the walk for names and the look inside.
+	let visited = 0;
 	let found: ReturnType<typeof scanRoots>;
 	try {
 		found = scanRoots(options.writableRoots, {
 			match: (name, kind, path) => {
+				visited++;
 				// Git's own metadata: protected by the session profile, and the
 				// tripwire's when new. Matched only so it is not descended into.
 				if (name === ".git") return true;
@@ -111,52 +148,88 @@ export function protectedWriteTargets(options: ProtectedWritesOptions): Protecte
 				// one matched by name only (`**/.git`) is walked instead.
 				return matches(path, kind);
 			},
-			maxEntries: options.maxEntries ?? PROTECTED_WALK_LIMIT,
+			maxEntries: limit,
 		});
 	} catch (error) {
 		if (error instanceof PersistenceScanError) return { ok: false, reason: error.message };
 		throw error;
 	}
 
-	const paths = new Set<string>();
-	const candidates: typeof found = [];
-	for (const entry of found) {
-		if (basename(entry.path) !== ".git") {
-			candidates.push(entry);
-			continue;
-		}
-		if (entry.kind !== "dir") continue;
-		for (const name of ["config", "hooks"]) {
-			const inner = join(entry.path, name);
-			if (existsSync(inner) && matches(inner, name === "hooks" ? "dir" : "file")) {
-				candidates.push({ path: inner, kind: name === "hooks" ? "dir" : "file" });
-			}
-		}
-	}
-	for (const entry of candidates) {
-		if (entry.kind === "other") continue;
-		// A symlink resolves to its target. A dangling one resolves to itself,
-		// is neither a file nor a directory below, and is the tripwire's.
-		const resolved = canonical(entry.path);
-		// Outside every writable root the sandbox cannot write it anyway.
-		if (!roots.some((root) => isUnder(resolved, root))) continue;
-		if (denied.some((deny) => isUnder(resolved, deny))) continue;
+	const held = new Set<string>();
+	const seen = new Set<string>();
+	const writable = (path: string) =>
+		roots.some((root) => isUnder(path, root)) && !denied.some((deny) => isUnder(path, deny));
+
+	const hold = (path: string): void => {
 		let stats: ReturnType<typeof lstatSync>;
 		try {
-			stats = lstatSync(resolved);
+			stats = lstatSync(path);
 		} catch {
-			continue;
+			// Removed since the walk saw it: nothing left to hold.
+			return;
 		}
-		if (stats.isFile() && stats.nlink > 1) {
-			return {
-				ok: false,
-				reason: `${entry.path} is protected and has ${stats.nlink} hard links, so another name for it could still be written`,
-			};
+		if (stats.isSymbolicLink()) {
+			const target = linkTarget(path);
+			// Outside every writable root, or already denied: not writable anyway.
+			if (!writable(target)) return;
+			if (!existsSync(target)) {
+				throw new Unprotectable(
+					`${path} is a protected symlink to ${target}, which does not exist yet, so writing through it would create it`,
+				);
+			}
+			hold(target);
+			return;
 		}
-		if (!stats.isFile() && !stats.isDirectory()) continue;
-		paths.add(resolved);
+		const resolved = canonical(path);
+		if (!writable(resolved)) return;
+		if (stats.isFile()) {
+			if (stats.nlink > 1) {
+				throw new Unprotectable(
+					`${path} is protected and has ${stats.nlink} hard links, so another name for it could still be written`,
+				);
+			}
+			held.add(resolved);
+			return;
+		}
+		if (!stats.isDirectory() || seen.has(resolved)) return;
+		seen.add(resolved);
+		held.add(resolved);
+		let entries: string[];
+		try {
+			entries = readdirSync(resolved);
+		} catch (error) {
+			throw new Unprotectable(`cannot inspect ${resolved}: ${(error as Error).message}`);
+		}
+		for (const name of entries) {
+			visited++;
+			if (visited > limit) {
+				throw new Unprotectable(
+					`the writable roots and their protected paths hold more than ${limit} entries, too many to check; ` +
+						"configure a narrower sandbox.writableRoots",
+				);
+			}
+			hold(join(resolved, name));
+		}
+	};
+
+	try {
+		for (const entry of found) {
+			if (entry.kind === "other") continue;
+			if (basename(entry.path) !== ".git") {
+				hold(entry.path);
+				continue;
+			}
+			if (entry.kind !== "dir") continue;
+			for (const name of ["config", "hooks"]) {
+				const inner = join(entry.path, name);
+				if (existsSync(inner) && matches(inner, name === "hooks" ? "dir" : "file")) hold(inner);
+			}
+		}
+	} catch (error) {
+		if (error instanceof Unprotectable) return { ok: false, reason: error.message };
+		throw error;
 	}
 	// A path inside another one adds nothing.
-	const sorted = [...paths].sort((a, b) => a.length - b.length);
+	const sorted = [...held].sort((a, b) => a.length - b.length);
 	return { ok: true, paths: sorted.filter((path, i) => !sorted.slice(0, i).some((outer) => isUnder(path, outer))) };
 }
