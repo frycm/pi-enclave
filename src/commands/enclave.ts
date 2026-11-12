@@ -116,6 +116,20 @@ export function renderStatusLine(state: EnclaveState): string {
 	return `enclave: ${parts.join(" · ")}`;
 }
 
+/**
+ * The read boundary in one line (#23). Open mode is a deny-list and says so,
+ * because "reads are open" is the property a reader most needs to know.
+ */
+export function describeReadMode(profile: Profile, backendName: string): string {
+	if (backendName === "docker" || backendName === "podman") {
+		return `allowlist (container: only the mounted roots${profile.readableRoots?.length ? ` and ${profile.readableRoots.length} readable root(s)` : ""})`;
+	}
+	if (profile.readMode === "allowlist") {
+		return `allowlist: ${profile.readAllow?.length ?? 0} root(s) readable, everything else denied`;
+	}
+	return 'OPEN -- everything is readable except read-deny (sandbox.readMode "allowlist" to narrow)';
+}
+
 export function renderStatus(state: EnclaveState): string {
 	const lines = [formatProbeReport(state.report), ""];
 
@@ -133,6 +147,7 @@ export function renderStatus(state: EnclaveState): string {
 	lines.push(
 		`profile:    ${profile.mode}, network ${profile.network}, pty ${profile.allowPty ? "on" : "off"}`,
 		`writable:   ${profile.writableRoots.join(", ") || "(nothing)"}`,
+		`reads:      ${describeReadMode(profile, state.backendName)}`,
 		`read-deny:  ${profile.readDeny.length} path(s)`,
 		`limits:     ${describeLimits(profile.limits, state.backendName, process.platform, state.processLimit)}`,
 		`violations: ${state.violations.length} this session`,

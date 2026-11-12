@@ -78,8 +78,18 @@ export interface SandboxSettings {
 	mode: "workspace-write";
 	/** Absolute paths that may be written. Everything else is read-only. */
 	writableRoots: string[];
-	/** Absolute paths that may not be read, even though reads are otherwise open. */
+	/** Absolute paths that may not be read, in either read mode. */
 	readDeny: string[];
+	/**
+	 * `open`: everything is readable except `readDeny`. `allowlist`: only the
+	 * system runtime, the writable roots, the toolchain on PATH, pi-enclave's
+	 * own code and `readableRoots` are readable, and `readDeny` still applies
+	 * inside them (#23). Any source may tighten to `allowlist`; only the
+	 * user-global file may choose `open`.
+	 */
+	readMode: ReadMode;
+	/** Extra roots readable in `allowlist` mode. User-global only. */
+	readableRoots: string[];
 	/** User-global read-deny entries that a reviewed action may lift once. */
 	grantableReadDeny: string[];
 	/**
@@ -232,6 +242,8 @@ export interface AttendedSettings {
 	mode: AttendedMode;
 	confirmTimeoutMs: number;
 }
+
+export type ReadMode = "open" | "allowlist";
 
 export interface AuditSettings {
 	retentionDays: number;

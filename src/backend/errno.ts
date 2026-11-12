@@ -21,6 +21,7 @@
  */
 
 import { isUnderAny } from "./paths.ts";
+import { outsideReadAllowlist } from "./read-allowlist.ts";
 import type { BackendName, Profile, Violation, ViolationKind } from "./types.ts";
 
 /** Operations the helper performs, grouped by the kind of access they need. */
@@ -117,16 +118,17 @@ export function classifyErrno(input: ClassifyInput): Violation | null {
 			// the sandbox's doing.
 			return isUnderAny(path, profile.writableRoots) ? null : { ...base, kind };
 		}
-		// Reads are a deny-list: the sandbox refuses nothing outside readDeny, so
-		// a refusal there is the operating system's own.
-		return isUnderAny(path, profile.readDeny) ? { ...base, kind } : null;
+		// In open mode reads are a deny-list: the sandbox refuses nothing outside
+		// readDeny, so a refusal there is the operating system's own. In
+		// allowlist mode (#23) a refusal outside the allowed roots is ours too.
+		return isUnderAny(path, profile.readDeny) || outsideReadAllowlist(path, profile) ? { ...base, kind } : null;
 	}
 
 	// The ambiguous case. On bwrap a denied read region is a tmpfs mounted over
 	// the real directory, so its contents are *absent* rather than forbidden: the
 	// errno is indistinguishable from a file that was never there. Resolve it
 	// against the profile rather than guessing.
-	if (code === "ENOENT" && isUnderAny(path, profile.readDeny)) {
+	if (code === "ENOENT" && (isUnderAny(path, profile.readDeny) || outsideReadAllowlist(path, profile))) {
 		return { ...base, kind };
 	}
 

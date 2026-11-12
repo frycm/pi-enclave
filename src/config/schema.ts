@@ -54,6 +54,7 @@ const PROJECT_FORBIDDEN: Record<string, string> = {
 	"sandbox.grantableReadDeny": "grantableReadDeny authorizes one-shot read widening and is therefore user-global only.",
 	"sandbox.grantableWriteRoots":
 		"grantableWriteRoots authorizes one-shot write widening outside the workspace and is therefore user-global only.",
+	"sandbox.readableRoots": "readableRoots widens what the sandbox can read and is therefore user-global only.",
 	"rules.skipReview": "skipReview is an allow verdict: it bypasses review entirely. User-global only.",
 	"review.environment": "prose rulebook entries are user-global only; a repository must not reach the reviewer prompt.",
 	"review.hard_deny": "prose rulebook entries are user-global only; a repository must not reach the reviewer prompt.",
@@ -76,6 +77,8 @@ const SANDBOX_KEYS = [
 	"readDeny",
 	"grantableReadDeny",
 	"grantableWriteRoots",
+	"readMode",
+	"readableRoots",
 	"network",
 	"capabilities",
 	"hostExec",
@@ -209,7 +212,7 @@ class ParseContext {
 		private readonly options: DefaultProfileOptions,
 	) {}
 
-	private error(key: string, message: string) {
+	error(key: string, message: string) {
 		this.errors.push({ key: key || "<root>", message });
 	}
 
@@ -422,6 +425,14 @@ class ParseContext {
 				"sandbox.grantableWriteRoots",
 			);
 			if (roots) out.grantableWriteRoots = roots;
+		}
+		if ("readMode" in body) {
+			if (body.readMode === "open" || body.readMode === "allowlist") out.readMode = body.readMode;
+			else this.error(join(prefix, "readMode"), 'must be "open" or "allowlist"');
+		}
+		if ("readableRoots" in body) {
+			const roots = this.list(join(prefix, "readableRoots"), body.readableRoots, "sandbox.readableRoots");
+			if (roots) out.readableRoots = roots;
 		}
 		if ("network" in body) {
 			const network = this.object(join(prefix, "network"), body.network);

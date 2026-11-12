@@ -137,6 +137,12 @@ export function narrowerOrEqual(a: EffectiveProfile, b: EffectiveProfile): Order
 		b.sandbox.grantableWriteRoots ?? [],
 		fail,
 	);
+	// allowlist ⊑ open (#23): anyone may stop reads being open, nobody below
+	// user-global may open them again or add readable roots.
+	if ((a.sandbox.readMode ?? "open") === "open" && (b.sandbox.readMode ?? "open") === "allowlist") {
+		fail("sandbox.readMode", 'cannot change the read mode from "allowlist" to "open"');
+	}
+	subsetOf("sandbox.readableRoots", a.sandbox.readableRoots ?? [], b.sandbox.readableRoots ?? [], fail);
 
 	if (a.sandbox.network.mode !== b.sandbox.network.mode) {
 		fail("sandbox.network.mode", `cannot change the network mode from "${b.sandbox.network.mode}"`);
@@ -370,6 +376,12 @@ export function applyPatch(base: EffectiveProfile, patch: ProfilePatch, options:
 			const expanded = sandbox.grantableWriteRoots.map(expand);
 			track("sandbox.grantableWriteRoots", expanded);
 			next.sandbox.grantableWriteRoots = mergeList("replace", next.sandbox.grantableWriteRoots ?? [], expanded);
+		}
+		if (sandbox.readMode !== undefined) next.sandbox.readMode = sandbox.readMode;
+		if (sandbox.readableRoots) {
+			const expanded = sandbox.readableRoots.map(expand);
+			track("sandbox.readableRoots", expanded);
+			next.sandbox.readableRoots = mergeList("replace", next.sandbox.readableRoots ?? [], expanded);
 		}
 		if (sandbox.network) {
 			if (sandbox.network.mode !== undefined) next.sandbox.network.mode = sandbox.network.mode;
@@ -674,6 +686,28 @@ export function fold(documents: readonly ConfigDocument[], options: FoldOptions)
 		});
 	}
 
+	// A readable root of "/" is open mode under another name, and would make
+	// the status line's "allowlist" a claim that is not true.
+	for (const root of current.sandbox.readableRoots ?? []) {
+		if (canonical(root) === "/") {
+			errors.push({
+				source: "user_global",
+				field: "sandbox.readableRoots",
+				message: '"/" cannot be a readable root; use sandbox.readMode "open" instead.',
+			});
+			continue;
+		}
+		// The sandbox would let the readable root lift the deny it sits in.
+		const deny = current.sandbox.readDeny.find((entry) => isUnder(canonical(root), canonical(entry)));
+		if (deny) {
+			errors.push({
+				source: "user_global",
+				field: "sandbox.readableRoots",
+				message: `"${root}" is on or below read-deny path ${deny}; a readable root cannot expose a denied path.`,
+			});
+		}
+	}
+
 	// The same kind of invariant for the per-user scratch base. Configuration
 	// written for earlier versions listed "$TMPDIR" as a writable root, and
 	// `$TMPDIR` now expands to this base, so an old file would otherwise open
@@ -773,6 +807,7 @@ function recordBuiltinProvenance(provenance: Provenance, profile: EffectiveProfi
 	recordProvenance(provenance, "sandbox.readDeny", profile.sandbox.readDeny, "builtin");
 	recordProvenance(provenance, "sandbox.grantableReadDeny", profile.sandbox.grantableReadDeny, "builtin");
 	recordProvenance(provenance, "sandbox.grantableWriteRoots", profile.sandbox.grantableWriteRoots, "builtin");
+	recordProvenance(provenance, "sandbox.readableRoots", profile.sandbox.readableRoots, "builtin");
 	recordProvenance(provenance, "sandbox.network.allowHosts", profile.sandbox.network.allowHosts, "builtin");
 	recordProvenance(provenance, "sandbox.env.passthrough", profile.sandbox.env.passthrough, "builtin");
 	recordProvenance(provenance, "sandbox.env.envDeny", profile.sandbox.env.envDeny, "builtin");

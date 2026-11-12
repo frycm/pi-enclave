@@ -14,6 +14,7 @@
  * every `denied` scenario reports `ok: false` against a backend that does not
  * sandbox at all.
  */
+import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { CompiledProfile, ResourceLimits, SandboxBackend, ViolationKind } from "../../src/backend/types.ts";
@@ -1167,6 +1168,215 @@ SCENARIOS.push(
 		},
 	},
 );
+
+/**
+ * Run one command under the fixture's profile in read-allowlist mode (#23),
+ * with `readAllow` as the configured readable roots.
+ */
+async function runAllowlisted(
+	{ backend, fixture }: ScenarioContext,
+	command: string,
+	readAllow: readonly string[] = [],
+	extra: { cwd?: string; readDeny?: readonly string[] } = {},
+): Promise<LimitedRun> {
+	const compiled = await backend.compile({
+		...fixture.profile,
+		readDeny: [...fixture.profile.readDeny, ...(extra.readDeny ?? [])],
+		readMode: "allowlist",
+		readAllow,
+	});
+	const chunks: Buffer[] = [];
+	const started = Date.now();
+	try {
+		const result = await backend.run(compiled, {
+			command,
+			cwd: extra.cwd ?? fixture.workspace,
+			env: scenarioEnv(fixture),
+			commandId: `allowlist-${Math.random().toString(36).slice(2)}`,
+			timeout: 30,
+			onData: (chunk) => chunks.push(chunk),
+		});
+		return { exitCode: result.exitCode, output: Buffer.concat(chunks).toString("utf8"), ms: Date.now() - started };
+	} catch (error) {
+		return {
+			exitCode: null,
+			output: Buffer.concat(chunks).toString("utf8"),
+			error: (error as Error).message,
+			ms: Date.now() - started,
+		};
+	}
+}
+
+const containerBackend = (ctx: ScenarioContext) => ctx.backend.name === "docker" || ctx.backend.name === "podman";
+
+SCENARIOS.push(
+	{
+		id: "R1",
+		title: "allowlist reads: a file outside every readable root cannot be read",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run(ctx) {
+			// A sibling directory the user can read, standing in for another
+			// project's .env or a database dump: nothing lists it in readDeny.
+			const r = await runAllowlisted(ctx, `cat ${JSON.stringify(ctx.fixture.outsideFile)}`);
+			const read = r.output.includes(OUTSIDE_FILE_CONTENT);
+			return { ok: !read, detail: read ? "READ a file outside the allowlist" : "outside file unreadable" };
+		},
+	},
+	{
+		id: "R2",
+		title: "allowlist reads: a directory outside every readable root cannot be listed",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run(ctx) {
+			const r = await runAllowlisted(ctx, `ls -a ${JSON.stringify(ctx.fixture.outside)}`);
+			const listed = r.output.includes("target.txt");
+			return { ok: !listed, detail: listed ? "LISTED a directory outside the allowlist" : "outside directory hidden" };
+		},
+	},
+	{
+		id: "R3",
+		title: "allowlist reads: the deny list still applies inside a readable root",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run(ctx) {
+			// A readable root holding a denied directory, as ~/.cargo holds its
+			// credentials: the root is readable and the deny inside it is not.
+			const readable = join(ctx.fixture.outside, "readable");
+			const secret = join(readable, "secret");
+			mkdirSync(secret, { recursive: true });
+			writeFileSync(join(readable, "visible.txt"), "visible\n");
+			writeFileSync(join(secret, "key"), `${SECRET_FILE_CONTENT}\n`);
+			const r = await runAllowlisted(ctx, `cat ${JSON.stringify(join(secret, "key"))}; cat visible.txt`, [readable], {
+				cwd: readable,
+				readDeny: [secret],
+			});
+			const leakedKey = leaked(r.output);
+			const rootReadable = r.output.includes("visible");
+			return {
+				ok: !leakedKey && rootReadable,
+				detail: leakedKey
+					? "SECRET LEAKED from a denied path inside a readable root"
+					: rootReadable
+						? "readable root readable, denied path inside it unreadable"
+						: `the readable root itself was not readable: ${r.error ?? r.output.slice(0, 160)}`,
+			};
+		},
+	},
+	{
+		id: "R6",
+		title: "allowlist reads: a readable root cannot lift the deny it sits in",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run(ctx) {
+			// The configuration refuses this; the backend must not honour it either.
+			const key = join(ctx.fixture.deniedHome, ".ssh", "id_ed25519");
+			const r = await runAllowlisted(ctx, `cat ${JSON.stringify(key)}`, [
+				ctx.fixture.deniedHome,
+				join(ctx.fixture.deniedHome, ".ssh"),
+			]);
+			const leakedKey = leaked(r.output);
+			return { ok: !leakedKey, detail: leakedKey ? "SECRET LEAKED: a readable root lifted a deny" : "deny kept" };
+		},
+	},
+	{
+		id: "R4",
+		title: "allowlist reads: the helper cannot read outside the readable roots",
+		surface: "fs",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ backend, fixture }) {
+			const compiled = await backend.compile({ ...fixture.profile, readMode: "allowlist", readAllow: [] });
+			try {
+				const content = await backend.fs(compiled).readFile(fixture.outsideFile);
+				const read = content.toString("utf8").includes(OUTSIDE_FILE_CONTENT);
+				return { ok: !read, detail: read ? "READ outside the allowlist through the helper" : "read returned nothing" };
+			} catch (error) {
+				const denied = error instanceof SandboxDenied && error.violation.kind === "read";
+				return {
+					ok: denied,
+					detail: denied
+						? "denied and classified as a read"
+						: `NOT CLASSIFIED as a read denial: ${String(error).slice(0, 90)}`,
+				};
+			}
+		},
+	},
+	{
+		id: "R5",
+		title: "allowlist reads: the shell, node, git and the helper still work",
+		surface: "fs",
+		expectation: "allowed",
+		falsifiableByNoop: false,
+		falsifiabilityNote: "An allowed row is meant to pass with or without a sandbox.",
+		async run(ctx) {
+			const { backend, fixture } = ctx;
+			// The container image carries its own userland; only the shell and the
+			// workspace are asserted there.
+			// Each tool is asserted only where the host has it, and then it must
+			// work: a fallback echo would hide exactly the breakage this row is for.
+			const onHost = (tool: string) => spawnSync("sh", ["-c", `command -v ${tool}`]).status === 0;
+			const checks: [string, string][] = containerBackend(ctx)
+				? [["ls /usr/bin >/dev/null && echo shell-ok", "shell-ok"]]
+				: [
+						[`${JSON.stringify(process.execPath)} -e 'console.log("node-ok")'`, "node-ok"],
+						["git status --porcelain >/dev/null && echo git-ok", "git-ok"],
+						...(onHost("python3") ? ([["python3 -c 'print(\"python-ok\")'", "python-ok"]] as [string, string][]) : []),
+						...(onHost("rg") ? ([["rg --version >/dev/null && echo rg-ok", "rg-ok"]] as [string, string][]) : []),
+					];
+			const r = await runAllowlisted(ctx, ["cat ok.txt", ...checks.map(([command]) => command)].join("; "));
+			const expected = ["workspace content", ...checks.map(([, marker]) => marker)];
+			const missing = expected.filter((marker) => !r.output.includes(marker));
+			const compiled = await backend.compile({ ...fixture.profile, readMode: "allowlist", readAllow: [] });
+			let helper = "";
+			try {
+				helper = (await backend.fs(compiled).readFile(join(fixture.workspace, "ok.txt"))).toString("utf8");
+			} catch (error) {
+				helper = `helper failed: ${(error as Error).message}`;
+			}
+			const helperOk = helper.includes("workspace content");
+			return {
+				ok: missing.length === 0 && helperOk,
+				detail:
+					missing.length === 0 && helperOk
+						? "shell, toolchain and helper work under the allowlist"
+						: `BROKE ordinary work: missing ${missing.join(", ") || "none"}; ${helperOk ? "helper ok" : helper.slice(0, 120)}; ${r.error ?? r.output.slice(0, 200)}`,
+			};
+		},
+	},
+);
+
+SCENARIOS.push({
+	id: "C20",
+	title: "another process's environment cannot be read through /proc",
+	surface: "bash",
+	expectation: "denied",
+	// macOS has no /proc; the row is Linux (and container) only.
+	falsifiableByNoop: process.platform === "linux",
+	falsifiabilityNote: "macOS has no /proc, so there is nothing to read and nothing for the control to leak.",
+	async run({ sh }) {
+		if (process.platform !== "linux") return { ok: true, detail: "no /proc on this platform" };
+		// A process of the same user holding a secret in its environment, as a
+		// shell with an exported token or a service started by hand would (#23).
+		const marker = "PROC-ENVIRON-CONFORMANCE-LEAK";
+		const holder = spawn("sleep", ["30"], { env: { ...process.env, ENCLAVE_PROC_SECRET: marker }, stdio: "ignore" });
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			const r = await sh(`grep -l -a ${marker} /proc/[0-9]*/environ 2>/dev/null; echo checked`);
+			const read = r.output.includes("/environ");
+			return {
+				ok: !read && r.output.includes("checked"),
+				detail: read ? `READ another process's environment: ${r.output.trim().slice(0, 120)}` : "not visible",
+			};
+		} finally {
+			holder.kill();
+		}
+	},
+});
 
 /** A valid 1x1 PNG, for the image-detection row. */
 const PNG_1X1 = Buffer.from(

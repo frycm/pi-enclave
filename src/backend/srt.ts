@@ -43,6 +43,7 @@ import {
 	timeoutNote,
 } from "./limits.ts";
 import { canonical, isUnder } from "./paths.ts";
+import { allowlistReadRoots, withReadCapability } from "./read-allowlist.ts";
 import { SessionScratch } from "./scratch.ts";
 import { checkUnixSocketBlocking } from "./self-test.ts";
 import {
@@ -342,6 +343,8 @@ const VIOLATION_SETTLE_STABLE_POLLS = 2;
 
 interface SrtFilesystemConfig {
 	denyRead: string[];
+	/** Allow-within-deny; used with a `/` deny for allowlist reads (#23). */
+	allowRead?: string[];
 	allowWrite: string[];
 	denyWrite: string[];
 }
@@ -403,7 +406,14 @@ export function toSrtConfig(
 		// argv. Deny the inherited value there as well as in buildChildEnv.
 		credentials: { envVars: [{ name: "JAVA_TOOL_OPTIONS", mode: "deny" }] },
 		filesystem: {
-			denyRead: withResolvedTargets(profile.readDeny, platform),
+			// Allowlist mode (#23) denies the whole filesystem and lets the
+			// compiled roots back in; the deny list still applies inside them,
+			// being deeper than any of them.
+			denyRead:
+				profile.readMode === "allowlist"
+					? ["/", ...withResolvedTargets(profile.readDeny, platform)]
+					: withResolvedTargets(profile.readDeny, platform),
+			...(profile.readMode === "allowlist" ? { allowRead: [...(profile.readAllow ?? [])] } : {}),
 			allowWrite,
 			denyWrite,
 		},
@@ -485,12 +495,12 @@ export class SrtBackend implements SandboxBackend {
 		// directory of ours, instead of letting the first `mktemp` fail (#20).
 		this.scratch ??= SessionScratch.create();
 		this.pinSrtTmpDir();
-		const profile = effectiveProfile(requested, process.platform, process.env, this.scratch.path);
+		const effective = effectiveProfile(requested, process.platform, process.env, this.scratch.path);
 		const pathSafety = hostRuntimeSafety(
-			profile.writableRoots,
+			effective.writableRoots,
 			process.env.PATH ?? "",
 			process.platform,
-			profile.writeDeny ?? [],
+			effective.writeDeny ?? [],
 		);
 		if (!pathSafety.ok) {
 			throw new Error(`pi-enclave: refusing unsafe host executable lookup. ${pathSafety.detail}`);
@@ -513,7 +523,7 @@ export class SrtBackend implements SandboxBackend {
 		// write would let it replace the filter it runs under. Checked against
 		// the compiled roots rather than in the probe, which only knows the cwd.
 		if (seccompHelper !== null) {
-			const helperSafety = hostExecutableSafety(profile.writableRoots, [seccompHelper], profile.writeDeny ?? []);
+			const helperSafety = hostExecutableSafety(effective.writableRoots, [seccompHelper], effective.writeDeny ?? []);
 			if (!helperSafety.ok) {
 				throw new Error(`pi-enclave: refusing an agent-writable seccomp helper. ${helperSafety.detail}`);
 			}
@@ -525,6 +535,23 @@ export class SrtBackend implements SandboxBackend {
 			...(socat ? { socat } : {}),
 			...(seccompHelper ? { seccompHelper } : {}),
 		};
+		// In allowlist mode the compiled profile carries the whole effective
+		// allowlist, as it carries the effective writable roots: what status
+		// shows, what the errno classifier judges against and what SRT gets.
+		const profile: Profile =
+			effective.readMode === "allowlist"
+				? {
+						...effective,
+						readAllow: allowlistReadRoots({
+							profile: effective,
+							platform: process.platform,
+							path: process.env.PATH ?? "",
+							execPath: process.execPath,
+							helperPath: HELPER_PATH,
+							hostTools: [rg ?? undefined, fd ?? undefined, seccompHelper ?? undefined],
+						}),
+					}
+				: effective;
 		materializeWriteDenyAnchors(profile);
 		const config = toSrtConfig(profile, this.weakened, process.platform, this.hostTools);
 
@@ -673,10 +700,7 @@ export class SrtBackend implements SandboxBackend {
 					this.scratch?.path,
 				)
 			: readTarget
-				? {
-						...compiled.profile,
-						readDeny: compiled.profile.readDeny.filter((entry) => canonical(entry) !== readTarget),
-					}
+				? withReadCapability(compiled.profile, readTarget)
 				: undefined;
 		const customConfig = customProfile
 			? toSrtConfig(customProfile, this.weakened, process.platform, this.hostTools)
@@ -972,10 +996,7 @@ export class SrtBackend implements SandboxBackend {
 		this.assertCurrent(compiled);
 		await this.refreshHelperIfStale(compiled);
 		const target = validateReadCapability(compiled.profile, cwd, value);
-		const customProfile: Profile = {
-			...compiled.profile,
-			readDeny: compiled.profile.readDeny.filter((entry) => canonical(entry) !== target),
-		};
+		const customProfile: Profile = withReadCapability(compiled.profile, target);
 		const customConfig = toSrtConfig(customProfile, this.weakened, process.platform, this.hostTools);
 		const { argv } = await SandboxManager.wrapWithSandboxArgv(
 			`exec ${shellQuote(process.execPath)} ${shellQuote(HELPER_PATH)}`,
