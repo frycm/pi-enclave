@@ -119,6 +119,35 @@ const NOT_CLEARED: readonly (readonly [string, Record<string, unknown>, GateOutc
 	// Protected paths are L1 denials before any review.
 	["write", { path: ".pi/extensions/x.ts", content: "x".repeat(9_000) }, "deny", "deny", "deny"],
 	[...bash("rm -rf .git"), "deny", "deny", "deny"],
+	// The whole workspace, or a directory holding a protected path, is not bounded (#18 review).
+	[...bash("rm -rf ."), "allow", "allow", "ask-denied"],
+	[...bash("rm -rf src/.."), "allow", "allow", "ask-denied"],
+	[...bash("rm -rf .github"), "allow", "allow", "ask-denied"],
+	[...bash("git checkout -- AGENTS.md"), "allow", "allow", "ask-denied"],
+];
+
+/**
+ * The residual (#18 review): an unparsed command that writes a protected path.
+ * L1 cannot see the target, so with nobody to ask it runs under
+ * `onUncertain: "sandbox"`, and a reviewer allow stands (the prompt lists the
+ * protected paths and tells the model to ask; this stub ignores it). L2 does
+ * not deny a protected-ask path, or one that does not exist yet. What follows
+ * is deterministic: the tripwire reports the change after the turn and counts
+ * it against the turn (audit-session.test.ts), so the breaker sees it. A
+ * spelling L1 can read is still asked about, in every mode.
+ */
+const UNREADABLE_PROTECTED: readonly (readonly [
+	string,
+	Record<string, unknown>,
+	GateOutcome,
+	GateOutcome,
+	GateOutcome,
+])[] = [
+	[...bash("echo x > .husky/pre-commit"), "ask-denied", "ask-denied", "ask-denied"],
+	[...bash('f=.husky/pre-commit; echo x > "$f"'), "ask-denied", "sandboxed-uncertain", "review-allow"],
+	[...bash(`python3 -c "open('AGENTS.md','w').write('x')"`), "ask-denied", "sandboxed-uncertain", "review-allow"],
+	[...bash("d=.pi/extensions; mkdir -p $d && echo x > $d/e.ts"), "ask-denied", "sandboxed-uncertain", "review-allow"],
+	[...bash("g=git; $g init sub"), "ask-denied", "sandboxed-uncertain", "review-allow"],
 ];
 
 const grantable = (p: EffectiveProfile) => {
@@ -129,6 +158,7 @@ describe("the #18 table, unattended", () => {
 	for (const [label, table] of [
 		["issue evidence", ISSUE_TABLE],
 		["not cleared", NOT_CLEARED],
+		["unreadable writes to protected paths", UNREADABLE_PROTECTED],
 	] as const) {
 		describe(label, () => {
 			it.each(table)("%s %j", async (tool, input, deterministic, sandbox, reviewer) => {

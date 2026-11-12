@@ -1228,9 +1228,9 @@ rules end in `deny` or `ask` before L3 exists.
   | chat (256 output tokens) | `numCtx − 512 − 256 − system bytes` |
   | classifier | `(n_ctx − 512 − 1 − 512 − question bytes) / 2`, since pi-ai puts the state twice into every question's prompt, beside pi-ai's system prompt |
 
-  With the default rulebook (a 3.0 KB system prompt, which since #18 lists the built-in
-  and user-global bash `rules.deny` / `rules.ask` patterns) that is about 4.4 KB of evidence
-  at 8,192 tokens and 12.6 KB at 16,384; the classifier gets about 2.07 KB at an 8,192 slot
+  With the default rulebook (a 3.7 KB system prompt, which since #18 lists the built-in
+  and user-global bash `rules.deny` / `rules.ask` patterns and `rules.protectedPaths`) that
+  is about 3.7 KB of evidence at 8,192 tokens and 11.9 KB at 16,384; the classifier gets about 2.07 KB at an 8,192 slot
   and 6.2 KB at 16,384, so serve a classifier reviewer with at least `--ctx-size 16384`.
   Every pattern a user-global file adds to those lists costs its length in evidence room. A
   configuration that leaves less than 2 KB is refused at session start, and a long
@@ -1299,33 +1299,54 @@ commit message) had a `high` floor, `rm -f build/x` and `git checkout -b feature
 too. With `attended: off` each of those ended the turn.
 
 The floors now separate two questions. **Can the action cross the boundary?** Capability
-requests, unsandboxed third-party tools, protected paths, targets outside the writable roots,
-processes, remotes. Those keep the strict floors, and only a person (or an exact direct
-instruction) clears them. **Is it an in-sandbox action L1 could not read?** The sandbox
-bounds it, so it is the reviewer's judgement.
+requests, unsandboxed third-party tools, protected paths L1 can see, targets outside the
+writable roots, processes, remotes. Those keep the strict floors, and only a person (or an
+exact direct instruction) clears them. **Is it an in-sandbox action L1 could not read?** The
+sandbox bounds most of what it can do, so it is the reviewer's judgement, with a residual
+that the paragraphs after the table spell out.
 
 | The reviewer may clear (floor `medium`) | Only a person may clear (floor `high` or above), or L1 decides |
 |---|---|
 | An unreadable bash command, while the sandbox has no network and the call carries no capability | The same command where the sandbox would not contain it (a profile with network, a capability) |
-| `rm`, `chmod`, `chown`, `truncate` whose every target, as the parser reads it, is a path inside the writable roots and not a protected path (`chmod +x run.sh` has no parsed target yet, so it stays `high`) | The same outside the writable roots, on `rules.protectedPaths` (`.git`, `.pi`, workflows, …), with no path operand, and `dd` |
-| `git checkout`, `restore`, `reset`, `clean` run inside the writable roots | `git push`, `gh … -X DELETE`, `kill`, `pkill`, `killall` |
+| `rm`, `chmod`, `chown`, `truncate` whose every target, as the parser reads it, is a path inside the writable roots and not a protected path (`chmod +x run.sh` has no parsed target yet, so it stays `high`) | The same outside the writable roots; on a writable root or above one (`rm -rf .`, `rm -rf src/..`); on or above a `rules.protectedPaths` match (`.git`, `.pi`, `rm -rf .github`, …); with no path operand; and `dd` |
+| `git checkout`, `restore`, `reset`, `clean` run inside the writable roots, on ordinary operands | The same on a protected or whole-workspace operand (`git checkout -- AGENTS.md`, `git checkout .`); `git push`, `gh … -X DELETE`, `kill`, `pkill`, `killall` |
 | A `write` or `edit` of any length to an ordinary workspace path (the body is summarized) | A truncated bash command; writes to a never-grantable tree (`critical`, always denied) |
 | | Anything an L1 `rules.ask` pattern matches (`git push *`, `git reset --hard*`, …) or `rules.deny` denies; these never reach the reviewer |
 
 An unreadable command means L1 matched its patterns against a guess. The reviewer prompt
-therefore lists the active bash `rules.deny` and `rules.ask` patterns and tells the model
-to deny a command that would do what a deny pattern describes, however it is spelled, and to
-ask for what an ask pattern describes. Only built-in and user-global patterns are listed: a
-pattern from a repository's `.pi/enclave.json` is text the repository chose, so it never
-reaches the prompt, and L1 still applies it to the guess. A repository's ask rule for a
-spelling L1 cannot read is therefore enforced only as well as the parser reads the
-command; this is the residual of the change. The classifier transport, with about 2 KB of
-room, gets one sentence (treat an unreadable command as ambiguous) instead of the lists.
+therefore lists the active bash `rules.deny` and `rules.ask` patterns and the
+`rules.protectedPaths` patterns, and tells the model to deny a command that would do what a
+deny pattern describes, however it is spelled, and to ask for what an ask pattern describes
+or for one that would create, change or delete a protected path. Only built-in and
+user-global entries are listed, and an entry with no recorded source only if it is a
+built-in default: a pattern from a repository's `.pi/enclave.json` is text the repository
+chose, so it never reaches the prompt, and L1 still applies it to the guess. The classifier
+transport, with about 2 KB of room, gets one sentence (treat an unreadable command as
+ambiguous) instead of the lists.
+
+**What an unreadable command can still change.** L1 cannot see its targets, so
+`rules.protectedPaths` does not stop `f=.husky/pre-commit; echo x > "$f"`,
+`python3 -c "open('AGENTS.md','w').write('x')"` or `g=git; $g init sub`. With a reviewer the
+model's judgement is all that asks about them; with `onUncertain: "sandbox"` nothing asks.
+L2 write-denies the existing `.git` metadata and `.pi` / `.agents` directories, but not the
+`rules.protectedPaths.ask` paths (`AGENTS.md`, `CLAUDE.md`, `.envrc`, hook managers,
+`.vscode/tasks.json`, workflows, Dockerfiles, and any user-global entry such as `infra/**`),
+and not a path that does not exist yet (a new `.pi`, a nested repository). Afterwards the
+[tripwire](#files-loaded-outside-the-sandbox-19) reports, at the end of the turn, every new or changed Git
+configuration, agent directory and project file, and in a turn that ran an unparsed command
+nobody was asked about (`sandboxed-uncertain`, or a reviewer allow of one) a changed project
+file counts against the turn like a denial, so repeated changes open the breaker. The
+user-global `protectedPaths` entries outside that list (workflows, Dockerfiles, `infra/**`)
+are not watched by the tripwire: for those an unreadable command is judged by the reviewer
+alone, or by nobody under `onUncertain: "sandbox"`. A repository's own ask rule for a
+spelling L1 cannot read is likewise enforced only as well as the parser reads the command.
 
 **Deterministic mode** has no reviewer, so `rules.onUncertain` (user-global only) chooses
 what happens to an unreadable command instead: `"ask"` (the default) sends it to a person,
-and `"sandbox"` runs it with the sandbox as the only boundary. The decision is recorded as
-`sandboxed-uncertain`, so the audit log shows which commands nobody judged. `"sandbox"`
+and `"sandbox"` runs it with the sandbox as the only boundary, which leaves the residual
+above with no judgement at all before the command runs. The decision is recorded as
+`sandboxed-uncertain`, so the audit log shows which commands nobody judged, and the
+tripwire's `violation` records say whether a hit counted (`adverse`). `"sandbox"`
 applies only to the owned bash tool, only while the network is off, and never to a call
 that requests a capability; L1 `deny` and `ask` rules still apply first. Under
 `review.trigger: "boundary"` the reviewer does not see ordinary commands, so the same setting
@@ -1366,8 +1387,8 @@ support are refused. Qualification record version 2 invalidates the earlier reco
 run `/enclave eval-reviewer` again after this update. The #17 update changes the corpus
 and raises the default context to 8,192 tokens, #59 changes the prompts and the corpus
 again, #25 replaces the two chat prompts with one and adds the `authorized` field, and #18
-adds the bash patterns, `action.summarized` and the unreadable-command instruction to the
-prompts (prompt v4, evidence schema v5), so each needs a new qualification too.
+adds the bash and protected-path patterns, `action.summarized` and the unreadable-command
+instruction to the prompts (prompt v4, evidence schema v5), so each needs a new qualification too.
 
 llama.cpp (classifier transport only) is identified from the router itself: `GET /models`
 must list the model as loaded or sleeping (load it with `/llama`), and `GET /props?model=`
@@ -2170,7 +2191,9 @@ without the sandbox. pi-enclave splits those files in two.
   and one too large to fingerprint is reported as unverifiable at every check. A hit is
   classified by the surface that found it, so a repository inside `.husky` is still Git. A new
   or changed `.pi` or `.agents` counts against the turn like a denial; a changed project file
-  is reported and audited but not counted, since it may be an approved edit. Every hit is also
+  is reported and audited but not counted, since it may be an approved edit, except in a turn
+  that ran an unparsed command nobody was asked about (`sandboxed-uncertain`, or a reviewer
+  allow of one, #18), where no rule saw what was written and it counts too. Every hit is also
   written to the state directory and repeated at each session start until you run
   `/enclave tripwire ack`, so a change made in an unattended session is not lost after its one
   notice. The reminder counts hits per kind and lists unverifiable, pi configuration and Git

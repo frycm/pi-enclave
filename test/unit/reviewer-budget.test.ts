@@ -154,12 +154,13 @@ describe("chat transport: system + evidence + output fits the context", () => {
 				// write input (path and content) is a body summary and nothing else.
 				const writeShaped = Object.keys(options.action.input).sort().join() === "content,path";
 				if (options.action.tool !== "write" || minimal) expect(evidence.action.truncated).toBe(true);
-				else if (writeShaped) {
+				else if (writeShaped && String(options.action.input.content).length > 2_048) {
 					expect(evidence.action.summarized).toBe(true);
 					const shownPath = (evidence.action.input as { path?: unknown }).path;
 					expect(evidence.action.truncated).toBe(shownPath !== options.action.input.path);
 					if (!evidence.action.truncated) stages.writeSummaryOnly++;
-				} else expect(evidence.action.summarized === true || evidence.action.truncated).toBe(true);
+				} else if (writeShaped) expect(evidence.action.truncated).toBe(true);
+				else expect(evidence.action.summarized === true || evidence.action.truncated).toBe(true);
 			}
 			// The hash binds the complete action whatever is displayed.
 			expect(evidence.action.hash).toBe(options.action.hash);

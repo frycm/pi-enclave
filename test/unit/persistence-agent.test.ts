@@ -158,9 +158,12 @@ describe("the agent configuration tripwire (#19)", () => {
 		]);
 		const repeat = tripwire.check();
 		expect(repeat).toHaveLength(2);
-		expect(repeat.some(countsAgainstTurn)).toBe(false);
-		// Project files never count; a surface that could not be read always does.
+		expect(repeat.some((hit) => countsAgainstTurn(hit))).toBe(false);
+		// Project files count only after an unparsed command nobody judged (#18);
+		// a surface that could not be read always does.
 		expect(countsAgainstTurn({ path: "/w/AGENTS.md", change: "modified", kind: "project" })).toBe(false);
+		expect(countsAgainstTurn({ path: "/w/AGENTS.md", change: "modified", kind: "project" }, true)).toBe(true);
+		expect(repeat.some((hit) => countsAgainstTurn(hit, true))).toBe(false);
 		expect(countsAgainstTurn({ path: "/w", change: "unverifiable", detail: "too many entries" })).toBe(true);
 	});
 

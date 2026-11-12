@@ -276,6 +276,12 @@ export default function (pi: ExtensionAPI): void {
 	let breaker = new CircuitBreaker({ consecutive: 3, window: [10, 50] });
 	/** Which layer settled each gate decision this session (#18). */
 	let layers = emptyTally();
+	/**
+	 * Whether the current turn ran an unparsed command that no person was asked
+	 * about (#18). Then no protected-path rule saw what it wrote, so a changed
+	 * project file counts against the turn.
+	 */
+	let unjudgedInTurn = false;
 	const directInput = new ProvenanceTracker();
 	// `pendingOpen`, not just `open`: the breaker only opens in turn_end, after a
 	// batch has run, but the whole batch's outcome is recorded before any of it
@@ -496,6 +502,9 @@ export default function (pi: ExtensionAPI): void {
 				backend: violation.backend,
 				path: violation.path,
 				host: violation.host,
+				// Whether it counted for the breaker: a tripwire hit on a project
+				// file counts only after an unjudged command (#18).
+				adverse: adverseForBreaker,
 			});
 		}
 		refreshStatusLine?.();
@@ -522,9 +531,11 @@ export default function (pi: ExtensionAPI): void {
 				...(hit.detail ? { raw: hit.detail } : {}),
 			}));
 		// Which hits count against the turn is decided in one place
-		// (countsAgainstTurn): project files and repeat reports never do.
-		const counted = hits.filter(countsAgainstTurn);
-		const uncounted = hits.filter((hit) => !countsAgainstTurn(hit));
+		// (countsAgainstTurn): repeat reports never do, project files only in
+		// a turn that ran an unparsed command nobody judged (#18).
+		const unjudged = agent && unjudgedInTurn;
+		const counted = hits.filter((hit) => countsAgainstTurn(hit, unjudged));
+		const uncounted = hits.filter((hit) => !countsAgainstTurn(hit, unjudged));
 		if (counted.length > 0) recordViolations(asViolations(counted), agent);
 		if (uncounted.length > 0) recordViolations(asViolations(uncounted), false);
 		try {
@@ -532,7 +543,12 @@ export default function (pi: ExtensionAPI): void {
 		} catch (error) {
 			process.stderr.write(`pi-enclave: could not record tripwire hits: ${(error as Error).message}\n`);
 		}
-		const message = formatTripwireHits(hits, agent ? "during the agent's turn" : "since the agent's last turn");
+		let message = formatTripwireHits(hits, agent ? "during the agent's turn" : "since the agent's last turn");
+		if (unjudged && hits.some((hit) => hit.kind === "project")) {
+			message +=
+				"\npi-enclave: this turn ran a command L1 could not read, and no person was asked about it " +
+				'(rules.onUncertain "sandbox", or a reviewer allow), so these project file changes count against the turn.';
+		}
 		process.stderr.write(`${message}\n`);
 		warnUser?.(message);
 	};
@@ -843,6 +859,11 @@ export default function (pi: ExtensionAPI): void {
 					// count.
 					if (effective?.auto && result.outcome !== "breaker-open") breaker.record(currentTurn, result.adverse);
 					if (effective?.auto) recordLayer(layers, result.outcome);
+					if (
+						result.outcome === "sandboxed-uncertain" ||
+						(result.outcome === "review-allow" && result.action?.tool === "bash" && !result.action.confident)
+					)
+						unjudgedInTurn = true;
 					if (!result.action) {
 						audit?.append("decision", {
 							outcome: result.outcome,
@@ -909,6 +930,7 @@ export default function (pi: ExtensionAPI): void {
 		forgetToolRegistry();
 		currentTurn = event.turnIndex;
 		queuedOwnedCall = false;
+		unjudgedInTurn = false;
 		// A server that connected mid-run has its tools judged here, not only
 		// at the next prompt.
 		applyActiveTools();

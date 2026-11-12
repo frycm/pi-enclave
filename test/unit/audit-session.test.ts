@@ -4,7 +4,7 @@
  * `executed` record follows each allowed call, a `!` command is recorded, and
  * `audit.required` stops the session when the log stops.
  */
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -16,6 +16,8 @@ import type { EffectiveProfile } from "../../src/config/types.ts";
 const mocks = vi.hoisted(() => ({
 	loadConfig: vi.fn(),
 	runs: [] as RunRequest[],
+	/** What the fake sandbox does for a command, for tests that need an effect. */
+	onRun: undefined as ((request: RunRequest) => void) | undefined,
 }));
 
 vi.mock("../../src/probe-host.ts", async (original) => ({
@@ -31,6 +33,7 @@ vi.mock("../../src/backend/select.ts", () => ({
 				({ profile, backend: "fake", describe: () => "" }) as unknown as CompiledProfile,
 			run: async (_compiled: CompiledProfile, request: RunRequest) => {
 				mocks.runs.push(request);
+				mocks.onRun?.(request);
 				return { exitCode: request.command.includes("fails") ? 3 : 0, violations: [] };
 			},
 			fs: () => ({}),
@@ -58,6 +61,7 @@ beforeEach(() => {
 	previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	mocks.runs.length = 0;
+	mocks.onRun = undefined;
 });
 afterEach(() => {
 	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -188,6 +192,37 @@ describe("a session's audit trail (#37)", () => {
 					layers: { L1: 3, L3: 0, L4: 1, askDenied: 1, sandboxedUncertain: 1, other: 0 },
 					description: "L1 3 (75%), L3 0 (0%), L4 1 (25%), ask-denied 1, sandboxed-uncertain 1",
 				}),
+			]);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	// #18 review: an unparsed command that ran with nobody asked may write a
+	// project file no protected-path rule saw, so the tripwire counts it.
+	it("counts a changed project file against a turn that ran an unjudged command", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			const s = await session((profile) => {
+				profile.rules.onUncertain = "sandbox";
+			});
+			const turn = async (index: number, id: string, command: string, content: string) => {
+				mocks.onRun = () => writeFileSync(join(ws, "AGENTS.md"), content);
+				await s.handlers.get("turn_start")?.({ turnIndex: index }, s.context);
+				await s.call(id, command);
+				await s.handlers.get("turn_end")?.({ turnIndex: index }, { ...s.context, abort: () => {} });
+			};
+			// Control: a command L1 read, so the protected-path ask rule saw it.
+			await turn(1, "t1", "ls", "one");
+			await turn(2, "t2", "npm test", "two");
+			await s.flush();
+			const hits = s
+				.records()
+				.filter((entry) => entry.kind === "violation" && entry.source === "tripwire")
+				.map((entry) => [entry.op, entry.adverse]);
+			expect(hits).toEqual([
+				["created", false],
+				["modified", true],
 			]);
 		} finally {
 			stderr.mockRestore();

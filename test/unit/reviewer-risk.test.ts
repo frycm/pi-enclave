@@ -50,6 +50,19 @@ describe("deterministic reviewer risk", () => {
 		"pkill node",
 		"git push origin main",
 		"gh api -X DELETE repos/o/r",
+		// A writable root itself, or a directory above one (#18 review).
+		"rm -rf .",
+		"rm -rf ./",
+		"rm -rf /work/",
+		"rm -rf src/..",
+		"git checkout .",
+		// A directory holding a protected path, though it matches none itself.
+		"rm -rf .github",
+		"rm -rf sub/.github",
+		"chmod -R 777 .husky",
+		// A protected operand the parser does not read as a write target.
+		"git checkout -- AGENTS.md",
+		"git restore .github/workflows/ci.yml",
 	])("keeps a destructive command the sandbox does not bound at high: %j", (command) => {
 		expect(minimumRisk(action(command), PROFILE)).toBe("high");
 	});

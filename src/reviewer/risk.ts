@@ -1,3 +1,4 @@
+import { relative, resolve, sep } from "node:path";
 import { resolveCapabilityTarget } from "../backend/capability.ts";
 import { canonical, isUnder, isUnderAny, normalizePath } from "../backend/paths.ts";
 import type { EffectiveProfile } from "../config/types.ts";
@@ -32,10 +33,11 @@ function broadCapability(value: string): boolean {
  * exactly. Now a destructive command whose every write lands inside the
  * writable roots, run from inside them, is `medium`: L2 is the boundary, and
  * the reviewer may clear it. It stays `high` when a target is outside the
- * writable roots, is a protected path (`rules.protectedPaths`: `.git`, `.pi`,
- * workflows and the rest), or is not a path at all (`dd of=`, a process, a
- * remote), and for `git push`. The never-grantable trees are `critical`
- * separately.
+ * writable roots, is a writable root or contains one (`rm -rf .`), is or
+ * contains a protected path (`rules.protectedPaths`: `.git`, `.pi`,
+ * `.github/workflows` and the rest), or is not a path at all (`dd of=`, a
+ * process, a remote), and for `git push`. The never-grantable trees are
+ * `critical` separately.
  */
 function destructiveShellRisk(action: CanonicalAction, profile: EffectiveProfile): ReviewRisk | undefined {
 	const commands = action.shell?.commands ?? [];
@@ -45,9 +47,12 @@ function destructiveShellRisk(action: CanonicalAction, profile: EffectiveProfile
 	const inRoots = (path: string) => isUnderAny(normalizePath(path), roots);
 	const protectedPatterns = [...profile.rules.protectedPaths.deny, ...profile.rules.protectedPaths.ask];
 	const writes = action.paths.filter((path) => path.writes);
-	const writesBounded = writes.every(
-		(path) => inRoots(path.resolved) && !matchesPathPattern(protectedPatterns, path.resolved, action.cwd),
-	);
+	const boundedTarget = (resolved: string) =>
+		inRoots(resolved) &&
+		!isOrContainsRoot(resolved, roots) &&
+		!matchesPathPattern(protectedPatterns, resolved, action.cwd) &&
+		!containsProtected(resolved, protectedPatterns, [...roots, action.cwd]);
+	const writesBounded = writes.every((path) => boundedTarget(path.resolved));
 	for (const command of commands) {
 		const name = command.name.slice(command.name.lastIndexOf("/") + 1).toLowerCase();
 		if (UNBOUNDED_DESTRUCTIVE_COMMANDS.has(name)) {
@@ -63,7 +68,16 @@ function destructiveShellRisk(action: CanonicalAction, profile: EffectiveProfile
 			bounded = false;
 		} else if (name === "git" && GIT_DISCARDING.has(command.args[0] ?? "")) {
 			destructive = true;
-			if (!inRoots(action.cwd) || !writesBounded) bounded = false;
+			// The parser does not read every operand of these as a path
+			// (`git checkout -- AGENTS.md`), so each operand is checked as one too:
+			// `git checkout .` discards the whole workspace.
+			const operands = command.args.slice(1).filter((arg) => arg !== "--" && !arg.startsWith("-"));
+			if (
+				!inRoots(action.cwd) ||
+				!writesBounded ||
+				!operands.every((operand) => boundedTarget(resolve(action.cwd, operand)))
+			)
+				bounded = false;
 		} else if (name === "gh" && command.args.some((arg) => ["-X", "--method=DELETE", "DELETE"].includes(arg))) {
 			destructive = true;
 			bounded = false;
@@ -71,6 +85,55 @@ function destructiveShellRisk(action: CanonicalAction, profile: EffectiveProfile
 	}
 	if (!destructive) return undefined;
 	return bounded ? "medium" : "high";
+}
+
+/** A writable root itself, or a directory above one: deleting it deletes the whole root. */
+function isOrContainsRoot(path: string, roots: readonly string[]): boolean {
+	const target = normalizePath(path);
+	return roots.some((root) => isUnder(root, target) || isUnder(canonical(root), target));
+}
+
+/** True when `[a..]` is a non-empty prefix of `b`, compared case-insensitively. */
+function segmentPrefix(a: readonly string[], b: readonly string[]): boolean {
+	return (
+		a.length > 0 &&
+		a.length <= b.length &&
+		a.every((segment, index) => segment.toLowerCase() === b[index]?.toLowerCase())
+	);
+}
+
+/**
+ * Whether a directory target may hold a path a protected pattern names (#18):
+ * `rm -rf .github` removes `.github/workflows/**` although the directory
+ * itself matches nothing. Decided from the pattern's literal leading segments,
+ * up to the first wildcard: the target contains a match when it ends with (for
+ * a `**`/ pattern) or is (anchored, relative to a root or the cwd) a leading
+ * part of them. A pattern with no literal segment (`**`/`docker-compose*.yml`)
+ * names no directory and is not counted, so `rm -rf dist` stays bounded.
+ */
+function containsProtected(path: string, patterns: readonly string[], bases: readonly string[]): boolean {
+	const target = normalizePath(path).split(sep).filter(Boolean);
+	const relatives = bases
+		.filter((base) => isUnder(path, base))
+		.map((base) => relative(normalizePath(base), normalizePath(path)).split(sep).filter(Boolean));
+	return patterns.some((pattern) => {
+		const floating = pattern.startsWith("**/");
+		const segments = (floating ? pattern.slice(3) : pattern.replace(/^\/+/, "")).split("/");
+		const literal: string[] = [];
+		for (const segment of segments) {
+			if (/[*?[]/.test(segment)) break;
+			literal.push(segment);
+		}
+		if (literal.length === 0) return false;
+		if (floating) {
+			// Some suffix of the target is a leading part of the literal segments.
+			for (let start = 0; start < target.length; start++) {
+				if (segmentPrefix(target.slice(start), literal)) return true;
+			}
+			return false;
+		}
+		return segmentPrefix(target, literal) || relatives.some((rel) => segmentPrefix(rel, literal));
+	});
 }
 
 /**
