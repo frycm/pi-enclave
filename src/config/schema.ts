@@ -645,7 +645,7 @@ class ParseContext {
 	private reviewer(prefix: string, raw: unknown): ProfilePatch["reviewer"] | undefined {
 		const body = this.object(prefix, raw);
 		if (!body) return undefined;
-		this.rejectUnknown(prefix, body, ["model", "timeoutMs", "fallback", "transport"]);
+		this.rejectUnknown(prefix, body, ["model", "timeoutMs", "fallback", "transport", "numCtx"]);
 
 		const out: NonNullable<ProfilePatch["reviewer"]> = {};
 		if ("model" in body) {
@@ -671,6 +671,10 @@ class ParseContext {
 					out.fallback = fallback;
 				}
 			}
+		}
+		if ("numCtx" in body) {
+			const numCtx = this.integer(join(prefix, "numCtx"), body.numCtx, 8_192, 262_144);
+			if (numCtx !== undefined) out.numCtx = numCtx;
 		}
 		if ("transport" in body) {
 			const transport = this.string(join(prefix, "transport"), body.transport);

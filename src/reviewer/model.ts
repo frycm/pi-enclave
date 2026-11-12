@@ -4,6 +4,7 @@ import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { parseReviewerModelReference } from "../config/reviewer-model.ts";
 import { stableSerialize } from "../policy/canonical.ts";
+import { chatPromptBound } from "./budget.ts";
 import { type CompletionRequest, REVIEWER_NUM_CTX, type ReviewerCompletion } from "./reviewer.ts";
 
 export type RuntimeModel = NonNullable<ReturnType<ModelRegistry["find"]>>;
@@ -127,14 +128,19 @@ async function manifest(target: Endpoint, signal: AbortSignal): Promise<string> 
 }
 
 /** Identity includes inference routing and model configuration, never the CLI's server. */
-async function endpointDigest(target: Endpoint, signal: AbortSignal): Promise<string> {
+async function endpointDigest(target: Endpoint, signal: AbortSignal, numCtx: number): Promise<string> {
 	const model = target.model;
 	const descriptor = { model: target.model, headers: target.headers, auth: target.authIdentity, transport: 4 };
 	if (model.provider === "ollama") {
 		const modelManifest = await manifest(target, signal);
 		const version = await ollamaJson(target, "version", signal);
 		if (typeof version.version !== "string") throw new Error("pi-enclave: Ollama did not report its runtime version");
-		return `ollama:sha256:${digest({ ...descriptor, modelManifest, version: version.version, numCtx: REVIEWER_NUM_CTX })}`;
+		if (!refusesOverlongPrompts(version.version)) {
+			throw new Error(
+				`pi-enclave: Ollama ${version.version} silently truncates a prompt longer than num_ctx; the reviewer needs ${OLLAMA_MIN_VERSION.join(".")} or later, which can refuse it instead (#17)`,
+			);
+		}
+		return `ollama:sha256:${digest({ ...descriptor, modelManifest, version: version.version, numCtx })}`;
 	}
 	if (isLoopback(target.model.baseUrl))
 		throw new Error(
@@ -147,8 +153,63 @@ async function endpointDigest(target: Endpoint, signal: AbortSignal): Promise<st
 	return `cloud:sha256:${digest(descriptor)}`;
 }
 
-export async function reviewerModelDigest(model: RuntimeModel, registry?: ModelRegistry): Promise<string> {
-	return endpointDigest(await endpoint(model, registry), AbortSignal.timeout(10_000));
+export async function reviewerModelDigest(
+	model: RuntimeModel,
+	registry?: ModelRegistry,
+	numCtx: number = REVIEWER_NUM_CTX,
+): Promise<string> {
+	return endpointDigest(await endpoint(model, registry), AbortSignal.timeout(10_000), numCtx);
+}
+
+/** The first Ollama release whose /api/chat takes `truncate` and `shift` (ollama/ollama#12582). */
+export const OLLAMA_MIN_VERSION = [0, 12, 6] as const;
+
+/** Release versions only; a development build ("0.0.0") or anything unparsable is refused. */
+export function refusesOverlongPrompts(version: string): boolean {
+	const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version.trim());
+	if (!match) return false;
+	const parts = match.slice(1, 4).map(Number);
+	for (let index = 0; index < 3; index++) {
+		const part = parts[index] ?? 0;
+		const minimum = OLLAMA_MIN_VERSION[index] ?? 0;
+		if (part !== minimum) return part > minimum;
+	}
+	return true;
+}
+
+/**
+ * When Ollama reports cached prompt tokens, its count is the whole prompt, and a
+ * count far below the request's size means part of it was never read. No
+ * tokenizer in use averages this many bytes a token on JSON evidence.
+ */
+const MAX_BYTES_PER_TOKEN = 16;
+
+/**
+ * Ollama's own count of the prompt it evaluated, against the request (#17).
+ * Above the worst-case bound, the budget's assumptions about the chat template
+ * are wrong; far below the request, the runtime did not read all of it. Both
+ * are an unavailable reviewer, never a verdict.
+ */
+function checkPromptCount(response: Record<string, unknown>, request: CompletionRequest): void {
+	const evaluated = response.prompt_eval_count;
+	const cached = response.prompt_eval_cached_count;
+	if (typeof evaluated !== "number" || !Number.isFinite(evaluated) || evaluated < 0) {
+		throw new Error("pi-enclave: Ollama did not report how many prompt tokens it evaluated");
+	}
+	const total = evaluated + (typeof cached === "number" && Number.isFinite(cached) ? cached : 0);
+	const bound = chatPromptBound(request.system, request.user);
+	if (total > bound || total > request.numCtx - request.maxTokens) {
+		throw new Error(
+			`pi-enclave: Ollama evaluated ${total} prompt tokens, above the ${Math.min(bound, request.numCtx - request.maxTokens)}-token budget; the chat template adds more than the reserve`,
+		);
+	}
+	// Without a cached count, a prompt-cache hit lowers the count legitimately.
+	const requested = Buffer.byteLength(request.system) + Buffer.byteLength(request.user);
+	if (typeof cached === "number" && total * MAX_BYTES_PER_TOKEN < requested) {
+		throw new Error(
+			`pi-enclave: Ollama evaluated ${total} prompt tokens for a ${requested}-byte prompt; part of the prompt was not read`,
+		);
+	}
 }
 
 async function completeOllama(target: Endpoint, request: CompletionRequest): Promise<string> {
@@ -161,6 +222,9 @@ async function completeOllama(target: Endpoint, request: CompletionRequest): Pro
 		],
 		stream: false,
 		think: false,
+		// Fail instead of dropping part of the prompt or the context (#17).
+		truncate: false,
+		shift: false,
 		options: {
 			temperature: request.temperature,
 			seed: request.seed,
@@ -185,6 +249,7 @@ async function completeOllama(target: Endpoint, request: CompletionRequest): Pro
 	) {
 		throw new Error("pi-enclave: invalid isolated Ollama completion");
 	}
+	checkPromptCount(response, request);
 	request.onFirstOutput?.();
 	return message.content;
 }
@@ -230,7 +295,11 @@ async function completeSnapshot(target: Endpoint, request: CompletionRequest): P
 		.join("");
 }
 
-export function resolveReviewerModel(registry: ModelRegistry, reference: string): ResolvedReviewerModel {
+export function resolveReviewerModel(
+	registry: ModelRegistry,
+	reference: string,
+	numCtx: number = REVIEWER_NUM_CTX,
+): ResolvedReviewerModel {
 	const parsed = parseReviewerModelReference(reference);
 	if (!parsed) throw new Error(`pi-enclave: invalid reviewer model reference ${JSON.stringify(reference)}`);
 	const model = registry.find(parsed.provider, parsed.id);
@@ -239,13 +308,13 @@ export function resolveReviewerModel(registry: ModelRegistry, reference: string)
 		throw new Error(`pi-enclave: reviewer model ${reference} has no configured provider authentication`);
 	const completeBound = async (request: CompletionRequest, expected?: string): Promise<string> => {
 		const target = await endpoint(model, registry);
-		const actual = await endpointDigest(target, request.signal);
+		const actual = await endpointDigest(target, request.signal, numCtx);
 		if (expected !== undefined && actual !== expected)
 			throw new Error("pi-enclave: reviewer identity changed; requalification required");
 		const result = await completeSnapshot(target, request);
 		if (
-			(await endpointDigest(target, request.signal)) !== actual ||
-			(await reviewerModelDigest(model, registry)) !== actual
+			(await endpointDigest(target, request.signal, numCtx)) !== actual ||
+			(await reviewerModelDigest(model, registry, numCtx)) !== actual
 		)
 			throw new Error("pi-enclave: reviewer identity changed during completion; requalification required");
 		return result;
@@ -255,7 +324,7 @@ export function resolveReviewerModel(registry: ModelRegistry, reference: string)
 		completeBound,
 		completion: {
 			name: reference,
-			numCtx: model.provider === "ollama" ? REVIEWER_NUM_CTX : null,
+			numCtx: model.provider === "ollama" ? numCtx : null,
 			complete: (request) => completeBound(request),
 		},
 	};

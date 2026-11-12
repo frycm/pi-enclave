@@ -225,7 +225,8 @@ export function narrowerOrEqual(a: EffectiveProfile, b: EffectiveProfile): Order
 	if (
 		a.reviewer.model !== b.reviewer.model ||
 		a.reviewer.fallback !== b.reviewer.fallback ||
-		a.reviewer.transport !== b.reviewer.transport
+		a.reviewer.transport !== b.reviewer.transport ||
+		a.reviewer.numCtx !== b.reviewer.numCtx
 	) {
 		fail("reviewer", "the reviewer is immutable below user-global");
 	}

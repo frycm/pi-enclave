@@ -1,13 +1,21 @@
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { EffectiveProfile, Provenance } from "../config/types.ts";
+import { assertEvidenceRoom, chatEvidenceBytes, classifierEvidenceBytes } from "./budget.ts";
 import { qualificationBinding } from "./eval.ts";
-import { bindReviewerClassifier, resolveReviewerClassifier, reviewerClassifierDigest } from "./llama.ts";
+import { bindReviewerClassifier, resolveReviewerClassifier, reviewerClassifierIdentity } from "./llama.ts";
 import { bindReviewerCompletion, resolveReviewerModel, reviewerModelDigest } from "./model.ts";
 import { CLASSIFIER_DENY_THRESHOLD, CLASSIFIER_TEMPERATURE } from "./probabilities.ts";
 import { buildReviewerPrompt, reviewerRulebook } from "./prompt.ts";
 import { readQualification } from "./qualification.ts";
-import type { IsolatedReviewerOptions, ReviewerTransport } from "./reviewer.ts";
-import { REVIEWER_MAX_TOKENS, REVIEWER_NUM_CTX, REVIEWER_SEED, REVIEWER_TEMPERATURE } from "./reviewer.ts";
+import {
+	type IsolatedReviewerOptions,
+	isClassifier,
+	REVIEWER_MAX_TOKENS,
+	REVIEWER_NUM_CTX,
+	REVIEWER_SEED,
+	REVIEWER_TEMPERATURE,
+	type ReviewerTransport,
+} from "./reviewer.ts";
 import type { ReviewerPrompt } from "./types.ts";
 
 export interface QualifiedReviewerSetup {
@@ -23,29 +31,34 @@ function notQualified(reference: string, reason: string): Error {
 	);
 }
 
-/** The classifier's thresholds come only from its qualification record. */
-async function qualifiedClassifier(
+/**
+ * The identity-bound transport for one configured reviewer, after checking
+ * that its context leaves room for evidence (#17). The classifier's real
+ * thresholds come from its qualification record; these are placeholders.
+ */
+export async function reviewerTarget(
+	registry: ModelRegistry,
 	reference: string,
 	profile: EffectiveProfile,
 	prompt: ReviewerPrompt,
-	registry: ModelRegistry,
-	qualifiedDir: string,
-): Promise<ReviewerTransport> {
-	const resolved = resolveReviewerClassifier(registry, reference);
-	const modelDigest = await reviewerClassifierDigest(resolved.model, registry);
-	const provisional = { allow: 1, deny: CLASSIFIER_DENY_THRESHOLD, temperature: CLASSIFIER_TEMPERATURE };
-	const binding = qualificationBinding({
-		model: reference,
-		modelDigest,
-		profile,
-		prompt,
-		completion: bindReviewerClassifier(resolved, modelDigest, provisional),
-		timeoutMs: profile.reviewer.timeoutMs,
-	});
-	const qualification = readQualification(qualifiedDir, binding);
-	if (!qualification.ok) throw notQualified(reference, qualification.reason);
-	if (!qualification.record.thresholds) throw notQualified(reference, "the record has no classifier thresholds");
-	return bindReviewerClassifier(resolved, modelDigest, qualification.record.thresholds);
+): Promise<{ modelDigest: string; completion: ReviewerTransport }> {
+	if (profile.reviewer.transport === "classifier") {
+		const resolved = resolveReviewerClassifier(registry, reference);
+		const identity = await reviewerClassifierIdentity(resolved.model, registry);
+		assertEvidenceRoom(
+			classifierEvidenceBytes(prompt, identity.nCtx),
+			`the llama.cpp slot context of ${reference} (${identity.nCtx} tokens)`,
+		);
+		const thresholds = { allow: 1, deny: CLASSIFIER_DENY_THRESHOLD, temperature: CLASSIFIER_TEMPERATURE };
+		return { modelDigest: identity.digest, completion: bindReviewerClassifier(resolved, identity, thresholds) };
+	}
+	const resolved = resolveReviewerModel(registry, reference, profile.reviewer.numCtx);
+	const modelDigest = await reviewerModelDigest(resolved.model, registry, profile.reviewer.numCtx);
+	const completion = bindReviewerCompletion(resolved, modelDigest);
+	if (typeof completion.numCtx === "number") {
+		assertEvidenceRoom(chatEvidenceBytes(prompt, completion.numCtx), `reviewer.numCtx ${completion.numCtx}`);
+	}
+	return { modelDigest, completion };
 }
 
 async function qualifiedCompletion(
@@ -55,22 +68,20 @@ async function qualifiedCompletion(
 	registry: ModelRegistry,
 	qualifiedDir: string,
 ): Promise<ReviewerTransport> {
-	if (profile.reviewer.transport === "classifier") {
-		return qualifiedClassifier(reference, profile, prompt, registry, qualifiedDir);
-	}
-	const resolved = resolveReviewerModel(registry, reference);
-	const modelDigest = await reviewerModelDigest(resolved.model, registry);
+	const { modelDigest, completion } = await reviewerTarget(registry, reference, profile, prompt);
 	const binding = qualificationBinding({
 		model: reference,
 		modelDigest,
 		profile,
 		prompt,
-		completion: bindReviewerCompletion(resolved, modelDigest),
+		completion,
 		timeoutMs: profile.reviewer.timeoutMs,
 	});
 	const qualification = readQualification(qualifiedDir, binding);
 	if (!qualification.ok) throw notQualified(reference, qualification.reason);
-	return bindReviewerCompletion(resolved, modelDigest);
+	if (!isClassifier(completion)) return completion;
+	if (!qualification.record.thresholds) throw notQualified(reference, "the record has no classifier thresholds");
+	return { ...completion, thresholds: qualification.record.thresholds };
 }
 
 export async function prepareQualifiedReviewer(
@@ -90,7 +101,7 @@ export async function prepareQualifiedReviewer(
 }
 
 export function reviewerSamplingSummary(): string {
-	return `temperature=${REVIEWER_TEMPERATURE}, seed=${REVIEWER_SEED}, Ollama num_ctx=${REVIEWER_NUM_CTX} (verified); remote context=provider-managed, maxTokens=${REVIEWER_MAX_TOKENS}`;
+	return `temperature=${REVIEWER_TEMPERATURE}, seed=${REVIEWER_SEED}, Ollama num_ctx=reviewer.numCtx (default ${REVIEWER_NUM_CTX}, verified); remote context=provider-managed, maxTokens=${REVIEWER_MAX_TOKENS}`;
 }
 
 export type ReviewerEvidenceSource = IsolatedReviewerOptions["evidence"];

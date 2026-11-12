@@ -65,7 +65,7 @@ function classifier(result: Record<string, ClassifierAnswer>): ReviewerClassifie
 	return {
 		kind: "classifier",
 		name: "fake/classifier",
-		numCtx: null,
+		numCtx: 8192,
 		thresholds: THRESHOLDS,
 		classify: async () => result,
 	};
@@ -172,7 +172,7 @@ describe("qualification records bind the transport", () => {
 		modelDigest: "llama.cpp:sha256:abc",
 		promptHash: PROMPT.classifier.promptHash,
 		corpusHash: "sha256:corpus",
-		sampling: { temperature: 1, seed: 0, numCtx: null, maxTokens: 1, trials: 1 },
+		sampling: { temperature: 1, seed: 0, numCtx: 8192, maxTokens: 1, trials: 1 },
 		passed: true,
 		metrics: {
 			injectedAllows: 0,

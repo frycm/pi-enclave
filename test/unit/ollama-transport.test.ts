@@ -2,13 +2,16 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { defaultProfile, OWNED_TOOLS } from "../../src/config/defaults.ts";
+import { ActionLock, decide } from "../../src/gate/gate.ts";
 import {
 	bindReviewerCompletion,
 	type RuntimeModel,
 	resolveReviewerModel,
 	reviewerModelDigest,
 } from "../../src/reviewer/model.ts";
-import type { CompletionRequest } from "../../src/reviewer/reviewer.ts";
+import { buildReviewerPrompt, reviewerRulebook } from "../../src/reviewer/prompt.ts";
+import { type CompletionRequest, IsolatedReviewer, REVIEWER_NUM_CTX } from "../../src/reviewer/reviewer.ts";
 
 let server: Server;
 let baseUrl: string;
@@ -16,6 +19,8 @@ let manifest: string;
 let context: number;
 let mutateDuringChat: boolean;
 let redirect: boolean;
+let version: string;
+let promptCounts: Record<string, number>;
 let received: Array<{ url: string; body: Record<string, unknown>; authorization?: string }>;
 
 beforeEach(async () => {
@@ -23,6 +28,8 @@ beforeEach(async () => {
 	context = 4096;
 	mutateDuringChat = false;
 	redirect = false;
+	version = "0.13.0";
+	promptCounts = { prompt_eval_count: 12 };
 	received = [];
 	server = createServer(async (req, res) => {
 		const chunks = [];
@@ -41,12 +48,15 @@ beforeEach(async () => {
 		}
 		if (req.url?.endsWith("/api/tags"))
 			res.end(JSON.stringify({ models: [{ name: "reviewer:latest", digest: manifest }] }));
-		else if (req.url?.endsWith("/api/version")) res.end(JSON.stringify({ version: "test-runtime" }));
+		else if (req.url?.endsWith("/api/version")) res.end(JSON.stringify({ version }));
 		else if (req.url?.endsWith("/api/ps"))
 			res.end(JSON.stringify({ models: [{ name: "reviewer:latest", digest: manifest, context_length: context }] }));
 		else if (req.url?.endsWith("/api/chat")) {
 			if (mutateDuringChat) manifest = "b".repeat(64);
-			res.end(JSON.stringify({ done: true, message: { role: "assistant", content: "1" } }));
+			// Stage one reads one token; stage two returns a verdict.
+			const content =
+				body.options?.num_predict === 1 ? "1" : '{"decision":"allow","risk":"low","reason":"routine change"}';
+			res.end(JSON.stringify({ done: true, message: { role: "assistant", content }, ...promptCounts }));
 		} else {
 			res.writeHead(404);
 			res.end("{}");
@@ -162,4 +172,102 @@ it("checks the exact inference snapshot even when auth alternates between endpoi
 	expect(received.filter((entry) => entry.url.endsWith("/api/chat")).map((entry) => entry.url)).toEqual([
 		"/proxy/api/chat",
 	]);
+});
+
+describe("prompt overflow fails closed (#17)", () => {
+	it("asks Ollama to refuse an over-long prompt instead of truncating it or shifting the context", async () => {
+		const { model, registry, request, resolved } = fixture();
+		await bindReviewerCompletion(resolved, await reviewerModelDigest(model, registry)).complete(request);
+		const chat = received.find((entry) => entry.url.endsWith("/api/chat"));
+		expect(chat?.body).toMatchObject({ truncate: false, shift: false });
+	});
+
+	it.each(["0.12.5", "0.11.10", "0.0.0", "test-runtime"])(
+		"refuses Ollama %s, which cannot refuse an over-long prompt",
+		async (old) => {
+			const { model, registry } = fixture();
+			version = old;
+			await expect(reviewerModelDigest(model, registry)).rejects.toThrow("silently truncates");
+		},
+	);
+
+	it.each(["0.12.6", "0.13.0", "1.0.0", "v0.12.10-rc1"])("accepts Ollama %s", async (current) => {
+		const { model, registry } = fixture();
+		version = current;
+		await expect(reviewerModelDigest(model, registry)).resolves.toMatch(/^ollama:sha256:/);
+	});
+
+	it("binds the configured context into the identity", async () => {
+		const { model, registry } = fixture();
+		expect(await reviewerModelDigest(model, registry, 8_192)).not.toBe(
+			await reviewerModelDigest(model, registry, 16_384),
+		);
+	});
+
+	it("rejects a response without a prompt count", async () => {
+		const { request, resolved } = fixture();
+		promptCounts = {};
+		await expect(resolved.completion.complete(request)).rejects.toThrow("did not report how many prompt tokens");
+	});
+
+	it("rejects a prompt count above the worst-case bound or the context", async () => {
+		const { request, resolved } = fixture();
+		promptCounts = { prompt_eval_count: 5_000 };
+		await expect(resolved.completion.complete(request)).rejects.toThrow("above the");
+	});
+
+	it("rejects a count far below the prompt when the cached part is reported", async () => {
+		const { request, resolved } = fixture();
+		const long = { ...request, user: "x".repeat(2_000) };
+		promptCounts = { prompt_eval_count: 10, prompt_eval_cached_count: 20 };
+		await expect(resolved.completion.complete(long)).rejects.toThrow("part of the prompt was not read");
+		// Control: the same prompt with a plausible count goes through.
+		promptCounts = { prompt_eval_count: 300, prompt_eval_cached_count: 200 };
+		await expect(resolved.completion.complete(long)).resolves.toBe("1");
+	});
+});
+
+it("escalates instead of allowing when Ollama reports fewer prompt tokens than it was sent (#17)", async () => {
+	const { model, registry } = fixture();
+	context = REVIEWER_NUM_CTX;
+	const resolved = resolveReviewerModel(registry, "ollama/reviewer");
+	const completion = bindReviewerCompletion(resolved, await reviewerModelDigest(model, registry));
+	const profile = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
+	profile.reviewer.model = "ollama/reviewer";
+	profile.review.trigger = "mutating";
+	const prompt = buildReviewerPrompt(reviewerRulebook(profile.review, new Map()));
+	const run = async () => {
+		let asked = false;
+		const decision = await decide(
+			{ toolName: "bash", toolCallId: "c1", input: { command: "touch output.txt" } },
+			{
+				profile,
+				cwd: "/work",
+				home: "/home/u",
+				lock: new ActionLock(),
+				owned: OWNED_TOOLS,
+				reviewer: new IsolatedReviewer({
+					profile,
+					prompt,
+					primary: completion,
+					timeoutMs: 2_000,
+					maxAttempts: 1,
+					evidence: { attended: "off" },
+				}),
+				escalator: {
+					confirm: async () => {
+						asked = true;
+						return false;
+					},
+				},
+			},
+		);
+		return { outcome: decision.outcome, asked };
+	};
+	// Control: a count that covers the prompt, and the reviewer's allow stands.
+	promptCounts = { prompt_eval_count: 200, prompt_eval_cached_count: 400 };
+	await expect(run()).resolves.toEqual({ outcome: "review-allow", asked: false });
+	// The same verdict over a prompt Ollama only partly read goes to the user.
+	promptCounts = { prompt_eval_count: 4, prompt_eval_cached_count: 8 };
+	await expect(run()).resolves.toEqual({ outcome: "ask-denied", asked: true });
 });

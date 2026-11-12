@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { DEFAULT_REVIEWER } from "../../src/config/defaults.ts";
 import { parseDocument, parseEnvironment } from "../../src/config/schema.ts";
 import type { SourceId } from "../../src/config/types.ts";
 
@@ -239,5 +240,22 @@ describe("reviewer.transport (#26)", () => {
 
 	it("refuses it from a project file, like every reviewer setting", () => {
 		expect(parse({ reviewer: { transport: "classifier" } }, "project_local").ok).toBe(false);
+	});
+});
+
+describe("reviewer.numCtx (#17)", () => {
+	it("defaults to 8,192 and accepts a larger context user-global", () => {
+		expect(DEFAULT_REVIEWER.numCtx).toBe(8_192);
+		expect(parse({ reviewer: { model: "ollama/reviewer", numCtx: 16_384 } }).ok).toBe(true);
+	});
+
+	it("refuses a context too small for the rulebook plus evidence, and non-integers", () => {
+		for (const numCtx of [4_096, 8_191, 262_145, 8_192.5, "8192"]) {
+			expect(errorKeys(parse({ reviewer: { model: "ollama/reviewer", numCtx } }))).toEqual(["reviewer.numCtx"]);
+		}
+	});
+
+	it("refuses it from a project file", () => {
+		expect(parse({ reviewer: { numCtx: 16_384 } }, "project_local").ok).toBe(false);
 	});
 });

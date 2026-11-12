@@ -2,6 +2,21 @@ import { isProvenanceRecord, PROVENANCE_ENTRY_TYPE, sha256 } from "../gate/prove
 import { MAX_AUTHORIZATION_ENTRIES, MAX_CONTEXT_ENTRIES } from "./evidence.ts";
 import type { ReviewAuthorization, ReviewContextEntry } from "./types.ts";
 
+/**
+ * Adds a gated call to the reviewer's context. Only calls that went ahead are
+ * history the reviewer may need; a denied call would let the agent fill the
+ * reviewer's context for free, with input it was not allowed to act on (#17).
+ */
+export function rememberReviewContext(
+	context: ReviewContextEntry[],
+	action: { tool: string; input: Record<string, unknown> },
+	blocked: boolean,
+): void {
+	if (blocked) return;
+	context.push({ provenance: "assistant_tool_call", tool: action.tool, input: structuredClone(action.input) });
+	if (context.length > MAX_CONTEXT_ENTRIES) context.splice(0, context.length - MAX_CONTEXT_ENTRIES);
+}
+
 export interface RestoredReviewHistory {
 	authorization: ReviewAuthorization[];
 	context: ReviewContextEntry[];

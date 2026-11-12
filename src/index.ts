@@ -85,8 +85,8 @@ import { countsAgainstTurn, formatTripwireHits, PersistenceTripwire } from "./pe
 import { formatProbeReport } from "./probe.ts";
 import { probeHost, resolveSeccompHelper } from "./probe-host.ts";
 import { critiqueRulebook, formatCritique } from "./reviewer/critique.ts";
-import { MAX_AUTHORIZATION_ENTRIES, MAX_CONTEXT_ENTRIES } from "./reviewer/evidence.ts";
-import { restoreReviewHistory } from "./reviewer/history.ts";
+import { MAX_AUTHORIZATION_ENTRIES } from "./reviewer/evidence.ts";
+import { rememberReviewContext, restoreReviewHistory } from "./reviewer/history.ts";
 import { formatQualificationRuns, qualifyConfiguredReviewers } from "./reviewer/qualify.ts";
 import { IsolatedReviewer } from "./reviewer/reviewer.ts";
 import { prepareQualifiedReviewer } from "./reviewer/setup.ts";
@@ -868,16 +868,7 @@ export default function (pi: ExtensionAPI): void {
 					"pi-enclave: direct instructions or active session branch changed during review; retry for a fresh decision",
 			};
 		}
-		if (decision.action) {
-			reviewContext.push({
-				provenance: "assistant_tool_call",
-				tool: decision.action.tool,
-				input: structuredClone(decision.action.input),
-			});
-			if (reviewContext.length > MAX_CONTEXT_ENTRIES) {
-				reviewContext.splice(0, reviewContext.length - MAX_CONTEXT_ENTRIES);
-			}
-		}
+		if (decision.action) rememberReviewContext(reviewContext, decision.action, decision.block === true);
 		if (!decision.block) {
 			// The decision record is queued inside decide(); under audit.required
 			// the call runs only once it is on disk (#37).
