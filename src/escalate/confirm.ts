@@ -50,6 +50,11 @@ export interface ConfirmEscalatorOptions {
 	onEscalation?: (event: EscalationEvent) => void;
 	/** Called when nobody was there, so a pending record can be written. */
 	onUnattended?: (action: CanonicalAction, reason: string, toolSource?: string) => void | Promise<void>;
+	/**
+	 * The approval queue (#30): writes the record, holds the call until a
+	 * decision, and returns it. Used when attendance is `queue`.
+	 */
+	queue?: (action: CanonicalAction, reason: string, toolSource?: string) => Promise<EscalationOutcome>;
 }
 
 export function createConfirmEscalator(options: ConfirmEscalatorOptions): Escalator {
@@ -62,7 +67,21 @@ export function createConfirmEscalator(options: ConfirmEscalatorOptions): Escala
 			const attendance = options.attendance();
 			const ui = options.ui();
 
-			if (attendance.effective === "off" || !ui) {
+			if (attendance.effective === "queue" && options.queue) {
+				// The record is the request: written once, and on a timeout it stays
+				// as an ordinary pending record, so no second one is written here.
+				const outcome = await options.queue(action, reason, toolSource);
+				options.onEscalation?.({
+					action,
+					reason,
+					outcome,
+					attended: attendance.effective,
+					...(reachability ? { reachability } : {}),
+				});
+				return outcome === "approved";
+			}
+
+			if (attendance.effective === "off" || attendance.effective === "queue" || !ui) {
 				await options.onUnattended?.(action, reason, toolSource);
 				options.onEscalation?.({ action, reason, outcome: "unattended", attended: attendance.effective });
 				return false;

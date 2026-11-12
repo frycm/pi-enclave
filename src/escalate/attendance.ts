@@ -58,6 +58,10 @@ export interface AttendanceState {
  */
 export function resolveAttendance(configured: AttendedMode, env: AttendanceEnvironment): AttendanceState {
 	if (configured === "off") return { configured, effective: "off" };
+	// The approval queue needs no dialog and no terminal (#30): the person
+	// answers from another terminal through the 0700 state directory, so it
+	// holds in every pi mode, headless included.
+	if (configured === "queue") return { configured, effective: "queue" };
 
 	// Neither mode can show anything at all in json or print mode: pi installs a
 	// no-op UI context there and `confirm` returns false immediately.

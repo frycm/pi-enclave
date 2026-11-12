@@ -80,9 +80,21 @@ export interface PendingRecord {
 	reason: string;
 	/** Set for a host-execution request, which no Phase-2 profile can grant. */
 	requiresHuman?: boolean;
+	/**
+	 * Set on a record a `queue` session is holding its tool call open for (#30):
+	 * the process that waits and when it stops waiting. While it waits, an
+	 * approval only records the decision and the session runs the call itself.
+	 */
+	waiter?: { pid: number; until: string };
 }
 
-export type PendingState = "pending" | "approved" | "consumed";
+/**
+ * Where a record is. `queued` is held open by a live session (#30);
+ * `declined` is a person's no. A queued record leaves `queued/` by exactly one
+ * rename, so a decision and the session giving up cannot both win.
+ */
+export type PendingState = "pending" | "queued" | "approved" | "declined" | "consumed";
+export const PENDING_STATES: readonly PendingState[] = ["queued", "pending", "approved", "declined", "consumed"];
 
 export interface PendingStore {
 	/** `<state>/state/<session-id>/`. */
@@ -94,14 +106,15 @@ export function pendingDirs(stateRoot: string, sessionId: string) {
 	return {
 		sessionDir,
 		pending: join(sessionDir, "pending"),
+		queued: join(sessionDir, "queued"),
 		approved: join(sessionDir, "approved"),
+		declined: join(sessionDir, "declined"),
 		consumed: join(sessionDir, "consumed"),
 	};
 }
 
-function dirFor(stateRoot: string, sessionId: string, state: PendingState): string {
-	const dirs = pendingDirs(stateRoot, sessionId);
-	return state === "pending" ? dirs.pending : state === "approved" ? dirs.approved : dirs.consumed;
+export function dirFor(stateRoot: string, sessionId: string, state: PendingState): string {
+	return pendingDirs(stateRoot, sessionId)[state];
 }
 
 export interface WriteOptions {
@@ -117,13 +130,16 @@ export interface WriteOptions {
 	ttlMs?: number;
 	now?: () => number;
 	nonce?: string;
+	/** Write into `queued/` for a waiting session instead of `pending/` (#30). */
+	waiter?: { pid: number; until: string };
 }
 
 /** Write a record. Returns its path and nonce. */
 export function writePending(options: WriteOptions): { path: string; record: PendingRecord } {
 	const dirs = pendingDirs(options.stateRoot, options.sessionId);
+	const directory = options.waiter ? dirs.queued : dirs.pending;
 	ensureSecureDir(dirs.sessionDir);
-	ensureSecureDir(dirs.pending);
+	ensureSecureDir(directory);
 
 	const now = options.now?.() ?? Date.now();
 	const nonce = options.nonce ?? randomBytes(16).toString("hex");
@@ -151,9 +167,10 @@ export function writePending(options: WriteOptions): { path: string; record: Pen
 		},
 		...(options.sessionFile !== undefined ? { sessionFile: options.sessionFile } : {}),
 		...(options.requiresHuman ? { requiresHuman: true } : {}),
+		...(options.waiter ? { waiter: options.waiter } : {}),
 	};
 
-	const path = join(dirs.pending, `${nonce}.json`);
+	const path = join(directory, `${nonce}.json`);
 	const tmp = `${path}.tmp`;
 	// Use the same injective JSON spelling as the action hash. Native
 	// JSON.stringify turns -0 into 0, which would make a freshly written record
@@ -245,6 +262,16 @@ function validateRecord(record: unknown): string | undefined {
 	if (typeof r.expiresAt !== "string" || Number.isNaN(Date.parse(r.expiresAt))) return "the record has no valid expiry";
 	if (typeof r.configHash !== "string") return "the record has no configuration hash";
 	if (r.toolSource !== undefined && typeof r.toolSource !== "string") return "the record has an invalid tool source";
+	if (
+		r.waiter !== undefined &&
+		(typeof r.waiter !== "object" ||
+			r.waiter === null ||
+			!Number.isInteger(r.waiter.pid) ||
+			typeof r.waiter.until !== "string" ||
+			Number.isNaN(Date.parse(r.waiter.until)))
+	) {
+		return "the record has an invalid waiter";
+	}
 	if (!r.profileSnapshot || typeof r.profileSnapshot !== "object") return "the record has no profile snapshot";
 	if (!r.action || typeof r.action !== "object") return "the record has no action";
 	const action = r.action as Partial<RecordedAction>;
@@ -278,6 +305,53 @@ export function transition(
 	return destination;
 }
 
+/**
+ * Move a queued or approved record back to `pending/` without its `waiter`
+ * (#30), if it is still where it was; `false` means another party moved it
+ * first.
+ *
+ * Dropping the waiter is what separates the two ways a record reaches
+ * `approved/`: from `queued/` by a person's decision for a waiting session,
+ * which still carries the waiter, or from `pending/` by an out-of-session
+ * `approve`, which may have run. Only the first may be taken back once its
+ * session is gone.
+ *
+ * The claim is still one rename, into a name nothing lists; the record
+ * appears in `pending/` only once it is rewritten, so nobody can approve the
+ * copy with a stale waiter, or see the record twice. A crash in between
+ * leaves it in that name, where nothing runs it.
+ */
+export function returnToPending(
+	stateRoot: string,
+	sessionId: string,
+	nonce: string,
+	from: "queued" | "approved",
+): boolean {
+	const target = dirFor(stateRoot, sessionId, "pending");
+	mkdirSync(target, { recursive: true, mode: 0o700 });
+	const source = join(dirFor(stateRoot, sessionId, from), `${nonce}.json`);
+	const claimed = join(target, `${nonce}.json.returning`);
+	try {
+		renameSync(source, claimed);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+	const record = JSON.parse(readFileSync(claimed, "utf8")) as PendingRecord;
+	delete record.waiter;
+	const tmp = join(target, `${nonce}.json.tmp`);
+	writeFileSync(tmp, `${executionSerialize(record)}\n`, { mode: 0o600 });
+	const fd = openSync(tmp, "r");
+	try {
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	renameSync(tmp, join(target, `${nonce}.json`));
+	unlinkSync(claimed);
+	return true;
+}
+
 export interface ListedRecord {
 	nonce: string;
 	state: PendingState;
@@ -287,7 +361,7 @@ export interface ListedRecord {
 /** Every record for a session, in every state. For `pi-enclave pending`. */
 export function listPending(stateRoot: string, sessionId: string, now = Date.now()): ListedRecord[] {
 	const out: ListedRecord[] = [];
-	for (const state of ["pending", "approved", "consumed"] as PendingState[]) {
+	for (const state of PENDING_STATES) {
 		const dir = dirFor(stateRoot, sessionId, state);
 		let names: string[];
 		try {

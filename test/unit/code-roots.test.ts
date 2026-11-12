@@ -223,6 +223,21 @@ describe("loaded code roots (#36)", () => {
 		expect(formatCodeRootProblems(result, true)).toMatch(/install Node outside the writable roots/);
 	});
 
+	// Review of #69: `["/work/project/tools/notify.sh"]` was accepted, and the
+	// agent could rewrite what the trusted process runs on every ask.
+	it("refuses an attended.notify program below a writable root, even with the opt-in (#30)", () => {
+		mkdirSync(join(ws, "tools"), { recursive: true });
+		writeFileSync(join(ws, "tools", "notify.sh"), "#!/bin/sh\n");
+		const result = check(sources({ extensionPaths: [], notifyProgram: join(ws, "tools", "notify.sh") }));
+		expect(result.refused.map((r) => r.root.from)).toEqual(["the attended.notify program"]);
+		expect(formatCodeRootProblems(result, true)).toMatch(
+			/install it, and anything it loads, outside the writable roots/,
+		);
+		const fine = check(sources({ extensionPaths: [], notifyProgram: join(outside, "node", "bin", "node") }));
+		expect(fine.refused).toEqual([]);
+		expect(fine.exposed).toEqual([]);
+	});
+
 	it("resolves pi-enclave's own dependencies, as its imports do", () => {
 		const own = join(import.meta.dirname, "..", "..", "src", "index.ts");
 		const entries = resolveDependencyEntries(own);

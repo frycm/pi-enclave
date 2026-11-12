@@ -21,10 +21,13 @@ import { ContainerBackend } from "../src/backend/container/backend.ts";
 import { qualifyContainer } from "../src/backend/container/qualification.ts";
 import { selectBackend } from "../src/backend/select.ts";
 import { approve } from "../src/cli/approve.ts";
+import { approveQueued, decline, locateUndecided } from "../src/cli/decide.ts";
 import { renderConfig, renderDefaults } from "../src/config/render.ts";
 import { loadConfig } from "../src/config/sources.ts";
+import type { EffectiveProfile } from "../src/config/types.ts";
 import { provisionSecret } from "../src/escalate/handshake.ts";
-import { describeRecord, listPending, listSessions, readPending } from "../src/escalate/pending.ts";
+import { describeRecord, listPending, listSessions } from "../src/escalate/pending.ts";
+import { strandedApproval } from "../src/escalate/queue.ts";
 import { formatProbeReport } from "../src/probe.ts";
 import { AuditLog, formatVerifyResult, verifyLog } from "../src/state/audit.ts";
 import { ensureStateDirs, stateDirs } from "../src/state/dir.ts";
@@ -36,7 +39,9 @@ const USAGE = `pi-enclave <command>
   rules config                  print the effective rulebook, tagged by source
 	                              (use /enclave rules critique inside pi for model critique)
   pending [--all]               list approval records awaiting a decision
-  approve <nonce>               show an action, ask, and run it once
+  approve <nonce>               show an action and ask; a waiting session runs it,
+                                otherwise it runs once here
+  decline <nonce>               refuse a request; a waiting session gets a denial
   audit [verify] [--session id] read or re-chain the audit log
   attend-secret                 provision the RPC attendance secret
   qualify-backend                qualify the explicitly configured local container engine
@@ -65,6 +70,9 @@ async function main(argv: string[]): Promise<number> {
 
 		case "approve":
 			return runApprove(rest);
+
+		case "decline":
+			return runDecline(rest);
 
 		case "audit":
 			return auditCommand(rest);
@@ -153,9 +161,18 @@ function pending(argv: string[]): number {
 
 	for (const sessionId of sessions) {
 		for (const entry of listPending(dirs.state, sessionId)) {
-			if (!showAll && entry.state !== "pending") continue;
+			// Approved for a session that ended before running it: not run, and
+			// `approve` takes it back to pending.
+			const stranded = entry.state === "approved" && strandedApproval(entry.record);
+			if (!showAll && entry.state !== "pending" && entry.state !== "queued" && !stranded) continue;
 			found++;
-			process.stdout.write(`\n[${entry.state}] session ${sessionId}\n${describeRecord(entry.record)}\n`);
+			const waiting =
+				entry.state === "queued" && entry.record.waiter
+					? ` (the session waits until ${entry.record.waiter.until})`
+					: stranded
+						? " (approved, but its session ended before running it; it did not run)"
+						: "";
+			process.stdout.write(`\n[${entry.state}] session ${sessionId}${waiting}\n${describeRecord(entry.record)}\n`);
 		}
 	}
 
@@ -167,42 +184,12 @@ function pending(argv: string[]): number {
 	return 0;
 }
 
-async function runApprove(argv: string[]): Promise<number> {
-	const nonce = argv[0];
-	if (!nonce) {
-		process.stderr.write("pi-enclave: approve needs a nonce. Run `pi-enclave pending` to see them.\n");
-		return 2;
-	}
-
-	const dirs = stateDirs();
-	// A nonce is unique across sessions, so the session does not have to be
-	// named -- but the record is still validated against the session it claims.
-	let located: { sessionId: string } | undefined;
-	for (const sessionId of listSessions(dirs.state)) {
-		const result = readPending({ stateRoot: dirs.state, sessionId, nonce });
-		if (result.ok) {
-			located = { sessionId };
-			break;
-		}
-	}
-	if (!located) {
-		process.stderr.write(`pi-enclave: no pending record with nonce ${nonce}.\n`);
-		return 1;
-	}
-
-	const read = readPending({ stateRoot: dirs.state, sessionId: located.sessionId, nonce });
-	if (!read.ok) {
-		process.stderr.write(`pi-enclave: ${read.reason}\n`);
-		return 1;
-	}
-
-	const loaded = currentConfig(read.record.action.cwd);
-	if (!loaded) return 1;
-
+/** The approvals log, shared by approve and decline. */
+function approvalsLog(profile: EffectiveProfile) {
 	// The one action a person approved by hand belongs in the trail (#37). It
 	// goes to its own log rather than the originating session's, which may
 	// still be open in a pi process that owns that file's chain.
-	const auditSettings = loaded.profile.audit;
+	const auditSettings = profile.audit;
 	const mirror = auditSettings.syslog
 		? createSyslogMirror((error) =>
 				process.stderr.write(`pi-enclave: the audit syslog mirror stopped: ${error.message}\n`),
@@ -211,35 +198,113 @@ async function runApprove(argv: string[]): Promise<number> {
 	const approvals = new AuditLog({
 		dir: ensureStateDirs().audit,
 		sessionId: "approvals",
-		readDeny: loaded.profile.sandbox.readDeny,
+		readDeny: profile.sandbox.readDeny,
 		maxBytes: auditSettings.sessionMaxMb * 1024 * 1024,
 		...(mirror ? { mirror } : {}),
 		onError: (error) => process.stderr.write(`pi-enclave: audit write failed: ${error.message}\n`),
 	});
-	/** Under audit.required, an approval runs only once its record is on disk. */
-	const recordApproval = async (fields: Record<string, unknown>): Promise<boolean> => {
+	/** Under audit.required, a decision counts only once its record is on disk. */
+	const record = async (fields: Record<string, unknown>): Promise<boolean> => {
 		approvals.append("approval", fields);
 		if (!auditSettings.required) return true;
 		await approvals.flush();
 		return !approvals.degraded && !mirror?.stopped;
 	};
+	return { record, flush: () => approvals.flush() };
+}
+
+function cliIO(rl: ReturnType<typeof createInterface>) {
+	return {
+		out: (text: string) => process.stdout.write(text.endsWith("\n") ? text : `${text}\n`),
+		err: (text: string) => process.stderr.write(`${text}\n`),
+		ask: async (question: string) => {
+			const answer = await rl.question(question);
+			return /^y(es)?$/i.test(answer.trim());
+		},
+	};
+}
+
+async function runDecline(argv: string[]): Promise<number> {
+	const nonce = argv[0];
+	if (!nonce) {
+		process.stderr.write("pi-enclave: decline needs a nonce. Run `pi-enclave pending` to see them.\n");
+		return 2;
+	}
+	const dirs = stateDirs();
+	const located = locateUndecided(dirs.state, nonce);
+	if (!located) {
+		process.stderr.write(`pi-enclave: no pending or queued record with nonce ${nonce}.\n`);
+		return 1;
+	}
+	const loaded = currentConfig(located.record.action.cwd);
+	if (!loaded) return 1;
+	const approvals = approvalsLog(loaded.profile);
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	try {
+		const result = await decline({
+			record: located.record,
+			state: located.state,
+			stateRoot: dirs.state,
+			current: loaded.profile,
+			home: homedir(),
+			audit: approvals.record,
+			io: cliIO(rl),
+		});
+		return result.outcome === "declined" ? 0 : 1;
+	} finally {
+		rl.close();
+		await approvals.flush();
+	}
+}
+
+async function runApprove(argv: string[]): Promise<number> {
+	const nonce = argv[0];
+	if (!nonce) {
+		process.stderr.write("pi-enclave: approve needs a nonce. Run `pi-enclave pending` to see them.\n");
+		return 2;
+	}
+
+	const dirs = stateDirs();
+	const located = locateUndecided(dirs.state, nonce);
+	if (!located) {
+		process.stderr.write(`pi-enclave: no pending record with nonce ${nonce}.\n`);
+		return 1;
+	}
+	const read = { record: located.record };
+
+	const loaded = currentConfig(read.record.action.cwd);
+	if (!loaded) return 1;
+
+	if (located.state === "queued") {
+		const approvals = approvalsLog(loaded.profile);
+		const rl = createInterface({ input: process.stdin, output: process.stdout });
+		try {
+			const result = await approveQueued({
+				record: read.record,
+				stateRoot: dirs.state,
+				current: loaded.profile,
+				home: homedir(),
+				audit: approvals.record,
+				io: cliIO(rl),
+			});
+			return result.outcome === "approved" || result.outcome === "left" ? 0 : 1;
+		} finally {
+			rl.close();
+			await approvals.flush();
+		}
+	}
+
+	const approvals = approvalsLog(loaded.profile);
 	const rl = createInterface({ input: process.stdin, output: process.stdout });
 	try {
 		const result = await approve({
-			audit: recordApproval,
+			audit: approvals.record,
 			record: read.record,
 			stateRoot: dirs.state,
 			current: loaded.profile,
 			reloadCurrent: () => currentConfig(read.record.action.cwd)?.profile,
 			home: homedir(),
-			io: {
-				out: (text) => process.stdout.write(text.endsWith("\n") ? text : `${text}\n`),
-				err: (text) => process.stderr.write(`${text}\n`),
-				ask: async (question) => {
-					const answer = await rl.question(question);
-					return /^y(es)?$/i.test(answer.trim());
-				},
-			},
+			io: cliIO(rl),
 		});
 		switch (result.outcome) {
 			case "executed":

@@ -4,8 +4,9 @@
  *
  * Everything else pi-enclave protects is data a later start reads: Git
  * configuration, `.pi`, the state directory. This is the code itself: pi,
- * pi-enclave and its dependencies, every other extension, the Node binary and
- * the seccomp helper. A change to any of it is inert in the running session
+ * pi-enclave and its dependencies, every other extension, the Node binary,
+ * the seccomp helper and the `attended.notify` program (#30), which the pi
+ * process runs whenever it writes an approval record. A change to any of it is inert in the running session
  * and runs with the user's privileges, outside every layer, the next time pi
  * starts. So none of it may sit below a writable root unless the user has
  * said so (`sandbox.allowSelfHosting`, user-global only), and then it is
@@ -65,6 +66,8 @@ export interface CodeSources {
 	extensionPaths: readonly { path: string; from: string }[];
 	execPath: string;
 	seccompHelper: string | null;
+	/** `attended.notify[0]`, the program the pi process runs for a new record (#30). */
+	notifyProgram?: string;
 	/** Where relative extension paths are resolved. */
 	cwd: string;
 	/** Injected by tests. */
@@ -251,6 +254,16 @@ export function collectCodeRoots(sources: CodeSources, writableRoots: readonly s
 	});
 	addLinks(sources.execPath, "the Node binary");
 	if (sources.seccompHelper) found.push({ path: canonical(sources.seccompHelper), from: "the seccomp helper" });
+	if (sources.notifyProgram) {
+		// Run by the trusted process on every ask, so like the Node binary:
+		// write-denying it for the session is not enough, it has to move.
+		found.push({
+			path: canonical(sources.notifyProgram),
+			from: "the attended.notify program",
+			fixed: "install it, and anything it loads, outside the writable roots",
+		});
+		addLinks(sources.notifyProgram, "the attended.notify program");
+	}
 
 	// An npm workspace or `npm link` puts a symlink in `node_modules` and the
 	// code elsewhere, so a collected directory does not contain everything it

@@ -292,3 +292,41 @@ describe("reviewer.numCtx (#17)", () => {
 		expect(parse({ reviewer: { numCtx: 16_384 } }, "project_local").ok).toBe(false);
 	});
 });
+
+describe("the approval queue and notify hook (#30)", () => {
+	it("accepts queue mode, a queue timeout and an argv notify command user-global", () => {
+		const result = parse({
+			attended: { mode: "queue", queueTimeoutMs: 600_000, notify: ["/usr/bin/curl", "-d", "@-", "-d", "@-"] },
+		});
+		if (!result.ok) throw new Error(JSON.stringify(result.errors));
+		expect(result.document.patch?.attended).toEqual({
+			mode: "queue",
+			queueTimeoutMs: 600_000,
+			// An argv keeps order and repeats, unlike a list.
+			notify: ["/usr/bin/curl", "-d", "@-", "-d", "@-"],
+		});
+	});
+
+	it.each([
+		[{ queueTimeoutMs: 999 }, "attended.queueTimeoutMs"],
+		[{ queueTimeoutMs: 86_400_001 }, "attended.queueTimeoutMs"],
+		[{ notify: ["wall"] }, "attended.notify[0]"],
+		[{ notify: "/usr/bin/wall -n" }, "attended.notify"],
+		[{ notify: ["/usr/bin/wall", 3] }, "attended.notify"],
+		[{ notify: ["/usr/bin/wall", "a\u0000b"] }, "attended.notify"],
+	])("rejects attended %j", (attended, key) => {
+		expect(errorKeys(parse({ attended }))).toEqual([key]);
+	});
+
+	// The attended section never ran the project check before #30, so a
+	// project file's headlessTrust was accepted too.
+	it.each([
+		["attended.notify", { notify: ["/usr/bin/wall"] }],
+		["attended.headlessTrust", { headlessTrust: ["/work"] }],
+	])("refuses %s from a project file", (key, attended) => {
+		for (const source of ["project_local", "project_shared"] as const) {
+			expect(errorKeys(parse({ attended }, source))).toEqual([key]);
+		}
+		expect(parse({ attended }).ok).toBe(true);
+	});
+});
