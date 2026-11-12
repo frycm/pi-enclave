@@ -1342,15 +1342,56 @@ for the check, not an execution input. Every resumed action remains sandboxed.
 ### Audit log
 
 One JSONL record per decision, including sandbox violations, capability grants, breaker
-trips, attendance changes, and pending-approval lifecycle events.
+trips, attendance changes, and pending-approval lifecycle events. For an unattended agent on
+a server, the log is meant to answer "what did it run, and what happened?" (#37):
+
+| Record | What it holds |
+|---|---|
+| `decision` | The gate's outcome, the action hash, and the **command as bash received it** (redacted, at most 8 KiB, with `commandTruncated` when cut) next to the tokenizer's reading in `commands`. The raw text is what lets an investigator re-run or re-hash the action, and what shows a tokenizer mistake instead of repeating it. |
+| `executed` | For every call the gate allowed, once pi has run it: tool call id, hash, `isError`, duration and, for bash, the exit code (`null` when the command was killed or timed out). |
+| `user_command` | Each `!`/`!!` command the person typed: command, cwd, exit code, duration. It is sandboxed but not gated, and on a shared server it belongs in the trail too. |
+| `reviewer` | Each verdict: the model's decision, risk and reason next to the enforced decision, the deterministic minimum risk, and whether a direct instruction covered the action; failures say which kind. Timing is recorded separately. |
+| `approval` | `pi-enclave approve`, in its own `approvals` log: an `executing` record when it starts and one with the outcome (`executed`, `declined`, `refused`, `unsupported`), with nonce, hash, originating session, both configuration hashes, uid, user, tty, SSH client address, exit code and duration. It is a separate log because the originating session may still be open and own its own chain. |
+| `audit` | The log's own events: a missing tail found when a session resumes, and the per-session cap. |
+
+What the chain detects, and what it does not:
+
+- **Detected by the chain alone:** an edited, removed, reordered or inserted record anywhere
+  before the newest one.
+- **Detected with the head anchor:** removing the newest records, replacing the newest
+  record, or deleting the whole file. Every append also writes `<session-id>.head` (the newest
+  seq and its hash) beside the log, atomically. `pi-enclave audit verify` compares the two and
+  lists a head anchor whose log is gone. A session that resumes from a log shorter than its
+  anchor writes an `audit` record of the gap before anything else, so the evidence survives in
+  the chain once the anchor moves on. One record past the anchor is a crash between the two
+  writes; more is reported.
+- **Not detected:** a rewrite of both the log and its anchor. They belong to the same user,
+  so anything running as that user can redo both; the sandbox keeps the agent away from them.
+  `audit.syslog: true` sends each head (session, seq, kind, hash; never a record's content)
+  to syslog with `logger -p authpriv.info`, which on most servers the user can add to but not
+  edit, and which is often forwarded off the host. Comparing that copy with the log is a
+  manual step today.
+
+Behaviour under failure, for `attended: off`:
+
+- A write failure prints to stderr and shows `AUDIT FAILING` in the status line. With
+  `audit.required: true` (user-global only) it also ends the turn and refuses every later tool
+  call and `!` command in the session.
+- `audit.sessionMaxMb` (default 100) bounds one session's file. At the cap the log writes one
+  last `audit` record saying so and stops, which counts as a failure for `audit.required`.
+- Retention's size budget never deletes a session holding a `breaker`, `violation` or
+  `approval` record: those are the ones an incident review needs, and oldest-first would pick
+  them. Only the age limit removes them, and the budget may be exceeded until then. A log
+  retention deletes keeps its head anchor, marked retired, for one more retention period, so
+  verify can tell retention from loss.
 
 | Property | Contract |
 |---|---|
 | Location | `~/.pi/agent/enclave/audit/<session-id>.jsonl` — same extension-owned, `readDeny`-listed directory as the state. Never the workspace. |
 | Permissions | Directory `0700`, file `0600`, opened `O_APPEND`. |
-| Integrity | Each record carries `seq` (monotonic per session) and `prevHash` (SHA-256 of the previous line), so truncation or edits are detectable by `pi-enclave audit verify`. Not tamper-*proof* against root; tamper-*evident* against the agent and against accidents. |
+| Integrity | Each record carries `seq` (monotonic per session) and `prevHash` (SHA-256 of the previous line), and the head is anchored beside the log (above), so edits and truncation are detectable by `pi-enclave audit verify`. Not tamper-*proof* against the user or root; tamper-*evident* against the agent and against accidents. |
 | Redaction | Argument values matching the `readDeny` path list, anything shaped like a credential (`AKIA…`, `ghp_…`, `-----BEGIN`, `Authorization:` headers) and the bodies of `write`/`edit` tool calls are replaced by `<redacted:sha256:…>` before writing—including when an action description is embedded in a denial reason. The hash lets an investigator confirm a value without the log storing it. The full canonical action is in the record only for pending-approval events, where the standalone approval boundary renders it completely and with terminal controls escaped. |
-| Retention | Default 30 days or 200 MB per user, whichever first; configurable in the user-global file only. |
+| Retention | Default 30 days or 200 MB per user, whichever first, except that the size budget keeps sessions with incidents; configurable in the user-global file only, with `required`, `sessionMaxMb` and `syslog`. |
 | Rotation | Per session file; sessions older than retention are deleted on session start. No in-session rotation, so `prevHash` chains stay unbroken. |
 | Reading | `pi-enclave audit [--session <id>] [--since …] [--json]`; also surfaced in `/enclave violations`. |
 

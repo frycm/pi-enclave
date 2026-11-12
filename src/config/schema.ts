@@ -61,7 +61,7 @@ const PROJECT_FORBIDDEN: Record<string, string> = {
 	"review.allow": "prose rulebook entries are user-global only; a repository must not reach the reviewer prompt.",
 	reviewer: "the reviewer is immutable below user-global.",
 	breaker: "breaker thresholds are immutable below user-global.",
-	audit: "audit retention is immutable below user-global.",
+	audit: "audit settings are immutable below user-global.",
 	"sandbox.env": "the child environment is user-global only: a project cannot add a variable.",
 	profiles: "only a user-global file may define profiles; a project file may select one.",
 };
@@ -712,7 +712,7 @@ class ParseContext {
 	private audit(prefix: string, raw: unknown): ProfilePatch["audit"] | undefined {
 		const body = this.object(prefix, raw);
 		if (!body) return undefined;
-		this.rejectUnknown(prefix, body, ["retentionDays", "retentionMb"]);
+		this.rejectUnknown(prefix, body, ["retentionDays", "retentionMb", "required", "sessionMaxMb", "syslog"]);
 
 		const out: NonNullable<ProfilePatch["audit"]> = {};
 		if ("retentionDays" in body) {
@@ -722,6 +722,15 @@ class ParseContext {
 		if ("retentionMb" in body) {
 			const mb = this.integer(join(prefix, "retentionMb"), body.retentionMb, 1, 100_000);
 			if (mb !== undefined) out.retentionMb = mb;
+		}
+		if ("sessionMaxMb" in body) {
+			const mb = this.integer(join(prefix, "sessionMaxMb"), body.sessionMaxMb, 1, 100_000);
+			if (mb !== undefined) out.sessionMaxMb = mb;
+		}
+		for (const key of ["required", "syslog"] as const) {
+			if (!(key in body)) continue;
+			const value = this.boolean(join(prefix, key), body[key]);
+			if (value !== undefined) out[key] = value;
 		}
 		return out;
 	}

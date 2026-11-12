@@ -243,6 +243,10 @@ export function narrowerOrEqual(a: EffectiveProfile, b: EffectiveProfile): Order
 
 	if (a.audit.retentionDays < b.audit.retentionDays) fail("audit.retentionDays", "cannot shorten audit retention");
 	if (a.audit.retentionMb < b.audit.retentionMb) fail("audit.retentionMb", "cannot shrink the audit budget");
+	if (a.audit.sessionMaxMb < b.audit.sessionMaxMb)
+		fail("audit.sessionMaxMb", "cannot shrink the per-session audit cap");
+	if (b.audit.required && !a.audit.required) fail("audit.required", "cannot stop requiring the audit log");
+	if (b.audit.syslog && !a.audit.syslog) fail("audit.syslog", "cannot turn off the syslog mirror");
 
 	return violations;
 }

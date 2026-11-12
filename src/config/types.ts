@@ -236,6 +236,16 @@ export interface AttendedSettings {
 export interface AuditSettings {
 	retentionDays: number;
 	retentionMb: number;
+	/**
+	 * When true, a failed audit write (or a session over `sessionMaxMb`) ends
+	 * the turn and refuses every later tool call, because an unattended session
+	 * the log has stopped recording is one nobody can account for (#37).
+	 */
+	required: boolean;
+	/** One session's log may not grow past this; the log stops and says so. */
+	sessionMaxMb: number;
+	/** Mirror each record's head hash to syslog (`logger -p authpriv.info`). */
+	syslog: boolean;
 }
 
 /**

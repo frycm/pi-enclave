@@ -33,6 +33,7 @@ import {
 	shellWriteCapabilityIssue,
 	validateReadCapability,
 	validateWriteCapability,
+	WriteBoundaryError,
 } from "./backend/capability.ts";
 import { canonical as canonicalPath, isUnder } from "./backend/paths.ts";
 import { selectBackend } from "./backend/select.ts";
@@ -89,9 +90,18 @@ import { formatQualificationRuns, qualifyConfiguredReviewers } from "./reviewer/
 import { IsolatedReviewer } from "./reviewer/reviewer.ts";
 import { prepareQualifiedReviewer } from "./reviewer/setup.ts";
 import type { ActionReviewer, ReviewAuthorization, ReviewContextEntry } from "./reviewer/types.ts";
-import { AuditLog, configFields, configHash, decisionFields } from "./state/audit.ts";
+import {
+	AuditLog,
+	configFields,
+	configHash,
+	decisionFields,
+	executedFields,
+	reviewerVerdictFields,
+	userCommandFields,
+} from "./state/audit.ts";
 import { ensureStateDirs, StateDirError, stateDirs } from "./state/dir.ts";
 import { applyRetention } from "./state/retention.ts";
+import { createSyslogMirror } from "./state/syslog.ts";
 import { BASH_PROMPT_GUIDELINES, createEnclaveBashOperations } from "./tools/bash.ts";
 import {
 	createEditOperations,
@@ -321,6 +331,18 @@ export default function (pi: ExtensionAPI): void {
 	/** An admitted owned call earlier in the current prepared batch. */
 	let queuedOwnedCall = false;
 	let audit: AuditLog | undefined;
+	/**
+	 * Allowed calls waiting for pi to run them, by tool call id, and the exit
+	 * code each bash action ended with, by action hash: together they make the
+	 * `executed` record that follows a `decision: allow` (#37).
+	 */
+	const executions = new Map<string, { tool: string; hash: string; turnIndex: number }>();
+	const exitCodes = new Map<string, number | null>();
+	/** Set when `audit.required` is on and the log stopped recording. */
+	const requiredAuditIssue = (): string | undefined =>
+		effective?.audit.required && audit?.degraded
+			? `pi-enclave: the audit log is not recording (${audit.full ? "the session reached audit.sessionMaxMb" : "a write failed"}), and audit.required is set, so nothing more may run in this session.`
+			: undefined;
 	let attendance: AttendanceState = { configured: "off", effective: "off" };
 	/** Rebuilt per escalation from the live context, so a lost channel is seen. */
 	let uiContext: ConfirmUI | undefined;
@@ -494,6 +516,9 @@ export default function (pi: ExtensionAPI): void {
 		getCompiled: requireCompiled,
 		onViolations: (found) => recordViolations(found, true),
 		onDeniedReadAttempt: (paths) => recordRuntimeViolation(breaker, currentTurn, paths.length, true),
+		onExit: (exitCode, action) => {
+			if (action) exitCodes.set(action.hash, exitCode);
+		},
 		guard: guardCommand,
 	});
 
@@ -519,6 +544,8 @@ export default function (pi: ExtensionAPI): void {
 			if (effective?.auto && breakerBlocks()) {
 				throw new Error("pi-enclave: the denial circuit breaker is open; this turn is over.");
 			}
+			const auditIssue = requiredAuditIssue();
+			if (auditIssue) throw new Error(auditIssue);
 			return undefined;
 		},
 	});
@@ -567,8 +594,35 @@ export default function (pi: ExtensionAPI): void {
 				}
 			},
 		};
-		pi.on("user_bash", () => {
-			if (report.ok) return { operations: userBashWithTripwire };
+		// The person's own command is not gated, but it is recorded: on a shared
+		// server it belongs in the trail as much as the agent's (#37).
+		const recordedUserBash = (event: { command: string; cwd: string; excludeFromContext: boolean }) => ({
+			...userBashWithTripwire,
+			async exec(...args: Parameters<typeof userBashWithTripwire.exec>) {
+				const started = performance.now();
+				const record = (fields: { exitCode?: number | null; error?: string }) =>
+					audit?.append(
+						"user_command",
+						userCommandFields({
+							command: event.command,
+							cwd: event.cwd,
+							excludeFromContext: event.excludeFromContext,
+							durationMs: performance.now() - started,
+							...fields,
+						}),
+					);
+				try {
+					const result = await userBashWithTripwire.exec(...args);
+					record({ exitCode: result.exitCode ?? null });
+					return result;
+				} catch (error) {
+					record({ error: (error as Error).message });
+					throw error;
+				}
+			},
+		});
+		pi.on("user_bash", (event) => {
+			if (report.ok) return { operations: recordedUserBash(event) };
 			return {
 				result: {
 					output: `pi-enclave: refusing to run unsandboxed.\n${formatProbeReport(report)}\n`,
@@ -653,6 +707,8 @@ export default function (pi: ExtensionAPI): void {
 		if (!report.ok) return { block: true, reason: formatProbeReport(report) };
 		if (ownershipError) return { block: true, reason: ownershipError };
 		if (!effective) return { block: true, reason: "pi-enclave: no policy is loaded yet, so nothing may run." };
+		const auditIssue = requiredAuditIssue();
+		if (auditIssue) return { block: true, terminate: true, reason: auditIssue };
 
 		const ownedTool = OWNED_TOOLS.includes(event.toolName);
 
@@ -683,6 +739,7 @@ export default function (pi: ExtensionAPI): void {
 						validateWriteCapability(profile, actionCwd, value);
 						return undefined;
 					} catch (error) {
+						if (error instanceof WriteBoundaryError) return { message: error.message, boundary: true as const };
 						return (error as Error).message;
 					}
 				},
@@ -754,6 +811,13 @@ export default function (pi: ExtensionAPI): void {
 		refreshStatusLine?.();
 		if (!decision.block) {
 			if (ownedTool) queuedOwnedCall = true;
+			if (decision.action) {
+				executions.set(event.toolCallId, {
+					tool: decision.action.tool,
+					hash: decision.action.hash,
+					turnIndex: currentTurn,
+				});
+			}
 			return {};
 		}
 		return { block: true, reason: decision.reason ?? "denied", ...(decision.terminate ? { terminate: true } : {}) };
@@ -840,6 +904,29 @@ export default function (pi: ExtensionAPI): void {
 		lock.consume(event.toolCallId);
 	});
 
+	// The decision says the gate let a call through; this says what became of
+	// it. pi emits it for every call it ran, including nested ones.
+	pi.on("tool_execution_end", (event) => {
+		const pending = executions.get(event.toolCallId);
+		if (!pending) return;
+		executions.delete(event.toolCallId);
+		const hasExit = exitCodes.has(pending.hash);
+		const exitCode = exitCodes.get(pending.hash);
+		exitCodes.delete(pending.hash);
+		audit?.append(
+			"executed",
+			executedFields({
+				toolCallId: event.toolCallId,
+				tool: pending.tool,
+				hash: pending.hash,
+				isError: event.isError,
+				...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
+				...(hasExit ? { exitCode: exitCode ?? null } : {}),
+				turnIndex: pending.turnIndex,
+			}),
+		);
+	});
+
 	const restoreBranch = (ctx: ExtensionContext) => {
 		authorizationGeneration++;
 		directInput.reset();
@@ -852,6 +939,8 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		compiled = undefined;
+		executions.clear();
+		exitCodes.clear();
 		tripwire = undefined;
 		tripwireLedger = undefined;
 		warnUser = (message) => ctx.ui.notify(message, "warning");
@@ -966,11 +1055,27 @@ export default function (pi: ExtensionAPI): void {
 				retentionMb: loaded.profile.audit.retentionMb,
 				keepSessionId: ctx.sessionManager.getSessionId(),
 			});
+			const auditSettings = loaded.profile.audit;
+			const auditError = (error: Error) => {
+				process.stderr.write(`pi-enclave: audit write failed: ${error.message}\n`);
+				if (auditSettings.required) {
+					process.stderr.write("pi-enclave: audit.required is set, so no further tool call will run.\n");
+				}
+				refreshStatusLine?.();
+			};
 			audit = new AuditLog({
 				dir: dirs.audit,
 				sessionId: ctx.sessionManager.getSessionId(),
 				readDeny: loaded.profile.sandbox.readDeny,
-				onError: (error) => process.stderr.write(`pi-enclave: audit write failed: ${error.message}\n`),
+				maxBytes: auditSettings.sessionMaxMb * 1024 * 1024,
+				...(auditSettings.syslog
+					? {
+							mirror: createSyslogMirror((error) =>
+								process.stderr.write(`pi-enclave: the audit syslog mirror stopped: ${error.message}\n`),
+							),
+						}
+					: {}),
+				onError: auditError,
 			});
 			audit.touch();
 			audit.append("session_start", { pi: PI_VERSION ?? null, backend: backend.name, weakened: backend.weakened });
@@ -1056,7 +1161,7 @@ export default function (pi: ExtensionAPI): void {
 
 		uiContext = ctx.ui;
 		if (reviewerSetup) {
-			actionReviewer = new IsolatedReviewer({
+			const isolated = new IsolatedReviewer({
 				profile: loaded.profile,
 				prompt: reviewerSetup.prompt,
 				primary: reviewerSetup.primary,
@@ -1093,6 +1198,16 @@ export default function (pi: ExtensionAPI): void {
 					};
 				},
 			});
+			// Every verdict is recorded, not only its timing: the model's own
+			// decision and reason next to what the deterministic floor made of
+			// them is what a later tuning pass needs (#37).
+			actionReviewer = {
+				review: async (request) => {
+					const result = await isolated.review(request);
+					audit?.append("reviewer", reviewerVerdictFields(result, request));
+					return result;
+				},
+			};
 		}
 
 		// The breaker survives a resume. Guardian deliberately drops its counters

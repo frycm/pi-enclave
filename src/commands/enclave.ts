@@ -173,7 +173,8 @@ export function renderStatus(state: EnclaveState): string {
 				: `reviewer:   ${state.effective.reviewer.model} (trigger ${state.effective.review.trigger})`,
 			`attended:   ${state.attendance ?? state.effective.attended.mode}`,
 			`breaker:    ${state.breaker?.open ? "OPEN -- the turn is stopped" : `${state.breaker?.consecutive ?? 0} of ${state.effective.breaker.consecutive} consecutive`}`,
-			`audit:      ${state.auditPath ?? "(not open)"}${state.auditDegraded ? "   WRITES ARE FAILING" : ""}`,
+			`audit:      ${state.auditPath ?? "(not open)"}${state.auditDegraded ? `   ${state.effective.audit.required ? "NOT RECORDING -- tool calls are refused (audit.required)" : "WRITES ARE FAILING"}` : ""}`,
+			`            ${describeAudit(state.effective.audit)}`,
 		);
 		if (state.sources) lines.push("sources:", renderSources(state.sources));
 	}
@@ -259,6 +260,15 @@ function renderRules(state: EnclaveState, argv: readonly string[]): CommandOutpu
 		default:
 			return { text: `unknown rules subcommand "${verb}"\n${USAGE}`, level: "warning" };
 	}
+}
+
+function describeAudit(audit: EffectiveProfile["audit"]): string {
+	return [
+		`head anchor beside the log${audit.syslog ? " and in syslog (authpriv)" : "; no syslog mirror"}`,
+		`${audit.sessionMaxMb} MB per session`,
+		audit.required ? "required: a failed write stops the session" : "not required",
+		`retention ${audit.retentionDays} days / ${audit.retentionMb} MB`,
+	].join("; ");
 }
 
 /** `audit` and `audit verify`. */

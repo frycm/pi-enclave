@@ -114,6 +114,11 @@ export interface EnclaveBashOptions {
 	passthrough?: readonly string[];
 	/** Additional credential deny patterns. */
 	envDeny?: readonly string[];
+	/**
+	 * Called once the command has finished, with its exit code and the locked
+	 * action it ran under, for the audit log's `executed` record (#37).
+	 */
+	onExit?: (exitCode: number | null, action: CanonicalAction | undefined) => void;
 	/** Called for every violation, for the phase-2 audit log and status line. */
 	onViolations?: (violations: Violation[]) => void;
 	/**
@@ -226,6 +231,7 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 				execOptions.onData(Buffer.from(`\n${formatViolations(violations)}\n`, "utf8"));
 			}
 
+			options.onExit?.(result.exitCode, action);
 			return { exitCode: result.exitCode };
 		},
 	};

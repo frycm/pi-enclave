@@ -94,7 +94,15 @@ export interface GateDeps {
 	/** Where a tool came from, for grant pinning. */
 	toolSource?: (tool: string) => string | undefined;
 	/** Backend-aware last check that a write capability is structurally grantable. */
-	writeCapabilityIssue?: (value: string, cwd: string, tool: string) => string | undefined;
+	/**
+	 * Why a write capability cannot be granted, if it cannot. `boundary: true`
+	 * marks a refusal that already says no approval can lift it (#21).
+	 */
+	writeCapabilityIssue?: (
+		value: string,
+		cwd: string,
+		tool: string,
+	) => string | { message: string; boundary: true } | undefined;
 	/** Backend-aware last check that a read capability can be isolated. */
 	readCapabilityIssue?: (value: string, cwd: string, tool: string) => string | undefined;
 	/** Last admission check for boundaries that have no execute-time guard. */
@@ -291,7 +299,7 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 				outcome: "deny",
 				block: true,
 				// The trust-root refusals (#21) already say no approval can lift them.
-				reason: issue.includes("no approval can") ? issue : `${issue}\n  This boundary is not grantable by approval.`,
+				reason: typeof issue === "string" ? `${issue}\n  This boundary is not grantable by approval.` : issue.message,
 				matches: evaluation.matches,
 				adverse: true,
 				action,

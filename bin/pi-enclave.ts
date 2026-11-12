@@ -26,8 +26,9 @@ import { loadConfig } from "../src/config/sources.ts";
 import { provisionSecret } from "../src/escalate/handshake.ts";
 import { describeRecord, listPending, listSessions, readPending } from "../src/escalate/pending.ts";
 import { formatProbeReport } from "../src/probe.ts";
-import { formatVerifyResult, verifyLog } from "../src/state/audit.ts";
+import { AuditLog, formatVerifyResult, verifyLog } from "../src/state/audit.ts";
 import { ensureStateDirs, stateDirs } from "../src/state/dir.ts";
+import { createSyslogMirror } from "../src/state/syslog.ts";
 
 const USAGE = `pi-enclave <command>
 
@@ -198,9 +199,28 @@ async function runApprove(argv: string[]): Promise<number> {
 	const loaded = currentConfig(read.record.action.cwd);
 	if (!loaded) return 1;
 
+	// The one action a person approved by hand belongs in the trail (#37). It
+	// goes to its own log rather than the originating session's, which may
+	// still be open in a pi process that owns that file's chain.
+	const auditSettings = loaded.profile.audit;
+	const approvals = new AuditLog({
+		dir: ensureStateDirs().audit,
+		sessionId: "approvals",
+		readDeny: loaded.profile.sandbox.readDeny,
+		maxBytes: auditSettings.sessionMaxMb * 1024 * 1024,
+		...(auditSettings.syslog
+			? {
+					mirror: createSyslogMirror((error) =>
+						process.stderr.write(`pi-enclave: the audit syslog mirror stopped: ${error.message}\n`),
+					),
+				}
+			: {}),
+		onError: (error) => process.stderr.write(`pi-enclave: audit write failed: ${error.message}\n`),
+	});
 	const rl = createInterface({ input: process.stdin, output: process.stdout });
 	try {
 		const result = await approve({
+			audit: (fields) => approvals.append("approval", fields),
 			record: read.record,
 			stateRoot: dirs.state,
 			current: loaded.profile,
@@ -225,6 +245,7 @@ async function runApprove(argv: string[]): Promise<number> {
 		}
 	} finally {
 		rl.close();
+		await approvals.flush();
 	}
 }
 
@@ -235,9 +256,16 @@ function auditCommand(argv: string[]): number {
 
 	let files: string[];
 	try {
-		files = readdirSync(dirs.audit)
-			.filter((name) => name.endsWith(".jsonl"))
-			.filter((name) => !sessionId || name === `${sessionId}.jsonl`);
+		const names = readdirSync(dirs.audit);
+		// A head anchor without its log is a log that disappeared; verify says
+		// whether retention retired it or nothing accounts for it (#37).
+		const orphans = names
+			.filter((name) => name.endsWith(".head"))
+			.map((name) => name.replace(/\.head$/, ".jsonl"))
+			.filter((name) => !names.includes(name));
+		files = [...names.filter((name) => name.endsWith(".jsonl")), ...orphans]
+			.filter((name) => !sessionId || name === `${sessionId}.jsonl`)
+			.sort();
 	} catch {
 		process.stdout.write("no audit logs yet\n");
 		return 0;

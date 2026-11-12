@@ -389,7 +389,13 @@ export const DEFAULT_BREAKER: BreakerSettings = { consecutive: 3, window: [10, 5
 
 export const DEFAULT_ATTENDED: AttendedSettings = { mode: "off", confirmTimeoutMs: 300_000 };
 
-export const DEFAULT_AUDIT: AuditSettings = { retentionDays: 30, retentionMb: 200 };
+export const DEFAULT_AUDIT: AuditSettings = {
+	retentionDays: 30,
+	retentionMb: 200,
+	required: false,
+	sessionMaxMb: 100,
+	syslog: false,
+};
 
 export interface DefaultProfileOptions {
 	/** The workspace root. Normally pi's cwd. */
