@@ -888,8 +888,9 @@ For those patterns L1 also asks when:
   `cp -al .github gh-backup`);
 - a `cp`, `mv`, `git mv` or `ln` would create a match, judged by whether the destination is
   an existing directory (`mv gh2 .github` when `.github` is gone, `cp -r s/workflows .github/`,
-  `-t` and `-T` included; a source ending in `/.` copies its contents into the destination
-  itself, as in `cp -r s/. .github/`); when the source does not exist yet, an earlier command
+  `-t` and `-T` included; a source ending in `/.` or `/..` copies its contents into the
+  destination itself, as in `cp -r s/. .github/`; a destination reached through a symlink,
+  such as `cp t/tasks.json .vscode/` with `.vscode -> v`, is judged by both names); when the source does not exist yet, an earlier command
   on the same line could change it, or the command is `ln -s` (whose link follows whatever
   the source holds later), by whether the destination could hold a match at all;
 - a write goes to a file with more than one hard link (`echo x > gh-backup/workflows/ci.yml`,
@@ -899,7 +900,11 @@ For those patterns L1 also asks when:
 Every protected pattern, on both lists, is also compared with the path as written as well as
 with where its symlinks lead, so `echo x > AGENTS.md` with `AGENTS.md -> docs/ai/instructions.md`,
 `rm AGENTS.md`, and a write to `.vscode/tasks.json` through a symlinked `.vscode` are judged by
-the protected name.
+the protected name. The target itself is not: with `AGENTS.md -> docs/ai/instructions.md`,
+`echo x > docs/ai/instructions.md` changes what pi loads as `AGENTS.md` and is allowed (a write
+through a chain such as `notes.md -> AGENTS.md -> …` is judged by every name on it). When a protected name is a symlink, add its target to
+`rules.protectedPaths` as well. A `git rm` or `git mv` with a pathspec L1 cannot list (`:/`,
+`:!src`, `--pathspec-from-file`) asks.
 
 These are asks, whichever list names the pattern. A directory too large to look through
 (200,000 entries) asks as well. Some ordinary work asks as a result: `rm -rf node_modules` and
@@ -1433,20 +1438,34 @@ Dockerfiles, compose files, `.pi` and `.agents` created since the session starte
 A directory whose contents a pattern covers is denied whole, so nothing new can be created
 inside it either, and everything it holds is checked as below; a symlink inside it is held
 through its target. The deny lasts for that one call, on bubblewrap, Seatbelt and the container
-backend alike (conformance rows W1 to W6, with a control row that the same commands still
+backend alike (conformance rows W1 to W5 and W7 to W10, with a control row (W6) that the same commands still
 write ordinary files and a falsifiability run that shows the rows fail without the deny).
 A command a person approved, at the terminal or with `pi-enclave approve` while a queued
 session waits, was judged, and runs under the session profile as before.
 
+A protected file, or a file inside a denied directory, with a second hard link has its other
+names denied as well (a read-only bind holds a name, not an inode): the walk looks for them by
+device and inode across the writable roots, `.git` included, and a name it does not find there
+is outside them, where the command cannot write anyway (conformance row W9). A new name made
+during the call (`ln AGENTS.md notes/x`, or `os.link` from Python) cannot reach a denied file
+either (row W10).
+
 The call is **not run unjudged** when the walk cannot vouch for it: past 200,000 entries
-(the walk and what the denied directories hold together), when a protected file, or a file
-inside a denied directory, has a second hard link (a read-only bind holds a name, not an
-inode, so the other name could still be written, wherever it is), or when a protected
+(the walk, what the denied directories hold, and the search for other hard-link names
+together), when a directory cannot be read during that search, when a protected
 symlink points at a target in a writable root that does not exist yet (writing through it
-would create the target).
+would create the target), when a protected symlink resolves through another symlink, or a
+symlinked directory, that the command could replace (`.husky/pre-push -> ../middle` with
+`middle -> scripts/hook.sh`, or a target below `tools/current -> v1`), or when a protected
+symlink points at a directory that holds the link or a whole writable root (`infra/self -> ..`
+would make the workspace read-only for the call; the message names the link).
 The gate then asks a person, and if that happens between the gate and the call, the command
-is refused. The walk costs about 8 µs per entry; it skips the inside of every `.git`
-directory, and it runs twice per unjudged call (at the gate and just before the call).
+is refused. The walk costs about 3 µs per entry (about 4 µs with an anchored user-global pattern
+such as `infra/**`), and about 5 µs per entry inside a denied directory: 410 ms for 150,000
+files, 890 ms with 40,000 more inside `infra/**`. It skips the inside of every `.git`
+directory, and it runs twice per unjudged call (at the gate and just before the call). The
+search for other hard-link names runs only when a protected file has one, and costs about
+one more walk.
 
 What remains:
 
@@ -1464,8 +1483,8 @@ What remains:
   large to fingerprint (16,384 entries, such as a user-global `vendor/**`) is reported as
   unverifiable at every check, and counts only once, when it first appears.
 - **A protected symlink** is protected through its target when the target is inside a
-  writable root; the link itself can be replaced by a regular file, which the tripwire
-  reports.
+  writable root, and every link on the way to the target is in a place the command cannot
+  write; the link itself can be replaced by a regular file, which the tripwire reports.
 - **A directory a pattern names only by itself** (`**/build`, or the built-in `**/.git` of a
   repository created since start) is not denied whole, since that would hold its contents,
   which the pattern leaves ordinary. It can be renamed or removed; a repository's `config`
@@ -1475,8 +1494,8 @@ What remains:
   regenerates a Dockerfile cannot either, and `npm ci` cannot remove or replace an installed
   package that ships an `AGENTS.md` or a Dockerfile, since the patterns match at any depth,
   `node_modules` included, as they do at L1. A pnpm workspace hard-links each package file
-  from its store, so one installed package that ships such a file makes every unjudged call
-  ask, or be refused on a headless run. Approve such a command, or run it yourself.
+  from its store; when the store is outside the writable roots its names are left alone, and
+  when it is inside them they are denied too. Approve such a command, or run it yourself.
 - **Everything else in the writable roots** is the agent's to change, as it is for a readable
   command: source files, build scripts, `package.json` scripts that a later `npm test` run
   outside the sandbox would execute. A writable workspace is one whose build files the

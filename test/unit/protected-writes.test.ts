@@ -5,7 +5,7 @@
  * protected pattern for what L2 cannot deny before it exists.
  */
 import { spawnSync } from "node:child_process";
-import { linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -135,13 +135,14 @@ describe("finding the protected paths of an unjudged command", () => {
 	// Review of #71: a read-only bind holds a name, not an inode, so what a
 	// directory denied whole holds is looked at too.
 	describe("inside a directory denied whole", () => {
-		it("refuses a file with another name outside it, as `cp -al .github gh-backup` leaves", () => {
+		it("holds the other name of a file in it, as `cp -al .github gh-backup` leaves (#73)", () => {
 			const ci = put(".github/workflows/ci.yml");
 			mkdirSync(join(ws, "gh-backup", "workflows"), { recursive: true });
 			linkSync(ci, join(ws, "gh-backup", "workflows", "ci.yml"));
-			const found = targets();
-			expect(found.ok).toBe(false);
-			expect(!found.ok && found.reason).toMatch(/ci\.yml is protected and has 2 hard links/);
+			expect(targets()).toEqual({
+				ok: true,
+				paths: [join(ws, ".github", "workflows"), join(ws, "gh-backup", "workflows", "ci.yml")],
+			});
 		});
 
 		it("holds a symlink through its target", () => {
@@ -187,10 +188,113 @@ describe("finding the protected paths of an unjudged command", () => {
 			const outside = join(realpathSync(tmpdir()), "enclave-missing-target", "hook.sh");
 			symlinkSync(outside, join(ws, ".husky", "pre-push"));
 			expect(targets()).toEqual({ ok: true, paths: [join(ws, ".husky")] });
-			// The same through a chain whose middle link is inside the workspace.
-			symlinkSync(outside, join(ws, "middle"));
+		});
+
+		it("refuses a chain through a link the command could replace (#73)", () => {
+			put(".husky/pre-commit");
+			// .husky/pre-push -> ../middle -> scripts/hook.sh: `rm middle; echo EVIL > middle`
+			// changes what the hook runs while scripts/hook.sh stays put.
+			put("scripts/hook.sh");
+			symlinkSync(join("scripts", "hook.sh"), join(ws, "middle"));
+			symlinkSync(join("..", "middle"), join(ws, ".husky", "pre-push"));
+			const found = targets();
+			expect(found.ok).toBe(false);
+			expect(!found.ok && found.reason).toContain(`resolves through ${join(ws, "middle")}`);
+		});
+
+		it("refuses a chain whose middle link is in the workspace, even to a target outside the roots", () => {
+			put(".husky/pre-commit");
+			symlinkSync(join(realpathSync(tmpdir()), "enclave-missing-target", "hook.sh"), join(ws, "middle"));
 			symlinkSync(join("..", "middle"), join(ws, ".husky", "pre-merge"));
-			expect(targets()).toEqual({ ok: true, paths: [join(ws, ".husky")] });
+			expect(targets().ok).toBe(false);
+		});
+
+		it("refuses a target below a symlinked directory the command could replace (#73)", () => {
+			put(".husky/pre-commit");
+			put("tools/v1/hook.sh");
+			put("tools/v2/hook.sh");
+			// `ln -sfn v2 tools/current` would point the hook at tools/v2/hook.sh.
+			symlinkSync("v1", join(ws, "tools", "current"));
+			symlinkSync(join("..", "tools", "current", "hook.sh"), join(ws, ".husky", "pre-push"));
+			const found = targets();
+			expect(found.ok).toBe(false);
+			expect(!found.ok && found.reason).toContain(`resolves through ${join(ws, "tools", "current")}`);
+		});
+
+		it("follows a link it cannot replace to the links its target passes through", () => {
+			// AGENTS.md -> <outside>/hop/agents.md, <outside>/hop -> <ws>/cur, cur -> v1:
+			// hop is outside the roots, but `ln -sfn v2 cur` still retargets AGENTS.md.
+			const outside = realpathSync(mkdtempSync(join(tmpdir(), "enclave-hop-")));
+			try {
+				put("v1/agents.md");
+				put("v2/agents.md");
+				symlinkSync("v1", join(ws, "cur"));
+				symlinkSync(join(ws, "cur"), join(outside, "hop"));
+				symlinkSync(join(outside, "hop", "agents.md"), join(ws, "AGENTS.md"));
+				const found = targets();
+				expect(found.ok).toBe(false);
+				expect(!found.ok && found.reason).toContain(`resolves through ${join(ws, "cur")}`);
+			} finally {
+				rmSync(outside, { recursive: true, force: true });
+			}
+		});
+
+		it("follows a session-denied middle link to what its target passes through", () => {
+			put(".husky/pre-commit");
+			put("v1/hook.sh");
+			symlinkSync("v1", join(ws, "cur"));
+			mkdirSync(join(ws, "locked"));
+			symlinkSync(join("..", "cur", "hook.sh"), join(ws, "locked", "middle"));
+			symlinkSync(join("..", "locked", "middle"), join(ws, ".husky", "pre-push"));
+			const found = targets({ writeDeny: [join(ws, "locked")] });
+			expect(found.ok).toBe(false);
+			expect(!found.ok && found.reason).toContain(`resolves through ${join(ws, "cur")}`);
+		});
+
+		it("accepts a chain through a link the session already denies", () => {
+			const hook = put("scripts/hook.sh");
+			put(".husky/pre-commit");
+			mkdirSync(join(ws, "locked"));
+			symlinkSync(join("..", "scripts", "hook.sh"), join(ws, "locked", "middle"));
+			symlinkSync(join("..", "locked", "middle"), join(ws, ".husky", "pre-push"));
+			expect(targets({ writeDeny: [join(ws, "locked")] })).toEqual({ ok: true, paths: [join(ws, ".husky"), hook] });
+		});
+
+		it("accepts a chain whose links are all inside the held directory", () => {
+			const hook = put("scripts/hook.sh");
+			put(".husky/pre-commit");
+			symlinkSync(join("..", "scripts", "hook.sh"), join(ws, ".husky", "b"));
+			symlinkSync("b", join(ws, ".husky", "a"));
+			expect(targets()).toEqual({ ok: true, paths: [join(ws, ".husky"), hook] });
+		});
+
+		it("refuses a link to a directory that holds it, naming the link (#73)", () => {
+			put("infra/main.tf");
+			symlinkSync("..", join(ws, "infra", "self"));
+			const found = targets({ patterns: [...PATTERNS, "infra/**"] });
+			expect(found.ok).toBe(false);
+			expect(!found.ok && found.reason).toContain(`${join(ws, "infra", "self")} is a protected symlink to ${ws}`);
+			expect(!found.ok && found.reason).toContain("remove the link");
+		});
+
+		it("refuses a protected name that links to the directory holding it", () => {
+			mkdirSync(join(ws, "docs"));
+			symlinkSync(".", join(ws, "docs", "AGENTS.md"));
+			const found = targets();
+			expect(found.ok).toBe(false);
+			expect(!found.ok && found.reason).toContain("the link itself");
+		});
+
+		it("refuses a protected link to a whole writable root", () => {
+			const other = realpathSync(mkdtempSync(join(tmpdir(), "enclave-root-")));
+			try {
+				symlinkSync(other, join(ws, "AGENTS.md"));
+				const found = targets({ writableRoots: [ws, other] });
+				expect(found.ok).toBe(false);
+				expect(!found.ok && found.reason).toContain("a whole writable root");
+			} finally {
+				rmSync(other, { recursive: true, force: true });
+			}
 		});
 	});
 
@@ -206,12 +310,75 @@ describe("finding the protected paths of an unjudged command", () => {
 		expect(found.ok && found.paths.some((path) => path.includes("objects"))).toBe(false);
 	});
 
-	it("refuses a protected file with another hard link", () => {
-		const agents = put("AGENTS.md");
-		linkSync(agents, join(ws, "notes.txt"));
-		const found = targets();
-		expect(found.ok).toBe(false);
-		expect(!found.ok && found.reason).toContain("hard links");
+	describe("a protected file with another hard link (#73)", () => {
+		it("holds the other name as well", () => {
+			const agents = put("AGENTS.md");
+			linkSync(agents, join(ws, "notes.txt"));
+			// An unrelated pair of names stays ordinary.
+			linkSync(put("a.txt"), join(ws, "b.txt"));
+			expect(targets()).toEqual({ ok: true, paths: [agents, join(ws, "notes.txt")] });
+		});
+
+		it("finds a name inside Git metadata too, which the walk for names skips", () => {
+			const agents = put("AGENTS.md");
+			put("repo/.git/objects/x");
+			linkSync(agents, join(ws, "repo", ".git", "objects", "y"));
+			expect(targets()).toEqual({ ok: true, paths: [agents, join(ws, "repo", ".git", "objects", "y")] });
+		});
+
+		it("leaves a name outside the writable roots alone, as a pnpm store outside them", () => {
+			const store = realpathSync(mkdtempSync(join(tmpdir(), "enclave-store-")));
+			try {
+				const shipped = join(store, "Dockerfile");
+				writeFileSync(shipped, "FROM x\n");
+				const installed = join(ws, "node_modules", "pkg", "Dockerfile");
+				mkdirSync(join(installed, ".."), { recursive: true });
+				linkSync(shipped, installed);
+				expect(targets()).toEqual({ ok: true, paths: [installed] });
+			} finally {
+				rmSync(store, { recursive: true, force: true });
+			}
+		});
+
+		it("does not add a name the session already denies", () => {
+			const agents = put("AGENTS.md");
+			put("denied/keep");
+			linkSync(agents, join(ws, "denied", "notes.txt"));
+			expect(targets({ writeDeny: [join(ws, "denied")] })).toEqual({ ok: true, paths: [agents] });
+		});
+
+		it("counts the search against the same bound", () => {
+			const agents = put("AGENTS.md");
+			linkSync(agents, join(ws, "notes.txt"));
+			for (let i = 0; i < 6; i++) put(`src/f${i}`);
+			// Nine for the walk (AGENTS.md, notes.txt, src and six files), nine again for the search.
+			expect(targets({ maxEntries: 17 }).ok).toBe(false);
+			expect(targets({ maxEntries: 18 }).ok).toBe(true);
+		});
+
+		it.skipIf(process.getuid?.() === 0)("refuses when a directory cannot be read to look for the names", () => {
+			const agents = put("AGENTS.md");
+			linkSync(agents, join(ws, "notes.txt"));
+			// Inside Git metadata, which only the search descends into.
+			const closed = join(ws, "repo", ".git", "closed");
+			put("repo/.git/closed/x");
+			chmodSync(closed, 0o000);
+			try {
+				const found = targets();
+				expect(found.ok).toBe(false);
+				expect(!found.ok && found.reason).toContain("more than one name");
+				expect(!found.ok && found.reason).toContain(closed);
+			} finally {
+				chmodSync(closed, 0o755);
+			}
+		});
+
+		it("does not search when no protected file has another name", () => {
+			const agents = put("AGENTS.md");
+			for (let i = 0; i < 6; i++) put(`src/f${i}`);
+			// Eight for the walk and nothing more.
+			expect(targets({ maxEntries: 8 })).toEqual({ ok: true, paths: [agents] });
+		});
 	});
 
 	it("gives up past its bound instead of vouching for what it did not see", () => {
@@ -226,6 +393,10 @@ describe("finding the protected paths of an unjudged command", () => {
 		put(".husky/agents.md");
 		// The link's target is inside .husky, which is denied whole.
 		symlinkSync(join(".husky", "agents.md"), join(ws, "CLAUDE.md"));
+		expect(targets()).toEqual({ ok: true, paths: [join(ws, ".husky")] });
+		// Several levels down, too.
+		put(".husky/deep/er/notes.md");
+		symlinkSync(join(".husky", "deep", "er", "notes.md"), join(ws, "AGENTS.md"));
 		expect(targets()).toEqual({ ok: true, paths: [join(ws, ".husky")] });
 	});
 

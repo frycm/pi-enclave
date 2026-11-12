@@ -4,7 +4,7 @@
  * `executed` record follows each allowed call, a `!` command is recorded, and
  * `audit.required` stops the session when the log stops.
  */
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -150,9 +150,9 @@ async function session(edit: (profile: EffectiveProfile) => void = () => {}) {
 	} as unknown as ExtensionContext;
 	await handlers.get("session_start")?.({}, context);
 	const auditPath = join(agentDir, "enclave", "audit", "s1.jsonl");
-	const call = async (id: string, command: string) => {
+	const call = async (id: string, command: string, extra: Record<string, unknown> = {}) => {
 		const gate = (await handlers.get("tool_call")?.(
-			{ toolName: "bash", toolCallId: id, input: { command } },
+			{ toolName: "bash", toolCallId: id, input: { command, ...extra } },
 			context,
 		)) as {
 			block?: boolean;
@@ -161,7 +161,7 @@ async function session(edit: (profile: EffectiveProfile) => void = () => {}) {
 		if (gate?.block) return gate;
 		let isError = false;
 		try {
-			await tools.get("bash")?.execute(id, { command }, undefined, undefined, context);
+			await tools.get("bash")?.execute(id, { command, ...extra }, undefined, undefined, context);
 		} catch {
 			isError = true;
 		}
@@ -438,6 +438,72 @@ describe("an unjudged command's protected paths (#64)", () => {
 			await s.flush();
 		} finally {
 			stderr.mockRestore();
+		}
+	});
+
+	it("run unjudged when a protected file's other name is outside the writable roots, and deny one inside (#73)", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		const store = realpathSync(mkdtempSync(join(tmpdir(), "enclave-store-")));
+		try {
+			plant();
+			// As a pnpm store outside the workspace leaves an installed package's file.
+			linkSync(join(ws, "AGENTS.md"), join(store, "AGENTS.md"));
+			mkdirSync(join(ws, "notes"));
+			linkSync(join(ws, ".husky", "pre-commit"), join(ws, "notes", "hook-copy"));
+			const s = await session((profile) => {
+				profile.rules.onUncertain = "sandbox";
+			});
+			const gate = await s.call("t1", unparsed);
+			expect(gate?.block).not.toBe(true);
+			expect(mocks.runs).toHaveLength(1);
+			const denied = mocks.runs[0]?.protectWrites ?? [];
+			expect(denied).toEqual(expect.arrayContaining([join(ws, "AGENTS.md"), join(ws, "notes", "hook-copy")]));
+			expect(denied.some((path) => path.startsWith(store))).toBe(false);
+			await s.flush();
+		} finally {
+			stderr.mockRestore();
+			rmSync(store, { recursive: true, force: true });
+		}
+	});
+
+	// Bash write capabilities are refused on macOS (Seatbelt cannot reap an
+	// escaped child), so there is no such call to protect there.
+	it.skipIf(process.platform === "darwin")("are looked for under a write capability's target too (#73)", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		const granted = realpathSync(mkdtempSync(join(tmpdir(), "enclave-granted-")));
+		try {
+			plant();
+			// A second name of AGENTS.md, and a protected file, only under the target.
+			linkSync(join(ws, "AGENTS.md"), join(granted, "agents-copy.md"));
+			writeFileSync(join(granted, "CLAUDE.md"), "original\n");
+			const s = await session((profile) => {
+				profile.reviewer.model = "ollama/reviewer";
+				profile.review.trigger = "mutating";
+				profile.sandbox.grantableWriteRoots = [granted];
+			});
+			// Unparsed (the variable), with one write L1 sees under the target.
+			// A write capability is high risk, so the reviewer's allow stands only
+			// with the person's direct approval of this exact action.
+			const command = `echo ok > ${join(granted, "out.txt")}; ${unparsed}`;
+			const first = await s.call("t0", command, { allow_write: granted });
+			expect(first?.block).toBe(true);
+			const hash = s.records().find((entry) => entry.kind === "decision" && entry.outcome === "ask-denied")?.hash;
+			expect(hash).toBeDefined();
+			const approval = `approve ${hash}`;
+			await s.handlers.get("input")?.({ text: approval, source: "interactive" }, s.context);
+			await s.handlers.get("before_agent_start")?.({ messageType: "user", prompt: approval }, s.context);
+			await s.handlers.get("message_start")?.({ message: { role: "user", content: approval } }, s.context);
+			const gate = await s.call("t1", command, { allow_write: granted });
+			expect(gate?.block, gate?.reason).not.toBe(true);
+			expect(mocks.runs).toHaveLength(1);
+			expect(mocks.runs[0]?.writeCapability).toBe(granted);
+			expect(mocks.runs[0]?.protectWrites).toEqual(
+				expect.arrayContaining([join(ws, "AGENTS.md"), join(granted, "agents-copy.md"), join(granted, "CLAUDE.md")]),
+			);
+			await s.flush();
+		} finally {
+			stderr.mockRestore();
+			rmSync(granted, { recursive: true, force: true });
 		}
 	});
 

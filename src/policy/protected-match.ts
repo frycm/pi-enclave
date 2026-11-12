@@ -23,8 +23,8 @@
  * whichever list the pattern is in: the operand holds a protected path, and a
  * person decides. A write that names a protected path is matched as before.
  */
-import { lstatSync, statSync } from "node:fs";
-import { basename, join, relative } from "node:path";
+import { lstatSync, readlinkSync, statSync } from "node:fs";
+import { basename, dirname, join, relative, resolve as resolvePath } from "node:path";
 import { PROTECTED_WALK_LIMIT, protectedPathMatcher } from "../gate/protected-writes.ts";
 import { PersistenceScanError, scanRoots } from "../persistence/scan.ts";
 import type { CanonicalAction } from "./canonical.ts";
@@ -103,6 +103,8 @@ type Role = {
 	intoDirectory?: true;
 	/** `ln -s`: the link aliases whatever the source holds later, not only now. */
 	symbolic?: true;
+	/** `git rm`/`git mv` with pathspec magic (`:/`, `:!src`) or a pathspec file: operands L1 cannot list. */
+	pathspec?: true;
 };
 
 /** Option letters of `cp`, `mv` and `ln` that take a separate value. */
@@ -114,9 +116,14 @@ function roles(command: SimpleCommand): Role | undefined {
 	let args = command.args;
 	// `git mv` and `git rm` take the same operands as `mv` and `rm`. Git's
 	// global options make a command unreadable, so the subcommand comes first.
+	let pathspec = false;
 	if (name === "git" && (args[0] === "mv" || args[0] === "rm")) {
 		name = args[0];
 		args = args.slice(1);
+		// `:/` is the top of the repository, `:!src` everything but `src`, and a
+		// pathspec file names operands L1 never sees.
+		// Git accepts any unambiguous prefix of a long option.
+		pathspec = args.some((arg) => arg.startsWith(":") || arg.startsWith("--pathspec"));
 	}
 	if (!["cp", "mv", "ln", "rm", "rmdir"].includes(name)) return undefined;
 	const operands: string[] = [];
@@ -161,6 +168,7 @@ function roles(command: SimpleCommand): Role | undefined {
 			}
 		}
 	}
+	if (pathspec) return { name, sources: [], removes: false, links: false, pathspec: true };
 	if (name === "rm" || name === "rmdir") return { name, sources: operands, removes: true, links: false };
 	if (name === "ln" && symbolic) links = false;
 	const base = {
@@ -177,6 +185,26 @@ function roles(command: SimpleCommand): Role | undefined {
 		destination: operands.at(-1) as string,
 		...(noTargetDirectory ? { noTargetDirectory: true as const } : {}),
 	};
+}
+
+/**
+ * The names a symlink chain passes through after its first: for
+ * `notes.md -> AGENTS.md -> docs/ai/instructions.md`, `AGENTS.md` and the
+ * target. A write through `notes.md` changes what each of them reads.
+ */
+function linkHops(path: string): string[] {
+	const hops: string[] = [];
+	let current = path;
+	for (let i = 0; i < 40; i++) {
+		try {
+			if (!lstatSync(current).isSymbolicLink()) break;
+			current = resolvePath(dirname(current), readlinkSync(current));
+			hops.push(current);
+		} catch {
+			break;
+		}
+	}
+	return hops;
 }
 
 /**
@@ -199,7 +227,7 @@ export function protectedMatches(
 		if (!path.writes) continue;
 		// Both names: a write through `AGENTS.md -> docs/ai/instructions.md`
 		// changes AGENTS.md, and `rm`/`mv` act on the link itself.
-		for (const target of new Set([path.resolved, path.typed])) {
+		for (const target of new Set([path.resolved, path.typed, ...linkHops(path.typed)])) {
 			const pattern = matchesPathPattern(patterns, target, options.cwd);
 			if (pattern) {
 				matches.push({ list: "ask", pattern, target });
@@ -222,7 +250,8 @@ function derivedMatches(action: CanonicalAction, options: ProtectedMatchOptions)
 	const found = (pattern: string, target: string): never => {
 		throw new Found({ list: "ask", pattern, target });
 	};
-	const resolve = (raw: string) => resolveForPolicy(normalizeInputPath(raw, options.home), options.cwd).resolved;
+	const place = (raw: string) => resolveForPolicy(normalizeInputPath(raw, options.home), options.cwd);
+	const resolve = (raw: string) => place(raw).resolved;
 
 	// A write to a file with another name may change a protected file through
 	// that name; finding the other names would mean walking every root.
@@ -300,6 +329,7 @@ function derivedMatches(action: CanonicalAction, options: ProtectedMatchOptions)
 			}
 		}
 		const role = roles(command);
+		if (role?.pathspec) found("(a Git pathspec)", options.cwd);
 		if (!role || ancestors.length === 0) {
 			// The hard-link check of a copy's destination needs no patterns.
 			if (role?.destination !== undefined && role.name === "cp") cpDestination(role);
@@ -316,10 +346,14 @@ function derivedMatches(action: CanonicalAction, options: ProtectedMatchOptions)
 			}
 		}
 		if (role.destination === undefined || role.name === "rm" || role.name === "rmdir") continue;
-		const destination = resolve(role.destination);
+		// Both names of the destination: with `.vscode -> v`, a copy into
+		// `.vscode/` creates `v/tasks.json`, which is `.vscode/tasks.json`.
+		const { typed, resolved: destination } = place(role.destination);
+		const destinations = [...new Set([destination, typed])];
 		for (const [index, source] of sources.entries()) {
-			// `s/.` copies what `s` holds, not `s`: into the destination itself.
-			const contents = /(?:^|\/)\.\/*$/.test(role.sources[index] as string);
+			// `s/.` and `s/x/..` copy what the directory holds, not the directory
+			// itself: into the destination itself.
+			const contents = /(?:^|\/)\.\.?\/*$/.test(role.sources[index] as string);
 			// What the copy or move would create: `dest/name/rel` when it goes
 			// inside an existing directory, `dest/rel` when it takes that name.
 			// When an earlier command may create the directory, both.
@@ -327,10 +361,11 @@ function derivedMatches(action: CanonicalAction, options: ProtectedMatchOptions)
 				!contents && (role.intoDirectory || (!role.noTargetDirectory && (severalCommands || isDir(destination))));
 			const replaces =
 				contents || (!role.intoDirectory && (role.noTargetDirectory || severalCommands || !isDir(destination)));
-			const created = (rel: string) => [
-				...(replaces ? [join(destination, rel)] : []),
-				...(inside ? [join(destination, basename(source), rel)] : []),
-			];
+			const created = (rel: string) =>
+				destinations.flatMap((place) => [
+					...(replaces ? [join(place, rel)] : []),
+					...(inside ? [join(place, basename(source), rel)] : []),
+				]);
 			for (const path of created("")) {
 				if (matcher(path)) found(firstMatch("", path), path);
 				// A symlink aliases whatever is written below its source later.

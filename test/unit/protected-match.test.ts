@@ -175,6 +175,17 @@ describe("a copy of a directory's contents", () => {
 		expect(bash("cp -r .github/. backup/")).toEqual([]);
 	});
 
+	it.each(["cp -r s/workflows/.. .github", "cp -r s/workflows/../ .github/"])(
+		"reads a source ending in `..` as the contents of the directory it names: %s",
+		(command) => {
+			put("s/workflows/ci.yml");
+			mkdirSync(join(ws, ".github"));
+			expect(bash(command)).not.toEqual([]);
+			mkdirSync(join(ws, "backup"));
+			expect(bash(command.replace(".github", "backup"))).toEqual([]);
+		},
+	);
+
 	it("does not read a name that only ends in a dot as its contents", () => {
 		put("g./workflows/ci.yml");
 		mkdirSync(join(ws, ".github"));
@@ -200,6 +211,40 @@ describe("a symlink into place", () => {
 	it("keeps judging a hard link by what its source holds", () => {
 		put("v2/readme.md");
 		expect(bash("ln v2/readme.md .vscode")).toEqual([]);
+	});
+});
+
+describe("a destination reached through a symlink", () => {
+	beforeEach(() => {
+		put("t/tasks.json");
+		put("t/readme.md");
+		put("s/workflows/ci.yml");
+		mkdirSync(join(ws, "v"));
+		symlinkSync("v", join(ws, ".vscode"));
+		mkdirSync(join(ws, "g"));
+		mkdirSync(join(ws, "r"));
+		symlinkSync("../g", join(ws, "r", ".github"));
+	});
+
+	it.each([
+		"cp t/tasks.json .vscode/",
+		"mv t/tasks.json .vscode/",
+		"cp t/tasks.json .vscode",
+		"cp -r t/. .vscode",
+		"cp -r s/workflows r/.github/",
+	])("is judged by the name as written too: %s", (command) => {
+		expect(bash(command)).not.toEqual([]);
+	});
+
+	it("is judged by where an ordinary name leads too", () => {
+		mkdirSync(join(ws, ".vscode2", ".vscode"), { recursive: true });
+		symlinkSync(join(".vscode2", ".vscode"), join(ws, "x"));
+		expect(bash("cp t/tasks.json x/")).not.toEqual([]);
+	});
+
+	it("allows what creates nothing protected under either name", () => {
+		expect(bash("cp t/readme.md .vscode/")).toEqual([]);
+		expect(bash("cp -r t r/.github/")).toEqual([]);
 	});
 });
 
@@ -234,6 +279,21 @@ describe("a protected name that is a symlink", () => {
 
 	it("does not ask for the target written by its own name", () => {
 		expect(bash("echo x > docs/ai/instructions.md")).toEqual([]);
+	});
+
+	it.each([
+		["echo x > notes.md", "bash"],
+		["notes.md", "write"],
+	])("asks for %s through a chain whose middle name is protected", (target, tool) => {
+		symlinkSync("AGENTS.md", join(ws, "notes.md"));
+		const result = tool === "bash" ? bash(target) : asks("write", { path: target, content: "x" });
+		expect(result).toEqual([expect.objectContaining({ pattern: "**/AGENTS.md", target: join(ws, "AGENTS.md") })]);
+	});
+
+	it("asks for a longer chain whose protected name is further along", () => {
+		symlinkSync("AGENTS.md", join(ws, "b"));
+		symlinkSync("b", join(ws, "a"));
+		expect(bash("echo x > a")).not.toEqual([]);
 	});
 
 	it("still asks for an ordinary name that leads to a protected one", () => {
@@ -278,6 +338,19 @@ describe("git mv and git rm", () => {
 
 	it.each(["git mv docs d3", "git rm -r docs", "git status", "git log -- .github"])("allows %s", (command) => {
 		expect(bash(command)).toEqual([]);
+	});
+
+	it.each([
+		"git rm -r :/.github",
+		"git rm -r :/",
+		"git rm -r ':!src'",
+		"git rm -r -- ':(top).github'",
+		"git rm -r --pathspec-from-file=list.txt",
+		"git rm --pathspec-from-file list.txt",
+		"git rm --pathspec-from list.txt",
+		"git rm --pathspec-file-nul --pathspec-from-file=list.txt",
+	])("asks for a pathspec L1 cannot list: %s", (command) => {
+		expect(bash(command)).toEqual([expect.objectContaining({ pattern: "(a Git pathspec)" })]);
 	});
 
 	it("does not read the subcommand as an operand", () => {

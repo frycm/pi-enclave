@@ -15,7 +15,17 @@
  * sandbox at all.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	linkSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type {
@@ -1594,6 +1604,50 @@ SCENARIOS.push(
 				if (!result.ok) return { ok: false, detail: `${file.slice(fixture.workspace.length + 1)}: ${result.detail}` };
 			}
 			return { ok: true, detail: `all three unchanged at their paths (exit ${r.exitCode})` };
+		},
+	},
+	{
+		id: "W9",
+		title: "an unjudged command cannot write a protected file through another hard link to it (#73)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const agents = plant(fixture, "AGENTS.md");
+			mkdirSync(join(fixture.workspace, "notes"), { recursive: true });
+			const other = join(fixture.workspace, "notes", "agents-copy.md");
+			linkSync(agents, other);
+			const protectWrites = protectedFor(fixture);
+			// The walk reports canonical paths (`/private/var/…` on macOS).
+			if (!protectWrites.includes(realpathSync(other))) {
+				return { ok: false, detail: `the other name is not denied: ${JSON.stringify(protectWrites)}` };
+			}
+			// Both forms: a write in place, and appending through the other name.
+			const r = await sh(`n=notes/agents-copy.md; echo x > "$n"; echo y >> "$n"`, { protectWrites });
+			return unchanged(agents, r);
+		},
+	},
+	{
+		id: "W10",
+		title: "an unjudged command cannot make a second name for a protected file and write through it (#73)",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run({ sh, fixture }) {
+			const files = [plant(fixture, "AGENTS.md"), plant(fixture, ".husky/pre-commit")];
+			mkdirSync(join(fixture.workspace, "notes"), { recursive: true });
+			const protectWrites = protectedFor(fixture);
+			// From the shell, and with link(2) from another interpreter.
+			const r = await sh(
+				"ln AGENTS.md notes/x && echo y > notes/x; ln .husky/pre-commit notes/h && echo y >> notes/h; " +
+					`python3 -c "import os; os.link('AGENTS.md', 'notes/p'); open('notes/p', 'w').write('z')"`,
+				{ protectWrites },
+			);
+			for (const file of files) {
+				const result = unchanged(file, r);
+				if (!result.ok) return { ok: false, detail: `${file.slice(fixture.workspace.length + 1)}: ${result.detail}` };
+			}
+			return { ok: true, detail: `both unchanged (exit ${r.exitCode}): ${r.output.slice(0, 160)}` };
 		},
 	},
 	{
