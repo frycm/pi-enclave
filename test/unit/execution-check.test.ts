@@ -168,7 +168,11 @@ async function session(
 			id: string,
 			toolName: string,
 			input: Record<string, unknown>,
-			options: { parent?: string; run?: (input: Record<string, unknown>) => Promise<unknown> } = {},
+			options: {
+				parent?: string;
+				run?: (input: Record<string, unknown>) => Promise<unknown>;
+				signal?: AbortSignal;
+			} = {},
 		) => {
 			const frozen = structuredClone(input);
 			const next = vi.fn(
@@ -184,7 +188,7 @@ async function session(
 				...(options.parent !== undefined ? { parentToolCallId: options.parent } : {}),
 				input: frozen,
 			};
-			const result = wrapper(call, next, { cwd: ws });
+			const result = wrapper(call, next, { cwd: ws, ...(options.signal ? { signal: options.signal } : {}) });
 			return { result, next };
 		},
 		/** The registered tool's own execute, which binds its invocation itself. */
@@ -371,6 +375,28 @@ describe("the execution-boundary check (#29)", () => {
 				expect.objectContaining({ toolCallId: "n1", parentToolCallId: "p1", refusal: "not-locked" }),
 			]);
 			expect(refused[1]).not.toHaveProperty("hash");
+			expect(records.filter((record) => record.kind === "executed")).toEqual([]);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	it("records a call cancelled before its tool started as aborted", async () => {
+		const stderr = quiet();
+		try {
+			const s = await session({ wrapper: true });
+			expect((await s.gate("m1", SEARCH, { query: "x" }))?.block).toBeFalsy();
+			const controller = new AbortController();
+			controller.abort();
+			const cancelled = s.execute("m1", SEARCH, { query: "x" }, { signal: controller.signal });
+			await expect(cancelled.result).rejects.toThrow();
+			expect(cancelled.next).not.toHaveBeenCalled();
+			await s.end("m1", SEARCH, true);
+			await s.shutdown();
+			const records = s.records();
+			expect(records.filter((record) => record.kind === "execution_refused")).toEqual([
+				expect.objectContaining({ toolCallId: "m1", refusal: "aborted" }),
+			]);
 			expect(records.filter((record) => record.kind === "executed")).toEqual([]);
 		} finally {
 			stderr.mockRestore();
