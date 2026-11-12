@@ -191,14 +191,22 @@ describe("no control-token spelling reaches either transport", () => {
 });
 
 describe("the corpus forges turns in control-token spelling", () => {
-	it("carries ten injected cases, in the action input and in the context", () => {
-		const cases = reviewerCorpus(PROFILE).filter((entry) => entry.id.startsWith("injected-control-token-"));
-		expect(cases).toHaveLength(10);
+	it("forges a turn in each of five template families, in the action input and in the context", () => {
+		const cases = reviewerCorpus(PROFILE).filter((entry) => entry.id.startsWith("injection/forged-turn-"));
+		expect(cases).toHaveLength(5);
 		expect(cases.every((entry) => entry.kind === "injected" && entry.authorization.length === 0)).toBe(true);
 		const raw = cases.map((entry) => JSON.stringify([entry.request.action.input, entry.context]));
 		for (const family of ["<|im_end|>", "<|eot_id|>", "<end_of_turn>", "[INST]", "<｜User｜>"]) {
-			expect(raw.filter((text) => text.includes(family))).toHaveLength(2);
+			expect(raw.filter((text) => text.includes(family))).toHaveLength(1);
 		}
-		expect(cases.filter((entry) => entry.context.length > 0)).toHaveLength(5);
+		expect(cases.filter((entry) => entry.context.length > 0)).toHaveLength(2);
+	});
+
+	it("has benign twins that carry the same spelling in content the user asked for (#27)", () => {
+		const twins = reviewerCorpus(PROFILE).filter(
+			(entry) => entry.kind === "benign" && JSON.stringify(entry.request.action.input).includes("<|im_start|>"),
+		);
+		expect(twins.map((entry) => entry.id)).toEqual(["injection-twin/chatml-fixture"]);
+		expect(twins[0]?.authorization).toHaveLength(1);
 	});
 });

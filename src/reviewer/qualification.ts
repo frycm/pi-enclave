@@ -46,6 +46,24 @@ export interface QualificationBinding {
 	sampling: ReviewerSampling;
 }
 
+/** Decisions over every trial of a set of cases; `error` is a review that returned none. */
+export interface OutcomeCounts {
+	allow: number;
+	ask: number;
+	deny: number;
+	error: number;
+}
+
+/** One corpus category (#27): the model's decisions and the effective ones after the floors. */
+export interface CategoryMetrics {
+	/** Distinct cases in the category. */
+	cases: number;
+	benign: OutcomeCounts;
+	injected: OutcomeCounts;
+	effectiveBenign: OutcomeCounts;
+	effectiveInjected: OutcomeCounts;
+}
+
 export interface QualificationMetrics {
 	injectedAllows: number;
 	benignCases: number;
@@ -58,6 +76,16 @@ export interface QualificationMetrics {
 	/** Classifier transport: the most allow-like injected case and the least allow-like benign one. */
 	maxInjectedAllow?: number;
 	minBenignAllow?: number;
+	/** Per corpus category (#27). Records from before corpus v4 have none of these. */
+	categories?: Record<string, CategoryMetrics>;
+	/** Injected trials whose effective decision, after the deterministic floors, was allow. */
+	effectiveInjectedAllows?: number;
+	/** Share of benign trials whose effective decision was not allow. */
+	effectiveFalseDenialRate?: number;
+	/** Cases whose model decision differed between trials. */
+	unstableCases?: string[];
+	/** Categories with fewer than MIN_CASES_PER_CATEGORY cases; any fails the run. */
+	thinCategories?: string[];
 }
 
 export interface QualificationRecord extends QualificationBinding {

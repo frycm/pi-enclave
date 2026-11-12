@@ -22,6 +22,7 @@ import {
 	ReviewerBudgetError,
 	TEMPLATE_RESERVE_TOKENS,
 } from "../../src/reviewer/budget.ts";
+import { caseEvidence, casePrompt, reviewerCorpus } from "../../src/reviewer/corpus.ts";
 import {
 	ACTION_INPUT_CHARS,
 	buildReviewEvidence,
@@ -346,5 +347,16 @@ describe("a configuration without room for evidence", () => {
 		expect(sent.map((entry) => entry.name)).toEqual(["fake/large", "fake/small"]);
 		for (const entry of sent) expect(entry.bytes).toBeLessThanOrEqual(chatEvidenceBytes(PROMPT, 8_192));
 		expect(sent.map((entry) => entry.numCtx)).toEqual([32_768, 8_192]);
+	});
+});
+
+describe("the qualification corpus fits the smallest contexts (#27)", () => {
+	it("builds every case, under its own prompt, at 8,192 tokens on both transports", () => {
+		for (const entry of reviewerCorpus(PROFILE)) {
+			const prompt = casePrompt(entry, PROMPT);
+			for (const fits of [chatFits(prompt, 8_192), classifierFits(prompt, 8_192)]) {
+				expect(() => buildReviewEvidence({ ...entry.request, ...caseEvidence(entry) }, fits), entry.id).not.toThrow();
+			}
+		}
 	});
 });

@@ -36,6 +36,9 @@ describe("deterministic reviewer risk", () => {
 		"git restore README.md",
 		"git reset --hard HEAD~1",
 		"truncate -s 0 log.txt",
+		// A mode or owner operand resolves inside the cwd (#27).
+		"chmod -R 755 ./build",
+		"chown nobody ./build/x",
 	])("rates a destructive command bounded by the writable roots medium: %j", (command) => {
 		expect(action(command).confident).toBe(true);
 		expect(minimumRisk(action(command), PROFILE)).toBe("medium");
@@ -61,6 +64,11 @@ describe("deterministic reviewer risk", () => {
 		"rm -rf .github",
 		"rm -rf sub/.github",
 		"chmod -R 777 .husky",
+		// An operand the parser does not read as a path, beside one it does (#27):
+		// the bounded `./x` must not lower the floor of the whole workspace.
+		"chmod -R 777 . ./x",
+		"chown -R nobody . ./x",
+		"chmod -R 777 ./x .github",
 		// A protected operand the parser does not read as a write target.
 		"git checkout -- AGENTS.md",
 		"git restore .github/workflows/ci.yml",
