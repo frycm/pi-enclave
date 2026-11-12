@@ -394,6 +394,13 @@ using argv prepared when the profile was compiled, speaks a length-prefixed JSON
 its stdio, and performs the actual `open`/`readdir`/`rg` call from inside the boundary. If the
 kernel denies it, the helper reports a `Violation` exactly as a shell command would.
 
+The helper is one thread, so nothing it does may block (#35). `read`, `edit` and `write` open
+their path non-blocking and check the descriptor: anything other than a regular file (a FIFO,
+a device, a socket, a directory) is refused at once, and a full read stops at the size limit
+counted from the bytes read, not from what `stat` reported. If a call still times out, the
+client pings the helper; one that does not answer within a second is killed, every call in
+flight fails, and the next call starts a fresh helper under the usual restart budget.
+
 This also handles a concrete gap in pi's current `grep` tool: its operations object only
 abstracts the filesystem walk, while the tool itself still
 [spawns `rg` directly](https://github.com/earendil-works/pi/blob/b4afdddf44e059c67ccf5097e5317d913521b470/packages/coding-agent/src/core/tools/grep.ts#L155-L180)
