@@ -968,6 +968,8 @@ export default function (pi: ExtensionAPI): void {
 							...(result.reason !== undefined ? { reason: result.reason } : {}),
 						}),
 						...(reachability ? { reachability } : {}),
+						// Ran with its protected paths write-denied (#72).
+						...(result.held ? { held: true } : {}),
 					});
 				},
 			},

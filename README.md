@@ -1525,16 +1525,25 @@ spelling of a protected route L1 misjudges (conformance row W11, with the falsif
 above). The other tools (`read`, `write`, `edit`, `grep`) are judged by path at L1 and are
 not held.
 
-The cost is the walk above on every bash call instead of only the unjudged ones: about 3 µs
-per entry, run twice per call (30 ms per walk for 5,000 entries, 95 ms for 20,000 and 470 ms
-for a 100,000-entry `node_modules`, measured on the development container), so a workspace
-with a large `node_modules` adds about a second to every bash call. The refusals are the
+The cost is the walk above on every bash call instead of only the unjudged ones, run twice per
+call. Per entry it depends on the tree's shape and on the host: from about 3 µs to about 8 µs.
+On development containers a `node_modules`-shaped tree took 30 ms per walk for 5,000
+entries, 95 ms for 20,000, and 470 ms on one container and 760 to 840 ms on another for
+100,000, so a workspace with a
+large `node_modules` adds one to two seconds to every bash call. The refusals are the
 ones above as well, now for ordinary commands: past 200,000 entries, a protected file with a
 hard link the walk cannot account for, or a replaceable link on the way to a protected
-target, the gate asks a person (a refusal on a headless or deterministic run), and
-`npm install` running `husky` fails. Ordinary commands that only write ordinary files run as
-before (row W6). The [tripwire](#files-loaded-outside-the-sandbox-19) still counts a
-protected change against the turn only when the turn ran an unjudged command.
+target, the gate asks a person (a refusal on a headless or deterministic run). Ordinary
+commands that only write ordinary files run as before (row W6). The
+[tripwire](#files-loaded-outside-the-sandbox-19) still counts a protected change against the
+turn only when the turn ran an unjudged command.
+
+A wanted command that must change a protected file fails under the hold: `git checkout` of a
+branch whose `Dockerfile` or `AGENTS.md` differs, `git pull` or `git stash pop` that touches
+one, `npm install` whose `prepare` runs `husky`. Run it yourself as a `!` command (sandboxed,
+not gated, not held), or add a `rules.ask` pattern for it (`bash(git checkout *)`) so that the
+call you approve runs unheld; on a headless run that ask is a refusal, so do it from a
+terminal or with `pi-enclave approve` under `attended.mode: "queue"`.
 
 **Deterministic mode** has no reviewer, so `rules.onUncertain` (user-global only) chooses
 what happens to an unreadable command instead: `"ask"` (the default) sends it to a person,

@@ -540,6 +540,8 @@ export function configFields(
 			deny: profile.rules.deny.length,
 			ask: profile.rules.ask.length,
 			skipReview: profile.rules.skipReview.length,
+			onUncertain: profile.rules.onUncertain,
+			protectedHold: profile.rules.protectedHold,
 		},
 	};
 }
