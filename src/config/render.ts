@@ -9,8 +9,9 @@
  * require reading three files and simulating a merge.
  */
 
+import { isReviewedGrant } from "../gate/tools.ts";
 import { READ_ONLY_CLASSIFIER } from "../reviewer/classifier.ts";
-import { type DefaultProfileOptions, defaultProfile } from "./defaults.ts";
+import { type DefaultProfileOptions, defaultProfile, OWNED_TOOLS } from "./defaults.ts";
 import type { EffectiveProfile, Provenance, SourceId } from "./types.ts";
 import { provenanceOf } from "./types.ts";
 
@@ -138,7 +139,18 @@ export function renderConfig(profile: EffectiveProfile, provenance: Provenance):
 	lines.push("tools.allow");
 	for (const [name, grant] of Object.entries(profile.tools.allow)) {
 		const source = provenanceOf(provenance, "tools.allow", name) ?? "builtin";
-		const kind = grant.reviewed ? "reviewed" : grant.readOnly ? "read-only" : "allowed";
+		// A bare grant on a tool outside the sandbox is reviewed (#22), and the
+		// label says so rather than "allowed".
+		const sandboxed = OWNED_TOOLS.includes(name);
+		const kind = isReviewedGrant(name, grant, OWNED_TOOLS)
+			? grant.reviewed
+				? "reviewed, outside the sandbox"
+				: "reviewed (bare grant), outside the sandbox"
+			: grant.readOnly
+				? sandboxed
+					? "read-only"
+					: "read-only, outside the sandbox, no review"
+				: "allowed";
 		const pin = grant.source ? `  pinned to ${grant.source}` : "";
 		lines.push(`  ${pad(source)}  ${name} (${kind})${pin}`);
 	}

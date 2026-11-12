@@ -181,6 +181,19 @@ describe("rendering", () => {
 		expect(renderConfig(result.profile, result.provenance)).toContain("ALLOW (skips review)");
 	});
 
+	it("labels a bare grant on a tool outside the sandbox as reviewed (#22)", () => {
+		const result = load({
+			[PATHS.userGlobal]: JSON.stringify({
+				tools: { allow: { bash: {}, deploy: {}, search: { readOnly: true } } },
+			}),
+		});
+		if (!result.ok) throw new Error(result.message);
+		const rendered = renderConfig(result.profile, result.provenance);
+		expect(rendered).toContain("deploy (reviewed (bare grant), outside the sandbox)");
+		expect(rendered).toContain("search (read-only, outside the sandbox, no review)");
+		expect(rendered).toMatch(/bash \(allowed\)/);
+	});
+
 	it("says when L1 and L4 are off but the sandbox is not", () => {
 		const result = load({}, { env: { PI_ENCLAVE_AUTO: "off" } });
 		if (!result.ok) throw new Error(result.message);

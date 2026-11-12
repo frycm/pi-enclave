@@ -75,6 +75,7 @@ import { ActionLock } from "./gate/lock.ts";
 import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
 import { PROVENANCE_ENTRY_TYPE, ProvenanceTracker } from "./gate/provenance.ts";
 import { toolReachability } from "./gate/reachability.ts";
+import { describeDeclaredHints, grantWarnings } from "./gate/tools.ts";
 import { persistenceSurface, protectedByProfile } from "./persistence/agent.ts";
 import { formatPendingHits, TripwireLedger } from "./persistence/ledger.ts";
 import { countsAgainstTurn, formatTripwireHits, PersistenceTripwire } from "./persistence/tripwire.ts";
@@ -258,6 +259,7 @@ export default function (pi: ExtensionAPI): void {
 	 */
 	const escalator = createConfirmEscalator({
 		reachability: (action) => toolReachability(pi.getAllTools?.() ?? [], action.tool, action.input),
+		declaredHints: (action) => describeDeclaredHints(action.tool, pi.getAllTools?.() ?? [], OWNED_TOOLS),
 		ui: () => uiContext,
 		attendance: () => attendance,
 		confirmTimeoutMs: () => effective?.attended.confirmTimeoutMs ?? 300_000,
@@ -908,6 +910,12 @@ export default function (pi: ExtensionAPI): void {
 			ctx.ui.notify(ownershipError, "error");
 			ctx.ui.setStatus?.("enclave", renderStatusLine(state()));
 			return;
+		}
+
+		// Grants on tools outside the sandbox that are worth a second look (#22):
+		// a readOnly grant the tool itself contradicts, and an unpinned name.
+		for (const warning of grantWarnings(loaded.profile.tools, pi.getAllTools?.() ?? [], OWNED_TOOLS)) {
+			ctx.ui.notify(warning, "warning");
 		}
 
 		// Loaded code below a writable root would run the agent's changes outside

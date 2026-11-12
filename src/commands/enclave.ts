@@ -14,11 +14,13 @@
  * in the detailed report nobody opens.
  */
 import type { BackendName, CompiledProfile, Profile, Violation } from "../backend/types.ts";
+import { OWNED_TOOLS } from "../config/defaults.ts";
 import { renderConfig, renderDefaults } from "../config/render.ts";
 import type { LoadedSource } from "../config/sources.ts";
 import { renderSources } from "../config/sources.ts";
 import type { EffectiveProfile, Provenance } from "../config/types.ts";
 import { describeRecord, listPending } from "../escalate/pending.ts";
+import { unsandboxedPermits } from "../gate/tools.ts";
 import { formatPendingHits, type TripwireLedger } from "../persistence/ledger.ts";
 import { formatProbeReport, type ProbeReport } from "../probe.ts";
 import { formatVerifyResult, verifyLog } from "../state/audit.ts";
@@ -160,6 +162,7 @@ export function renderStatus(state: EnclaveState): string {
 			"",
 			`config:     profile "${state.effective.name}"${state.effective.auto ? "" : "   L1/L4 disabled by PI_ENCLAVE_AUTO=off"}`,
 			`rules:      ${state.effective.rules.deny.length} deny, ${state.effective.rules.ask.length} ask, ${state.effective.rules.skipReview.length} skipReview`,
+			...renderUnsandboxed(state.effective),
 			state.effective.reviewer.model === "none"
 				? `reviewer:   none (deterministic mode: every crossing is an ask)`
 				: `reviewer:   ${state.effective.reviewer.model} (trigger ${state.effective.review.trigger})`,
@@ -170,6 +173,21 @@ export function renderStatus(state: EnclaveState): string {
 		if (state.sources) lines.push("sources:", renderSources(state.sources));
 	}
 	return lines.join("\n");
+}
+
+/**
+ * Tools that can run outside the sandbox without a person deciding (#22).
+ *
+ * Shown whether or not there are any: "none" is the statement worth reading
+ * before walking away from an unattended session.
+ */
+function renderUnsandboxed(effective: EffectiveProfile): string[] {
+	const permits = unsandboxedPermits(effective.tools, effective.rules.skipReview, OWNED_TOOLS);
+	if (permits.length === 0) return ["unsandboxed: no tool runs outside the sandbox without a person"];
+	return [
+		`unsandboxed: ${permits.length} route(s) run a tool outside the sandbox with no person deciding:`,
+		...permits.map((permit) => `            ${permit.tool} (${permit.via})`),
+	];
 }
 
 /**

@@ -11,6 +11,7 @@ import {
 	renderStatusLine,
 	renderViolations,
 } from "../../src/commands/enclave.ts";
+import { defaultProfile } from "../../src/config/defaults.ts";
 import { TripwireLedger } from "../../src/persistence/ledger.ts";
 import type { ProbeReport } from "../../src/probe.ts";
 
@@ -111,6 +112,21 @@ describe("renderStatusLine", () => {
 });
 
 describe("renderStatus", () => {
+	it("lists every tool that runs outside the sandbox without a person (#22)", () => {
+		const effective = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
+		expect(renderStatus(state({ effective }))).toContain("no tool runs outside the sandbox without a person");
+		effective.tools.allow.mcp__docs__search = { readOnly: true };
+		effective.tools.allow.deploy = {};
+		effective.tools.allow.notify = { reviewed: true };
+		effective.rules.skipReview.push("deploy(preview)", "bash(npm test)");
+		const text = renderStatus(state({ effective }));
+		expect(text).toContain("2 route(s)");
+		expect(text).toContain("mcp__docs__search (readOnly grant)");
+		expect(text).toContain("deploy (skipReview deploy(preview))");
+		expect(text).not.toContain("notify (");
+		expect(text).not.toContain("bash (");
+	});
+
 	it("includes the probe report, profile and coverage", () => {
 		const text = renderStatus(state());
 		expect(text).toContain("pi-enclave probe");
