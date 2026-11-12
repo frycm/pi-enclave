@@ -128,13 +128,18 @@ export interface LimitsSettings {
 	fileSizeMb: number;
 	/** RLIMIT_NOFILE. */
 	openFiles: number;
-	/** RLIMIT_NPROC on the native Linux backend (counted in the sandbox's user namespace). */
+	/**
+	 * RLIMIT_NPROC on the native Linux backend. Set only on kernel 5.14+ when
+	 * the sandbox has a user namespace of its own, where the kernel counts it
+	 * there; otherwise it would count every task of the uid, and it is skipped.
+	 */
 	processes: number;
 	/** RLIMIT_DATA on the native Linux backend: private writable memory per process. */
 	memoryMb: number;
 	/**
-	 * Below this much free space on a writable root, commands run with a file
-	 * size limit of zero: they can delete and inspect, not grow anything.
+	 * Below this much free space on a writable root (or 5% of that filesystem,
+	 * when that is less), shell commands run with a file size limit of zero:
+	 * they can delete and inspect, not grow anything.
 	 */
 	minFreeDiskMb: number;
 	/** The container backend's cgroup and tmpfs limits. */

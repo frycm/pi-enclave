@@ -369,6 +369,7 @@ export default function (pi: ExtensionAPI): void {
 		report,
 		backendName: backend.name,
 		weakened: backend.weakened ?? false,
+		...(backend.processLimit ? { processLimit: backend.processLimit } : {}),
 		profile,
 		compiled,
 		violations,

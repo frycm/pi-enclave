@@ -1094,8 +1094,9 @@ SCENARIOS.push(
 		// native backend does not set it there; the row is Linux (and container) only.
 		falsifiableByNoop: process.platform === "linux",
 		falsifiabilityNote:
-			"The native backend limits processes only on Linux, where RLIMIT_NPROC is counted in the " +
-			"sandbox's own user namespace. On macOS the row reports 'not applicable' for every backend.",
+			"The native backend limits processes only on Linux 5.14+ when the sandbox has its own user " +
+			"namespace, where RLIMIT_NPROC is counted there. Elsewhere it skips the limit and the row " +
+			"reports 'not applicable' for that backend; the containers use the cgroup pids limit.",
 		async run(ctx) {
 			if (process.platform !== "linux" && ctx.backend.name !== "docker" && ctx.backend.name !== "podman") {
 				return { ok: true, detail: "processes are not limited by the native backend on this platform" };
@@ -1111,6 +1112,12 @@ SCENARIOS.push(
 				started = Number(readFileSync(count, "utf8").trim());
 			} catch {
 				started = 0;
+			}
+			// Decided by the backend at its first command: an older kernel, or a
+			// sandbox in pi's own user namespace, would count the host's processes.
+			const decision = ctx.backend.processLimit;
+			if (decision && !decision.applies) {
+				return { ok: true, detail: `processes are not limited by this backend here: ${decision.reason}` };
 			}
 			const bounded = started > 0 && started < 400;
 			return {

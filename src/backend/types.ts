@@ -9,6 +9,7 @@
  * the layers above noticing.
  */
 import type { BackendName } from "../probe.ts";
+import type { ProcessLimitDecision } from "./limits.ts";
 
 export type { BackendName };
 
@@ -210,6 +211,8 @@ export interface RunResult {
 
 export interface SandboxBackend {
 	readonly weakened?: boolean;
+	/** Whether RLIMIT_NPROC is set for this session's commands (#24); known after the first command. */
+	readonly processLimit?: ProcessLimitDecision | undefined;
 	onFsViolation?: ((violation: Violation) => void) | undefined;
 	fsWithReadCapability?(
 		compiled: CompiledProfile,

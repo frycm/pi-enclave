@@ -114,10 +114,17 @@ export class OutputCap {
 /**
  * Which limits a sandbox's shell can set, for the prefix and for `/enclave status`.
  *
+ * `"processes"` on Linux is only a capability: whether RLIMIT_NPROC is set is
+ * decided per session by {@link processLimitDecision}, because the kernel
+ * counts it per user namespace only from 5.14 and only when the sandbox has
+ * one of its own. Anywhere else it counts every task of the uid on the host,
+ * and a limit low enough to stop a fork loop would refuse the command's first
+ * fork on a busy server.
+ *
  * `"container"` is Linux inside Docker or Podman: the container runs as the
  * host uid without a user namespace of its own, so RLIMIT_NPROC there would
- * count every process the user has on the host and refuse the command's
- * first fork. The cgroup `pids` limit takes its place.
+ * count every process the user has on the host. The cgroup `pids` limit takes
+ * its place.
  */
 export function enforcedRlimits(
 	platform: NodeJS.Platform | "container",
@@ -144,9 +151,11 @@ export function limitPrefix(
 	limits: ResourceLimits | undefined,
 	platform: NodeJS.Platform | "container",
 	fileSizeZero = false,
+	/** RLIMIT_NPROC is set only when {@link processLimitDecision} said it applies. */
+	processes = false,
 ): string {
 	if (!limits) return "";
-	const enforced = enforcedRlimits(platform);
+	const enforced = enforcedRlimits(platform).filter((limit) => limit !== "processes" || processes);
 	const settings: [string, number][] = [];
 	if (enforced.includes("fileSize")) settings.push(["-f", fileSizeZero ? 0 : limits.fileSizeMb * 1024]);
 	if (enforced.includes("openFiles")) settings.push(["-n", limits.openFiles]);
@@ -163,18 +172,84 @@ export function limitPrefix(
 	);
 }
 
-/** Free bytes for an unprivileged user on the filesystem holding `path`, or undefined. */
-export type FreeSpaceProbe = (path: string) => number | undefined;
+/** Why RLIMIT_NPROC is or is not set for this session's commands. */
+export interface ProcessLimitDecision {
+	applies: boolean;
+	reason: string;
+}
+
+/** True for a Linux release string at or after 5.14 ("6.8.0-45-generic", "5.14.0-362.el9"). */
+export function kernelCountsNprocPerUserNamespace(release: string): boolean {
+	const match = /^(\d+)\.(\d+)/.exec(release);
+	if (!match) return false;
+	const major = Number(match[1]);
+	const minor = Number(match[2]);
+	return major > 5 || (major === 5 && minor >= 14);
+}
+
+/**
+ * Whether RLIMIT_NPROC bounds only the sandboxed command.
+ *
+ * Since Linux 5.14 the process count behind RLIMIT_NPROC is kept per user
+ * namespace (the ucounts rework), so a sandbox in a namespace of its own
+ * starts from zero. On an older kernel, or when the sandbox shares pi's user
+ * namespace (a setuid bwrap, no unprivileged user namespaces), it counts every
+ * task of the uid on the host, and the limit is skipped rather than set.
+ */
+export function processLimitDecision(options: {
+	platform: NodeJS.Platform;
+	kernelRelease: string;
+	/** `readlink /proc/self/ns/user` in pi and in the sandboxed shell. */
+	hostUserNamespace: string | undefined;
+	sandboxUserNamespace: string | undefined;
+}): ProcessLimitDecision {
+	if (options.platform !== "linux") {
+		return { applies: false, reason: "this platform counts processes across all of the user's processes" };
+	}
+	if (!kernelCountsNprocPerUserNamespace(options.kernelRelease)) {
+		return {
+			applies: false,
+			reason: `kernel ${options.kernelRelease} counts RLIMIT_NPROC across the whole uid (per user namespace only from 5.14)`,
+		};
+	}
+	if (!options.hostUserNamespace || !options.sandboxUserNamespace) {
+		return { applies: false, reason: "the sandbox's user namespace could not be read" };
+	}
+	if (options.hostUserNamespace === options.sandboxUserNamespace) {
+		return {
+			applies: false,
+			reason: "the sandbox shares pi's user namespace, so RLIMIT_NPROC would count every process of the uid",
+		};
+	}
+	return { applies: true, reason: "counted in the sandbox's own user namespace" };
+}
+
+/** Free and total bytes on the filesystem holding `path`, or undefined. */
+export type FreeSpaceProbe = (path: string) => { free: number; total: number } | undefined;
 
 export const statfsFreeBytes: FreeSpaceProbe = (path) => {
 	try {
 		const stats = statfsSync(path);
-		return Number(stats.bavail) * Number(stats.bsize);
+		// `bavail` is what an unprivileged user may still write; `blocks` the size.
+		return { free: Number(stats.bavail) * Number(stats.bsize), total: Number(stats.blocks) * Number(stats.bsize) };
 	} catch {
 		// A root that does not exist yet has no filesystem to fill.
 		return undefined;
 	}
 };
+
+/**
+ * The floor never exceeds this share of the filesystem it is measured on. A
+ * small filesystem (the scratch directory under $XDG_RUNTIME_DIR is a tmpfs
+ * of 10% of RAM by default) would otherwise sit below a fixed floor while
+ * empty, and every command would run unable to write.
+ */
+export const FREE_SPACE_FLOOR_SHARE = 0.05;
+
+/** The floor for one filesystem: the configured one, or a share of a small filesystem. */
+export function freeSpaceFloor(limits: ResourceLimits, total: number): number {
+	return Math.min(limits.minFreeDiskMb * 1024 * 1024, Math.floor(total * FREE_SPACE_FLOOR_SHARE));
+}
 
 /** The first writable root below the free-space floor, as a message, or undefined. */
 export function freeSpaceIssue(
@@ -183,13 +258,16 @@ export function freeSpaceIssue(
 	probe: FreeSpaceProbe = statfsFreeBytes,
 ): string | undefined {
 	if (!limits || limits.minFreeDiskMb <= 0) return undefined;
-	const floor = limits.minFreeDiskMb * 1024 * 1024;
+	const mb = (bytes: number) => Math.floor(bytes / (1024 * 1024));
 	for (const path of paths) {
-		const free = probe(path);
-		if (free !== undefined && free < floor) {
+		const space = probe(path);
+		if (!space) continue;
+		const floor = freeSpaceFloor(limits, space.total);
+		if (space.free < floor) {
 			return (
-				`pi-enclave: ${path} has ${Math.floor(free / (1024 * 1024))} MB free, below the ${limits.minFreeDiskMb} MB floor ` +
-				"(sandbox.limits.minFreeDiskMb), so this command ran with a file size limit of zero: it can delete and inspect files, not grow them."
+				`pi-enclave: ${path} has ${mb(space.free)} MB free of ${mb(space.total)} MB, below the ${mb(floor)} MB floor ` +
+				`(sandbox.limits.minFreeDiskMb, at most ${FREE_SPACE_FLOOR_SHARE * 100}% of the filesystem), so this command ran ` +
+				"with a file size limit of zero: it can delete and inspect files, not grow them."
 			);
 		}
 	}
@@ -197,14 +275,19 @@ export function freeSpaceIssue(
 }
 
 /** One line for `/enclave status`. */
-export function describeLimits(limits: ResourceLimits | undefined, backend: string, platform: NodeJS.Platform): string {
+export function describeLimits(
+	limits: ResourceLimits | undefined,
+	backend: string,
+	platform: NodeJS.Platform,
+	processLimit?: ProcessLimitDecision,
+): string {
 	if (!limits) return "not configured";
 	const parts = [
 		`timeout ${limits.defaultTimeoutSec}s default, ${limits.maxTimeoutSec}s max`,
 		`output ${limits.maxOutputMb} MB`,
 		`file ${limits.fileSizeMb} MB`,
 		`open files ${limits.openFiles}`,
-		`free-space floor ${limits.minFreeDiskMb} MB`,
+		`free-space floor ${limits.minFreeDiskMb} MB (at most ${FREE_SPACE_FLOOR_SHARE * 100}% of a filesystem; shell commands only)`,
 	];
 	if (backend === "docker" || backend === "podman") {
 		const c = limits.container;
@@ -213,7 +296,14 @@ export function describeLimits(limits: ResourceLimits | undefined, backend: stri
 			`memory ${limits.memoryMb} MB (RLIMIT_DATA, per process)`,
 		);
 	} else if (enforcedRlimits(platform).includes("processes")) {
-		parts.push(`processes ${limits.processes}`, `memory ${limits.memoryMb} MB (RLIMIT_DATA, per process)`);
+		parts.push(
+			processLimit === undefined
+				? `processes ${limits.processes} if the sandbox has its own user namespace (decided at the first command)`
+				: processLimit.applies
+					? `processes ${limits.processes}`
+					: `processes NOT limited: ${processLimit.reason}`,
+			`memory ${limits.memoryMb} MB (RLIMIT_DATA, per process)`,
+		);
 	} else {
 		parts.push("processes and memory NOT limited on this platform");
 	}

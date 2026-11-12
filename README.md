@@ -428,9 +428,9 @@ so every backend enforces `sandbox.limits` (#24):
 | `maxOutputMb` | 64 | Output past the cap is discarded and the command is killed, because pi keeps the whole output in a temporary file. |
 | `fileSizeMb` | 4096 | `RLIMIT_FSIZE`: a write past the size fails and the writer gets `SIGXFSZ`. |
 | `openFiles` | 8192 | `RLIMIT_NOFILE`. |
-| `processes` | 1024 | `RLIMIT_NPROC`, Linux only. bubblewrap starts each command in a new user namespace and the kernel counts processes per namespace, so the limit covers the command, not the user's other processes. |
+| `processes` | 1024 | `RLIMIT_NPROC`, Linux only, and only where it covers just the command: the kernel counts it per user namespace from 5.14, and the sandbox must be in a user namespace other than pi's (checked once per session with a sandboxed `readlink /proc/self/ns/user`). On an older kernel (RHEL 8, Ubuntu 20.04, Debian 11) or with bubblewrap in pi's namespace it would count every process of the uid on the host and refuse the command's first fork on a busy server, so it is skipped, and `/enclave status` says so and why. |
 | `memoryMb` | 8192 | `RLIMIT_DATA` per process, Linux only. `RLIMIT_AS` would break V8 and other runtimes that reserve large address ranges. |
-| `minFreeDiskMb` | 1024 | Below this much free space on a writable root, the command still runs but with a file size limit of zero, so it can delete and inspect files but not grow them. |
+| `minFreeDiskMb` | 1024 | Below this much free space on a writable root or the scratch directory, a shell command still runs but with a file size limit of zero, so it can delete and inspect files but not grow them. The floor is at most 5% of the filesystem it is measured on, so a small one (the scratch tmpfs under `$XDG_RUNTIME_DIR` is 10% of RAM by default) is not below it while empty. The `write` and `edit` tools are not affected. |
 | `container.{pids,memoryMb,cpus,shmMb,tmpMb}` | 256, 512, 2, 32, 128 | The Docker/Podman cgroup and tmpfs flags. The rlimits above apply inside the container too, except `processes`: the container runs as the host uid without its own user namespace, so `RLIMIT_NPROC` would count the user's host processes, and the cgroup `pids` limit covers it instead. |
 
 The rlimits are set by plain `ulimit` in the sandboxed shell before the command, which sets

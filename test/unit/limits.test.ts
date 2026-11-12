@@ -3,14 +3,20 @@
  * on a real kernel is the L rows of the conformance suite.
  */
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import {
 	describeLimits,
 	effectiveTimeout,
 	enforcedRlimits,
+	FREE_SPACE_FLOOR_SHARE,
+	freeSpaceFloor,
 	freeSpaceIssue,
+	kernelCountsNprocPerUserNamespace,
 	limitPrefix,
 	OutputCap,
+	processLimitDecision,
+	statfsFreeBytes,
 	timeoutNote,
 } from "../../src/backend/limits.ts";
 import type { CompiledProfile, Profile, RunRequest, SandboxBackend } from "../../src/backend/types.ts";
@@ -64,7 +70,7 @@ describe("the output cap", () => {
 
 describe("the rlimit prefix", () => {
 	it("sets file size, open files, memory and processes on Linux, processes last", () => {
-		const prefix = limitPrefix(LIMITS, "linux");
+		const prefix = limitPrefix(LIMITS, "linux", false, true);
 		expect(prefix).toContain(`-f ${LIMITS.fileSizeMb * 1024}`);
 		expect(prefix).toContain(`-n ${LIMITS.openFiles}`);
 		expect(prefix).toContain(`-d ${LIMITS.memoryMb * 1024}`);
@@ -118,16 +124,86 @@ describe("the rlimit prefix", () => {
 });
 
 describe("the free-space floor", () => {
+	const GB = 1024 ** 3;
+	const MB = 1024 ** 2;
+	const disks = new Map([
+		["/work", { free: 5 * GB, total: 500 * GB }],
+		["/scratch", { free: 100 * MB, total: 500 * GB }],
+		// The scratch tmpfs under $XDG_RUNTIME_DIR on a server with 8 GB of RAM: empty, and
+		// smaller than the configured floor.
+		["/run/user/1000", { free: 800 * MB, total: 800 * MB }],
+		["/run/user/1001", { free: 30 * MB, total: 800 * MB }],
+	]);
+	const probe = (path: string) => disks.get(path);
+
 	it("reports the first writable root below the floor", () => {
-		const free = new Map([
-			["/work", 5 * 1024 ** 3],
-			["/scratch", 100 * 1024 ** 2],
-		]);
-		const issue = freeSpaceIssue(["/work", "/scratch"], LIMITS, (path) => free.get(path));
-		expect(issue).toContain("/scratch has 100 MB free");
+		const issue = freeSpaceIssue(["/work", "/scratch"], LIMITS, probe);
+		expect(issue).toContain("/scratch has 100 MB free of 512000 MB, below the 1024 MB floor");
 		expect(issue).toContain("file size limit of zero");
-		expect(freeSpaceIssue(["/work"], LIMITS, (path) => free.get(path))).toBeUndefined();
-		expect(freeSpaceIssue(["/scratch"], { ...LIMITS, minFreeDiskMb: 0 }, (path) => free.get(path))).toBeUndefined();
+		expect(freeSpaceIssue(["/work"], LIMITS, probe)).toBeUndefined();
+		expect(freeSpaceIssue(["/scratch"], { ...LIMITS, minFreeDiskMb: 0 }, probe)).toBeUndefined();
+	});
+
+	it("does not hold an empty small filesystem to a floor larger than itself", () => {
+		expect(freeSpaceIssue(["/work", "/run/user/1000"], LIMITS, probe)).toBeUndefined();
+		expect(freeSpaceFloor(LIMITS, 800 * MB)).toBe(Math.floor(800 * MB * FREE_SPACE_FLOOR_SHARE));
+	});
+
+	it("still catches a small filesystem that is nearly full", () => {
+		expect(freeSpaceIssue(["/run/user/1001"], LIMITS, probe)).toContain("below the 40 MB floor");
+	});
+
+	it("measures a real filesystem", () => {
+		const space = statfsFreeBytes(tmpdir());
+		expect(space?.total).toBeGreaterThan(0);
+		expect(space?.free).toBeLessThanOrEqual(space?.total ?? 0);
+		expect(statfsFreeBytes("/does/not/exist")).toBeUndefined();
+	});
+});
+
+describe("the process limit decision", () => {
+	const decide = (
+		kernelRelease: string,
+		sandboxUserNamespace: string | undefined,
+		platform: NodeJS.Platform = "linux",
+	) => processLimitDecision({ platform, kernelRelease, hostUserNamespace: "user:[4026531837]", sandboxUserNamespace });
+
+	it("sets RLIMIT_NPROC only on 5.14+ with a user namespace of the sandbox's own", () => {
+		expect(decide("6.8.0-45-generic", "user:[4026532301]").applies).toBe(true);
+		expect(decide("5.14.0-362.el9.x86_64", "user:[4026532301]").applies).toBe(true);
+	});
+
+	it("skips it on an older kernel, where it counts every task of the uid", () => {
+		for (const release of ["4.18.0-513.el8.x86_64", "5.4.0-200-generic", "5.10.0-30-amd64", "5.13.19"]) {
+			const decision = decide(release, "user:[4026532301]");
+			expect(decision.applies).toBe(false);
+			expect(decision.reason).toContain(`kernel ${release}`);
+		}
+	});
+
+	it("skips it when the sandbox shares pi's user namespace or it cannot be read", () => {
+		expect(decide("6.8.0", "user:[4026531837]")).toMatchObject({
+			applies: false,
+			reason: expect.stringContaining("shares"),
+		});
+		expect(decide("6.8.0", undefined).applies).toBe(false);
+		expect(decide("24.1.0", "x", "darwin").applies).toBe(false);
+		expect(kernelCountsNprocPerUserNamespace("not a release")).toBe(false);
+	});
+
+	it("is what puts -u in the prefix", () => {
+		expect(limitPrefix(LIMITS, "linux")).not.toContain(" -u ");
+		expect(limitPrefix(LIMITS, "linux", false, true)).toContain(`-u ${LIMITS.processes}`);
+		expect(limitPrefix(LIMITS, "darwin", false, true)).not.toContain(" -u ");
+		expect(limitPrefix(LIMITS, "container", false, true)).not.toContain(" -u ");
+	});
+
+	it("is shown in /enclave status", () => {
+		expect(describeLimits(LIMITS, "bwrap", "linux", decide("6.8.0", "user:[1]"))).toContain("processes 1024");
+		expect(describeLimits(LIMITS, "bwrap", "linux", decide("5.4.0", "user:[1]"))).toContain(
+			"processes NOT limited: kernel 5.4.0",
+		);
+		expect(describeLimits(LIMITS, "bwrap", "linux")).toContain("decided at the first command");
 	});
 });
 
@@ -194,7 +270,6 @@ describe("limits in the configuration", () => {
 	});
 
 	it("is described for /enclave status per backend", () => {
-		expect(describeLimits(LIMITS, "bwrap", "linux")).toContain("processes 1024");
 		expect(describeLimits(LIMITS, "seatbelt", "darwin")).toContain("NOT limited on this platform");
 		expect(describeLimits(LIMITS, "docker", "linux")).toContain("cgroup pids 256, memory 512 MB");
 	});
