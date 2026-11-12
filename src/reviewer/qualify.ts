@@ -1,9 +1,12 @@
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { EffectiveProfile, Provenance } from "../config/types.ts";
 import { evalReviewer } from "./eval.ts";
+import { bindReviewerClassifier, resolveReviewerClassifier, reviewerClassifierDigest } from "./llama.ts";
 import { bindReviewerCompletion, resolveReviewerModel, reviewerModelDigest } from "./model.ts";
+import { CLASSIFIER_DENY_THRESHOLD, CLASSIFIER_TEMPERATURE } from "./probabilities.ts";
 import { buildReviewerPrompt, reviewerRulebook } from "./prompt.ts";
 import { type QualificationRecord, writeQualification } from "./qualification.ts";
+import type { ReviewerTransport } from "./reviewer.ts";
 
 export interface QualificationRun {
 	model: string;
@@ -32,14 +35,17 @@ export async function qualifyConfiguredReviewers(options: {
 
 	const runs: QualificationRun[] = [];
 	for (const reference of references) {
-		const resolved = resolveReviewerModel(options.registry, reference);
-		const modelDigest = await reviewerModelDigest(resolved.model, options.registry);
+		const { modelDigest, completion } = await qualificationTarget(
+			options.registry,
+			reference,
+			options.profile.reviewer.transport === "classifier",
+		);
 		const record = await evalReviewer({
 			model: reference,
 			modelDigest,
 			profile: options.profile,
 			prompt,
-			completion: bindReviewerCompletion(resolved, modelDigest),
+			completion,
 			timeoutMs: options.profile.reviewer.timeoutMs,
 			...(options.onProgress
 				? { onProgress: (completed: number, total: number) => options.onProgress?.(reference, completed, total) }
@@ -51,19 +57,43 @@ export async function qualifyConfiguredReviewers(options: {
 	return runs;
 }
 
+async function qualificationTarget(
+	registry: ModelRegistry,
+	reference: string,
+	classifier: boolean,
+): Promise<{ modelDigest: string; completion: ReviewerTransport }> {
+	if (classifier) {
+		const resolved = resolveReviewerClassifier(registry, reference);
+		const modelDigest = await reviewerClassifierDigest(resolved.model, registry);
+		// The evaluation replaces these with provisional values and chooses the real ones.
+		const thresholds = { allow: 1, deny: CLASSIFIER_DENY_THRESHOLD, temperature: CLASSIFIER_TEMPERATURE };
+		return { modelDigest, completion: bindReviewerClassifier(resolved, modelDigest, thresholds) };
+	}
+	const resolved = resolveReviewerModel(registry, reference);
+	const modelDigest = await reviewerModelDigest(resolved.model, registry);
+	return { modelDigest, completion: bindReviewerCompletion(resolved, modelDigest) };
+}
+
 export function formatQualificationRuns(runs: readonly QualificationRun[]): string {
 	const lines: string[] = [];
 	for (const run of runs) {
 		const result = run.record.passed ? "QUALIFIED" : "FAILED";
 		const metrics = run.record.metrics;
 		lines.push(
-			`${run.model}: ${result}`,
+			`${run.model}: ${result} (${run.record.transport ?? "chat"} transport)`,
 			`  injected allows: ${metrics.injectedAllows}`,
 			`  benign false-denial rate: ${(metrics.falseDenialRate * 100).toFixed(1)}%`,
 			`  p95 latency: ${metrics.p95LatencyMs.toFixed(0)} ms`,
 			`  completion errors: ${metrics.errors}`,
 			`  record: ${run.path}`,
 		);
+		const thresholds = run.record.thresholds;
+		if (thresholds) {
+			lines.push(
+				`  allow threshold: P(allow) >= ${thresholds.allow} (most allow-like injected case ${metrics.maxInjectedAllow ?? "n/a"}, least allow-like benign case ${metrics.minBenignAllow ?? "n/a"})`,
+				`  deny threshold: P(deny) >= ${thresholds.deny}`,
+			);
+		}
 		for (const [label, value] of [
 			["authorization", metrics.p95AuthorizationMs],
 			["decision", metrics.p95DecisionMs],

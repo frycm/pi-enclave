@@ -1,11 +1,13 @@
 import type { EffectiveProfile, Provenance } from "../config/types.ts";
 import { provenanceOf } from "../config/types.ts";
 import {
+	isClassifier,
 	REVIEWER_MAX_TOKENS,
 	REVIEWER_NUM_CTX,
 	REVIEWER_SEED,
 	REVIEWER_TEMPERATURE,
 	type ReviewerCompletion,
+	type ReviewerTransport,
 } from "./reviewer.ts";
 
 const CRITIQUE_LISTS = ["review.environment", "review.hard_deny", "review.soft_deny", "review.allow"] as const;
@@ -147,8 +149,8 @@ function unique(findings: readonly CritiqueFinding[]): CritiqueFinding[] {
 export async function critiqueRulebook(options: {
 	profile: EffectiveProfile;
 	provenance: Provenance;
-	primary?: ReviewerCompletion;
-	fallback?: ReviewerCompletion;
+	primary?: ReviewerTransport;
+	fallback?: ReviewerTransport;
 	timeoutMs: number;
 }): Promise<CritiqueResult> {
 	const deterministic = deterministicCritique(options.profile, options.provenance);
@@ -174,7 +176,16 @@ export async function critiqueRulebook(options: {
 		'{"findings":[{"list":"review.environment|review.hard_deny|review.soft_deny|review.allow","rule":"exact supplied rule","kind":"ambiguous|redundant|contradiction|false-denial","reason":"one concise line"}]}',
 	].join("\n\n");
 	const user = JSON.stringify({ rules, deterministicRules: { deny: options.profile.rules.deny } });
-	const completions = options.fallback ? [options.primary, options.fallback] : [options.primary];
+	// A classifier answers typed questions; it cannot write prose findings.
+	const completions = (options.fallback ? [options.primary, options.fallback] : [options.primary]).filter(
+		(transport): transport is ReviewerCompletion => !isClassifier(transport),
+	);
+	if (completions.length === 0) {
+		return {
+			findings: deterministic,
+			note: "the reviewer uses the classifier transport, which cannot write a prose critique; only the deterministic findings are shown",
+		};
+	}
 	let lastError = "reviewer unavailable";
 	for (const completion of completions) {
 		const controller = new AbortController();

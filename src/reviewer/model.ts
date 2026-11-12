@@ -13,10 +13,25 @@ export interface ResolvedReviewerModel {
 	completeBound(request: CompletionRequest, expected: string): Promise<string>;
 }
 
-type Endpoint = { model: RuntimeModel; headers: Record<string, string>; authIdentity: unknown };
+/** Any registry entry a reviewer can be: a chat model or a classifier model (#26). */
+type EndpointModel = Pick<RuntimeModel, "provider" | "id" | "api" | "baseUrl" | "headers">;
 
-async function endpoint(model: RuntimeModel, registry?: ModelRegistry): Promise<Endpoint> {
-	const auth = registry ? await registry.getApiKeyAndHeaders(model) : { ok: true as const };
+/** One immutable endpoint/auth snapshot, shared by the identity check and the request. */
+export type Endpoint<M extends EndpointModel = RuntimeModel> = {
+	model: M;
+	headers: Record<string, string>;
+	authIdentity: unknown;
+	apiKey?: string;
+};
+
+export async function endpoint<M extends EndpointModel = RuntimeModel>(
+	model: M,
+	registry?: ModelRegistry,
+): Promise<Endpoint<M>> {
+	// The registry resolves auth by provider; a classifier entry resolves like a chat entry.
+	const auth: Awaited<ReturnType<ModelRegistry["getApiKeyAndHeaders"]>> = registry
+		? await registry.getApiKeyAndHeaders(model as unknown as RuntimeModel)
+		: { ok: true };
 	if (!auth.ok) throw new Error(`pi-enclave: reviewer authentication unavailable: ${auth.error}`);
 	const effective = structuredClone({ ...model, baseUrl: auth.baseUrl ?? model.baseUrl });
 	const url = new URL(effective.baseUrl);
@@ -32,10 +47,15 @@ async function endpoint(model: RuntimeModel, registry?: ModelRegistry): Promise<
 	if (auth.apiKey && !Object.keys(headers).some((key) => key.toLowerCase() === "authorization")) {
 		headers.Authorization = `Bearer ${auth.apiKey}`;
 	}
-	return { model: effective, headers, authIdentity: structuredClone(auth) };
+	return {
+		model: effective,
+		headers,
+		authIdentity: structuredClone(auth),
+		...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
+	};
 }
 
-function isLoopback(baseUrl: string): boolean {
+export function isLoopback(baseUrl: string): boolean {
 	const host = new URL(baseUrl).hostname
 		.replace(/\.$/, "")
 		.replace(/^\[|\]$/g, "")
@@ -51,7 +71,7 @@ function isLoopback(baseUrl: string): boolean {
 	);
 }
 
-function digest(value: unknown): string {
+export function digest(value: unknown): string {
 	// Pi materializes optional metadata as undefined; JSON transport omits it.
 	return createHash("sha256")
 		.update(stableSerialize(JSON.parse(JSON.stringify(value))))
@@ -117,7 +137,11 @@ async function endpointDigest(target: Endpoint, signal: AbortSignal): Promise<st
 		return `ollama:sha256:${digest({ ...descriptor, modelManifest, version: version.version, numCtx: REVIEWER_NUM_CTX })}`;
 	}
 	if (isLoopback(target.model.baseUrl))
-		throw new Error("pi-enclave: local reviewer does not expose an exact weights digest; use Ollama");
+		throw new Error(
+			model.provider === "llama.cpp"
+				? 'pi-enclave: a llama.cpp reviewer is identified by its GGUF digest only on the classifier transport; set reviewer.transport to "classifier" or use Ollama'
+				: "pi-enclave: local reviewer does not expose an exact weights digest; use Ollama, or llama.cpp with reviewer.transport classifier",
+		);
 	if (model.api !== "openai-completions")
 		throw new Error("pi-enclave: reviewer adapter cannot enforce the required seed; use openai-completions or Ollama");
 	return `cloud:sha256:${digest(descriptor)}`;

@@ -222,7 +222,11 @@ export function narrowerOrEqual(a: EffectiveProfile, b: EffectiveProfile): Order
 		}
 	}
 
-	if (a.reviewer.model !== b.reviewer.model || a.reviewer.fallback !== b.reviewer.fallback) {
+	if (
+		a.reviewer.model !== b.reviewer.model ||
+		a.reviewer.fallback !== b.reviewer.fallback ||
+		a.reviewer.transport !== b.reviewer.transport
+	) {
 		fail("reviewer", "the reviewer is immutable below user-global");
 	}
 	if (a.reviewer.timeoutMs > b.reviewer.timeoutMs) {
@@ -788,6 +792,13 @@ export function fold(documents: readonly ConfigDocument[], options: FoldOptions)
 				source: "user_global",
 				field: "reviewer.fallback",
 				message: 'fallback requires a named primary reviewer; set reviewer.model or use fallback "none".',
+			});
+		}
+		if (current.reviewer.transport !== "chat") {
+			errors.push({
+				source: "user_global",
+				field: "reviewer.transport",
+				message: "a reviewer transport requires a named reviewer; set reviewer.model or remove reviewer.transport.",
 			});
 		}
 		for (const list of ["environment", "hard_deny", "soft_deny", "allow"] as const) {

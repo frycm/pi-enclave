@@ -1,15 +1,19 @@
+import type { ClassifierAnswer, ClassifierQuestion, JsonObject } from "@earendil-works/pi-ai";
 import type { EffectiveProfile } from "../config/types.ts";
 import { buildReviewEvidence, renderReviewEvidence } from "./evidence.ts";
 import { parseReviewerOutput, ReviewerOutputError } from "./output.ts";
+import { parseReviewProbabilities, reviewFromProbabilities } from "./probabilities.ts";
 import { enforceReview } from "./risk.ts";
 import { ReviewerTelemetry, type ReviewerTelemetrySummary } from "./telemetry.ts";
 import type {
 	ActionReviewer,
 	BuildEvidenceOptions,
+	ClassifierThresholds,
 	ModelReview,
 	ReviewerPrompt,
 	ReviewerRequest,
 	ReviewerResult,
+	ReviewProbabilities,
 } from "./types.ts";
 
 export const REVIEWER_MAX_ATTEMPTS = 3;
@@ -32,17 +36,45 @@ export interface CompletionRequest {
 
 /** A model-specific transport. It returns only assistant text and carries no tools or session context. */
 export interface ReviewerCompletion {
+	readonly kind?: "chat";
 	readonly name: string;
 	/** null means provider-managed context; a number is enforced by the transport. */
 	readonly numCtx?: number | null;
 	complete(request: CompletionRequest): Promise<string>;
 }
 
+export interface ClassifyRequest {
+	state: JsonObject;
+	questions: Record<string, ClassifierQuestion>;
+	signal: AbortSignal;
+	temperature: number;
+}
+
+/**
+ * A classifier transport (#26). It returns label probabilities for typed
+ * questions about the evidence; there is no generated text to parse.
+ */
+export interface ReviewerClassifier {
+	readonly kind: "classifier";
+	readonly name: string;
+	/** The server's context is bound through the model identity, not a request setting. */
+	readonly numCtx: null;
+	/** From the qualification record; qualification itself runs with provisional values. */
+	readonly thresholds: ClassifierThresholds;
+	classify(request: ClassifyRequest): Promise<Record<string, ClassifierAnswer>>;
+}
+
+export type ReviewerTransport = ReviewerCompletion | ReviewerClassifier;
+
+export function isClassifier(transport: ReviewerTransport): transport is ReviewerClassifier {
+	return transport.kind === "classifier";
+}
+
 export interface IsolatedReviewerOptions {
 	profile: EffectiveProfile;
 	prompt: ReviewerPrompt;
-	primary: ReviewerCompletion;
-	fallback?: ReviewerCompletion;
+	primary: ReviewerTransport;
+	fallback?: ReviewerTransport;
 	timeoutMs: number;
 	evidence:
 		| Omit<BuildEvidenceOptions, "action" | "trigger" | "toolSource">
@@ -119,44 +151,31 @@ export class IsolatedReviewer implements ActionReviewer {
 				attempt === maxAttempts - 1 && this.options.fallback ? this.options.fallback : this.options.primary;
 			const timer = timeoutSignal(this.options.timeoutMs);
 			try {
-				const gate = await telemetry.measure("authorization", attempt + 1, timer.signal, (onFirstOutput) =>
-					timer.wait(
-						completion.complete({
-							system: this.options.prompt.authorizationSystem,
-							user: rendered,
-							signal: timer.signal,
-							maxTokens: 1,
-							temperature: REVIEWER_TEMPERATURE,
-							seed: seed + attempt,
-							numCtx: REVIEWER_NUM_CTX,
-							onFirstOutput,
-						}),
-					),
-				);
-				if (gate !== "0" && gate !== "1") {
-					return invalidOutput(`authorization stage returned ${JSON.stringify(gate)} instead of 0 or 1`, evidence);
-				}
-
-				const text = await telemetry.measure("decision", attempt + 1, timer.signal, (onFirstOutput) =>
-					timer.wait(
-						completion.complete({
-							system: this.options.prompt.decisionSystem[gate],
-							user: rendered,
-							signal: timer.signal,
-							maxTokens: REVIEWER_MAX_TOKENS,
-							temperature: REVIEWER_TEMPERATURE,
-							seed: seed + attempt,
-							numCtx: REVIEWER_NUM_CTX,
-							onFirstOutput,
-						}),
-					),
-				);
 				let model: ModelReview;
-				try {
-					model = parseReviewerOutput(text);
-				} catch (error) {
-					if (error instanceof ReviewerOutputError) return invalidOutput(error.message, evidence);
-					throw error;
+				let probabilities: ReviewProbabilities | undefined;
+				if (isClassifier(completion)) {
+					const answers = await telemetry.measure("classify", attempt + 1, timer.signal, () =>
+						timer.wait(
+							completion.classify({
+								// The same bounded document the chat transport sends as its user turn.
+								state: JSON.parse(rendered) as JsonObject,
+								questions: this.options.prompt.classifier.questions,
+								signal: timer.signal,
+								temperature: completion.thresholds.temperature,
+							}),
+						),
+					);
+					try {
+						probabilities = parseReviewProbabilities(answers);
+					} catch (error) {
+						if (error instanceof ReviewerOutputError) return invalidOutput(error.message, evidence);
+						throw error;
+					}
+					model = reviewFromProbabilities(probabilities, completion.thresholds);
+				} else {
+					const chat = await this.chatReview(completion, rendered, timer, telemetry, attempt, seed);
+					if ("invalid" in chat) return invalidOutput(chat.invalid, evidence);
+					model = chat.model;
 				}
 				const currentEvidence =
 					typeof this.options.evidence === "function" ? this.options.evidence(request) : this.options.evidence;
@@ -168,6 +187,7 @@ export class IsolatedReviewer implements ActionReviewer {
 					review: enforceReview(model, request.action, this.options.profile, evidence, authorization),
 					modelReview: model,
 					evidence,
+					...(probabilities ? { probabilities } : {}),
 				};
 			} catch (error) {
 				lastError = `${completion.name}: ${(error as Error).message}`;
@@ -183,5 +203,54 @@ export class IsolatedReviewer implements ActionReviewer {
 			reason: `reviewer failed after ${maxAttempts} attempts (${lastError})`,
 			evidence,
 		};
+	}
+
+	/** The two-stage chat protocol: a one-token authorization gate, then the JSON verdict. */
+	private async chatReview(
+		completion: ReviewerCompletion,
+		rendered: string,
+		timer: ReturnType<typeof timeoutSignal>,
+		telemetry: ReviewerTelemetry,
+		attempt: number,
+		seed: number,
+	): Promise<{ model: ModelReview } | { invalid: string }> {
+		const gate = await telemetry.measure("authorization", attempt + 1, timer.signal, (onFirstOutput) =>
+			timer.wait(
+				completion.complete({
+					system: this.options.prompt.authorizationSystem,
+					user: rendered,
+					signal: timer.signal,
+					maxTokens: 1,
+					temperature: REVIEWER_TEMPERATURE,
+					seed: seed + attempt,
+					numCtx: REVIEWER_NUM_CTX,
+					onFirstOutput,
+				}),
+			),
+		);
+		if (gate !== "0" && gate !== "1") {
+			return { invalid: `authorization stage returned ${JSON.stringify(gate)} instead of 0 or 1` };
+		}
+
+		const text = await telemetry.measure("decision", attempt + 1, timer.signal, (onFirstOutput) =>
+			timer.wait(
+				completion.complete({
+					system: this.options.prompt.decisionSystem[gate],
+					user: rendered,
+					signal: timer.signal,
+					maxTokens: REVIEWER_MAX_TOKENS,
+					temperature: REVIEWER_TEMPERATURE,
+					seed: seed + attempt,
+					numCtx: REVIEWER_NUM_CTX,
+					onFirstOutput,
+				}),
+			),
+		);
+		try {
+			return { model: parseReviewerOutput(text) };
+		} catch (error) {
+			if (error instanceof ReviewerOutputError) return { invalid: error.message };
+			throw error;
+		}
 	}
 }

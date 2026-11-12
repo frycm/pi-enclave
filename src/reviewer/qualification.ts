@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { ReviewerTransportKind } from "../config/types.ts";
 import { checkSecureFile } from "../state/dir.ts";
+import type { ClassifierThresholds } from "./types.ts";
 
 export const QUALIFICATION_VERSION = 2;
 export const DEFAULT_QUALIFICATION_TRIALS = 5;
@@ -16,6 +18,11 @@ export interface ReviewerSampling {
 
 export interface QualificationBinding {
 	model: string;
+	/**
+	 * A chat qualification never qualifies the classifier transport, or the
+	 * reverse (#26). Absent means chat: records written before #26 have none.
+	 */
+	transport?: ReviewerTransportKind;
 	modelDigest: string;
 	promptHash: string;
 	corpusHash: string;
@@ -32,10 +39,15 @@ export interface QualificationMetrics {
 	p95AuthorizationMs?: number;
 	p95DecisionMs?: number;
 	p95FirstOutputMs?: number;
+	/** Classifier transport: the most allow-like injected case and the least allow-like benign one. */
+	maxInjectedAllow?: number;
+	minBenignAllow?: number;
 }
 
 export interface QualificationRecord extends QualificationBinding {
 	version: typeof QUALIFICATION_VERSION;
+	/** Required for the classifier transport: the thresholds qualification chose. */
+	thresholds?: ClassifierThresholds;
 	passed: boolean;
 	metrics: QualificationMetrics;
 	createdAt: string;
@@ -55,6 +67,25 @@ function isFiniteNumber(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value);
 }
 
+function isProbability(value: unknown): value is number {
+	return isFiniteNumber(value) && value >= 0 && value <= 1;
+}
+
+function isThresholds(value: unknown): value is ClassifierThresholds {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const thresholds = value as Partial<ClassifierThresholds>;
+	return (
+		isProbability(thresholds.allow) &&
+		isProbability(thresholds.deny) &&
+		isFiniteNumber(thresholds.temperature) &&
+		thresholds.temperature > 0
+	);
+}
+
+export function recordTransport(record: Pick<QualificationBinding, "transport">): ReviewerTransportKind {
+	return record.transport ?? "chat";
+}
+
 export function isQualificationRecord(value: unknown): value is QualificationRecord {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const record = value as Partial<QualificationRecord>;
@@ -62,6 +93,8 @@ export function isQualificationRecord(value: unknown): value is QualificationRec
 	const metrics = record.metrics as Partial<QualificationMetrics> | undefined;
 	return (
 		record.version === QUALIFICATION_VERSION &&
+		(record.transport === undefined || record.transport === "chat" || record.transport === "classifier") &&
+		(record.transport === "classifier" ? isThresholds(record.thresholds) : record.thresholds === undefined) &&
 		typeof record.model === "string" &&
 		typeof record.modelDigest === "string" &&
 		typeof record.promptHash === "string" &&
@@ -83,7 +116,8 @@ export function isQualificationRecord(value: unknown): value is QualificationRec
 		isFiniteNumber(metrics.errors) &&
 		[metrics.p95AuthorizationMs, metrics.p95DecisionMs, metrics.p95FirstOutputMs].every(
 			(value) => value === undefined || isFiniteNumber(value),
-		)
+		) &&
+		[metrics.maxInjectedAllow, metrics.minBenignAllow].every((value) => value === undefined || isProbability(value))
 	);
 }
 
@@ -109,6 +143,12 @@ export function readQualification(directory: string, expected: QualificationBind
 	}
 	if (!isQualificationRecord(value)) return { ok: false, reason: `${path} is not a valid qualification record` };
 	if (!value.passed) return { ok: false, reason: `${path} records a failed evaluation` };
+	if (recordTransport(value) !== recordTransport(expected)) {
+		return {
+			ok: false,
+			reason: `${path} qualifies the ${recordTransport(value)} transport, not ${recordTransport(expected)}`,
+		};
+	}
 	for (const key of ["model", "modelDigest", "promptHash", "corpusHash"] as const) {
 		if (value[key] !== expected[key]) return { ok: false, reason: `${key} changed since qualification` };
 	}

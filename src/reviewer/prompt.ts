@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Provenance } from "../config/types.ts";
 import { provenanceOf } from "../config/types.ts";
+import { buildClassifierQuestions, classifierPromptHash } from "./probabilities.ts";
 import type { ReviewerPrompt, ReviewerRulebook, ReviewLists, SourcedReviewRule } from "./types.ts";
 
 export const REVIEWER_PROMPT_VERSION = 2;
@@ -69,5 +70,12 @@ export function buildReviewerPrompt(rulebook: ReviewerRulebook): ReviewerPrompt 
 		.update("\0")
 		.update(decisionSystem["1"])
 		.digest("hex")}`;
-	return { authorizationSystem, system, decisionSystem, promptHash };
+	const questions = buildClassifierQuestions(rulebook);
+	return {
+		authorizationSystem,
+		system,
+		decisionSystem,
+		promptHash,
+		classifier: { questions, promptHash: classifierPromptHash(questions) },
+	};
 }

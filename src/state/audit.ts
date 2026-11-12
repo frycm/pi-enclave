@@ -479,6 +479,8 @@ export function reviewerVerdictFields(
 		authorizationCovers: result.review.authorizationCovers,
 		reason: boundedText(result.review.reason, 2048).text,
 		modelReason: boundedText(result.modelReview.reason, 2048).text,
+		// Classifier transport (#26): what the thresholds were applied to.
+		...(result.probabilities ? { probabilities: result.probabilities } : {}),
 	};
 }
 
@@ -494,6 +496,7 @@ export function configFields(
 		auto: profile.auto,
 		attended: profile.attended.mode,
 		reviewer: profile.reviewer.model,
+		reviewerTransport: profile.reviewer.transport,
 		trigger: profile.review.trigger,
 		writableRoots: profile.sandbox.writableRoots,
 		// Resource limits (#24), so a run that was killed can be read against them.
