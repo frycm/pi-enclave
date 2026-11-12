@@ -89,7 +89,12 @@ interface FakeTool {
 }
 
 async function session(
-	options: { edit?: (profile: EffectiveProfile) => void; others?: FakeTool[]; entries?: unknown[] } = {},
+	options: {
+		edit?: (profile: EffectiveProfile) => void;
+		others?: FakeTool[];
+		entries?: unknown[];
+		startSession?: boolean;
+	} = {},
 ) {
 	vi.resetModules();
 	const { default: register } = await import("../../src/index.ts");
@@ -137,7 +142,7 @@ async function session(
 		modelRegistry: {},
 	} as unknown as ExtensionContext;
 	const start = async (reason = "startup") => handlers.get("session_start")?.({ reason }, context);
-	await start();
+	if (options.startSession !== false) await start();
 	const gate = async (id: string, toolName: string, input: Record<string, unknown>) =>
 		(await handlers.get("tool_call")?.({ toolName, toolCallId: id, input }, context)) as
 			| { block?: boolean; reason?: string }
@@ -296,6 +301,77 @@ describe("the project-trust question (#28)", () => {
 			} as unknown as ExtensionContext);
 			expect(answer).toEqual({ trusted: "no" });
 			expect(stderr).toHaveBeenCalledWith(expect.stringContaining("not loading project resources"));
+			expect(stderr).toHaveBeenCalledWith(expect.stringContaining("own project files"));
+			await s.shutdown();
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	// pi's startup context (cli/project-trust.ts): notify prints nothing in
+	// interactive mode, which is when the first trust prompt is shown.
+	const startupContext = (cwd: string) =>
+		({
+			cwd,
+			mode: "tui",
+			hasUI: true,
+			ui: {
+				notify: (_message: string) => {
+					/* interactive startup: dropped */
+				},
+				select: async () => undefined,
+				confirm: async () => false,
+				input: async () => undefined,
+			},
+		}) as unknown as ExtensionContext;
+
+	it("shows the TUI warning on stderr before the first session, and through notify after (review of #56)", async () => {
+		const stderr = quiet();
+		try {
+			const s = await session({ startSession: false });
+			mkdirSync(join(ws, ".pi", "extensions"), { recursive: true });
+			const answer = await s.handlers.get("project_trust")?.({ type: "project_trust", cwd: ws }, startupContext(ws));
+			expect(answer).toEqual({ trusted: "undecided" });
+			expect(stderr).toHaveBeenCalledWith(expect.stringContaining(join(ws, ".pi", "extensions")));
+			stderr.mockClear();
+			await s.start();
+			const notified: string[] = [];
+			const later = {
+				...startupContext(ws),
+				ui: { notify: (message: string) => notified.push(message) },
+			} as unknown as ExtensionContext;
+			await s.handlers.get("project_trust")?.({ type: "project_trust", cwd: ws }, later);
+			expect(notified.join()).toContain(join(ws, ".pi", "extensions"));
+			expect(stderr).not.toHaveBeenCalled();
+			await s.shutdown();
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	it("answers no in a headless run when deciding throws, instead of falling back to pi's trust store", async () => {
+		const stderr = quiet();
+		try {
+			const s = await session();
+			mocks.loadConfig.mockImplementationOnce(() => {
+				throw new Error("boom");
+			});
+			const headless = {
+				cwd: ws,
+				mode: "print",
+				hasUI: false,
+				ui: { notify: () => {} },
+			} as unknown as ExtensionContext;
+			expect(await s.handlers.get("project_trust")?.({ type: "project_trust", cwd: ws }, headless)).toEqual({
+				trusted: "no",
+			});
+			expect(stderr).toHaveBeenCalledWith(expect.stringContaining("boom"));
+			mocks.loadConfig.mockImplementationOnce(() => {
+				throw new Error("boom");
+			});
+			expect(await s.handlers.get("project_trust")?.({ type: "project_trust", cwd: ws }, startupContext(ws))).toEqual({
+				trusted: "undecided",
+			});
 			await s.shutdown();
 		} finally {
 			stderr.mockRestore();

@@ -101,6 +101,7 @@ export function answerProjectTrust(question: TrustQuestion): TrustAnswer {
 			message:
 				`pi-enclave: not loading project resources from ${question.cwd} in a headless run:\n${listing}\n` +
 				"  They would run in, or configure, the pi process outside the sandbox, in a directory the agent can write.\n" +
+				"  pi-enclave's own project files (.pi/enclave.json, .pi/enclave.local.json) are not applied either.\n" +
 				"  List the project in the user-global attended.headlessTrust to allow it.",
 		};
 	}

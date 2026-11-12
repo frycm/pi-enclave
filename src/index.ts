@@ -252,6 +252,8 @@ export default function (pi: ExtensionAPI): void {
 	 * MCP server that connects in between is picked up by the next of these).
 	 */
 	let toolRegistry: ReturnType<NonNullable<typeof pi.getAllTools>> | undefined;
+	/** Whether any session has started; before that, pi asks project trust with its startup UI. */
+	let sessionStarted = false;
 	const registeredTools = () => (toolRegistry ??= pi.getAllTools?.() ?? []);
 	const forgetToolRegistry = () => {
 		toolRegistry = undefined;
@@ -909,6 +911,9 @@ export default function (pi: ExtensionAPI): void {
 		forgetToolRegistry();
 		currentTurn = event.turnIndex;
 		queuedOwnedCall = false;
+		// A server that connected mid-run has its tools judged here, not only
+		// at the next prompt.
+		applyActiveTools();
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
@@ -1065,14 +1070,30 @@ export default function (pi: ExtensionAPI): void {
 	// Before anything is loaded from the project: a headless run does not
 	// trust project resources the user-global policy does not list (#28).
 	pi.on("project_trust", (event, ctx) => {
-		const answer = answerProjectTrust({
-			cwd: event.cwd,
-			mode: ctx.mode,
-			hasUI: ctx.hasUI,
-			config: loadConfig({ cwd: event.cwd, projectTrusted: false }),
-		});
+		const headless = ctx.mode !== "tui" || !ctx.hasUI;
+		let answer: ReturnType<typeof answerProjectTrust>;
+		try {
+			answer = answerProjectTrust({
+				cwd: event.cwd,
+				mode: ctx.mode,
+				hasUI: ctx.hasUI,
+				config: loadConfig({ cwd: event.cwd, projectTrusted: false }),
+			});
+		} catch (error) {
+			// pi treats a throwing handler as no answer and falls back to its trust
+			// store, which may hold the very "yes" this exists to override.
+			answer = headless
+				? {
+						trusted: "no",
+						message: `pi-enclave: could not decide project trust (${(error as Error).message}), so this headless run does not trust the project.`,
+					}
+				: { trusted: "undecided" };
+		}
 		if (answer.message) {
-			if (answer.trusted === "no") process.stderr.write(`${answer.message}\n`);
+			// For the first runtime pi asks with a startup context whose notify
+			// prints nothing in interactive mode, so until a session has started
+			// the warning goes to stderr, above pi's own prompt.
+			if (answer.trusted === "no" || !sessionStarted) process.stderr.write(`${answer.message}\n`);
 			else ctx.ui.notify(answer.message, "warning");
 		}
 		return { trusted: answer.trusted };
@@ -1089,6 +1110,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_tree", (_event, ctx) => restoreBranch(ctx));
 
 	pi.on("session_start", async (_event, ctx) => {
+		sessionStarted = true;
 		forgetToolRegistry();
 		compiled = undefined;
 		executions.clear();
