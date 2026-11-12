@@ -33,8 +33,9 @@ Designed to be trustworthy **offline, with open-weight models**.
 > or parent death. Each host must pass `pi-enclave qualify-backend` before selection succeeds.
 > See [container setup and supported limits](docs/phase-4a-containers.md).
 >
-> **Not built:** the egress proxy and the Phase 5 ops broker. Sections describing them
-> are design commitments, not descriptions of working software.
+> **Not built:** the `ops-observe` profile, the Phase 5 ops broker and the egress proxy.
+> Sections describing them are design commitments, not descriptions of working software.
+> What v1 still needs is listed under [the v1 cut](#order-and-the-v1-cut).
 >
 > **Known gaps in what *is* built** are listed under [Phase 1 status](#phase-1-status),
 > [Phase 2 status](#phase-2-status), and [Phase 3 status](#phase-3-status).
@@ -170,7 +171,7 @@ exposes everything required: built-in tool overrides with pluggable operations, 
 ## Threat model
 
 | Threat | Primary control | Backup |
-|---|---|---|---|
+|---|---|---|
 | Prompt injection via repo files, tool output, or fetched content steering the agent to run `curl … \| sh`, read `~/.ssh`, or push secrets | Sandbox: filesystem deny-read on secrets, no network except the proxy allowlist | Pattern `deny` rules; reviewer |
 | Injection aimed at the **reviewer** (text in arguments or messages telling it to allow) | Reviewer sees structured, provenance-labelled evidence only; only direct TUI/RPC input can carry authorization | A reviewer `allow` can only widen the sandbox by one declared capability for one action — it can never produce unsandboxed host execution, so the sandbox still bounds a wrong allow |
 | Agent tampers with pi-enclave's own state (approval records, config) from inside the sandbox | All extension state lives outside every writable root, mode `0600`, written atomically; project-local config is tighten-only | Session-bound nonces and expiry on approval records |
@@ -183,6 +184,22 @@ exposes everything required: built-in tool overrides with pluggable operations, 
 | Sandbox bypass through tools that do not go through `bash` (custom / MCP tools) | Auto mode denies any tool not in the allowlist; allowlisted tools are declared read-only or reviewed | Outer container or VM |
 | Agent changes code the trusted pi process loads (pi-enclave or another extension checked out in the workspace, its `node_modules`, the Node binary) so the change runs at the next start (#36) | Auto mode refuses when any loaded code root is below a writable root | User-global `sandbox.allowSelfHosting` write-denies those roots at L2 instead — see [below](#loaded-code-below-a-writable-root-36) |
 | Persistence through files a later, unsandboxed process loads: pi configuration (`.pi`, `.agents`) at any depth, instruction files (`AGENTS.md`, `CLAUDE.md`), `.envrc`, hook managers, editor tasks, Git configuration (#19, #33) | Existing `.pi`, `.agents` and Git metadata are L2-denied at compile time; for a command nobody judged, every existing `rules.protectedPaths` match is L2-denied for that call (#64); the trusted parent's post-turn tripwire reports new ones and changes, and keeps them until acknowledged | L1 `deny` for `.pi`/`.agents`, `ask` for project files. **Residual:** anything the agent writes into the workspace (build files, `package.json` scripts, `Makefile`, tests) must be treated as untrusted input by whatever reads it later — see [below](#files-loaded-outside-the-sandbox-19) |
+
+**What the main model sees.** The table treats the main model as untrusted for *actions*.
+For *data* it is a recipient: pi sends it the system prompt with the project's context files
+(`AGENTS.md` and the like), every user message, every tool call's arguments and every tool
+result in full, which means the contents of each file it reads and the output of each command
+up to the output cap. pi-enclave does not filter or redact what goes back to the main model;
+its redaction applies to the audit log and to approval prompts. So the boundary for what a
+**remote** main model receives is the read boundary: anything the sandbox lets a command or
+file tool read may end up with that provider. `sandbox.readMode: "allowlist"` and the
+`readDeny` list are therefore the controls that matter when a remote model is used on a host
+whose data must stay there. `network.mode: "off"` does not help here: it applies to the
+sandboxed children, while pi's own connection to its model provider runs in the trusted
+parent. A **local** main model (Ollama or llama.cpp on loopback) keeps all of this on the host.
+An installation that mixes the two, a remote main model with a local reviewer for instance,
+gets the remote model's data boundary for everything the session reads; the reviewer's own
+data boundary is under [remote review](#open-questions-and-risks).
 
 ---
 
@@ -1995,9 +2012,10 @@ that opens the breaker.
 ## Server-ops profile
 
 > [!NOTE]
-> **Deferred past v1.** The ops profile is kept in this document because it shapes the
-> backend interface, but it does not ship until the privileged-broker boundary below exists
-> and has its own conformance tests. See the [delivery plan](#delivery-plan).
+> **After v1, in two parts.** The read-only [`ops-observe`](#phase-5a--ops-observe-scheduled-after-v1)
+> profile comes first and needs no privileged component. The mutating profile below does not
+> ship until the privileged-broker boundary exists and has its own conformance tests, and
+> then one slice at a time. See the [delivery plan](#delivery-plan).
 
 The second use case — managing servers that must stay offline — needs real privileges on the
 host, which a workspace sandbox cannot express. The approach is to **shrink the action space
@@ -2125,28 +2143,146 @@ header and attribution preserved, alongside a `NOTICE` file.
 
 ## Delivery plan
 
-### The v1 cut
+### Order and the v1 cut
 
-v1 is deliberately small, and its contract is:
+The project exists to run small open-weight models on servers without internet access,
+safely enough to walk away. The order below is measured against that (#31): first make the
+layers that exist trustworthy, then make auto mode usable unattended, then deliver the
+server use case in a form whose worst case is a wrong suggestion, and only then add
+privilege and network access.
+
+| Step | What | State |
+| --- | --- | --- |
+| 1 | Make the existing layers trustworthy: shell reading, the sandbox boundary defects, workspace persistence, resource limits, the audit log, the read boundary (#13 stages 1 to 3) | Merged |
+| 2 | Make auto mode useful unattended: what the reviewer may clear, its protocol and transports, the qualification corpus, the approval queue (#13 stage 4) | Merged |
+| — | **Checkpoints A to C** (below), then the **v1 release** | Open |
+| 3 | **Phase 5a, `ops-observe`**: diagnosis on a server, no new privileged component | Scheduled, after v1 |
+| 4 | **Phase 5b, the broker**, in three slices: `service`, then `apply_config`, then `ssh` | After 5a |
+| 5 | **Phase 4b, egress**: reduced, and last | After 5b |
+
+**v1 is defined by unattended use, not by features.** It ships when all of these hold:
+
+- **Checkpoint A, the sandbox on real hosts.** The native conformance suite passes on one
+  real Linux server and one Mac (`npm run probe && npm run test:conformance && npm run
+  conformance:report srt`), not only in CI containers and runners.
+- **Checkpoint B, a release candidate.** Unit, policy, container and native conformance
+  runs green on the same commit, tagged as the candidate.
+- **Checkpoint C, a qualified local model on the target hardware.** At least one real local
+  model passes `/enclave eval-reviewer` on the server it will run on. The record is kept in
+  `docs/`: hardware, model digest, per-category tables, p95 review latency for one 8B and one
+  14B to 30B model, and what the live llama.cpp and Ollama runtimes were observed to do with
+  over-long prompts, turn markers and `format`.
+- **A recorded headless session that does ordinary work.** One unattended run on a server
+  through a realistic task (edit, `npm test` or its equivalent, a commit) finishes without
+  a breaker trip, with the `summary` record showing which layer settled each decision.
+- **The approval loop on a server.** `attended.mode: "queue"` with one real `notify`
+  command (`wall`, `mail`) delivers a request, and `pi-enclave approve` in another terminal
+  lets the session continue.
+- **An operator runbook** (below) that someone other than the author can follow.
+
+Without these the first experience on a headless machine is a refusal or a breaker trip on
+the first test run, and a release would advertise what has not been seen working.
+
+The v1 contract itself stays small:
 
 - **Dev profile only.** `workspace-write` on macOS and Linux.
 - **Offline.** `network.mode: "off"` is the only mode; the egress proxy and `allowHosts`
   are not in v1. "Off" means **no host is allowlisted**, not that no network stack exists:
   raw sockets and DNS are denied by the kernel, while HTTP reaches a loopback proxy that
-  refuses every request. That last hop is a userspace boundary, not a kernel one.
+  refuses every request. That last hop is a userspace boundary, not a kernel one. On an
+  air-gapped host `off` is also the correct final state, not a stage on the way to egress.
 - **Sandboxing is delegated, not reimplemented.** v1 pins an exact version of
   [`@anthropic-ai/sandbox-runtime`](https://github.com/anthropic-experimental/sandbox-runtime)
   and wraps it as the `seatbelt` and `bwrap` backends, behind the `SandboxBackend` interface
   and a **backend-conformance test suite** that any backend — SRT-based, own, Docker, microVM
   — must pass. The suite is the contract; SRT is the first implementation. Bumping SRT is a
-  PR that re-runs the suite, not a trust decision.
+  PR that re-runs the suite, not a trust decision. See the
+  [backend decision](#backend-decision-sandbox-runtime-until-a-conformance-row-says-otherwise).
 - **No model-approved escape.** `hostExec: "never"` is the only value in v1; `capabilities:
   "reviewed"` (one-shot, still sandboxed) is the whole of what L3 can grant.
-- **Ops profile deferred** until the [broker boundary](#the-privilege-boundary-a-broker-not-sudoers)
-  exists and has its own conformance tests.
+- **No privileged component.** Neither `ops-observe` nor the broker is in v1.
 
 Phases are ordered so each is independently useful and the riskiest part — the sandbox — is
 validated first.
+
+### Backend decision: sandbox-runtime until a conformance row says otherwise
+
+Decided in #31, from what #23, #24, #33, #19 and #64 needed and from one spike. The ops
+profile, `ops-observe` included, stays on `@anthropic-ai/sandbox-runtime`; an owned backend
+is not started now.
+
+What the ops shapes need, and where it comes from today:
+
+| Need | Provided by | Evidence |
+| --- | --- | --- |
+| A read allowlist (`/` denied, chosen roots readable) | SRT `denyRead` plus `allowRead`, on bwrap and Seatbelt (#23) | Conformance R1 to R6 on both |
+| Name-based write denials inside a writable root | SRT `denyWrite` (#33, #19, #64) | C15 to C19, W1 to W8 |
+| One call with a wider or narrower profile | SRT per-invocation `customConfig` | Phase 3 overlap rows |
+| Resource limits and timeouts | pi-enclave's own rlimits, timeout and output cap (`src/backend/limits.ts`, #24), not SRT | L1 to L6 |
+| Network off | SRT's network namespace and refusing proxy | C5 |
+| Exec denial of named binaries (Phase 5b) | SRT `denyRead` on the binary, on Linux | Spike below; no conformance row yet |
+
+The spike (November 12, 2026; SRT 0.0.82, bubblewrap 0.9.0, as a non-root user in a
+Linux container, so not Checkpoint A): with a copy of `id` read-denied, running it fails
+with `Permission denied` (exit 126), and so do running it from a script, copying it to the
+workspace and running the copy, and loading it through `ld-linux` directly. An unlisted copy
+of the same binary runs. Under bubblewrap's user namespace a setuid bit grants nothing, so
+denying execution of named binaries covers what the broker design asks of Linux.
+
+Not known, and what changes the decision:
+
+- **Seatbelt.** Whether a read denial also stops `process-exec` on macOS, and how setuid
+  binaries are enumerated there, has not been tried. The ops profile targets Linux servers;
+  macOS ops is out of scope until it has been.
+- **Exit conditions.** An owned Linux backend replaces SRT, without changing anything above
+  `SandboxBackend`, when any of these happens: a Phase 5b exec-denial conformance row cannot
+  be made to pass through SRT; an SRT release breaks a conformance row and no pinned version
+  passes; a security advisory reachable through pi-enclave's use of SRT has no fix (#38 is
+  the current one, traced as not reachable). SRT is pre-1.0 and pinned exactly, so every
+  bump is a reviewed PR that re-runs the suite.
+
+### Release engineering
+
+- **Package and versions.** `pi-enclave` is published to npm from a tag once v1 holds. Its
+  version is semver for its own configuration and behaviour; each minor names the pi range it
+  supports, which stays bounded on both sides (`>=1.5.2 <1.6.0` today) because `probe()`
+  refuses outside it.
+- **Following pi.** pi releases often. A new pi minor gets one PR that rebases `frycm/pi`,
+  re-runs unit, policy and native conformance against it, and widens the range, as the
+  [API baseline](#api-baseline) section requires. Before that PR, the CI job runs the suite
+  against the newest pi release candidate when one exists, so a break is seen before users
+  upgrade.
+- **Dependencies.** Exact pins for SRT and the pi packages, `npm audit` reviewed per release,
+  and every advisory traced to whether pi-enclave reaches it (see
+  [dependency upgrades](docs/dependency-upgrade.md) and #38).
+
+### Outcome telemetry
+
+Kept locally, never sent anywhere. Each session's audit log ends with a `summary` record
+that counts the decisions each layer settled (L1, L3, L4), and `/enclave status` shows the
+same tally live (#18); breaker openings are `breaker` records. That is the measure of
+whether a change improved autonomy or safety: a reviewer or rule change should move the L4
+share down without moving denials of the qualification corpus's injected cases. A
+cross-session report (`pi-enclave audit stats`) is still to be written; until then the
+records are read with `jq`.
+
+### The operator runbook (v1 gate)
+
+To be written as `docs/operator-runbook.md` before v1, from Checkpoint C's server:
+
+1. Install pi and pi-enclave as a dedicated low-privilege user with no `sudoers` entry;
+   `loginctl enable-linger` for that user if sessions run in tmux (the sandbox scratch is
+   under `/run/user/<uid>`).
+2. A user-global `enclave.json` for a server: `sandbox.readMode: "allowlist"` with tool
+   roots in `sandbox.readableRoots`, `audit.required: true`, `audit.syslog: true`,
+   `sandbox.grantableWriteRoots` only where a write outside the workspace is expected.
+3. The reviewer model: serve it (Ollama with `OLLAMA_KEEP_ALIVE`, or llama.cpp on loopback
+   with the documented flags), then `/enclave eval-reviewer`, and again after any change to
+   the model, runtime or pi-enclave.
+4. Headless runs: project trust (`attended.headlessTrust`), `rules.onUncertain`, and what the
+   queue and `notify` deliver.
+5. When something stops: reading `/enclave status`, the audit log, the tripwire ledger, and
+   what to do after a breaker trip (read the summary, then `/enclave` or a new direct message).
 
 ### Phase 1 — Sandbox core ✅ implemented
 
@@ -2210,10 +2346,11 @@ after passing the eval.*
   summarized instead of truncated, the prompt carries the trusted bash deny and ask patterns,
   `rules.onUncertain` for deterministic mode, and a per-session layer tally.
 
-**v1 release gate:** expand the reviewer corpus beyond repeated templates, qualify a real
-local model on target hardware with measured denial, approval and latency rates, and run
-the end-to-end approval, cancellation, resume and parallel-call flows against the packaged
-pi 1.5.2 integration. Publish the supported host and model limits with those results.
+**v1 release gate:** the corpus is no longer repeated templates (#27); what remains is in
+[the v1 cut](#order-and-the-v1-cut): qualify a real local model on target hardware with
+measured denial, approval and latency rates, and run the end-to-end approval, cancellation,
+resume and parallel-call flows against the packaged pi integration. Publish the supported
+host and model limits with those results.
 
 ### Phase 4a — Offline container backend (Linux implementation; broader host qualification pending)
 
@@ -2232,9 +2369,71 @@ pi 1.5.2 integration. Publish the supported host and model limits with those res
   Linux engine configuration locally before enabling it as a fallback. macOS and Windows
   container engines remain disabled pending equivalent host-path and lifetime evidence.
 
-### Phase 4b — Authenticated egress
+### Phase 5a — `ops-observe` (scheduled after v1)
+
+*Outcome: an agent that helps diagnose a server it cannot change. Its worst case is a wrong
+suggestion.*
+
+Most of "help me manage this server" is diagnosis: read logs, inspect unit state, check
+disk, ports and configuration, and draft a change. None of that needs privilege separation,
+only a sandbox shaped for it, so it comes before any broker.
+
+- **A built-in `ops-observe` profile**, Linux only: `sandbox.readMode: "allowlist"` with
+  explicit readable roots (`/var/log`, chosen `/etc` subtrees, application directories) and
+  the server secret set in `readDeny`; writes only to an unprivileged staging directory and
+  the session scratch; network off; capabilities none; `hostExec: "never"`; the resource
+  limits of #24 on.
+- **Narrow read-only tools run by the trusted parent from fixed argv tables**, because what
+  an operator looks at is often not reachable from inside a user namespace:
+  `service_status(unit)`, `logs(unit, since, lines)`, `listening_ports()`, `disk_usage()`,
+  `process_list()`. Units come from a user-global allowlist, arguments are typed and never
+  reach a shell, output is size-bounded, and credential-shaped values are redacted with the
+  audit log's rules before the model sees them.
+- **Output is a proposal**: a configuration diff or a command list in staging, for a person
+  to apply.
+
+Gates, each a test or a recorded run:
+
+1. Conformance rows for the profile: the staging directory is the only writable place
+   outside scratch; a `readDeny` secret inside a readable root (a key under `/etc/ssl/private`,
+   a database password file) is not readable; `/proc/<pid>/environ` of the operator's other
+   processes is not visible (C20).
+2. Each narrow tool: an argv-table test (no shell, no unit outside the allowlist, no
+   argument that becomes an option), an output bound test, and a redaction test.
+3. The tools are `readOnly` grants by construction and appear in `/enclave status` under
+   their own heading, not under `unsandboxed:` as unexplained routes.
+4. One recorded diagnosis session on Checkpoint C's server, kept as qualification corpus
+   cases (#68).
+
+### Phase 5b — Ops broker, in slices
+
+*Outcome: unattended server management on an offline host.*
+
+The broker design under [server-ops profile](#server-ops-profile) holds. It is built in
+three slices, each shippable alone:
+
+1. **`service(unit, verb)` only**, with `pi-enclave-broker`, its protocol, peer credentials,
+   one-shot request MACs, the durable replay ledger, a separate broker uid, a fixed
+   unit/verb-to-argv table, and the per-backend exec-denial rows. Exec denial of
+   `sudo`, `su`, `doas`, `pkexec` and `systemctl` gets a conformance row first; it is the row
+   that decides whether SRT stays (see the [backend decision](#backend-decision-sandbox-runtime-until-a-conformance-row-says-otherwise)).
+2. **`apply_config(path, stagedPath, digest)`** with validation, backup and rollback: the
+   staged input is opened once with no-follow constraints, hashed and copied from that same
+   descriptor; targets are resolved descriptor-relatively and installed atomically.
+3. **`ssh(host, argv)` last**, because it extends the trust boundary to other hosts: fixed
+   hosts, pinned host keys and forced-command argv templates.
+
+No broad agent-facing sudo rule is permitted in any slice. The `sudoers` rule for the
+broker user and the `authorized_keys` templates ship with the slice that needs them.
+
+### Phase 4b — Egress, reduced and last
 
 *Outcome: allowlisted network access for online tasks without raw child egress.*
+
+On an air-gapped server none of this is used, so it moves behind Phase 5b. If online
+development work matters sooner, a first slice can expose only SRT's existing domain
+allowlist on the native backends as `network.mode: "allowlist"`, labelled as destination
+filtering and nothing more. The rest stays as designed:
 
 - Per-invocation authenticated proxy grants; canonical host, port, DNS and address checks;
   connection-time rebinding defenses; redirects repeat validation. Define grant lifetime for
@@ -2244,22 +2443,6 @@ pi 1.5.2 integration. Publish the supported host and model limits with those res
 - Acceptance gates: no raw child socket bypasses the proxy; credentials are action-bound,
   single-use and expired on process exit; DNS rebinding, redirects, private IPs, sibling
   isolation and revocation pass adversarial tests.
-
-### Phase 5 — Ops profile
-
-*Outcome: unattended server management on an offline host.*
-
-- `pi-enclave-broker`, its protocol and conformance tests; exec-denial clauses per backend.
-- Broker-only privileged mutations, peer credentials and one-shot request MACs, descriptor-
-  relative atomic config installation/rollback, fixed service/SSH argv tables, and a separate
-  broker uid. No broad agent-facing sudo rule is permitted.
-- Broker nonces survive broker restarts in a bounded durable replay ledger; requests expire,
-  bind the session and action hash, and are marked consumed before the privileged operation.
-  The staged input is opened once with no-follow constraints, hashed and copied from that
-  same descriptor so validation cannot race a path replacement.
-- `custom` sandbox mode with unprivileged staging only, the `service` / `apply_config` /
-  `ssh` tools, plus `sudoers` (for the broker user) and `authorized_keys` templates and
-  documentation.
 
 ### Platform matrix
 
@@ -2842,9 +3025,11 @@ These are accepted, not solved, and the README says so rather than implying othe
 
 - **SRT's remaining profile gap.** v1 depends on `@anthropic-ai/sandbox-runtime`. Phase 3's
   per-invocation `customConfig` and ephemeral-helper isolation now have conformance tests,
-  including overlapping base/capability calls. Phase 5 still requires exec-denial clauses
-  for the ops `custom` mode. If that property cannot be demonstrated by the conformance
-  suite, an owned backend replaces SRT without changing anything above the interface. SRT's own
+  including overlapping base/capability calls. Phase 5b still requires exec-denial clauses
+  for the ops `custom` mode; on Linux a read denial already stops execution of a named
+  binary, on macOS it has not been tried. The
+  [backend decision](#backend-decision-sandbox-runtime-until-a-conformance-row-says-otherwise)
+  names when an owned backend replaces SRT, without changing anything above the interface. SRT's own
   [security limitations](https://github.com/anthropic-experimental/sandbox-runtime/blob/bcad38810efcc2b7342bbc6ec26d15b7bbbabcfb/README.md#L772-L785)
   (weaker nested mode, `enableWeakerNetworkIsolation`, `allowAppleEvents`,
   `allowUnixSockets`) are all options pi-enclave does **not** expose in the dev profile.
