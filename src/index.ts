@@ -289,6 +289,8 @@ export default function (pi: ExtensionAPI): void {
 	let unjudgedInTurn = false;
 	/** Tool calls the gate let run unjudged; their protected paths are write-denied (#64). */
 	const unjudgedCalls = new Set<string>();
+	/** Tool calls held like unjudged ones under `rules.protectedHold: "unapproved"` (#72). */
+	const heldCalls = new Set<string>();
 	/**
 	 * Every existing path `rules.protectedPaths` names, for one unjudged call
 	 * (#64), under the roots that call can write: a write capability adds its
@@ -660,12 +662,14 @@ export default function (pi: ExtensionAPI): void {
 		guard: guardCommand,
 		protectWrites: (action) => {
 			const toolCallId = callOfAction.get(action);
-			if (toolCallId === undefined || !unjudgedCalls.has(toolCallId)) return undefined;
+			if (toolCallId === undefined) return undefined;
+			const unjudged = unjudgedCalls.has(toolCallId);
+			if (!unjudged && !heldCalls.has(toolCallId)) return undefined;
 			const found = protectedTargets(action);
 			if (!found.ok) {
 				throw new Error(
-					`pi-enclave: this command was not judged by anyone, and its protected paths cannot all be ` +
-						`write-denied for it (${found.reason}); it does not run.`,
+					`pi-enclave: ${unjudged ? "this command was not judged by anyone" : "no person approved this command"}, ` +
+						`and its protected paths cannot all be write-denied for it (${found.reason}); it does not run.`,
 				);
 			}
 			return found.paths;
@@ -943,6 +947,7 @@ export default function (pi: ExtensionAPI): void {
 						unjudgedInTurn = true;
 						unjudgedCalls.add(event.toolCallId);
 					}
+					if (result.held) heldCalls.add(event.toolCallId);
 					if (!result.action) {
 						audit?.append("decision", {
 							outcome: result.outcome,
@@ -963,6 +968,8 @@ export default function (pi: ExtensionAPI): void {
 							...(result.reason !== undefined ? { reason: result.reason } : {}),
 						}),
 						...(reachability ? { reachability } : {}),
+						// Ran with its protected paths write-denied (#72).
+						...(result.held ? { held: true } : {}),
 					});
 				},
 			},
@@ -1049,6 +1056,7 @@ export default function (pi: ExtensionAPI): void {
 		queuedOwnedCall = false;
 		unjudgedInTurn = false;
 		unjudgedCalls.clear();
+		heldCalls.clear();
 		// A server that connected mid-run has its tools judged here, not only
 		// at the next prompt.
 		applyActiveTools();

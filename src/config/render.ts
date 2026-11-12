@@ -120,6 +120,7 @@ export function renderConfig(profile: EffectiveProfile, provenance: Provenance):
 	lines.push(`sandbox.allowSelfHosting ${profile.sandbox.allowSelfHosting}`);
 	lines.push(`review.trigger         ${profile.review.trigger}`);
 	lines.push(`rules.onUncertain      ${profile.rules.onUncertain}`);
+	lines.push(`rules.protectedHold    ${profile.rules.protectedHold}`);
 	lines.push(`reviewer.model         ${profile.reviewer.model}`);
 	if (profile.reviewer.model !== "none") {
 		lines.push(`reviewer.transport     ${profile.reviewer.transport}`);

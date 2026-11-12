@@ -507,6 +507,52 @@ describe("an unjudged command's protected paths (#64)", () => {
 		}
 	});
 
+	it('are denied for a command L1 read too under rules.protectedHold: "unapproved" (#72)', async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			plant();
+			mkdirSync(join(ws, "docs"));
+			writeFileSync(join(ws, "docs", "AGENTS.md"), "original\n");
+			const s = await session((profile) => {
+				profile.rules.protectedHold = "unapproved";
+			});
+			const gate = await s.call("t1", "rm -rf docs");
+			expect(gate?.block).not.toBe(true);
+			expect(mocks.runs).toHaveLength(1);
+			expect(mocks.runs[0]?.protectWrites).toEqual(
+				expect.arrayContaining([join(ws, "AGENTS.md"), join(ws, ".husky"), join(ws, "docs", "AGENTS.md")]),
+			);
+			await s.flush();
+			const decisions = s.records().filter((entry) => entry.kind === "decision");
+			expect(decisions.map((entry) => [entry.outcome, entry.held])).toEqual([["allow", true]]);
+			const config = s.records().find((entry) => entry.kind === "config");
+			expect(config?.rules).toMatchObject({ onUncertain: "ask", protectedHold: "unapproved" });
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	it("refuse a held command at execution when the walk fails after the gate (#72)", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			plant();
+			const s = await session((profile) => {
+				profile.rules.protectedHold = "unapproved";
+			});
+			const gate = (await s.handlers.get("tool_call")?.(
+				{ toolName: "bash", toolCallId: "t1", input: { command: "rm -rf docs" } },
+				s.context,
+			)) as { block?: boolean } | undefined;
+			expect(gate?.block).not.toBe(true);
+			mocks.protectedFail = "a protected file has 2 hard links";
+			await expect(s.execute("t1", "rm -rf docs")).rejects.toThrow(/no person approved this command.*it does not run/s);
+			expect(mocks.runs).toEqual([]);
+			await s.flush();
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
 	it("are not denied for a command L1 could read", async () => {
 		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 		try {
@@ -518,6 +564,10 @@ describe("an unjudged command's protected paths (#64)", () => {
 			expect(mocks.runs).toHaveLength(1);
 			expect(mocks.runs[0]?.protectWrites).toBeUndefined();
 			await s.flush();
+			const decisions = s.records().filter((entry) => entry.kind === "decision");
+			expect(decisions.map((entry) => [entry.outcome, entry.held])).toEqual([["allow", undefined]]);
+			const config = s.records().find((entry) => entry.kind === "config");
+			expect(config?.rules).toMatchObject({ onUncertain: "sandbox", protectedHold: "unjudged" });
 		} finally {
 			stderr.mockRestore();
 		}

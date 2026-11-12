@@ -570,6 +570,7 @@ export function defaultProfile(options: DefaultProfileOptions): EffectiveProfile
 			skipReview: [],
 			protectedPaths: { deny: [...DEFAULT_PROTECTED_DENY], ask: [...DEFAULT_PROTECTED_ASK] },
 			onUncertain: "ask",
+			protectedHold: "unjudged",
 		},
 		review: { trigger: "boundary", environment: [], hard_deny: [], soft_deny: [], allow: [] },
 		tools: defaultTools(),
