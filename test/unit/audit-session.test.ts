@@ -166,6 +166,34 @@ describe("a session's audit trail (#37)", () => {
 		}
 	});
 
+	// #18: the decision names what ran with the sandbox as its only boundary,
+	// and shutdown records which layer settled each decision.
+	it("records sandboxed-uncertain decisions and a layer summary at shutdown", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			const s = await session((profile) => {
+				profile.rules.onUncertain = "sandbox";
+			});
+			await s.call("t1", "ls");
+			await s.call("t2", "npm test");
+			await s.call("t3", "sudo ls");
+			await s.call("t4", "git push origin main");
+			await s.flush();
+			const all = s.records();
+			expect(all.find((entry) => entry.kind === "decision" && entry.command === "npm test")).toMatchObject({
+				outcome: "sandboxed-uncertain",
+			});
+			expect(all.filter((entry) => entry.kind === "summary")).toEqual([
+				expect.objectContaining({
+					layers: { L1: 3, L3: 0, L4: 1, askDenied: 1, sandboxedUncertain: 1, other: 0 },
+					description: "L1 3 (75%), L3 0 (0%), L4 1 (25%), ask-denied 1, sandboxed-uncertain 1",
+				}),
+			]);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
 	it("records a ! command the person typed", async () => {
 		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 		try {

@@ -21,6 +21,16 @@ describe("narrowerOrEqual", () => {
 		expect(narrowerOrEqual(base(), base())).toEqual([]);
 	});
 
+	// #18: "sandbox" runs an unparsed command without a person, so only a
+	// user-global file may choose it; "ask" is the narrower setting.
+	it("orders rules.onUncertain: ask is narrower than sandbox", () => {
+		const sandboxed = applyPatch(base(), { rules: { onUncertain: "sandbox" } }, { ...OPTIONS, source: "user_global" });
+		expect(sandboxed.rules.onUncertain).toBe("sandbox");
+		expect(base().rules.onUncertain).toBe("ask");
+		expect(narrowerOrEqual(base(), sandboxed)).toEqual([]);
+		expect(fields(narrowerOrEqual(sandboxed, base()))).toEqual(["rules.onUncertain"]);
+	});
+
 	describe("writable roots", () => {
 		// Containment rather than set membership is what makes "a project may add
 		// roots inside the repo" fall out of the order instead of needing a

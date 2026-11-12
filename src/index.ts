@@ -73,6 +73,7 @@ import {
 	resolveDependencyEntries,
 } from "./gate/code-roots.ts";
 import { decide, type GateDecision } from "./gate/gate.ts";
+import { describeTally, emptyTally, recordLayer } from "./gate/layers.ts";
 import { ActionLock } from "./gate/lock.ts";
 import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
 import { answerProjectTrust } from "./gate/project-trust.ts";
@@ -273,6 +274,8 @@ export default function (pi: ExtensionAPI): void {
 	// from the configured thresholds. A `let` so that rebuild is visible to the
 	// closures below, which read `breaker` at call time rather than capturing it.
 	let breaker = new CircuitBreaker({ consecutive: 3, window: [10, 50] });
+	/** Which layer settled each gate decision this session (#18). */
+	let layers = emptyTally();
 	const directInput = new ProvenanceTracker();
 	// `pendingOpen`, not just `open`: the breaker only opens in turn_end, after a
 	// batch has run, but the whole batch's outcome is recorded before any of it
@@ -461,6 +464,7 @@ export default function (pi: ExtensionAPI): void {
 		...(tripwireLedger ? { tripwireLedger } : {}),
 		loadedCode: loadedCode.map((root) => root.path),
 		breaker: { open: breaker.open, consecutive: breaker.state.consecutive, limit: effective?.breaker.consecutive ?? 3 },
+		layers: { ...layers },
 		// A configuration refusal and an ownership refusal are both "auto mode
 		// will not start"; the status line shows whichever came first.
 		...(configError !== undefined
@@ -838,6 +842,7 @@ export default function (pi: ExtensionAPI): void {
 					// the outcome the breaker exists to stop. Only real gate decisions
 					// count.
 					if (effective?.auto && result.outcome !== "breaker-open") breaker.record(currentTurn, result.adverse);
+					if (effective?.auto) recordLayer(layers, result.outcome);
 					if (!result.action) {
 						audit?.append("decision", {
 							outcome: result.outcome,
@@ -1421,6 +1426,7 @@ export default function (pi: ExtensionAPI): void {
 		// restored from the session's persisted state. Building it here rather
 		// than at load is what makes `breaker.consecutive` / `window` actually
 		// take effect and keeps the status line's reported limit honest.
+		layers = emptyTally();
 		breaker = new CircuitBreaker({
 			consecutive: loaded.profile.breaker.consecutive,
 			window: [...loaded.profile.breaker.window],
@@ -1458,6 +1464,9 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", async () => {
 		warming?.abort();
+		// How often each layer settled a decision (#18): the only way to tell
+		// from the log whether a reviewer reduced interruptions.
+		if (effective?.auto) audit?.append("summary", { layers: { ...layers }, description: describeTally(layers) });
 		// Flush, then dispose, then flush once more: tearing the backend down can
 		// deliver a last `onFsViolation` (a denial during teardown), which queues
 		// an audit append that the first flush has already passed. The second

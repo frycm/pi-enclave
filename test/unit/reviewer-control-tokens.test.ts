@@ -16,7 +16,7 @@ import { IsolatedReviewer, type ReviewerCompletion } from "../../src/reviewer/re
 import type { BuildEvidenceOptions } from "../../src/reviewer/types.ts";
 
 const PROFILE = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
-const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map()));
+const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map(), PROFILE.rules));
 
 /** Markers of the common template families, written as a chat template spells them. */
 const MARKERS = [

@@ -15,7 +15,7 @@ import {
 import type { CompletionRequest, ReviewerCompletion } from "../../src/reviewer/reviewer.ts";
 
 const PROFILE = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
-const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map()));
+const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map(), PROFILE.rules));
 const directories: string[] = [];
 
 afterEach(() => {

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { type EvidenceFits, ReviewerBudgetError } from "./budget.ts";
 import type { BuildEvidenceOptions, ReviewContextEntry, ReviewEvidence } from "./types.ts";
 
@@ -99,7 +100,8 @@ function serializedBytes(value: ReviewEvidence): number {
  * the newest direct authorization, drops low-trust context, and forces the
  * deterministic high-risk floor through action.truncated.
  */
-function minimalEvidence(evidence: ReviewEvidence): ReviewEvidence {
+function minimalEvidence(evidence: ReviewEvidence, textChars = 512, authorizations = 2): ReviewEvidence {
+	const pathChars = Math.min(128, textChars);
 	const violation = evidence.violation
 		? {
 				kind: evidence.violation.kind,
@@ -116,8 +118,8 @@ function minimalEvidence(evidence: ReviewEvidence): ReviewEvidence {
 			input: { truncated: "complete input omitted; action.hash binds it" },
 			cwd: evidence.action.cwd.slice(0, 256),
 			paths: evidence.action.paths.slice(0, 2).map((path) => ({
-				raw: path.raw.slice(0, 128),
-				resolved: path.resolved.slice(0, 128),
+				raw: path.raw.slice(0, pathChars),
+				resolved: path.resolved.slice(0, pathChars),
 				writes: path.writes,
 			})),
 			hash: evidence.action.hash,
@@ -129,10 +131,10 @@ function minimalEvidence(evidence: ReviewEvidence): ReviewEvidence {
 		requestedCapability: evidence.requestedCapability
 			? { kind: evidence.requestedCapability.kind, value: evidence.requestedCapability.value.slice(0, 256) }
 			: null,
-		authorization: evidence.authorization.slice(-2).map((entry) => ({
+		authorization: evidence.authorization.slice(-authorizations).map((entry) => ({
 			provenance: "direct",
 			channel: entry.channel,
-			text: entry.text.slice(0, 512),
+			text: entry.text.slice(0, textChars),
 		})),
 		context: [],
 		profile: { name: evidence.profile.name.slice(0, 128), attended: evidence.profile.attended },
@@ -142,10 +144,66 @@ function minimalEvidence(evidence: ReviewEvidence): ReviewEvidence {
 export const ACTION_INPUT_CHARS = 8_192;
 const MIN_ACTION_INPUT_CHARS = 256;
 
+/** File tools whose long bodies are summarized rather than cut (#18). */
+const SUMMARIZED_TOOLS = new Set(["write", "edit"]);
+
+export interface ContentSummary {
+	chars: number;
+	sha256: string;
+	head: string;
+	tail: string;
+}
+
+/**
+ * A long write or edit body as its head, its tail, its length and its hash
+ * (#18). Cutting it used to mark the action truncated, which forces the high
+ * floor, so every write of a file above 2 KB needed a person once a reviewer
+ * was on. What a write may do is decided by its path; the body is shown so the
+ * reviewer can judge it, and the hash names the whole of it.
+ */
+function summarized(value: string, inputChars: number): ContentSummary {
+	// A quarter of the input budget at most, so the hash, the keys and a path
+	// still fit beside it when the input is cut to fit the context.
+	const side = Math.floor(Math.min(MAX_EVIDENCE_TEXT_CHARS, inputChars / 4) / 2);
+	return {
+		chars: value.length,
+		sha256: createHash("sha256").update(value).digest("hex"),
+		head: value.slice(0, side),
+		tail: value.slice(value.length - side),
+	};
+}
+
+function summarizeBodies(
+	value: unknown,
+	inputChars: number,
+	found: { any: boolean },
+	key?: string,
+	depth = 0,
+): unknown {
+	if (typeof value === "string") {
+		if (key === "path" || value.length <= MAX_EVIDENCE_TEXT_CHARS) return value;
+		found.any = true;
+		return summarized(value, inputChars);
+	}
+	if (depth >= MAX_VALUE_DEPTH) return value;
+	if (Array.isArray(value))
+		return value.map((entry) => summarizeBodies(entry, inputChars, found, undefined, depth + 1));
+	if (value && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value).map(([name, entry]) => [name, summarizeBodies(entry, inputChars, found, name, depth + 1)]),
+		);
+	}
+	return value;
+}
+
 /** Every field bounded, before anything is cut to fit; the tests compare the cut against it. */
 export function fullEvidence(options: BuildEvidenceOptions, inputChars: number): ReviewEvidence {
 	const { action } = options;
-	const input = boundedRecord(action.input, inputChars);
+	const found = { any: false };
+	const displayed = SUMMARIZED_TOOLS.has(action.tool)
+		? (summarizeBodies(action.input, inputChars, found) as Record<string, unknown>)
+		: action.input;
+	const input = boundedRecord(displayed, inputChars);
 	const detailBudget: Budget = { remaining: 4_096, truncated: false };
 	const argv = action.shell?.commands
 		.slice(0, MAX_COLLECTION_ENTRIES)
@@ -176,6 +234,7 @@ export function fullEvidence(options: BuildEvidenceOptions, inputChars: number):
 			trigger: options.trigger,
 			confident: action.confident,
 			truncated: actionTruncated,
+			...(found.any ? { summarized: true as const } : {}),
 			...(toolSource ? { toolSource } : {}),
 		},
 		violation: options.violation ? boundedViolation(options.violation) : null,
@@ -213,7 +272,9 @@ export function buildReviewEvidence(options: BuildEvidenceOptions, fits?: Eviden
 	}
 	for (let chars = ACTION_INPUT_CHARS / 2; chars >= MIN_ACTION_INPUT_CHARS && !ok(evidence); chars /= 2) {
 		const smaller = fullEvidence(options, chars);
-		smaller.action.truncated = true;
+		// A write or edit body is summarized at every size, so a smaller head and
+		// tail are not truncation (#18); anything else cut here is.
+		if (!SUMMARIZED_TOOLS.has(options.action.tool)) smaller.action.truncated = true;
 		smaller.context = evidence.context;
 		smaller.authorization = evidence.authorization;
 		if (evidence.contextTruncated) smaller.contextTruncated = true;
@@ -221,7 +282,20 @@ export function buildReviewEvidence(options: BuildEvidenceOptions, fits?: Eviden
 		evidence = smaller;
 	}
 	if (ok(evidence)) return evidence;
-	const minimal = minimalEvidence(evidence);
+	// The minimal form, tightened until it fits: first the older of the two
+	// authorizations goes (only the newest can cover an action), then the
+	// newest and the paths are shortened. A shortened authorization no longer
+	// matches the action, so it can only fail to cover it.
+	let minimal = minimalEvidence(evidence);
+	for (const [chars, kept] of [
+		[512, 1],
+		[256, 1],
+		[128, 1],
+		[64, 1],
+	] as const) {
+		if (ok(minimal)) break;
+		minimal = minimalEvidence(evidence, chars, kept);
+	}
 	if (options.context?.length) minimal.contextTruncated = true;
 	const kept = evidence.authorization.slice(-minimal.authorization.length);
 	if (

@@ -31,6 +31,7 @@ import type {
 	ReviewTrigger,
 	SourceId,
 	ToolGrant,
+	UncertainMode,
 } from "./types.ts";
 import { isProjectSource, REVIEWER_TRANSPORTS, SOURCE_LABELS } from "./types.ts";
 
@@ -57,6 +58,7 @@ const PROJECT_FORBIDDEN: Record<string, string> = {
 		"grantableWriteRoots authorizes one-shot write widening outside the workspace and is therefore user-global only.",
 	"sandbox.readableRoots": "readableRoots widens what the sandbox can read and is therefore user-global only.",
 	"rules.skipReview": "skipReview is an allow verdict: it bypasses review entirely. User-global only.",
+	"rules.onUncertain": "onUncertain decides whether an unparsed command runs without a person. User-global only.",
 	"review.environment": "prose rulebook entries are user-global only; a repository must not reach the reviewer prompt.",
 	"review.hard_deny": "prose rulebook entries are user-global only; a repository must not reach the reviewer prompt.",
 	"review.soft_deny": "prose rulebook entries are user-global only; a repository must not reach the reviewer prompt.",
@@ -90,7 +92,7 @@ const SANDBOX_KEYS = [
 	"limits",
 	"env",
 ] as const;
-const RULES_KEYS = ["deny", "ask", "skipReview", "protectedPaths"] as const;
+const RULES_KEYS = ["deny", "ask", "skipReview", "protectedPaths", "onUncertain"] as const;
 const REVIEW_KEYS = ["trigger", "environment", "hard_deny", "soft_deny", "allow"] as const;
 
 /**
@@ -540,6 +542,10 @@ class ParseContext {
 				}
 				out.protectedPaths = parsed;
 			}
+		}
+		if ("onUncertain" in body) {
+			const mode = this.enum<UncertainMode>(join(prefix, "onUncertain"), body.onUncertain, ["ask", "sandbox"]);
+			if (mode) out.onUncertain = mode;
 		}
 		return out;
 	}

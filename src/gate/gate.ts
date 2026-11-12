@@ -45,6 +45,11 @@ export type GateOutcome =
 	| "ask-approved"
 	/** Matched `skipReview` and nothing above it. */
 	| "skip-review"
+	/**
+	 * A command L1 could not parse ran under `rules.onUncertain: "sandbox"`
+	 * (#18): no person and no reviewer judged it; L2 is the boundary.
+	 */
+	| "sandboxed-uncertain"
 	/** L3 permitted the action after deterministic risk enforcement. */
 	| "review-allow"
 	/** L3 denied the action, or returned invalid output. */
@@ -394,6 +399,15 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 	// uncertainty still goes to a person; it never becomes a fast path.
 	const askReason = needsHumanWithoutReview(action, disposition.reviewed, deps.reviewer !== undefined);
 	if (askReason) {
+		if (uncertainRunsSandboxed(action, disposition.reviewed, profile)) {
+			return finish(action, event, deps, {
+				outcome: "sandboxed-uncertain",
+				block: false,
+				reason: `${askReason}; rules.onUncertain is "sandbox", so it runs with the sandbox (no network, workspace-only writes) as the boundary`,
+				matches: evaluation.matches,
+				adverse: false,
+			});
+		}
 		return escalate(action, event, deps, evaluation, toolSource, askReason);
 	}
 
@@ -612,6 +626,24 @@ function deterministicAskReason(evaluation: Evaluation): string | undefined {
 		return evaluation.decisive.map((match) => `matches ${match.list} rule ${match.pattern}`).join("; ");
 	}
 	return undefined;
+}
+
+/**
+ * `rules.onUncertain: "sandbox"` (#18): a non-confident bash command that
+ * nothing else sends to a person runs, because L2 bounds it. Only for the
+ * owned bash tool, only while the network is off, and never with a
+ * capability, which widens L2 for that one call.
+ */
+function uncertainRunsSandboxed(action: CanonicalAction, reviewed: boolean, profile: EffectiveProfile): boolean {
+	return (
+		profile.rules.onUncertain === "sandbox" &&
+		action.tool === "bash" &&
+		!!action.shell &&
+		!action.confident &&
+		!reviewed &&
+		!action.capability &&
+		profile.sandbox.network.mode === "off"
+	);
 }
 
 function needsHumanWithoutReview(action: CanonicalAction, reviewed: boolean, hasReviewer: boolean): string | undefined {

@@ -22,6 +22,7 @@ import type { LoadedSource } from "../config/sources.ts";
 import { renderSources } from "../config/sources.ts";
 import type { EffectiveProfile, Provenance } from "../config/types.ts";
 import { describeRecord, listPending } from "../escalate/pending.ts";
+import { describeTally, type LayerTally } from "../gate/layers.ts";
 import { unsandboxedPermits } from "../gate/tools.ts";
 import { formatPendingHits, type TripwireLedger } from "../persistence/ledger.ts";
 import { formatProbeReport, type ProbeReport } from "../probe.ts";
@@ -49,6 +50,8 @@ export interface EnclaveState {
 	configError?: string;
 	/** Breaker counters, for the footer. Absent before the gate is running. */
 	breaker?: { open: boolean; consecutive: number; limit: number };
+	/** Which layer settled each gate decision this session (#18). */
+	layers?: LayerTally;
 	/** What attendance is actually in force, and what was configured. */
 	attendance?: string;
 	/** Where pending approval records live, and the session they belong to. */
@@ -197,6 +200,7 @@ export function renderStatus(state: EnclaveState): string {
 				? `reviewer:   none (deterministic mode: every crossing is an ask)`
 				: `reviewer:   ${state.effective.reviewer.model} (${state.effective.reviewer.transport} transport, trigger ${state.effective.review.trigger})`,
 			`attended:   ${state.attendance ?? state.effective.attended.mode}`,
+			`decided:    ${state.layers ? describeTally(state.layers) : "no gate decisions yet"}`,
 			`breaker:    ${state.breaker?.open ? "OPEN -- the turn is stopped" : `${state.breaker?.consecutive ?? 0} of ${state.effective.breaker.consecutive} consecutive`}`,
 			`audit:      ${state.auditPath ?? "(not open)"}${state.auditDegraded ? `   ${state.effective.audit.required ? "NOT RECORDING -- tool calls are refused (audit.required)" : "WRITES ARE FAILING"}` : ""}`,
 			`            ${describeAudit(state.effective.audit, state.auditSyslogStopped)}`,

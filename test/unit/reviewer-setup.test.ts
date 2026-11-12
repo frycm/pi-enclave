@@ -59,7 +59,7 @@ describe("qualified reviewer startup", () => {
 
 	it("accepts only a record bound to the current model, prompt, corpus, and sampling", async () => {
 		const { profile, provenance, directory } = fixture();
-		const prompt = buildReviewerPrompt(reviewerRulebook(profile.review, provenance));
+		const prompt = buildReviewerPrompt(reviewerRulebook(profile.review, provenance, profile.rules));
 		const modelDigest = await reviewerModelDigest(model, registry);
 		const binding = qualificationBinding({
 			model: profile.reviewer.model,

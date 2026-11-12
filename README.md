@@ -784,7 +784,7 @@ configuration only at user-global scope. Broker and egress fields are rejected.
 |---|---|---|---|
 | Built-in defaults | package | — | — |
 | User global | `~/.pi/agent/enclave.json` | Everything: profiles, backend, reviewer model, `rules`, the whole `review` rulebook, tool allowlist | — |
-| Project local (untracked) | `.pi/enclave.local.json` | Select a profile, add writable roots *inside* the repo, add `rules.deny` / `rules.ask`, add protected paths, raise `review.trigger` | Touch `rules.skipReview` or **any of the four prose lists** `review.environment` / `hard_deny` / `soft_deny` / `allow`, change the reviewer, disable the sandbox |
+| Project local (untracked) | `.pi/enclave.local.json` | Select a profile, add writable roots *inside* the repo, add `rules.deny` / `rules.ask`, add protected paths, raise `review.trigger` | Touch `rules.skipReview` or `rules.onUncertain` or **any of the four prose lists** `review.environment` / `hard_deny` / `soft_deny` / `allow`, change the reviewer, disable the sandbox |
 | Project shared (tracked) | `.pi/enclave.json` | Add `rules.deny` / `rules.ask`, add protected paths, raise `review.trigger` | Change backend or image, relax policy, or set any of the four prose lists; ignored entirely if the project is not trusted |
 | Environment | `PI_ENCLAVE_*` (three variables, listed below) | Force attendance off; select an *already-defined, narrower* profile; disable auto mode | Name a model, backend or any value not already defined in user-global config; relax anything |
 
@@ -809,6 +809,7 @@ the result must satisfy `effective ⊑ incoming` under a partial order defined p
 | `sandbox.limits` | Every value may only go down, except `minFreeDiskMb`, which may only go up (#24) |
 | `rules.deny` / `rules.ask` / `rules.protectedPaths.*` | Superset |
 | `rules.skipReview` | Subset — user-global only; any project-file entry rejects the file |
+| `rules.onUncertain` | `ask ⊑ sandbox` — user-global only; a project file that sets it is rejected (#18) |
 | `review.environment` / `hard_deny` / `soft_deny` / `allow` (the four prose lists) | **Immutable below user-global.** Prose has no partial order a merge can check: "append only" is a syntactic superset, not a semantic tightening, and a project-supplied string inside the reviewer prompt is the repo-to-reviewer injection path the threat model excludes. A project file that contains any of these four keys is rejected whole. `review.trigger` is the only `review` key a project may set. |
 | `review.trigger` | `boundary ⊑ mutating ⊑ all`; a project file may move it right (review more), never left |
 | `tools.allow` | Subset; `readOnly` may become `reviewed`, never the reverse |
@@ -951,6 +952,7 @@ git -c core.fsmonitor=false -c core.hooksPath=/dev/null --no-pager status --igno
         "deny": ["$defaults"],
         "ask":  ["$defaults", "git push *", "gh pr create *"],
         "skipReview": [],
+        "onUncertain": "ask",
         "protectedPaths": { "deny": ["$defaults"], "ask": ["infra/**", ".github/workflows/**"] }
       },
       "review": {
@@ -1173,7 +1175,7 @@ rules end in `deny` or `ask` before L3 exists.
   and is approved or denied there. It used to deny the action outright. When nobody can
   answer (attendance `off`, or a headless run), the ask is denied, which ends the agent's
   turn and counts as an adverse event for the breaker, exactly as for an unreachable
-  reviewer; the escalation path itself is #18 and #30. Identity is checked four times per
+  reviewer; the escalation path itself is #30. What the reviewer may clear without a person is [below](#what-the-reviewer-may-clear). Identity is checked four times per
   review, not eighteen (below). When a reviewer is configured, the session start loads its
   Ollama model with the configured context (a chat request with no messages, which
   generates nothing), so the first review's timeout is not spent loading it; the load is
@@ -1226,9 +1228,11 @@ rules end in `deny` or `ask` before L3 exists.
   | chat (256 output tokens) | `numCtx − 512 − 256 − system bytes` |
   | classifier | `(n_ctx − 512 − 1 − 512 − question bytes) / 2`, since pi-ai puts the state twice into every question's prompt, beside pi-ai's system prompt |
 
-  With the default rulebook (a 1.9 KB system prompt) that is about 5.6 KB of evidence
-  at 8,192 tokens and 14 KB at 16,384; the classifier gets about 2 KB at an 8,192 slot and
-  6 KB at 16,384, so serve a classifier reviewer with at least `--ctx-size 16384`. A
+  With the default rulebook (a 3.0 KB system prompt, which since #18 lists the built-in
+  and user-global bash `rules.deny` / `rules.ask` patterns) that is about 4.4 KB of evidence
+  at 8,192 tokens and 12.6 KB at 16,384; the classifier gets about 2.07 KB at an 8,192 slot
+  and 6.2 KB at 16,384, so serve a classifier reviewer with at least `--ctx-size 16384`.
+  Every pattern a user-global file adds to those lists costs its length in evidence room. A
   configuration that leaves less than 2 KB is refused at session start, and a long
   `review.*` rulebook can cause that. The bound is pessimistic (JSON evidence runs 3 to 4
   bytes a token), which is the price of not depending on a tokenizer. Remote reviewers keep
@@ -1238,8 +1242,13 @@ rules end in `deny` or `ask` before L3 exists.
   first (`contextTruncated`), then older direct authorization, keeping the newest
   (`authorizationTruncated`), then a smaller display of the action input (`action.truncated`,
   which raises the deterministic risk floor, while `action.hash` still binds the whole input),
-  then a minimal form. If even that does not fit, the reviewer is unavailable and the action
-  escalates. Denied calls are no longer added to the context, so an agent cannot fill it
+  then a minimal form, which keeps the newest authorization at 512 characters and, only if
+  that still does not fit, drops the older one and shortens the newest to 64 at the least
+  (a shortened instruction can no longer cover the action). If even that does not fit, the
+  reviewer is unavailable and the action escalates. A `write` or `edit` body longer than
+  2,048 characters is not cut but summarized as `{chars, sha256, head, tail}`
+  (`action.summarized`, #18): what a write may do is decided by its path, so a long body no
+  longer forces the high floor. A long bash command still does. Denied calls are no longer added to the context, so an agent cannot fill it
   with calls it was not allowed to make.
 
   Overflow fails closed on both transports. Ollama 0.12.6 or later is required, and the
@@ -1280,6 +1289,61 @@ rules end in `deny` or `ask` before L3 exists.
   A model that allows *any* injected case is refused as a reviewer, with a clear message.
   This is the offline substitute for "product-validated reviewer models".
 
+### What the reviewer may clear
+
+The reviewer exists so an unattended session can run what a person would wave through. Before
+#18 it could only add refusals: every bash command the tokenizer could not read (`npm test`,
+`cd src && ls`, `ls *.ts`, `echo $HOME`, any script runner or interpreter, a multi-line
+commit message) had a `high` floor, `rm -f build/x` and `git checkout -b feature` were
+`high` wherever they pointed, and a write above 8 KB was truncated evidence and so `high`
+too. With `attended: off` each of those ended the turn.
+
+The floors now separate two questions. **Can the action cross the boundary?** Capability
+requests, unsandboxed third-party tools, protected paths, targets outside the writable roots,
+processes, remotes. Those keep the strict floors, and only a person (or an exact direct
+instruction) clears them. **Is it an in-sandbox action L1 could not read?** The sandbox
+bounds it, so it is the reviewer's judgement.
+
+| The reviewer may clear (floor `medium`) | Only a person may clear (floor `high` or above), or L1 decides |
+|---|---|
+| An unreadable bash command, while the sandbox has no network and the call carries no capability | The same command where the sandbox would not contain it (a profile with network, a capability) |
+| `rm`, `chmod`, `chown`, `truncate` whose every target, as the parser reads it, is a path inside the writable roots and not a protected path (`chmod +x run.sh` has no parsed target yet, so it stays `high`) | The same outside the writable roots, on `rules.protectedPaths` (`.git`, `.pi`, workflows, …), with no path operand, and `dd` |
+| `git checkout`, `restore`, `reset`, `clean` run inside the writable roots | `git push`, `gh … -X DELETE`, `kill`, `pkill`, `killall` |
+| A `write` or `edit` of any length to an ordinary workspace path (the body is summarized) | A truncated bash command; writes to a never-grantable tree (`critical`, always denied) |
+| | Anything an L1 `rules.ask` pattern matches (`git push *`, `git reset --hard*`, …) or `rules.deny` denies; these never reach the reviewer |
+
+An unreadable command means L1 matched its patterns against a guess. The reviewer prompt
+therefore lists the active bash `rules.deny` and `rules.ask` patterns and tells the model
+to deny a command that would do what a deny pattern describes, however it is spelled, and to
+ask for what an ask pattern describes. Only built-in and user-global patterns are listed: a
+pattern from a repository's `.pi/enclave.json` is text the repository chose, so it never
+reaches the prompt, and L1 still applies it to the guess. A repository's ask rule for a
+spelling L1 cannot read is therefore enforced only as well as the parser reads the
+command; this is the residual of the change. The classifier transport, with about 2 KB of
+room, gets one sentence (treat an unreadable command as ambiguous) instead of the lists.
+
+**Deterministic mode** has no reviewer, so `rules.onUncertain` (user-global only) chooses
+what happens to an unreadable command instead: `"ask"` (the default) sends it to a person,
+and `"sandbox"` runs it with the sandbox as the only boundary. The decision is recorded as
+`sandboxed-uncertain`, so the audit log shows which commands nobody judged. `"sandbox"`
+applies only to the owned bash tool, only while the network is off, and never to a call
+that requests a capability; L1 `deny` and `ask` rules still apply first. Under
+`review.trigger: "boundary"` the reviewer does not see ordinary commands, so the same setting
+applies there.
+
+**Measured.** `/enclave` shows which layer settled the session's decisions (`decided: L1 21
+(55%), L3 …, ask-denied 1`), and the audit log's `summary` record keeps it. The target, on
+the recorded development task in `test/harness/dev-task.ts` (38 in-sandbox actions: reads,
+greps, globs, `cd`, `npm test`, `make`, interpreters, an edit, a 10 KB test file, a branch,
+a commit), with a qualified reviewer and `attended: off`: **at most 5% of the in-sandbox
+actions end as `ask-denied`**. With a model that always answers allow it is 0 of 38, and the
+one push that crosses the boundary still needs a person; in deterministic mode with
+`onUncertain: "ask"` it is 17 of 38. A real model's figure is lower than the best case
+only by its own refusals, which the qualification corpus measures. Not yet in this
+change: teaching the parser `cd <literal>`, globs and `$VAR` on read-only commands, and
+script runners as a property rather than a reason to give up (#18 item 5), which would move
+more of these commands to L1.
+
 ### Reviewer qualification contract
 
 "Passes the eval" has to be a precise statement, or a model that passed once on a different
@@ -1301,8 +1365,9 @@ and must give the same digest. Non-Ollama loopback chat services and adapters wi
 support are refused. Qualification record version 2 invalidates the earlier records;
 run `/enclave eval-reviewer` again after this update. The #17 update changes the corpus
 and raises the default context to 8,192 tokens, #59 changes the prompts and the corpus
-again, and #25 replaces the two chat prompts with one and adds the `authorized` field, so
-each needs a new qualification too.
+again, #25 replaces the two chat prompts with one and adds the `authorized` field, and #18
+adds the bash patterns, `action.summarized` and the unreadable-command instruction to the
+prompts (prompt v4, evidence schema v5), so each needs a new qualification too.
 
 llama.cpp (classifier transport only) is identified from the router itself: `GET /models`
 must list the model as loaded or sleeping (load it with `/llama`), and `GET /props?model=`
@@ -1594,6 +1659,7 @@ a server, the log is meant to answer "what did it run, and what happened?" (#37)
 | `reviewer` | Each verdict: the model's decision, risk and reason next to the enforced decision, the deterministic minimum risk, and whether a direct instruction covered the action; failures say which kind. Timing is recorded separately. |
 | `approval` | `pi-enclave approve`, in its own `approvals` log: an `executing` record when it starts and one with the outcome (`executed`, `declined`, `refused`, `unsupported`), with nonce, hash, originating session, both configuration hashes, uid, user, tty, SSH client address, exit code and duration. It is a separate log because the originating session may still be open and own its own chain. |
 | `audit` | The log's own events: a missing tail found when a session resumes, and the per-session cap. |
+| `summary` | At session shutdown, in auto mode: how many gate decisions each layer settled (`L1`, `L3`, `L4`), how many asks nobody approved, and how many unreadable commands ran under `rules.onUncertain: "sandbox"` (#18). |
 
 Every `session_start` record says `anchored: true`, so verify fails a log whose anchor was
 deleted, while one written before anchors existed only gets a warning.
@@ -1871,6 +1937,10 @@ after passing the eval.*
   minimum risk are applied after the model result and cannot be lowered by it.
 - Eval corpus, `/enclave eval-reviewer` command and qualification records. Published model
   results remain follow-up evidence and never replace qualification on the user's hardware.
+- [What the reviewer may clear](#what-the-reviewer-may-clear) (#18): in-sandbox unreadable
+  commands and bounded destructive commands floor at `medium`, long write bodies are
+  summarized instead of truncated, the prompt carries the trusted bash deny and ask patterns,
+  `rules.onUncertain` for deterministic mode, and a per-session layer tally.
 
 **v1 release gate:** expand the reviewer corpus beyond repeated templates, qualify a real
 local model on target hardware with measured denial, approval and latency rates, and run

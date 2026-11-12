@@ -112,6 +112,15 @@ describe("renderStatusLine", () => {
 });
 
 describe("renderStatus", () => {
+	it("shows which layer settled the session's decisions, and rules.onUncertain (#18)", () => {
+		const effective = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
+		expect(renderStatus(state({ effective }))).toContain("decided:    no gate decisions yet");
+		const text = renderStatus(
+			state({ effective, layers: { L1: 6, L3: 3, L4: 1, askDenied: 1, sandboxedUncertain: 0, other: 0 } }),
+		);
+		expect(text).toContain("decided:    L1 6 (60%), L3 3 (30%), L4 1 (10%), ask-denied 1");
+	});
+
 	it("lists every tool that runs outside the sandbox without a person (#22)", () => {
 		const effective = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
 		expect(renderStatus(state({ effective }))).toContain("no tool runs outside the sandbox without a person");
