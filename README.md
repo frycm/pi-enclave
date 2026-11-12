@@ -2193,7 +2193,7 @@ privilege and network access.
 
 | Step | What | State |
 | --- | --- | --- |
-| 1 | Make the existing layers trustworthy: shell reading, the sandbox boundary defects, workspace persistence, resource limits, the audit log, the read boundary (#13 stages 1 to 3) | Merged |
+| 1 | Make the existing layers trustworthy: shell reading, the sandbox boundary defects, workspace persistence, resource limits, the audit log, the read boundary (#13 stages 1 to 3) | Merged, except #72 (reopened) and #73, which finish before Checkpoint C |
 | 2 | Make auto mode useful unattended: what the reviewer may clear, its protocol and transports, the qualification corpus, the approval queue (#13 stage 4) | Merged |
 | — | **Checkpoints A to C** (below), then the **v1 release** | Open |
 | 3 | **Phase 5a, `ops-observe`**: diagnosis on a server, no new privileged component | Scheduled, after v1 |
@@ -2204,9 +2204,13 @@ privilege and network access.
 
 - **Checkpoint A, the sandbox on real hosts.** The native conformance suite passes on one
   real Linux server and one Mac (`npm run probe && npm run test:conformance && npm run
-  conformance:report srt`), not only in CI containers and runners.
+  conformance:report srt`), not only in CI containers and runners. The
+  [exec-denial spike](docs/ops-exec-denial-spike.md) is re-run on the same Linux server, and
+  tried on the Mac, with the results added to that file.
 - **Checkpoint B, a release candidate.** Unit, policy, container and native conformance
-  runs green on the same commit, tagged as the candidate.
+  runs green on the same commit, tagged as the candidate. The CI job that runs the suites
+  against the newest pi release candidate ([release engineering](#release-engineering)) is
+  added here.
 - **Checkpoint C, a qualified local model on the target hardware.** At least one real local
   model passes `/enclave eval-reviewer` on the server it will run on. The record is kept in
   `docs/`: hardware, model digest, per-category tables, p95 review latency for one 8B and one
@@ -2222,6 +2226,17 @@ privilege and network access.
 
 Without these the first experience on a headless machine is a refusal or a breaker trip on
 the first test run, and a release would advertise what has not been seen working.
+
+Where the open #13 issues go:
+
+| Issue | Place |
+| --- | --- |
+| #72 L1: a protected path changed through a directory operand or a second hard link (reopened; item 4 waits for Martin, the L1 leftovers are listed in its latest comment) | Before Checkpoint C |
+| #73 protected-path walk follow-ups (writable links on the way, cost inside denied directories, fewer hard-link refusals) | With or just before #72, before Checkpoint C |
+| #68 site-specific corpus cases, then labelled pairs from the audit log | After Checkpoint C, part 1 then part 2 |
+| #70 approval queue follow-ups, flood control first | After Checkpoint C |
+| #65 the parser reads more ordinary commands confidently | After v1, and each parser change requalifies the reviewer. It moves before v1 if the recorded headless session shows unparsed commands as what stops it |
+| #29 posting the upstream discussions drafted in [pi-core-proposals.md](docs/pi-core-proposals.md) | Not a v1 gate; Martin's step |
 
 The v1 contract itself stays small:
 
@@ -2262,12 +2277,14 @@ What the ops shapes need, and where it comes from today:
 | Network off | SRT's network namespace and refusing proxy | C5 |
 | Exec denial of named binaries (Phase 5b) | SRT `denyRead` on the binary, on Linux | Spike below; no conformance row yet |
 
-The spike (November 12, 2026; SRT 0.0.82, bubblewrap 0.9.0, as a non-root user in a
-Linux container, so not Checkpoint A): with a copy of `id` read-denied, running it fails
-with `Permission denied` (exit 126), and so do running it from a script, copying it to the
-workspace and running the copy, and loading it through `ld-linux` directly. An unlisted copy
-of the same binary runs. Under bubblewrap's user namespace a setuid bit grants nothing, so
-denying execution of named binaries covers what the broker design asks of Linux.
+The [spike](docs/ops-exec-denial-spike.md) (November 12, 2026; SRT 0.0.82, bubblewrap
+0.9.0, as a non-root user in a Linux container, so not Checkpoint A): with a copy of `id`
+read-denied, running it fails with `Permission denied` (exit 126), and so does running it
+from a script (126); copying it fails because the copy cannot be read (exit 1), and loading
+it through `ld-linux` directly fails with `Permission denied` (exit 127). An unlisted copy of
+the same binary runs. Inside the sandbox `NoNewPrivs` is 1 and the effective capability set
+is empty, so a setuid bit grants nothing. Denying execution of named binaries covers what
+the broker design asks of Linux; it is a second line, as slice 1 below says.
 
 Not known, and what changes the decision:
 
@@ -2289,9 +2306,9 @@ Not known, and what changes the decision:
   refuses outside it.
 - **Following pi.** pi releases often. A new pi minor gets one PR that rebases `frycm/pi`,
   re-runs unit, policy and native conformance against it, and widens the range, as the
-  [API baseline](#api-baseline) section requires. Before that PR, the CI job runs the suite
-  against the newest pi release candidate when one exists, so a break is seen before users
-  upgrade.
+  [API baseline](#api-baseline) section requires. Before that PR, a CI job is to run the
+  suites against the newest pi release candidate when one exists, so a break is seen before
+  users upgrade. `ci.yml` has no such job yet; it is added at Checkpoint B.
 - **Dependencies.** Exact pins for SRT and the pi packages, `npm audit` reviewed per release,
   and every advisory traced to whether pi-enclave reaches it (see
   [dependency upgrades](docs/dependency-upgrade.md) and #38).
@@ -2322,7 +2339,13 @@ To be written as `docs/operator-runbook.md` before v1, from Checkpoint C's serve
 4. Headless runs: project trust (`attended.headlessTrust`), `rules.onUncertain`, and what the
    queue and `notify` deliver.
 5. When something stops: reading `/enclave status`, the audit log, the tripwire ledger, and
-   what to do after a breaker trip (read the summary, then `/enclave` or a new direct message).
+   what to do after a breaker trip. `/enclave` shows the breaker but does not reset it; only
+   a direct message from a person does (a prompt typed in the TUI, or a prompt pi reports as
+   direct input over print mode or RPC), never one an extension sends. On a headless run the
+   trip ends the turn, and the breaker state is saved in the session, so whatever sends the
+   next prompt (a scheduler, pi-huginn over RPC) is what resets it. That sender must not
+   resend automatically after a trip: it checks the audit log for a `breaker` record, and a
+   person reads the `summary` and the denials before the next prompt goes out.
 
 ### Phase 1 — Sandbox core ✅ implemented
 
@@ -2454,9 +2477,14 @@ three slices, each shippable alone:
 
 1. **`service(unit, verb)` only**, with `pi-enclave-broker`, its protocol, peer credentials,
    one-shot request MACs, the durable replay ledger, a separate broker uid, a fixed
-   unit/verb-to-argv table, and the per-backend exec-denial rows. Exec denial of
-   `sudo`, `su`, `doas`, `pkexec` and `systemctl` gets a conformance row first; it is the row
-   that decides whether SRT stays (see the [backend decision](#backend-decision-sandbox-runtime-until-a-conformance-row-says-otherwise)).
+   unit/verb-to-argv table, and the per-backend exec-denial rows. The boundary is that the
+   agent's user has no `sudoers` entry and no polkit grant, and that the broker socket is
+   never reachable from inside a sandbox; each gets a conformance row or a qualification
+   check. Exec denial of `sudo`, `su`, `doas` and `pkexec` is a second line with its own row,
+   and it is the row that decides whether SRT stays (see the
+   [backend decision](#backend-decision-sandbox-runtime-until-a-conformance-row-says-otherwise)).
+   Denying `systemctl` is not a boundary: it only talks to systemd over D-Bus and
+   `/run/systemd/private`, so what matters is that those refuse the agent's user.
 2. **`apply_config(path, stagedPath, digest)`** with validation, backup and rollback: the
    staged input is opened once with no-follow constraints, hashed and copied from that same
    descriptor; targets are resolved descriptor-relatively and installed atomically.
