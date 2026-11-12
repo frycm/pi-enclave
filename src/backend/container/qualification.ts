@@ -284,13 +284,19 @@ export async function qualifyContainer(
 			assert(refused, "revoked helper lease survived");
 		});
 		await row("timeout-descendant-cleanup", async () => {
-			const result = await sh(
-				"setsid sh -c 'echo started > detached-started; sleep 4; echo escaped > detached.txt' >/dev/null 2>&1 & sleep 30",
-				{
-					timeout: 2,
-				},
-			);
-			assert(result.exitCode === null, "timeout did not cancel");
+			// A timeout throws `timeout:N`, as pi's bash tool expects (#24).
+			let timedOut = false;
+			try {
+				await sh(
+					"setsid sh -c 'echo started > detached-started; sleep 4; echo escaped > detached.txt' >/dev/null 2>&1 & sleep 30",
+					{
+						timeout: 2,
+					},
+				);
+			} catch (error) {
+				timedOut = (error as Error).message === "timeout:2";
+			}
+			assert(timedOut, "timeout did not cancel");
 			assert(existsSync(join(workspace, "detached-started")), "timeout descendant positive control did not start");
 			await new Promise((resolve) => setTimeout(resolve, 4300));
 			let escaped = false;

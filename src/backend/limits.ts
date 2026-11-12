@@ -111,11 +111,22 @@ export class OutputCap {
 	}
 }
 
-/** Which limits a platform's shell can set, for the prefix and for `/enclave status`. */
-export function enforcedRlimits(platform: NodeJS.Platform): ("fileSize" | "openFiles" | "processes" | "memory")[] {
+/**
+ * Which limits a sandbox's shell can set, for the prefix and for `/enclave status`.
+ *
+ * `"container"` is Linux inside Docker or Podman: the container runs as the
+ * host uid without a user namespace of its own, so RLIMIT_NPROC there would
+ * count every process the user has on the host and refuse the command's
+ * first fork. The cgroup `pids` limit takes its place.
+ */
+export function enforcedRlimits(
+	platform: NodeJS.Platform | "container",
+): ("fileSize" | "openFiles" | "processes" | "memory")[] {
 	// macOS counts RLIMIT_NPROC across every process of the user, not per
 	// sandbox, and does not enforce RLIMIT_DATA at all, so neither is set there.
-	return platform === "linux" ? ["fileSize", "openFiles", "processes", "memory"] : ["fileSize", "openFiles"];
+	if (platform === "linux") return ["fileSize", "openFiles", "processes", "memory"];
+	if (platform === "container") return ["fileSize", "openFiles", "memory"];
+	return ["fileSize", "openFiles"];
 }
 
 /**
@@ -131,7 +142,7 @@ export function enforcedRlimits(platform: NodeJS.Platform): ("fileSize" | "openF
  */
 export function limitPrefix(
 	limits: ResourceLimits | undefined,
-	platform: NodeJS.Platform,
+	platform: NodeJS.Platform | "container",
 	fileSizeZero = false,
 ): string {
 	if (!limits) return "";
@@ -197,7 +208,10 @@ export function describeLimits(limits: ResourceLimits | undefined, backend: stri
 	];
 	if (backend === "docker" || backend === "podman") {
 		const c = limits.container;
-		parts.push(`cgroup pids ${c.pids}, memory ${c.memoryMb} MB, cpus ${c.cpus}, /tmp ${c.tmpMb} MB, shm ${c.shmMb} MB`);
+		parts.push(
+			`cgroup pids ${c.pids}, memory ${c.memoryMb} MB, cpus ${c.cpus}, /tmp ${c.tmpMb} MB, shm ${c.shmMb} MB`,
+			`memory ${limits.memoryMb} MB (RLIMIT_DATA, per process)`,
+		);
 	} else if (enforcedRlimits(platform).includes("processes")) {
 		parts.push(`processes ${limits.processes}`, `memory ${limits.memoryMb} MB (RLIMIT_DATA, per process)`);
 	} else {

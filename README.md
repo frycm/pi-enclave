@@ -431,7 +431,7 @@ so every backend enforces `sandbox.limits` (#24):
 | `processes` | 1024 | `RLIMIT_NPROC`, Linux only. bubblewrap starts each command in a new user namespace and the kernel counts processes per namespace, so the limit covers the command, not the user's other processes. |
 | `memoryMb` | 8192 | `RLIMIT_DATA` per process, Linux only. `RLIMIT_AS` would break V8 and other runtimes that reserve large address ranges. |
 | `minFreeDiskMb` | 1024 | Below this much free space on a writable root, the command still runs but with a file size limit of zero, so it can delete and inspect files but not grow them. |
-| `container.{pids,memoryMb,cpus,shmMb,tmpMb}` | 256, 512, 2, 32, 128 | The Docker/Podman cgroup and tmpfs flags. The rlimits above apply inside the container too. |
+| `container.{pids,memoryMb,cpus,shmMb,tmpMb}` | 256, 512, 2, 32, 128 | The Docker/Podman cgroup and tmpfs flags. The rlimits above apply inside the container too, except `processes`: the container runs as the host uid without its own user namespace, so `RLIMIT_NPROC` would count the user's host processes, and the cgroup `pids` limit covers it instead. |
 
 The rlimits are set by plain `ulimit` in the sandboxed shell before the command, which sets
 the hard limit as well, so the command cannot raise them again; if one cannot be set, the

@@ -79,6 +79,15 @@ describe("the rlimit prefix", () => {
 		expect(enforcedRlimits("darwin")).toEqual(["fileSize", "openFiles"]);
 	});
 
+	it("leaves the process count to the cgroup inside a container", () => {
+		// The container runs as the host uid with no user namespace of its own, so
+		// RLIMIT_NPROC there counts the user's host processes and refuses the first fork.
+		const prefix = limitPrefix(LIMITS, "container");
+		expect(prefix).not.toContain(" -u ");
+		expect(prefix).toContain(`-d ${LIMITS.memoryMb * 1024}`);
+		expect(enforcedRlimits("container")).toEqual(["fileSize", "openFiles", "memory"]);
+	});
+
 	it("is a file size limit of zero below the free-space floor", () => {
 		expect(limitPrefix(LIMITS, "linux", true)).toContain("__pi_enclave_limit -f 0 ");
 	});

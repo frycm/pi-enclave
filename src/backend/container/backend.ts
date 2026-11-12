@@ -435,7 +435,7 @@ export class ContainerBackend implements SandboxBackend {
 				// stdin is the supervisor's control channel, so it is never closed;
 				// the command gets /dev/null instead, so a program that waits for
 				// input fails at once (#24). Then the resource limits.
-				`exec </dev/null; mkdir -p /tmp/claude; ${limitPrefix(limits, "linux", lowDisk !== undefined)}${request.command}`,
+				`exec </dev/null; mkdir -p /tmp/claude; ${limitPrefix(limits, "container", lowDisk !== undefined)}${request.command}`,
 			],
 			request.env,
 		);
