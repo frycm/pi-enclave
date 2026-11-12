@@ -100,3 +100,48 @@ describe("qualified reviewer startup", () => {
 		await expect(prepareQualifiedReviewer(profile, provenance, registry, directory)).resolves.toBeUndefined();
 	});
 });
+
+describe("the thinking budget at startup (#62)", () => {
+	const ollama = {
+		...model,
+		provider: "ollama",
+		id: "reviewer",
+		baseUrl: "http://127.0.0.1:9/v1",
+	} as RuntimeModel;
+	const both = {
+		...registry,
+		find: (provider: string, id: string) =>
+			provider === "ollama" && id === "reviewer" ? ollama : registry.find(provider, id),
+	} as unknown as ModelRegistry;
+
+	it("refuses thinking for a reviewer that is not on Ollama", async () => {
+		const { profile, provenance, directory } = fixture();
+		profile.reviewer.thinkingTokens = 1_024;
+		await expect(prepareQualifiedReviewer(profile, provenance, both, directory)).rejects.toThrow(
+			"supported only for an Ollama chat reviewer",
+		);
+	});
+
+	it("refuses thinking on the classifier transport", async () => {
+		const { profile, provenance, directory } = fixture();
+		profile.reviewer.model = "llama.cpp/qwen3-4b";
+		profile.reviewer.transport = "classifier";
+		profile.reviewer.thinkingTokens = 1_024;
+		await expect(prepareQualifiedReviewer(profile, provenance, both, directory)).rejects.toThrow(
+			'applies only to reviewer.transport "chat"',
+		);
+	});
+
+	it("refuses a budget that leaves the evidence too little room, before asking the server", async () => {
+		const { profile, provenance, directory } = fixture();
+		profile.reviewer.model = "ollama/reviewer";
+		profile.reviewer.thinkingTokens = 2_048;
+		await expect(prepareQualifiedReviewer(profile, provenance, both, directory)).rejects.toThrow(
+			"reviewer.numCtx 8192 with reviewer.thinkingTokens 2048 leaves",
+		);
+		// Control: a larger context leaves room, and setup goes on to the server (here unreachable).
+		profile.reviewer.numCtx = 16_384;
+		const error = await prepareQualifiedReviewer(profile, provenance, both, directory).catch((caught) => caught);
+		expect(String(error)).not.toContain("leaves");
+	});
+});

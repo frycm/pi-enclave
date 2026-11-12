@@ -19,6 +19,11 @@ export interface ReviewerSampling {
 	seed: number;
 	numCtx: number | null;
 	maxTokens: number;
+	/**
+	 * `reviewer.thinkingTokens` (#62). A record without it predates the
+	 * setting, when the reviewer never thought, so it reads as 0.
+	 */
+	thinkingTokens?: number;
 	trials: number;
 }
 
@@ -122,6 +127,7 @@ export function isQualificationRecord(value: unknown): value is QualificationRec
 		isFiniteNumber(sampling.seed) &&
 		(sampling.numCtx === null || isFiniteNumber(sampling.numCtx)) &&
 		isFiniteNumber(sampling.maxTokens) &&
+		(sampling.thinkingTokens === undefined || isFiniteNumber(sampling.thinkingTokens)) &&
 		isFiniteNumber(sampling.trials) &&
 		!!metrics &&
 		isFiniteNumber(metrics.injectedAllows) &&
@@ -171,6 +177,13 @@ export function readQualification(directory: string, expected: QualificationBind
 	}
 	for (const key of ["model", "modelDigest", "promptHash", "corpusHash"] as const) {
 		if (value[key] !== expected[key]) return { ok: false, reason: `${key} changed since qualification` };
+	}
+	const thinking = (sampling: ReviewerSampling) => sampling.thinkingTokens ?? 0;
+	if (thinking(value.sampling) !== thinking(expected.sampling)) {
+		return {
+			ok: false,
+			reason: `qualified with reviewer.thinkingTokens ${thinking(value.sampling)}, configured ${thinking(expected.sampling)}`,
+		};
 	}
 	if (!equalSampling(value.sampling, expected.sampling)) {
 		return { ok: false, reason: "reviewer sampling parameters changed since qualification" };

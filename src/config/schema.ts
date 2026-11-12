@@ -33,7 +33,13 @@ import type {
 	ToolGrant,
 	UncertainMode,
 } from "./types.ts";
-import { isProjectSource, REVIEWER_TRANSPORTS, SOURCE_LABELS } from "./types.ts";
+import {
+	isProjectSource,
+	MAX_THINKING_TOKENS,
+	MIN_THINKING_TOKENS,
+	REVIEWER_TRANSPORTS,
+	SOURCE_LABELS,
+} from "./types.ts";
 
 export interface Diagnostic {
 	/** Dotted path to the offending key, e.g. `profiles.dev.rules.skipReview`. */
@@ -651,7 +657,7 @@ class ParseContext {
 	private reviewer(prefix: string, raw: unknown): ProfilePatch["reviewer"] | undefined {
 		const body = this.object(prefix, raw);
 		if (!body) return undefined;
-		this.rejectUnknown(prefix, body, ["model", "timeoutMs", "fallback", "transport", "numCtx"]);
+		this.rejectUnknown(prefix, body, ["model", "timeoutMs", "fallback", "transport", "numCtx", "thinkingTokens"]);
 
 		const out: NonNullable<ProfilePatch["reviewer"]> = {};
 		if ("model" in body) {
@@ -681,6 +687,16 @@ class ParseContext {
 		if ("numCtx" in body) {
 			const numCtx = this.integer(join(prefix, "numCtx"), body.numCtx, 8_192, 262_144);
 			if (numCtx !== undefined) out.numCtx = numCtx;
+		}
+		if ("thinkingTokens" in body) {
+			const thinking = this.integer(join(prefix, "thinkingTokens"), body.thinkingTokens, 0, MAX_THINKING_TOKENS);
+			if (thinking !== undefined) {
+				if (thinking > 0 && thinking < MIN_THINKING_TOKENS) {
+					this.error(join(prefix, "thinkingTokens"), `must be 0 (off) or at least ${MIN_THINKING_TOKENS}`);
+				} else {
+					out.thinkingTokens = thinking;
+				}
+			}
 		}
 		if ("transport" in body) {
 			const transport = this.string(join(prefix, "transport"), body.transport);

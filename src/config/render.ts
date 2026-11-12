@@ -123,7 +123,12 @@ export function renderConfig(profile: EffectiveProfile, provenance: Provenance):
 	lines.push(`reviewer.model         ${profile.reviewer.model}`);
 	if (profile.reviewer.model !== "none") {
 		lines.push(`reviewer.transport     ${profile.reviewer.transport}`);
-		if (profile.reviewer.transport === "chat") lines.push(`reviewer.numCtx        ${profile.reviewer.numCtx}`);
+		if (profile.reviewer.transport === "chat") {
+			lines.push(`reviewer.numCtx        ${profile.reviewer.numCtx}`);
+			lines.push(
+				`reviewer.thinkingTokens ${profile.reviewer.thinkingTokens === 0 ? "0 (off)" : profile.reviewer.thinkingTokens}`,
+			);
+		}
 	}
 	lines.push(
 		`attended.mode          ${profile.attended.mode} (confirm timeout ${profile.attended.confirmTimeoutMs} ms)`,

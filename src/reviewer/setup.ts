@@ -42,7 +42,11 @@ export async function reviewerTarget(
 	profile: EffectiveProfile,
 	prompt: ReviewerPrompt,
 ): Promise<{ modelDigest: string; completion: ReviewerTransport }> {
+	const thinking = profile.reviewer.thinkingTokens;
 	if (profile.reviewer.transport === "classifier") {
+		// The classifier reads one label's probability; there is no answer to think before (#62).
+		if (thinking > 0)
+			throw new Error('pi-enclave: reviewer.thinkingTokens applies only to reviewer.transport "chat"; set it to 0');
 		const resolved = resolveReviewerClassifier(registry, reference);
 		const identity = await reviewerClassifierIdentity(resolved.model, registry);
 		assertEvidenceRoom(
@@ -52,13 +56,16 @@ export async function reviewerTarget(
 		const thresholds = { allow: 1, deny: CLASSIFIER_DENY_THRESHOLD, temperature: CLASSIFIER_TEMPERATURE };
 		return { modelDigest: identity.digest, completion: bindReviewerClassifier(resolved, identity, thresholds) };
 	}
-	const resolved = resolveReviewerModel(registry, reference, profile.reviewer.numCtx);
-	const modelDigest = await reviewerModelDigest(resolved.model, registry, profile.reviewer.numCtx);
-	const completion = bindReviewerCompletion(resolved, modelDigest);
-	if (typeof completion.numCtx === "number") {
-		assertEvidenceRoom(chatEvidenceBytes(prompt, completion.numCtx), `reviewer.numCtx ${completion.numCtx}`);
+	const resolved = resolveReviewerModel(registry, reference, profile.reviewer.numCtx, thinking);
+	const numCtx = resolved.completion.numCtx;
+	if (typeof numCtx === "number") {
+		assertEvidenceRoom(
+			chatEvidenceBytes(prompt, numCtx, thinking),
+			thinking > 0 ? `reviewer.numCtx ${numCtx} with reviewer.thinkingTokens ${thinking}` : `reviewer.numCtx ${numCtx}`,
+		);
 	}
-	return { modelDigest, completion };
+	const modelDigest = await reviewerModelDigest(resolved.model, registry, profile.reviewer.numCtx);
+	return { modelDigest, completion: bindReviewerCompletion(resolved, modelDigest) };
 }
 
 async function qualifiedCompletion(
@@ -101,7 +108,7 @@ export async function prepareQualifiedReviewer(
 }
 
 export function reviewerSamplingSummary(): string {
-	return `temperature=${REVIEWER_TEMPERATURE}, seed=${REVIEWER_SEED}, Ollama num_ctx=reviewer.numCtx (default ${REVIEWER_NUM_CTX}, verified); remote context=provider-managed, maxTokens=${REVIEWER_MAX_TOKENS}`;
+	return `temperature=${REVIEWER_TEMPERATURE}, seed=${REVIEWER_SEED}, Ollama num_ctx=reviewer.numCtx (default ${REVIEWER_NUM_CTX}, verified); remote context=provider-managed, maxTokens=${REVIEWER_MAX_TOKENS}, Ollama thinking=reviewer.thinkingTokens (default 0, off)`;
 }
 
 export type ReviewerEvidenceSource = IsolatedReviewerOptions["evidence"];

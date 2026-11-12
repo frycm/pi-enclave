@@ -231,9 +231,10 @@ function checkPromptCount(response: Record<string, unknown>, request: Completion
 	}
 	const total = evaluated + (typeof cached === "number" && Number.isFinite(cached) ? cached : 0);
 	const bound = chatPromptBound(request.system, request.user);
-	if (total > bound || total > request.numCtx - request.maxTokens) {
+	const room = request.numCtx - request.maxTokens - (request.thinkingTokens ?? 0);
+	if (total > bound || total > room) {
 		throw new Error(
-			`pi-enclave: Ollama evaluated ${total} prompt tokens, above the ${Math.min(bound, request.numCtx - request.maxTokens)}-token budget; the chat template adds more than the reserve`,
+			`pi-enclave: Ollama evaluated ${total} prompt tokens, above the ${Math.min(bound, room)}-token budget; the chat template adds more than the reserve`,
 		);
 	}
 	// Without a cached count, a prompt-cache hit lowers the count legitimately.
@@ -249,8 +250,15 @@ function checkPromptCount(response: Record<string, unknown>, request: Completion
  * One chat request, checked by two identity calls after it (#25): the loaded
  * model and its context (`ps`), and the manifest again (`tags`). The caller
  * made the two before it (`tags`, `version`), so a review costs four.
+ *
+ * With a thinking budget (#62), Ollama has no separate cap on thinking, so
+ * `num_predict` is the budget plus the answer reserve, and an answer that
+ * stops at that limit is refused, not parsed. Only `message.content` is the
+ * answer; `message.thinking` is model output derived from the evidence and is
+ * never parsed, returned or recorded, only measured.
  */
 async function completeOllama(target: Endpoint, request: CompletionRequest, before: OllamaIdentity): Promise<string> {
+	const thinking = request.thinkingTokens ?? 0;
 	const response = await ollamaJson(target, "chat", request.signal, {
 		model: target.model.id,
 		messages: [
@@ -258,7 +266,7 @@ async function completeOllama(target: Endpoint, request: CompletionRequest, befo
 			{ role: "user", content: request.user },
 		],
 		stream: false,
-		think: false,
+		think: thinking > 0,
 		// Fail instead of dropping part of the prompt or the context (#17).
 		truncate: false,
 		shift: false,
@@ -268,7 +276,7 @@ async function completeOllama(target: Endpoint, request: CompletionRequest, befo
 			temperature: request.temperature,
 			seed: request.seed,
 			num_ctx: request.numCtx,
-			num_predict: request.maxTokens,
+			num_predict: request.maxTokens + thinking,
 		},
 	});
 	const loaded = modelEntry(
@@ -282,7 +290,9 @@ async function completeOllama(target: Endpoint, request: CompletionRequest, befo
 	) {
 		throw new Error("pi-enclave: Ollama model identity or effective context changed; requalification required");
 	}
-	const message = response.message as { role?: unknown; content?: unknown; tool_calls?: unknown } | undefined;
+	const message = response.message as
+		| { role?: unknown; content?: unknown; thinking?: unknown; tool_calls?: unknown }
+		| undefined;
 	if (
 		response.done !== true ||
 		message?.role !== "assistant" ||
@@ -292,7 +302,12 @@ async function completeOllama(target: Endpoint, request: CompletionRequest, befo
 		throw new Error("pi-enclave: invalid isolated Ollama completion");
 	}
 	checkPromptCount(response, request);
-	request.onRuntime?.(runtimeReport(response));
+	request.onRuntime?.(runtimeReport(response, message.thinking));
+	if (thinking > 0 && response.done_reason === "length") {
+		throw new Error(
+			`pi-enclave: the reviewer stopped at ${request.maxTokens + thinking} generated tokens (reviewer.thinkingTokens ${thinking} plus the ${request.maxTokens}-token answer) before its answer was complete`,
+		);
+	}
 	request.onFirstOutput?.();
 	return message.content;
 }
@@ -301,15 +316,24 @@ function count(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
-/** Ollama's counts and its load time (reported in nanoseconds), for telemetry only. */
-function runtimeReport(response: Record<string, unknown>): RuntimeReport {
+/**
+ * Ollama's counts and durations (reported in nanoseconds), for telemetry only.
+ * Of the thinking text only its size is kept (#62): a non-streamed answer
+ * does not say when thinking ended, so its time is inside `generateMs`.
+ */
+function runtimeReport(response: Record<string, unknown>, thinking: unknown): RuntimeReport {
 	const promptTokens = count(response.prompt_eval_count);
 	const cachedPromptTokens = count(response.prompt_eval_cached_count);
 	const load = count(response.load_duration);
+	const generatedTokens = count(response.eval_count);
+	const generate = count(response.eval_duration);
 	return {
 		...(promptTokens !== undefined ? { promptTokens } : {}),
 		...(cachedPromptTokens !== undefined ? { cachedPromptTokens } : {}),
 		...(load !== undefined ? { loadMs: load / 1e6 } : {}),
+		...(generatedTokens !== undefined ? { generatedTokens } : {}),
+		...(generate !== undefined ? { generateMs: generate / 1e6 } : {}),
+		...(typeof thinking === "string" ? { thinkingBytes: Buffer.byteLength(thinking) } : {}),
 	};
 }
 
@@ -378,14 +402,22 @@ export function resolveReviewerModel(
 	registry: ModelRegistry,
 	reference: string,
 	numCtx: number = REVIEWER_NUM_CTX,
+	thinkingTokens = 0,
 ): ResolvedReviewerModel {
 	const parsed = parseReviewerModelReference(reference);
 	if (!parsed) throw new Error(`pi-enclave: invalid reviewer model reference ${JSON.stringify(reference)}`);
 	const model = registry.find(parsed.provider, parsed.id);
 	if (!model) throw new Error(`pi-enclave: reviewer model ${reference} is not present in pi's model registry`);
+	// Only Ollama's native API takes a thinking switch and a token cap the transport controls (#62).
+	if (thinkingTokens > 0 && model.provider !== "ollama")
+		throw new Error(
+			`pi-enclave: reviewer.thinkingTokens is supported only for an Ollama chat reviewer, not ${reference}; set it to 0`,
+		);
 	if (!registry.hasConfiguredAuth(model))
 		throw new Error(`pi-enclave: reviewer model ${reference} has no configured provider authentication`);
 	const completeBound = async (request: CompletionRequest, expected?: string): Promise<string> => {
+		if ((request.thinkingTokens ?? 0) > 0 && model.provider !== "ollama")
+			throw new Error("pi-enclave: internal error: thinking requested from a non-Ollama reviewer");
 		const target = await endpoint(model, registry);
 		const before = await endpointDigest(target, request.signal, numCtx, request.onIdentityCall);
 		if (expected !== undefined && before.digest !== expected)
@@ -408,6 +440,7 @@ export function resolveReviewerModel(
 		completion: {
 			name: reference,
 			numCtx: model.provider === "ollama" ? numCtx : null,
+			...(thinkingTokens > 0 ? { thinkingTokens } : {}),
 			complete: (request) => completeBound(request),
 			...(model.provider === "ollama" ? { warm } : {}),
 		},

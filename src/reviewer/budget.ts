@@ -11,9 +11,10 @@
  * U+FDFA to eighteen characters) can exceed it; the runtimes' overflow checks
  * then refuse the prompt instead of cutting it. Evidence is sized so that
  *
- *   system bytes + evidence bytes + template reserve + output tokens <= context
+ *   system bytes + evidence bytes + template reserve + thinking tokens + output tokens <= context
  *
- * for the one chat request. It is pessimistic (real text runs 3 to 4 bytes a token),
+ * for the one chat request. Thinking (#62) shares the context with the
+ * evidence, so its budget is taken from the evidence room. It is pessimistic (real text runs 3 to 4 bytes a token),
  * which is the price of a bound that does not depend on a tokenizer.
  */
 import type { ClassifierQuestion, JsonObject } from "@earendil-works/pi-ai";
@@ -44,9 +45,12 @@ function bytes(text: string): number {
 	return Buffer.byteLength(text);
 }
 
-/** Bytes of evidence the chat transport can send at `numCtx` without the bound failing. */
-export function chatEvidenceBytes(prompt: ReviewerPrompt, numCtx: number): number {
-	return numCtx - TEMPLATE_RESERVE_TOKENS - REVIEWER_MAX_TOKENS - bytes(prompt.system);
+/**
+ * Bytes of evidence the chat transport can send at `numCtx` without the bound
+ * failing, with `thinkingTokens` kept free for the model's thinking (#62).
+ */
+export function chatEvidenceBytes(prompt: ReviewerPrompt, numCtx: number, thinkingTokens = 0): number {
+	return numCtx - TEMPLATE_RESERVE_TOKENS - REVIEWER_MAX_TOKENS - thinkingTokens - bytes(prompt.system);
 }
 
 /** The worst-case token count of one chat request, as the Ollama post-check compares it. */
@@ -54,8 +58,8 @@ export function chatPromptBound(system: string, user: string): number {
 	return bytes(system) + bytes(user) + TEMPLATE_RESERVE_TOKENS;
 }
 
-export function chatFits(prompt: ReviewerPrompt, numCtx: number): EvidenceFits {
-	const budget = chatEvidenceBytes(prompt, numCtx);
+export function chatFits(prompt: ReviewerPrompt, numCtx: number, thinkingTokens = 0): EvidenceFits {
+	const budget = chatEvidenceBytes(prompt, numCtx, thinkingTokens);
 	return (rendered) => bytes(rendered) <= budget;
 }
 

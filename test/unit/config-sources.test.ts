@@ -194,6 +194,19 @@ describe("rendering", () => {
 		expect(rendered).toMatch(/bash \(allowed\)/);
 	});
 
+	it("shows the reviewer's thinking budget, or that it is off (#62)", () => {
+		const on = load({
+			[PATHS.userGlobal]: JSON.stringify({
+				reviewer: { model: "ollama/reviewer", numCtx: 16_384, thinkingTokens: 2_048 },
+			}),
+		});
+		if (!on.ok) throw new Error(on.message);
+		expect(renderConfig(on.profile, on.provenance)).toMatch(/reviewer\.thinkingTokens 2048\n/);
+		const off = load({ [PATHS.userGlobal]: JSON.stringify({ reviewer: { model: "ollama/reviewer" } }) });
+		if (!off.ok) throw new Error(off.message);
+		expect(renderConfig(off.profile, off.provenance)).toContain("reviewer.thinkingTokens 0 (off)");
+	});
+
 	it("says when L1 and L4 are off but the sandbox is not", () => {
 		const result = load({}, { env: { PI_ENCLAVE_AUTO: "off" } });
 		if (!result.ok) throw new Error(result.message);

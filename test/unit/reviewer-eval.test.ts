@@ -115,4 +115,88 @@ describe("reviewer qualification", () => {
 		chmodSync(path, 0o644);
 		expect(readQualification(directory, record)).toMatchObject({ ok: false });
 	});
+
+	describe("the thinking budget (#62)", () => {
+		function record(thinkingTokens?: number): QualificationRecord {
+			return {
+				version: 2,
+				model: "ollama/reviewer",
+				modelDigest: "ollama:sha256:abc",
+				promptHash: PROMPT.promptHash,
+				corpusHash: "sha256:corpus",
+				sampling: {
+					temperature: 0,
+					seed: 31337,
+					numCtx: 16_384,
+					maxTokens: 256,
+					...(thinkingTokens === undefined ? {} : { thinkingTokens }),
+					trials: 5,
+				},
+				passed: true,
+				metrics: {
+					injectedAllows: 0,
+					benignCases: 150,
+					benignFalseDenials: 0,
+					falseDenialRate: 0,
+					p95LatencyMs: 10,
+					errors: 0,
+				},
+				createdAt: new Date(0).toISOString(),
+			};
+		}
+		function directory(): string {
+			const created = mkdtempSync(join(tmpdir(), "pi-enclave-qualification-"));
+			directories.push(created);
+			chmodSync(created, 0o700);
+			return created;
+		}
+
+		it("does not let a record made with thinking off qualify a reviewer that thinks", () => {
+			const dir = directory();
+			writeQualification(dir, record(0));
+			expect(readQualification(dir, record(1_024))).toEqual({
+				ok: false,
+				reason: "qualified with reviewer.thinkingTokens 0, configured 1024",
+			});
+			// Control: the same setting qualifies.
+			expect(readQualification(dir, record(0))).toMatchObject({ ok: true });
+		});
+
+		it("does not let a record made with thinking qualify a reviewer that does not think, or another budget", () => {
+			const dir = directory();
+			writeQualification(dir, record(1_024));
+			expect(readQualification(dir, record(0))).toMatchObject({ ok: false, reason: expect.stringContaining("1024") });
+			expect(readQualification(dir, record(2_048))).toMatchObject({ ok: false });
+			expect(readQualification(dir, record(1_024))).toMatchObject({ ok: true });
+		});
+
+		it("reads a record from before the setting as made with thinking off", () => {
+			const dir = directory();
+			writeQualification(dir, record(undefined));
+			expect(readQualification(dir, record(0))).toMatchObject({ ok: true });
+			expect(readQualification(dir, record(1_024))).toMatchObject({ ok: false });
+		});
+
+		it("records the transport's budget and sends it with every case", async () => {
+			const thinking: (number | undefined)[] = [];
+			const base = completion((evidence) => {
+				const action = evidence.action as { input: Record<string, unknown> };
+				return typeof action.input.content === "string" && action.input.content.startsWith("routine generated report")
+					? "allow"
+					: "deny";
+			});
+			const thinks: ReviewerCompletion = {
+				...base,
+				thinkingTokens: 1_024,
+				complete: (request) => {
+					thinking.push(request.thinkingTokens);
+					return base.complete(request);
+				},
+			};
+			const made = await evalReviewer(options(thinks));
+			expect(made.sampling.thinkingTokens).toBe(1_024);
+			expect(new Set(thinking)).toEqual(new Set([1_024]));
+			expect((await evalReviewer(options(base))).sampling.thinkingTokens).toBe(0);
+		});
+	});
 });

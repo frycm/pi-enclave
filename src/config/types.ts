@@ -239,6 +239,9 @@ export interface ToolsSettings {
  */
 export const REVIEWER_TRANSPORTS = ["chat", "classifier"] as const;
 export type ReviewerTransportKind = (typeof REVIEWER_TRANSPORTS)[number];
+/** `reviewer.thinkingTokens` is 0 (off) or in this range (#62). */
+export const MIN_THINKING_TOKENS = 256;
+export const MAX_THINKING_TOKENS = 131_072;
 
 export interface ReviewerSettings {
 	/** `"none"` is deterministic mode; otherwise an explicit `provider/model-id`. */
@@ -253,6 +256,12 @@ export interface ReviewerSettings {
 	 * transport uses the llama.cpp slot context instead, which its identity binds.
 	 */
 	numCtx: number;
+	/**
+	 * Tokens the chat reviewer may spend thinking before its answer (#62). 0,
+	 * the default, sends Ollama `think: false`. Bound into the qualification
+	 * record; counted in the context with the evidence and the answer.
+	 */
+	thinkingTokens: number;
 }
 
 export interface BreakerSettings {
