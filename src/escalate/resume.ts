@@ -29,9 +29,8 @@ import { narrowerOrEqual, type OrderViolation } from "../config/merge.ts";
 import type { EffectiveProfile } from "../config/types.ts";
 import { checkTool } from "../gate/tools.ts";
 import { type CanonicalAction, canonicalize } from "../policy/canonical.ts";
-import type { RuleMatch } from "../policy/match.ts";
 import { evaluateRules } from "../policy/match.ts";
-import { matchesPathPattern } from "../policy/paths.ts";
+import { protectedMatches } from "../policy/protected-match.ts";
 import type { PendingRecord } from "./pending.ts";
 
 export type ResumeCheck = { ok: true; action: CanonicalAction } | { ok: false; reason: string; detail?: string[] };
@@ -118,15 +117,8 @@ export function checkResume(options: ResumeOptions): ResumeCheck {
 
 	// 3. L1 again, under the current configuration.
 	const evaluation = evaluateRules(action, current.rules, {
-		protectedMatcher: (patterns) => {
-			const matches: RuleMatch[] = [];
-			for (const path of action.paths) {
-				if (!path.writes) continue;
-				const pattern = matchesPathPattern(patterns, path.resolved, action.cwd);
-				if (pattern) matches.push({ list: "ask", pattern, target: path.resolved });
-			}
-			return matches;
-		},
+		protectedMatcher: (patterns, list) =>
+			protectedMatches(action, patterns, list, { cwd: action.cwd, home, rules: current.rules.protectedPaths }),
 	});
 	if (evaluation.verdict === "deny") {
 		return {

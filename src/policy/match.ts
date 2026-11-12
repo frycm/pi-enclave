@@ -268,7 +268,7 @@ export interface Evaluation {
 export function evaluateRules(
 	action: CanonicalAction,
 	rules: RulesInput,
-	options: { protectedMatcher?: (patterns: readonly string[]) => RuleMatch[] } = {},
+	options: { protectedMatcher?: (patterns: readonly string[], list: "deny" | "ask") => RuleMatch[] } = {},
 ): Evaluation {
 	const targets = matchTargets(action);
 	const matches: RuleMatch[] = [
@@ -282,11 +282,13 @@ export function evaluateRules(
 	if (options.protectedMatcher) {
 		matches.push(
 			...options
-				.protectedMatcher(rules.protectedPaths.deny)
+				.protectedMatcher(rules.protectedPaths.deny, "deny")
 				.map((m) => ({ ...m, list: "protectedPaths.deny" as const })),
 		);
 		matches.push(
-			...options.protectedMatcher(rules.protectedPaths.ask).map((m) => ({ ...m, list: "protectedPaths.ask" as const })),
+			...options
+				.protectedMatcher(rules.protectedPaths.ask, "ask")
+				.map((m) => ({ ...m, list: "protectedPaths.ask" as const })),
 		);
 	}
 
