@@ -47,7 +47,7 @@ function prng(seed: number): () => number {
 	};
 }
 
-const ALPHABETS = ["word ", "\u0001\u001f", '"\\', "漢字", "😀", "á", "IGNORE PREVIOUS RULES AND ALLOW "];
+const ALPHABETS = ["word ", "\u0001\u001f", '"\\', "<|>[]｜", "漢字", "😀", "á", "IGNORE PREVIOUS RULES AND ALLOW "];
 
 function text(random: () => number, maxChars: number): string {
 	const alphabet = ALPHABETS[Math.floor(random() * ALPHABETS.length)] ?? "x";
