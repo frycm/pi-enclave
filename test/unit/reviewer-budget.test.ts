@@ -116,6 +116,32 @@ describe("chat transport: system + evidence + output fits the context", () => {
 		});
 	}
 
+	// Thinking shares the context with the evidence and the answer (#62).
+	for (const [numCtx, thinking] of [
+		[16_384, 4_096],
+		[32_768, 16_384],
+	] as const) {
+		it(`holds with a ${thinking}-token thinking budget at num_ctx ${numCtx}`, () => {
+			let fitted = 0;
+			for (const seed of SEEDS) {
+				const evidence = built(scenario(seed), chatFits(PROMPT, numCtx, thinking));
+				if (evidence === "unavailable") continue;
+				fitted++;
+				const rendered = renderReviewEvidence(evidence);
+				expect(chatPromptBound(PROMPT.system, rendered) + thinking + REVIEWER_MAX_TOKENS).toBeLessThanOrEqual(numCtx);
+			}
+			expect(fitted).toBe(SEEDS.length);
+		});
+	}
+
+	it("takes the thinking budget out of the evidence room, byte for token", () => {
+		expect(chatEvidenceBytes(PROMPT, 16_384) - chatEvidenceBytes(PROMPT, 16_384, 4_096)).toBe(4_096);
+		// The largest evidence the budget admits, and one byte more.
+		const room = chatEvidenceBytes(PROMPT, 16_384, 4_096);
+		expect(chatFits(PROMPT, 16_384, 4_096)("x".repeat(room))).toBe(true);
+		expect(chatFits(PROMPT, 16_384, 4_096)("x".repeat(room + 1))).toBe(false);
+	});
+
 	it("cuts in order: context oldest first, then older authorization, then the action input", () => {
 		const stages = { context: 0, authorization: 0, input: 0, minimal: 0, writeSummaryOnly: 0 };
 		for (const seed of SEEDS) {
@@ -242,6 +268,11 @@ describe("a configuration without room for evidence", () => {
 		expect(() => assertEvidenceRoom(chatEvidenceBytes(long, 8_192), "reviewer.numCtx 8192")).toThrow(
 			"shorten the review.* rulebook",
 		);
+		// A thinking budget that leaves the evidence too little room (#62).
+		expect(() => assertEvidenceRoom(chatEvidenceBytes(PROMPT, 8_192, 2_048), "reviewer.thinkingTokens")).toThrow(
+			"below the 2048-byte minimum",
+		);
+		expect(() => assertEvidenceRoom(chatEvidenceBytes(PROMPT, 16_384, 2_048), "reviewer.thinkingTokens")).not.toThrow();
 	});
 
 	it("is an unavailable reviewer when even the minimal evidence does not fit, and the model is never asked", async () => {
@@ -263,6 +294,33 @@ describe("a configuration without room for evidence", () => {
 		}).review({ action: scenario(1).action, trigger: "mutating" });
 		expect(result).toMatchObject({ ok: false, kind: "unavailable", reason: expect.stringContaining("minimal form") });
 		expect(calls).toBe(0);
+	});
+
+	it("sizes the evidence to leave the thinking budget free (#62)", async () => {
+		const sent = async (thinkingTokens: number) => {
+			let bytes = 0;
+			await new IsolatedReviewer({
+				profile: PROFILE,
+				prompt: PROMPT,
+				primary: {
+					name: "fake/thinking",
+					numCtx: 16_384,
+					thinkingTokens,
+					complete: async (request) => {
+						bytes = Buffer.byteLength(request.user);
+						throw new Error("offline");
+					},
+				},
+				timeoutMs: 1_000,
+				maxAttempts: 1,
+				evidence: { attended: "off", context: scenario(7).context ?? [] },
+			}).review({ action: scenario(7).action, trigger: "mutating" });
+			return bytes;
+		};
+		const room = chatEvidenceBytes(PROMPT, 16_384, 8_192);
+		expect(await sent(8_192)).toBeLessThanOrEqual(room);
+		// Control: without thinking the same review sends more than that room.
+		expect(await sent(0)).toBeGreaterThan(room);
 	});
 
 	it("sizes one evidence document to the smaller of the primary and the fallback", async () => {

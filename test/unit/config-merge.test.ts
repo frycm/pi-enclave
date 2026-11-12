@@ -341,6 +341,44 @@ describe("fold", () => {
 			expect(fields(narrowerOrEqual(changed, ceiling))).toEqual(["reviewer"]);
 		});
 
+		it("keeps the thinking budget immutable below user-global (#62)", () => {
+			const ceiling = base();
+			ceiling.reviewer = { ...ceiling.reviewer, model: "ollama/reviewer", thinkingTokens: 1_024 };
+			for (const thinkingTokens of [0, 512, 4_096]) {
+				const changed = structuredClone(ceiling);
+				changed.reviewer.thinkingTokens = thinkingTokens;
+				expect(fields(narrowerOrEqual(changed, ceiling))).toEqual(["reviewer"]);
+			}
+			expect(narrowerOrEqual(structuredClone(ceiling), ceiling)).toEqual([]);
+		});
+
+		it("does not let a project file turn thinking on or raise the budget (#62)", () => {
+			const reviewer = { model: "ollama/reviewer" };
+			for (const [ceiling, project] of [
+				[0, 1_024],
+				[1_024, 4_096],
+			] as const) {
+				for (const source of ["project_local", "project_shared"] as const) {
+					const result = fold(
+						[
+							{ source: "builtin" },
+							doc("user_global", { reviewer: { ...reviewer, thinkingTokens: ceiling } }),
+							doc(source, { reviewer: { ...reviewer, thinkingTokens: project } }),
+						],
+						OPTIONS,
+					);
+					expect(result.ok).toBe(false);
+				}
+			}
+			// Control: the user-global file alone may choose it.
+			const result = fold(
+				[{ source: "builtin" }, doc("user_global", { reviewer: { ...reviewer, thinkingTokens: 1_024 } })],
+				OPTIONS,
+			);
+			if (!result.ok) throw new Error(JSON.stringify(result.errors));
+			expect(result.profile.reviewer.thinkingTokens).toBe(1_024);
+		});
+
 		it("rejects a named fallback without a named primary", () => {
 			const result = fold(
 				[{ source: "builtin" }, doc("user_global", { reviewer: { fallback: "ollama/fallback" } })],

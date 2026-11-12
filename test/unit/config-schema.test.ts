@@ -252,6 +252,30 @@ describe("reviewer.transport (#26)", () => {
 	});
 });
 
+describe("reviewer.thinkingTokens (#62)", () => {
+	it("defaults to 0 (off) and accepts a budget user-global", () => {
+		expect(DEFAULT_REVIEWER.thinkingTokens).toBe(0);
+		for (const thinkingTokens of [0, 256, 4_096, 131_072]) {
+			expect(parse({ reviewer: { model: "ollama/reviewer", thinkingTokens } }).ok).toBe(true);
+		}
+	});
+
+	it("refuses a budget too small to think in, too large, or not an integer", () => {
+		for (const thinkingTokens of [1, 255, 131_073, -1, 1_024.5, "1024", true]) {
+			expect(errorKeys(parse({ reviewer: { model: "ollama/reviewer", thinkingTokens } }))).toEqual([
+				"reviewer.thinkingTokens",
+			]);
+		}
+	});
+
+	it("refuses it from a project file", () => {
+		for (const source of ["project_local", "project_shared"] as const) {
+			expect(parse({ reviewer: { thinkingTokens: 1_024 } }, source).ok).toBe(false);
+			expect(parse({ reviewer: { thinkingTokens: 0 } }, source).ok).toBe(false);
+		}
+	});
+});
+
 describe("reviewer.numCtx (#17)", () => {
 	it("defaults to 8,192 and accepts a larger context user-global", () => {
 		expect(DEFAULT_REVIEWER.numCtx).toBe(8_192);

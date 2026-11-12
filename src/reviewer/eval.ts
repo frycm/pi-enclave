@@ -56,7 +56,14 @@ export function qualificationBinding(options: EvalReviewerOptions): Qualificatio
 			promptHash: options.prompt.classifier.promptHash,
 			corpusHash,
 			// No seed and no generated tokens: one label read per question.
-			sampling: { temperature: CLASSIFIER_TEMPERATURE, seed: 0, numCtx: null, maxTokens: 1, trials: CLASSIFIER_TRIALS },
+			sampling: {
+				temperature: CLASSIFIER_TEMPERATURE,
+				seed: 0,
+				numCtx: null,
+				maxTokens: 1,
+				thinkingTokens: 0,
+				trials: CLASSIFIER_TRIALS,
+			},
 		};
 	}
 	const trials = options.trials ?? DEFAULT_QUALIFICATION_TRIALS;
@@ -71,6 +78,7 @@ export function qualificationBinding(options: EvalReviewerOptions): Qualificatio
 			seed: REVIEWER_SEED,
 			numCtx: options.completion.numCtx === undefined ? REVIEWER_NUM_CTX : options.completion.numCtx,
 			maxTokens: REVIEWER_MAX_TOKENS,
+			thinkingTokens: options.completion.thinkingTokens ?? 0,
 			trials,
 		},
 	};

@@ -34,6 +34,11 @@ export interface CompletionRequest {
 	temperature: number;
 	seed: number;
 	numCtx: number;
+	/**
+	 * Tokens the model may think before its answer (#62); absent or 0 is off.
+	 * They come on top of `maxTokens`, which still bounds the answer.
+	 */
+	thinkingTokens?: number;
 	/** A JSON schema the runtime constrains the answer to, where it can (#25). */
 	schema?: Record<string, unknown>;
 	/** Observation only; no output bytes or authorization flow through these callbacks. */
@@ -48,6 +53,8 @@ export interface ReviewerCompletion {
 	readonly name: string;
 	/** null means provider-managed context; a number is enforced by the transport. */
 	readonly numCtx?: number | null;
+	/** `reviewer.thinkingTokens` as the transport sends it (#62); absent or 0 is off. */
+	readonly thinkingTokens?: number;
 	complete(request: CompletionRequest): Promise<string>;
 	/**
 	 * Loads the model ahead of the first review, so its load time does not count
@@ -154,7 +161,7 @@ export class IsolatedReviewer implements ActionReviewer {
 			isClassifier(transport)
 				? classifierFits(this.options.prompt, transport.numCtx)
 				: typeof transport.numCtx === "number"
-					? chatFits(this.options.prompt, transport.numCtx)
+					? chatFits(this.options.prompt, transport.numCtx, transport.thinkingTokens ?? 0)
 					: undefined,
 		);
 		let evidence: ReturnType<typeof buildReviewEvidence>;
@@ -269,6 +276,7 @@ export class IsolatedReviewer implements ActionReviewer {
 					temperature: REVIEWER_TEMPERATURE,
 					seed: seed + attempt,
 					numCtx: completion.numCtx ?? REVIEWER_NUM_CTX,
+					thinkingTokens: completion.thinkingTokens ?? 0,
 					schema: REVIEW_OUTPUT_SCHEMA,
 					onFirstOutput,
 					onIdentityCall: observer.identityCall,

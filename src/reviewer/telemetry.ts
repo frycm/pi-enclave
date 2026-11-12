@@ -15,6 +15,11 @@ export interface ReviewerStageMetrics {
 	cachedPromptTokens?: number;
 	/** Time the runtime spent loading the model for this request, inside durationMs. */
 	loadMs?: number;
+	/** Tokens generated (thinking and answer) and the time that took, inside durationMs (#62). */
+	generatedTokens?: number;
+	generateMs?: number;
+	/** Size of the thinking text the runtime returned; the text itself is never kept (#62). */
+	thinkingBytes?: number;
 }
 
 /** What a transport reports about one request. Counts and durations only. */
@@ -22,6 +27,9 @@ export interface RuntimeReport {
 	promptTokens?: number;
 	cachedPromptTokens?: number;
 	loadMs?: number;
+	generatedTokens?: number;
+	generateMs?: number;
+	thinkingBytes?: number;
 }
 
 export interface StageObserver {

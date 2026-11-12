@@ -813,7 +813,7 @@ the result must satisfy `effective ⊑ incoming` under a partial order defined p
 | `review.environment` / `hard_deny` / `soft_deny` / `allow` (the four prose lists) | **Immutable below user-global.** Prose has no partial order a merge can check: "append only" is a syntactic superset, not a semantic tightening, and a project-supplied string inside the reviewer prompt is the repo-to-reviewer injection path the threat model excludes. A project file that contains any of these four keys is rejected whole. `review.trigger` is the only `review` key a project may set. |
 | `review.trigger` | `boundary ⊑ mutating ⊑ all`; a project file may move it right (review more), never left |
 | `tools.allow` | Subset; `readOnly` may become `reviewed`, never the reverse |
-| `reviewer`, `backend` | Immutable below user-global |
+| `reviewer` (every key, including `numCtx` and `thinkingTokens`), `backend` | Immutable below user-global |
 
 Environment variables sit between user-global and project-local in the fold, so they obey
 the same order. These are the only ones that exist:
@@ -1183,9 +1183,41 @@ rules end in `deny` or `ask` before L3 exists.
   set `OLLAMA_KEEP_ALIVE` (for example `30m`, or `-1` to keep it loaded) on the Ollama
   service if reviews are further apart than that. Each review's audit `timing` record shows one `decision` stage per
   attempt, with Ollama's prompt token counts, its load time and the number of identity
-  calls. Thinking stays off (`think: false`): a thinking budget would have to be a
-  qualified setting of its own, and how Ollama combines it with a schema is not yet
-  checked on a live runtime.
+  calls.
+
+  **Thinking (#62).** By default the reviewer does not think (`think: false`). Several of
+  the small models that judge well are reasoning models, so the user-global
+  `reviewer.thinkingTokens` (0 for off, the default, or 256 to 131,072) lets one think
+  first, within a bound:
+
+  - It is Ollama-only. Remote reviewers and the classifier transport refuse it at session
+    start, and a model without thinking support makes Ollama refuse the request, so it
+    cannot qualify.
+  - It is a sampling parameter in the qualification record. A record made with thinking
+    off does not qualify a reviewer that thinks, a record made with thinking does not
+    qualify one that does not, and a different budget does not qualify either. Records
+    from before #62 read as thinking off.
+  - It shares the context with the evidence, so the budget comes out of the evidence room
+    (table below). For example, 4,096 thinking tokens need `reviewer.numCtx` 16,384 to
+    leave room for evidence.
+  - Ollama has no separate cap on thinking, so `num_predict` is the thinking budget plus
+    the 256-token answer. An answer that stops at that limit (`done_reason: "length"`) is
+    refused like an unreachable reviewer, never parsed.
+  - Only `message.content` is the answer. The thinking text is model output derived from
+    untrusted evidence, so it is never parsed, never shown in the approval prompt and
+    never written to the audit log. The `timing` record keeps only its size
+    (`thinkingBytes`), the generated tokens and the generation time (`generateMs`).
+    Without streaming, Ollama does not report when thinking ended, so thinking time is
+    part of `generateMs`.
+  - The per-attempt timeout (`reviewer.timeoutMs`) covers the thinking. Qualification
+    still requires the p95 latency to be at most half of it, so a model that thinks for
+    too long fails qualification.
+
+  How Ollama applies the schema while the model thinks is read from its source (at
+  `8a89b76`, November 2026), not yet observed. When the model's template marks thinking,
+  Ollama leaves the thinking free and applies the schema grammar after the closing tag,
+  and the thinking arrives in `message.thinking`. Checkpoint C observes this on a live
+  Ollama with at least one reasoning model and records the result here.
 - **Or a classifier, with probabilities instead of text** (`reviewer.transport:
   "classifier"`, #26). pi 1.5 lists every model on a llama.cpp router as a classifier:
   chat GGUFs answer through next-token label probabilities (`llama-cpp-classify`), and
@@ -1225,7 +1257,7 @@ rules end in `deny` or `ask` before L3 exists.
 
   | Transport | Evidence room in bytes |
   |---|---|
-  | chat (256 output tokens) | `numCtx − 512 − 256 − system bytes` |
+  | chat (256 output tokens) | `numCtx − 512 − 256 − thinkingTokens − system bytes` |
   | classifier | `(n_ctx − 512 − 1 − 512 − question bytes) / 2`, since pi-ai puts the state twice into every question's prompt, beside pi-ai's system prompt |
 
   With the default rulebook (a 3.7 KB system prompt, which since #18 lists the built-in
@@ -1376,7 +1408,7 @@ quantization keeps its badge forever. A qualification is a record bound to:
 | **Transport** — `chat` or `classifier`, and for the classifier the thresholds qualification chose and the running pi version | A model qualified as a chat reviewer is never used as a classifier, or the reverse; a threshold is only meaningful for the model and prompt it was chosen on. The classifier's system prompt, prompt layout and label readout belong to pi-ai, so a pi update requires a new (cheap) classifier qualification |
 | **Prompt version** — hash of the reviewer system prompt, the evidence schema, and the effective `review.*` rulebook as printed by `/enclave rules config` | Any prompt edit *or rulebook edit* invalidates every prior result. Custom prose is exactly as untested as a new prompt; a re-run on an unchanged model is cheap and cached per hash |
 | **Corpus version** — hash of the eval corpus | Adding cases must force re-qualification |
-| **Sampling parameters** — `temperature`, `seed`, max tokens, and enforced Ollama `num_ctx` (`reviewer.numCtx`; remote context is recorded as provider-managed) | Reproducibility without claiming unsupported request settings |
+| **Sampling parameters** — `temperature`, `seed`, max tokens, enforced Ollama `num_ctx` (`reviewer.numCtx`; remote context is recorded as provider-managed), and the thinking budget (`reviewer.thinkingTokens`, #62) | Reproducibility without claiming unsupported request settings |
 
 Ollama uses the native `/api/chat` endpoint with explicit sampling options and checks
 `/api/ps` for the loaded manifest and context length. Identity is checked around the one
@@ -1389,6 +1421,8 @@ and raises the default context to 8,192 tokens, #59 changes the prompts and the 
 again, #25 replaces the two chat prompts with one and adds the `authorized` field, and #18
 adds the bash and protected-path patterns, `action.summarized` and the unreadable-command
 instruction to the prompts (prompt v4, evidence schema v5), so each needs a new qualification too.
+#62 changes neither the prompts nor the corpus: a reviewer that does not think keeps its
+record, and turning thinking on or changing the budget needs a new qualification.
 
 llama.cpp (classifier transport only) is identified from the router itself: `GET /models`
 must list the model as loaded or sleeping (load it with `/llama`), and `GET /props?model=`
