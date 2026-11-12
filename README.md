@@ -871,8 +871,9 @@ For those patterns L1 also asks when:
   `cp -al .github gh-backup`);
 - a `cp`, `mv`, `git mv` or `ln` would create a match, judged by whether the destination is
   an existing directory (`mv gh2 .github` when `.github` is gone, `cp -r s/workflows .github/`,
-  `-t` and `-T` included; a source ending in `/.` copies its contents into the destination
-  itself, as in `cp -r s/. .github/`); when the source does not exist yet, an earlier command
+  `-t` and `-T` included; a source ending in `/.` or `/..` copies its contents into the
+  destination itself, as in `cp -r s/. .github/`; a destination reached through a symlink,
+  such as `cp t/tasks.json .vscode/` with `.vscode -> v`, is judged by both names); when the source does not exist yet, an earlier command
   on the same line could change it, or the command is `ln -s` (whose link follows whatever
   the source holds later), by whether the destination could hold a match at all;
 - a write goes to a file with more than one hard link (`echo x > gh-backup/workflows/ci.yml`,
@@ -882,7 +883,11 @@ For those patterns L1 also asks when:
 Every protected pattern, on both lists, is also compared with the path as written as well as
 with where its symlinks lead, so `echo x > AGENTS.md` with `AGENTS.md -> docs/ai/instructions.md`,
 `rm AGENTS.md`, and a write to `.vscode/tasks.json` through a symlinked `.vscode` are judged by
-the protected name.
+the protected name. The target itself is not: with `AGENTS.md -> docs/ai/instructions.md`,
+`echo x > docs/ai/instructions.md` changes what pi loads as `AGENTS.md` and is allowed (a write
+through a chain such as `notes.md -> AGENTS.md -> …` is judged by every name on it). When a protected name is a symlink, add its target to
+`rules.protectedPaths` as well. A `git rm` or `git mv` with a pathspec L1 cannot list (`:/`,
+`:!src`, `--pathspec-from-file`) asks.
 
 These are asks, whichever list names the pattern. A directory too large to look through
 (200,000 entries) asks as well. Some ordinary work asks as a result: `rm -rf node_modules` and

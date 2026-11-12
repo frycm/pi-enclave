@@ -433,6 +433,7 @@ async function ancestorScenario(world: World, mode: "real" | "operands-only"): P
 		"scripts/hook.sh",
 		"lv/readme.md",
 		"px/extensions/readme.md",
+		"t/tasks.json",
 	]) {
 		put(path);
 	}
@@ -443,6 +444,10 @@ async function ancestorScenario(world: World, mode: "real" | "operands-only"): P
 	mkdirSync(join(ws, "l"));
 	symlinkSync("../lv", join(ws, "l/.vscode"));
 	symlinkSync("px", join(ws, ".pi"));
+	symlinkSync("AGENTS.md", join(ws, "notes.md"));
+	mkdirSync(join(ws, "g3"));
+	mkdirSync(join(ws, "r3"));
+	symlinkSync("../g3", join(ws, "r3/.github"));
 	// What `cp -al .github gh-backup` and `cp -al deploy d5` leave.
 	mkdirSync(join(ws, "gh-backup", "workflows"), { recursive: true });
 	linkSync(join(ws, ".github/workflows/ci.yml"), join(ws, "gh-backup/workflows/ci.yml"));
@@ -493,6 +498,17 @@ async function ancestorScenario(world: World, mode: "real" | "operands-only"): P
 		["bash", { command: "git mv gh2 r2/.github" }],
 		["bash", { command: "git mv deploy d9" }],
 		["bash", { command: "git rm -r .github" }],
+		// Review of round 1: Git pathspecs, `s/x/..` copies, and a destination
+		// reached through a symlink.
+		["bash", { command: "git rm -r :/.github" }],
+		["bash", { command: "git rm -r ':!src'" }],
+		["bash", { command: "git rm -r --pathspec-from-file=list.txt" }],
+		["bash", { command: "cp -r s/workflows/.. .github" }],
+		["bash", { command: "cp t/tasks.json l/.vscode/" }],
+		["bash", { command: "mv t/tasks.json l/.vscode/" }],
+		["bash", { command: "cp -r t/. l/.vscode" }],
+		["bash", { command: "cp -r s/workflows r3/.github/" }],
+		["bash", { command: "echo x > notes.md" }],
 	];
 	const allows: [string, Record<string, unknown>][] = [
 		["bash", { command: "mkdir -p s2/workflows" }],
