@@ -19,7 +19,7 @@
  * Detected by a feature probe, never by version: pi-enclave keeps working on
  * unpatched pi, where nothing here is registered and the withholding stays.
  */
-import type { ActionLock } from "./lock.ts";
+import { type ActionLock, LockViolation } from "./lock.ts";
 
 /** One execution, as the prototype's wrapper receives it. */
 export interface ToolExecutionCall {
@@ -51,6 +51,23 @@ export function hasExecutionWrapper(pi: object): pi is ExecutionWrapperHost {
 	return typeof (pi as Partial<ExecutionWrapperHost>).wrapToolExecution === "function";
 }
 
+/**
+ * Why a call was stopped at execution: a lock check (`LockViolation`'s kind),
+ * a session that may run nothing (`unavailable`), or a cancellation that came
+ * before the tool started (`aborted`). Arguments the lock cannot compare count
+ * as `ambiguous`, like arguments that differ.
+ */
+export type ExecutionRefusalKind = LockViolation["kind"] | "unavailable" | "aborted";
+
+/** A call the check stopped before the tool ran. */
+export interface ExecutionRefusal {
+	toolName: string;
+	toolCallId: string;
+	parentToolCallId?: string;
+	kind: ExecutionRefusalKind;
+	reason: string;
+}
+
 export interface ExecutionCheckDeps {
 	lock: ActionLock;
 	owned: readonly string[];
@@ -58,6 +75,12 @@ export interface ExecutionCheckDeps {
 	refusal: () => string | undefined;
 	/** The gate is a pass-through (`PI_ENCLAVE_AUTO=off`): owned tools skip the lock then too. */
 	passThrough: () => boolean;
+	/**
+	 * Told about every call stopped before its tool ran, so the trail says it
+	 * did not run (the prototype still emits `tool_execution_end` for it, with
+	 * `isError`). Not called when the tool itself ran and failed.
+	 */
+	onRefused?: (refusal: ExecutionRefusal) => void;
 }
 
 /**
@@ -68,13 +91,47 @@ export interface ExecutionCheckDeps {
  */
 export function createExecutionCheck(deps: ExecutionCheckDeps): ToolExecutionWrapper {
 	return async (call, next, ctx) => {
+		const refuse = (kind: ExecutionRefusalKind, reason: string): void => {
+			deps.onRefused?.({
+				toolName: call.toolName,
+				toolCallId: call.toolCallId,
+				...(call.parentToolCallId !== undefined ? { parentToolCallId: call.parentToolCallId } : {}),
+				kind,
+				reason,
+			});
+		};
 		const refusal = deps.refusal();
-		if (refusal !== undefined) throw new Error(refusal);
+		if (refusal !== undefined) {
+			refuse("unavailable", refusal);
+			throw new Error(refusal);
+		}
 		if (deps.passThrough()) return next();
 		// Owned tools bind their invocation inside execute. Binding it here as
 		// well would start the entry before the tool reaches it, and the tool's
 		// own check would then refuse it as already started.
 		if (deps.owned.includes(call.toolName)) return next();
-		return deps.lock.runInvocation(call.toolCallId, call.toolName, call.input, ctx.cwd, next, ctx.signal);
+		let started = false;
+		try {
+			return await deps.lock.runInvocation(
+				call.toolCallId,
+				call.toolName,
+				call.input,
+				ctx.cwd,
+				() => {
+					started = true;
+					return next();
+				},
+				ctx.signal,
+			);
+		} catch (error) {
+			if (!started) {
+				const message = error instanceof Error ? error.message : String(error);
+				// Besides a LockViolation, only a cancellation or arguments the
+				// lock cannot compare (not JSON-like) stop a call here.
+				const kind = error instanceof LockViolation ? error.kind : ctx.signal?.aborted ? "aborted" : "ambiguous";
+				refuse(kind, message);
+			}
+			throw error;
+		}
 	};
 }

@@ -1919,6 +1919,7 @@ a server, the log is meant to answer "what did it run, and what happened?" (#37)
 |---|---|
 | `decision` | The gate's outcome, the action hash, and the **command as bash received it** (redacted, at most 8 KiB, with `commandTruncated` when cut) next to the tokenizer's reading in `commands`. The raw text is what lets an investigator re-run or re-hash the action, and what shows a tokenizer mistake instead of repeating it. |
 | `executed` | For every call the gate allowed, once pi has run it: tool call id, hash, `isError`, duration and, for bash, the exit code (`null` when the command was killed or timed out). |
+| `execution_refused` | Only on a pi with `pi.wrapToolExecution` ([frycm/pi#1](https://github.com/frycm/pi/pull/1)): a call the gate admitted but the execution check stopped before the tool ran. Tool, call id (and the parent's for a nested call), the action hash when the call passed the gate, which check stopped it (`refusal`: `breaker-open`, `ambiguous` for arguments that differ, `not-locked` for a call nobody gated, `already-consumed` for a second run, `unavailable` when the session may run nothing, `aborted`) and the reason. Such a call gets no `executed` record. |
 | `user_command` | Each `!`/`!!` command the person typed: a `started` record before it runs (command, cwd) and a `finished` one after (exit code, duration). It is sandboxed but not gated, and on a shared server it belongs in the trail too. |
 | `reviewer` | Each verdict: the model's decision, risk and reason next to the enforced decision, the deterministic minimum risk, and whether a direct instruction covered the action; failures say which kind. Timing is recorded separately. |
 | `approval` | `pi-enclave approve` and `decline`, in their own `approvals` log: an `executing` record when it starts and one with the outcome (`executed`, `declined`, `refused`, `unsupported`), or `queue-approved` and `declined` for a [queued](#the-approval-queue) request, with nonce, hash, originating session, both configuration hashes, uid, user, tty, SSH client address, exit code and duration. It is a separate log because the originating session may still be open and own its own chain. |
@@ -1961,8 +1962,8 @@ Behaviour under failure, for `attended: off`:
   starts with the next call.
 - `audit.sessionMaxMb` (default 100) bounds one session's file. At the cap the log writes one
   last `audit` record saying so and stops, which counts as a failure for `audit.required`.
-- Retention's size budget never deletes a session holding a `breaker`, `violation` or
-  `approval` record, or an `audit` record of a missing or replaced tail: those are the ones an
+- Retention's size budget never deletes a session holding a `breaker`, `violation`,
+  `approval` or `execution_refused` record, or an `audit` record of a missing or replaced tail: those are the ones an
   incident review needs, and oldest-first would pick them. Only the age limit removes them,
   and the budget may be exceeded until then; session start warns when it is, and status says
   how many logs are kept for that reason. A log
@@ -2725,7 +2726,7 @@ None has been posted yet; each item links its discussion here once it is open.
 
 | # | Proposal | State |
 | --- | --- | --- |
-| 1 | Execution-boundary hook for tools | **Prototyped** in [`frycm/pi#1`](https://github.com/frycm/pi/pull/1); used by pi-enclave when present |
+| 1 | Execution-boundary hook for tools | **Prototyped** in [`frycm/pi#1`](https://github.com/frycm/pi/pull/1) (open; not on the fork's `main`); used by pi-enclave when present |
 | 2 | Provenance on stored user messages | Draft |
 | 3 | A typed permission request, with an optional challenge and proof | Draft; design together with pi-huginn |
 | 4 | A spawn hook for stdio MCP servers | Draft |
@@ -2812,10 +2813,11 @@ arguments and environment, as `spawnHook` does for `bash`.
   part of the workspace-persistence problem (#19) at the source.
 
 The fork policy is unchanged: [`frycm/pi`](https://github.com/frycm/pi) is rebased onto every
-stable upstream release and carries only the patches listed here, one commit each. Item 1
-is the only patch so far. pi-enclave targets upstream pi at the
-[baseline](#api-baseline) and is tested there; what only works on the fork is marked as such
-in this document until it lands upstream.
+stable upstream release and carries only the patches listed here, one commit each. None is
+on the fork's `main` yet, which is still exactly `v1.5.2`: item 1 is prototyped in
+[frycm/pi#1](https://github.com/frycm/pi/pull/1), an open pull request. pi-enclave targets
+upstream pi at the [baseline](#api-baseline) and is tested there; what only works on the fork
+is marked as such in this document until it lands upstream.
 
 ---
 

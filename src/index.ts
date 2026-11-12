@@ -102,6 +102,7 @@ import {
 	configHash,
 	decisionFields,
 	executedFields,
+	executionRefusedFields,
 	reviewerVerdictFields,
 	userCommandFields,
 } from "./state/audit.ts";
@@ -1006,6 +1007,22 @@ export default function (pi: ExtensionAPI): void {
 					return requiredAuditIssue();
 				},
 				passThrough: () => effective?.auto === false,
+				// The call did not run, so it gets this record and no `executed`
+				// one: pi still ends it with an error result, which would otherwise
+				// read as a tool that ran and failed.
+				onRefused: (refusal) => {
+					const pending = executions.get(refusal.toolCallId);
+					executions.delete(refusal.toolCallId);
+					exitCodes.delete(refusal.toolCallId);
+					audit?.append(
+						"execution_refused",
+						executionRefusedFields({
+							...refusal,
+							...(pending ? { hash: pending.hash } : {}),
+							turnIndex: pending?.turnIndex ?? currentTurn,
+						}),
+					);
+				},
 			}),
 		);
 	}

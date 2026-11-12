@@ -6,22 +6,29 @@
  * invocation check, which compares the complete gated action, asks the breaker
  * again and runs the call once.
  */
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CompiledProfile, Profile } from "../../src/backend/types.ts";
 import { defaultProfile, OWNED_TOOLS } from "../../src/config/defaults.ts";
 import type { EffectiveProfile } from "../../src/config/types.ts";
 import { BREAKER_ENTRY_TYPE } from "../../src/gate/breaker.ts";
-import { hasExecutionWrapper, type ToolExecutionWrapper } from "../../src/gate/execution.ts";
+import {
+	createExecutionCheck,
+	type ExecutionRefusal,
+	hasExecutionWrapper,
+	type ToolExecutionWrapper,
+} from "../../src/gate/execution.ts";
+import { ActionLock } from "../../src/gate/lock.ts";
 
-const mocks = vi.hoisted(() => ({ loadConfig: vi.fn() }));
+const READY = { ok: true, platform: "linux", backend: "bwrap", piVersion: "1.5.2", checks: [] };
+const mocks = vi.hoisted(() => ({ loadConfig: vi.fn(), probe: { report: undefined as unknown } }));
 
 vi.mock("../../src/probe-host.ts", async (original) => ({
 	...(await original<typeof import("../../src/probe-host.ts")>()),
-	probeHost: () => ({ ok: true, platform: "linux", backend: "bwrap", piVersion: "1.5.2", checks: [] }),
+	probeHost: () => mocks.probe.report,
 }));
 vi.mock("../../src/config/sources.ts", async (original) => ({
 	...(await original<typeof import("../../src/config/sources.ts")>()),
@@ -51,6 +58,7 @@ let agentDir: string;
 let previousAgentDir: string | undefined;
 
 beforeEach(() => {
+	mocks.probe.report = READY;
 	root = realpathSync(mkdtempSync(join(tmpdir(), "enclave-exec-")));
 	ws = join(root, "ws");
 	agentDir = join(root, "agent");
@@ -76,9 +84,16 @@ async function session(
 		entries?: unknown[];
 		/** What loadConfig returns instead of the edited default profile. */
 		config?: unknown;
+		/** Skip session_start, so no policy is loaded. */
+		unstarted?: boolean;
+		/** Another extension provides `read`, which the ownership check refuses. */
+		foreignRead?: boolean;
+		/** What the host probe reports at extension load. */
+		probe?: unknown;
 	} = {},
 ) {
 	vi.resetModules();
+	if (options.probe) mocks.probe.report = options.probe;
 	const { default: register } = await import("../../src/index.ts");
 	const effective = defaultProfile({ cwd: ws, agentDir });
 	effective.attended.mode = "off";
@@ -91,12 +106,16 @@ async function session(
 	const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
 	const extension = { path: join(root, "ext", "index.ts"), baseDir: join(root, "ext") };
 	const registry = () => [
-		...OWNED_TOOLS.map((name) => ({ name, sourceInfo: extension })),
+		...OWNED_TOOLS.map((name) => ({
+			name,
+			sourceInfo: options.foreignRead && name === "read" ? { path: join(root, "other", "index.ts") } : extension,
+		})),
 		{ name: SEARCH, sourceInfo: { path: "<mcp:docs>" } },
 	];
 	const wrappers: ToolExecutionWrapper[] = [];
+	const tools = new Map<string, ToolDefinition>();
 	const api = {
-		registerTool: () => {},
+		registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
 		registerCommand: (name: string, command: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) =>
 			commands.set(name, command),
 		registerFlag: () => {},
@@ -134,21 +153,59 @@ async function session(
 		},
 		modelRegistry: {},
 	} as unknown as ExtensionContext;
-	await handlers.get("session_start")?.({ reason: "startup" }, context);
-	await handlers.get("turn_start")?.({ turnIndex: 0 }, context);
+	if (!options.unstarted) {
+		await handlers.get("session_start")?.({ reason: "startup" }, context);
+		await handlers.get("turn_start")?.({ turnIndex: 0 }, context);
+	}
+	const auditPath = join(agentDir, "enclave", "audit", "s1.jsonl");
 	return {
 		wrappers,
 		notes,
 		gate: async (id: string, toolName: string, input: Record<string, unknown>) =>
 			(await handlers.get("tool_call")?.({ toolName, toolCallId: id, input }, context)) as Decision,
 		/** Run one execution through the registered wrapper, the way the prototype does. */
-		execute: (id: string, toolName: string, input: Record<string, unknown>) => {
-			const next = vi.fn(async () => ({ content: [{ type: "text", text: "ran" }], details: {} }));
+		execute: (
+			id: string,
+			toolName: string,
+			input: Record<string, unknown>,
+			options: { parent?: string; run?: (input: Record<string, unknown>) => Promise<unknown> } = {},
+		) => {
+			const frozen = structuredClone(input);
+			const next = vi.fn(
+				options.run
+					? () => (options.run as (input: Record<string, unknown>) => Promise<unknown>)(frozen)
+					: async () => ({ content: [{ type: "text", text: "ran" }], details: {} }),
+			);
 			const wrapper = wrappers[0];
 			if (!wrapper) throw new Error("no wrapper registered");
-			const result = wrapper({ toolName, toolCallId: id, input: structuredClone(input) }, next, { cwd: ws });
+			const call = {
+				toolName,
+				toolCallId: id,
+				...(options.parent !== undefined ? { parentToolCallId: options.parent } : {}),
+				input: frozen,
+			};
+			const result = wrapper(call, next, { cwd: ws });
 			return { result, next };
 		},
+		/** The registered tool's own execute, which binds its invocation itself. */
+		ownTool: (id: string, toolName: string) => (input: Record<string, unknown>) => {
+			const tool = tools.get(toolName);
+			if (!tool) throw new Error(`${toolName} is not registered`);
+			return tool.execute(id, input as never, undefined, undefined, context as never);
+		},
+		/** What pi does once a call is over, whether it ran or was refused. */
+		end: async (id: string, toolName: string, isError: boolean) => {
+			await handlers.get("tool_result")?.({ toolCallId: id }, context);
+			await handlers.get("tool_execution_end")?.({ toolCallId: id, toolName, isError, durationMs: 1 }, context);
+		},
+		auditPath,
+		records: () =>
+			existsSync(auditPath)
+				? readFileSync(auditPath, "utf8")
+						.trim()
+						.split("\n")
+						.map((line) => JSON.parse(line) as Record<string, unknown>)
+				: [],
 		status: async () => {
 			notes.length = 0;
 			await commands.get("enclave")?.handler("status", context);
@@ -168,6 +225,31 @@ describe("the execution-boundary check (#29)", () => {
 		expect(hasExecutionWrapper({})).toBe(false);
 		expect(hasExecutionWrapper({ wrapToolExecution: "yes" })).toBe(false);
 		expect(hasExecutionWrapper({ wrapToolExecution: () => () => {} })).toBe(true);
+	});
+
+	it("tells the session about a refusal before any check of the lock, as unavailable", async () => {
+		const refused: ExecutionRefusal[] = [];
+		const check = createExecutionCheck({
+			lock: new ActionLock(),
+			owned: OWNED_TOOLS,
+			refusal: () => "fixture: nothing may run",
+			passThrough: () => false,
+			onRefused: (refusal) => refused.push(refusal),
+		});
+		const next = vi.fn(async () => ({}));
+		await expect(
+			check({ toolName: "bash", toolCallId: "c1", parentToolCallId: "p1", input: {} }, next, { cwd: "/" }),
+		).rejects.toThrow("fixture: nothing may run");
+		expect(next).not.toHaveBeenCalled();
+		expect(refused).toEqual([
+			{
+				toolName: "bash",
+				toolCallId: "c1",
+				parentToolCallId: "p1",
+				kind: "unavailable",
+				reason: "fixture: nothing may run",
+			},
+		]);
 	});
 
 	it("registers nothing on upstream pi, where a third-party sibling is still withheld", async () => {
@@ -248,7 +330,9 @@ describe("the execution-boundary check (#29)", () => {
 		try {
 			const s = await session({ wrapper: true });
 			expect((await s.gate("b1", "bash", { command: "ls" }))?.block).toBeFalsy();
-			const { result, next } = s.execute("b1", "bash", { command: "ls" });
+			// `next` is the real tool, which binds its own invocation: had the
+			// wrapper bound it first, the tool would refuse it as already started.
+			const { result, next } = s.execute("b1", "bash", { command: "ls" }, { run: s.ownTool("b1", "bash") });
 			await expect(result).resolves.toBeDefined();
 			expect(next).toHaveBeenCalledOnce();
 			await s.shutdown();
@@ -257,18 +341,129 @@ describe("the execution-boundary check (#29)", () => {
 		}
 	});
 
-	it("refuses everything when the configuration did not load, and passes through with auto off", async () => {
+	it("records a call stopped at execution as refused, with the check that stopped it, and not as executed", async () => {
 		const stderr = quiet();
 		try {
-			const broken = await session({
-				wrapper: true,
-				config: { ok: false, message: "fixture: bad configuration", sources: [] },
-			});
-			const refused = broken.execute("b1", "bash", { command: "ls" });
-			await expect(refused.result).rejects.toThrow(/fixture: bad configuration/);
-			expect(refused.next).not.toHaveBeenCalled();
-			await broken.shutdown();
+			const s = await session({ wrapper: true, entries: nearlyOpen });
+			const gated = await s.gate("m1", SEARCH, { query: "x" });
+			expect(gated?.block).toBeFalsy();
+			expect((await s.gate("m2", "mcp__other__send", { to: "x" }))?.block).toBe(true);
+			await expect(s.execute("m1", SEARCH, { query: "x" }).result).rejects.toThrow(/circuit breaker/);
+			await s.end("m1", SEARCH, true);
 
+			const nested = s.execute("n1", SEARCH, { query: "x" }, { parent: "p1" });
+			await expect(nested.result).rejects.toThrow(/did not pass the policy gate/);
+			await s.end("n1", SEARCH, true);
+			await s.shutdown();
+
+			const records = s.records();
+			const allowed = records.find((record) => record.kind === "decision" && record.tool === SEARCH);
+			expect(allowed).toMatchObject({ outcome: "allow" });
+			const refused = records.filter((record) => record.kind === "execution_refused");
+			expect(refused).toEqual([
+				expect.objectContaining({
+					toolCallId: "m1",
+					tool: SEARCH,
+					hash: allowed?.hash,
+					refusal: "breaker-open",
+					reason: expect.stringMatching(/circuit breaker/),
+				}),
+				expect.objectContaining({ toolCallId: "n1", parentToolCallId: "p1", refusal: "not-locked" }),
+			]);
+			expect(refused[1]).not.toHaveProperty("hash");
+			expect(records.filter((record) => record.kind === "executed")).toEqual([]);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	it("records only the refusal when a tool ran and failed, not the other way round", async () => {
+		const stderr = quiet();
+		try {
+			const s = await session({ wrapper: true });
+			expect((await s.gate("m1", SEARCH, { query: "x" }))?.block).toBeFalsy();
+			const failing = s.execute(
+				"m1",
+				SEARCH,
+				{ query: "x" },
+				{ run: async () => Promise.reject(new Error("tool failed")) },
+			);
+			await expect(failing.result).rejects.toThrow("tool failed");
+			await s.end("m1", SEARCH, true);
+			await s.shutdown();
+			const records = s.records();
+			expect(records.filter((record) => record.kind === "execution_refused")).toEqual([]);
+			expect(records.filter((record) => record.kind === "executed")).toEqual([
+				expect.objectContaining({ toolCallId: "m1", isError: true }),
+			]);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	const BROKEN_PROBE = {
+		ok: false,
+		platform: "linux",
+		backend: "bwrap",
+		piVersion: "1.5.2",
+		checks: [{ id: "fixture", title: "fixture check", status: "fail", detail: "fixture: probe failed" }],
+	};
+	const reasons: {
+		reason: string;
+		options: Parameters<typeof session>[0];
+		before?: (s: Awaited<ReturnType<typeof session>>) => Promise<void>;
+		message: RegExp;
+	}[] = [
+		{
+			reason: "the configuration did not load",
+			options: { config: { ok: false, message: "fixture: bad configuration", sources: [] } },
+			message: /fixture: bad configuration/,
+		},
+		{
+			reason: "the host probe failed",
+			options: { unstarted: true, probe: BROKEN_PROBE },
+			message: /fixture: probe failed/,
+		},
+		{ reason: "another extension owns a tool", options: { foreignRead: true }, message: /"read" is provided by/ },
+		{ reason: "no policy is loaded", options: { unstarted: true }, message: /no policy is loaded/ },
+		{
+			reason: "the required audit log stopped",
+			options: {
+				edit: (profile) => {
+					profile.audit.required = true;
+				},
+			},
+			before: async (s) => {
+				rmSync(s.auditPath);
+				mkdirSync(s.auditPath);
+				await s.gate("b0", "bash", { command: "ls" });
+			},
+			message: /audit\.required/,
+		},
+	];
+
+	it.each(reasons)("refuses every tool, owned or not, when $reason", async ({ options, before, message }) => {
+		const stderr = quiet();
+		try {
+			const s = await session({ wrapper: true, ...options });
+			await before?.(s);
+			for (const [id, tool, input] of [
+				["b1", "bash", { command: "ls" }],
+				["m1", SEARCH, { query: "x" }],
+			] as const) {
+				const { result, next } = s.execute(id, tool, input);
+				await expect(result).rejects.toThrow(message);
+				expect(next).not.toHaveBeenCalled();
+			}
+			await s.shutdown();
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	it("passes through with auto off", async () => {
+		const stderr = quiet();
+		try {
 			const off = await session({
 				wrapper: true,
 				edit: (profile) => {

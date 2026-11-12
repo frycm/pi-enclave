@@ -24,9 +24,10 @@ Checked against pi `v1.5.2` (`b4afddd`) and upstream `main` at `9b88b94`. Paths 
    The third call was admitted before the breaker opened, and nothing asks again.
 2. `event.input` is the object `execute` receives (`ToolCallEventResult` documents in-place
    mutation as the way to rewrite arguments). An extension that keeps a reference can change
-   the arguments after another extension approved them. The durable harness's README says the
-   same about `beforeTool`: "a later hook that rewrites them can run the call with arguments
-   nobody approved."
+   the arguments after another extension approved them. The durable harness's specification
+   (`packages/durable/docs/suspendable/spec.md` at `v1.5.2`) says the same about `beforeTool`:
+   "An approval binds to the arguments it saw: a later `beforeTool` that replaces them can make
+   a call run with arguments nobody approved."
 
 **What a permission extension does today.** pi-enclave deep-freezes `event.input` so that a
 later mutation throws, binds its own tools' operations to the approved call through
