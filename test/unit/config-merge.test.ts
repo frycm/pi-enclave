@@ -306,6 +306,23 @@ describe("fold", () => {
 			expect(result.profile.review.trigger).toBe("boundary");
 		});
 
+		it("rejects a classifier transport without a named reviewer (#26)", () => {
+			const result = fold(
+				[{ source: "builtin" }, doc("user_global", { reviewer: { transport: "classifier" } })],
+				OPTIONS,
+			);
+			expect(result.ok).toBe(false);
+			if (!result.ok) expect(result.errors.some((error) => error.field === "reviewer.transport")).toBe(true);
+		});
+
+		it("keeps the transport immutable below user-global (#26)", () => {
+			const ceiling = base();
+			ceiling.reviewer = { ...ceiling.reviewer, model: "llama.cpp/qwen3-4b", transport: "classifier" };
+			const changed = structuredClone(ceiling);
+			changed.reviewer.transport = "chat";
+			expect(fields(narrowerOrEqual(changed, ceiling))).toEqual(["reviewer"]);
+		});
+
 		it("rejects a named fallback without a named primary", () => {
 			const result = fold(
 				[{ source: "builtin" }, doc("user_global", { reviewer: { fallback: "ollama/fallback" } })],

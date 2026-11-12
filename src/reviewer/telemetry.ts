@@ -2,7 +2,7 @@
 import { InMemoryTelemetryContext } from "@earendil-works/pi-telemetry";
 
 export interface ReviewerStageMetrics {
-	stage: "authorization" | "decision";
+	stage: "authorization" | "decision" | "classify";
 	attempt: number;
 	durationMs: number;
 	firstOutputMs?: number;
@@ -19,12 +19,12 @@ export class ReviewerTelemetry {
 	private readonly started = performance.now();
 	private readonly stages: ReviewerStageMetrics[] = [];
 
-	async measure(
+	async measure<T>(
 		stage: ReviewerStageMetrics["stage"],
 		attempt: number,
 		signal: AbortSignal,
-		run: (firstOutput: () => void) => Promise<string>,
-	): Promise<string> {
+		run: (firstOutput: () => void) => Promise<T>,
+	): Promise<T> {
 		const result = await this.context.startSpan(
 			{ name: "pi_enclave.reviewer.stage", attributes: { stage, attempt } },
 			async (span) => {
@@ -38,7 +38,7 @@ export class ReviewerTelemetry {
 					span.addEvent("first_output", { durationMs: firstOutputMs });
 				};
 				try {
-					return { ok: true as const, text: await run(firstOutput) };
+					return { ok: true as const, value: await run(firstOutput) };
 				} catch (error) {
 					outcome = signal.aborted ? "aborted" : "error";
 					// Return errors as data inside the span so the recorder never
@@ -68,7 +68,7 @@ export class ReviewerTelemetry {
 			},
 		);
 		if (!result.ok) throw result.error;
-		return result.text;
+		return result.value;
 	}
 
 	summary(): ReviewerTelemetrySummary {

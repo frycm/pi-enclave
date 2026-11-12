@@ -224,11 +224,21 @@ export interface ToolsSettings {
 	allow: Record<string, ToolGrant>;
 }
 
+/**
+ * How the reviewer is asked (#26). `chat` generates the JSON verdict;
+ * `classifier` reads label probabilities from a pi classifier model on a
+ * loopback llama.cpp router and maps them through qualified thresholds.
+ */
+export const REVIEWER_TRANSPORTS = ["chat", "classifier"] as const;
+export type ReviewerTransportKind = (typeof REVIEWER_TRANSPORTS)[number];
+
 export interface ReviewerSettings {
 	/** `"none"` is deterministic mode; otherwise an explicit `provider/model-id`. */
 	model: string;
 	timeoutMs: number;
 	fallback: string;
+	/** One transport for the primary and the fallback. User-global only. */
+	transport: ReviewerTransportKind;
 }
 
 export interface BreakerSettings {

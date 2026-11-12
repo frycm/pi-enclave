@@ -1,3 +1,4 @@
+import type { ClassifierQuestion } from "@earendil-works/pi-ai";
 import type { Violation } from "../backend/types.ts";
 import type { AttendedMode, ReviewSettings, SourceId } from "../config/types.ts";
 import type { ToolReachability } from "../gate/reachability.ts";
@@ -77,13 +78,43 @@ export interface ReviewerPrompt {
 	authorizationSystem: string;
 	system: string;
 	decisionSystem: { "0": string; "1": string };
+	/** Binds the chat transport. */
 	promptHash: string;
+	/** The classifier transport's questions and their own hash (#26). */
+	classifier: { questions: Record<string, ClassifierQuestion>; promptHash: string };
+}
+
+/**
+ * What a classifier reviewer said, as normalized label probabilities (#26).
+ * Recorded in the audit log so thresholds can be checked against real traffic.
+ */
+export interface ReviewProbabilities {
+	authorized: number;
+	decision: Record<ReviewDecision, number>;
+	risk: Record<ReviewRisk, number>;
+}
+
+/** How probabilities become a verdict. Chosen by qualification, stored in its record. */
+export interface ClassifierThresholds {
+	/** allow only when P(allow) is at least this. */
+	allow: number;
+	/** otherwise deny when P(deny) is at least this; everything else is ask. */
+	deny: number;
+	/** Divides the label logits before normalizing (pi's classifier option). */
+	temperature: number;
 }
 
 export type ReviewerFailureKind = "invalid-output" | "unavailable";
 
 export type ReviewerResult =
-	| { ok: true; review: EffectiveReview; modelReview: ModelReview; evidence: ReviewEvidence }
+	| {
+			ok: true;
+			review: EffectiveReview;
+			modelReview: ModelReview;
+			evidence: ReviewEvidence;
+			/** Present for the classifier transport. */
+			probabilities?: ReviewProbabilities;
+	  }
 	| { ok: false; kind: ReviewerFailureKind; reason: string; evidence: ReviewEvidence };
 
 export interface ReviewerRequest {

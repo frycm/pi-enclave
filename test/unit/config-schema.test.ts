@@ -223,3 +223,21 @@ describe("parseEnvironment", () => {
 		expect(parseEnvironment({ PATH: "/usr/bin", HOME: "/home/u" }).ok).toBe(true);
 	});
 });
+
+describe("reviewer.transport (#26)", () => {
+	it("accepts chat and classifier user-global", () => {
+		for (const transport of ["chat", "classifier"]) {
+			expect(parse({ reviewer: { model: "llama.cpp/qwen3-4b", transport } }).ok).toBe(true);
+		}
+	});
+
+	it("refuses any other transport", () => {
+		expect(errorKeys(parse({ reviewer: { model: "llama.cpp/qwen3-4b", transport: "completion" } }))).toEqual([
+			"reviewer.transport",
+		]);
+	});
+
+	it("refuses it from a project file, like every reviewer setting", () => {
+		expect(parse({ reviewer: { transport: "classifier" } }, "project_local").ok).toBe(false);
+	});
+});

@@ -195,7 +195,7 @@ export function renderStatus(state: EnclaveState): string {
 			...renderUnsandboxed(state.effective),
 			state.effective.reviewer.model === "none"
 				? `reviewer:   none (deterministic mode: every crossing is an ask)`
-				: `reviewer:   ${state.effective.reviewer.model} (trigger ${state.effective.review.trigger})`,
+				: `reviewer:   ${state.effective.reviewer.model} (${state.effective.reviewer.transport} transport, trigger ${state.effective.review.trigger})`,
 			`attended:   ${state.attendance ?? state.effective.attended.mode}`,
 			`breaker:    ${state.breaker?.open ? "OPEN -- the turn is stopped" : `${state.breaker?.consecutive ?? 0} of ${state.effective.breaker.consecutive} consecutive`}`,
 			`audit:      ${state.auditPath ?? "(not open)"}${state.auditDegraded ? `   ${state.effective.audit.required ? "NOT RECORDING -- tool calls are refused (audit.required)" : "WRITES ARE FAILING"}` : ""}`,

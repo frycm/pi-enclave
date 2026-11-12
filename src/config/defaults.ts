@@ -479,7 +479,12 @@ export function defaultLimits(): LimitsSettings {
 	};
 }
 
-export const DEFAULT_REVIEWER: ReviewerSettings = { model: "none", timeoutMs: 30_000, fallback: "none" };
+export const DEFAULT_REVIEWER: ReviewerSettings = {
+	model: "none",
+	timeoutMs: 30_000,
+	fallback: "none",
+	transport: "chat",
+};
 
 /** Guardian's numbers, which are the only ones with field evidence behind them. */
 export const DEFAULT_BREAKER: BreakerSettings = { consecutive: 3, window: [10, 50] };
