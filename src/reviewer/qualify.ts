@@ -2,7 +2,12 @@ import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { EffectiveProfile, Provenance } from "../config/types.ts";
 import { evalReviewer } from "./eval.ts";
 import { buildReviewerPrompt, reviewerRulebook } from "./prompt.ts";
-import { type QualificationRecord, writeQualification } from "./qualification.ts";
+import {
+	type CategoryMetrics,
+	type OutcomeCounts,
+	type QualificationRecord,
+	writeQualification,
+} from "./qualification.ts";
 import { reviewerTarget } from "./setup.ts";
 
 export interface QualificationRun {
@@ -52,6 +57,38 @@ export async function qualifyConfiguredReviewers(options: {
 	return runs;
 }
 
+function total(counts: OutcomeCounts): number {
+	return counts.allow + counts.ask + counts.deny + counts.error;
+}
+
+function percent(part: number, whole: number): string {
+	return whole === 0 ? "n/a" : `${((part / whole) * 100).toFixed(0)}%`;
+}
+
+/**
+ * One line per corpus category (#27): how many trials were allowed, by the
+ * model and after the floors, and the precision and recall of the model's
+ * allow (allowed benign trials over all allowed trials, and over all benign ones).
+ */
+export function formatCategory(name: string, metrics: CategoryMetrics): string {
+	const parts: string[] = [];
+	const benign = total(metrics.benign);
+	const injected = total(metrics.injected);
+	if (benign > 0)
+		parts.push(`benign allowed ${metrics.benign.allow}/${benign} (effective ${metrics.effectiveBenign.allow})`);
+	if (injected > 0) {
+		parts.push(
+			`injected allowed ${metrics.injected.allow}/${injected} (effective ${metrics.effectiveInjected.allow}; ask ${metrics.injected.ask}, deny ${metrics.injected.deny})`,
+		);
+	}
+	const errors = metrics.benign.error + metrics.injected.error;
+	if (errors > 0) parts.push(`errors ${errors}`);
+	const allowed = metrics.benign.allow + metrics.injected.allow;
+	if (allowed > 0 && injected > 0) parts.push(`precision ${percent(metrics.benign.allow, allowed)}`);
+	if (benign > 0) parts.push(`recall ${percent(metrics.benign.allow, benign)}`);
+	return `    ${name} (${metrics.cases} cases): ${parts.join(", ")}`;
+}
+
 export function formatQualificationRuns(runs: readonly QualificationRun[]): string {
 	const lines: string[] = [];
 	for (const run of runs) {
@@ -77,6 +114,21 @@ export function formatQualificationRuns(runs: readonly QualificationRun[]): stri
 			["first output", metrics.p95FirstOutputMs],
 		] as const) {
 			if (value !== undefined) lines.push(`  p95 ${label}: ${value.toFixed(0)} ms`);
+		}
+		if (metrics.effectiveInjectedAllows !== undefined && metrics.effectiveFalseDenialRate !== undefined) {
+			lines.push(
+				`  effective, after the deterministic floors: injected allows ${metrics.effectiveInjectedAllows}, benign not allowed ${(metrics.effectiveFalseDenialRate * 100).toFixed(1)}%`,
+			);
+		}
+		if (metrics.categories) {
+			lines.push("  per category (model decision; effective after the floors):");
+			for (const [name, category] of Object.entries(metrics.categories)) lines.push(formatCategory(name, category));
+		}
+		if (metrics.thinCategories && metrics.thinCategories.length > 0) {
+			lines.push(`  categories below the minimum case count: ${metrics.thinCategories.join(", ")}`);
+		}
+		if (metrics.unstableCases && metrics.unstableCases.length > 0) {
+			lines.push(`  decision changed between trials: ${metrics.unstableCases.join(", ")}`);
 		}
 	}
 	return lines.join("\n");

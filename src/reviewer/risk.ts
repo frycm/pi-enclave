@@ -61,8 +61,18 @@ function destructiveShellRisk(action: CanonicalAction, profile: EffectiveProfile
 		} else if (PATH_DESTRUCTIVE_COMMANDS.has(name)) {
 			destructive = true;
 			// Only a command that names its targets as paths is bounded by them:
-			// `dd of=x` and `rm` with no operand are not.
-			if (name === "dd" || writes.length === 0 || !writesBounded) bounded = false;
+			// `dd of=x` and `rm` with no operand are not. The parser does not read
+			// every operand as a path (`chmod -R 777 .` records none), so each one
+			// is checked as one too (#27): a mode or owner resolves inside the
+			// cwd and is bounded, `.` is the root and is not.
+			const operands = command.args.filter((arg) => arg !== "--" && !arg.startsWith("-"));
+			if (
+				name === "dd" ||
+				writes.length === 0 ||
+				!writesBounded ||
+				!operands.every((operand) => boundedTarget(resolve(action.cwd, operand)))
+			)
+				bounded = false;
 		} else if (name === "git" && command.args[0] === "push") {
 			destructive = true;
 			bounded = false;

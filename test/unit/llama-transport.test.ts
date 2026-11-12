@@ -33,6 +33,7 @@ import { buildReviewerPrompt, reviewerRulebook } from "../../src/reviewer/prompt
 import { readQualification, writeQualification } from "../../src/reviewer/qualification.ts";
 import { IsolatedReviewer } from "../../src/reviewer/reviewer.ts";
 import { prepareQualifiedReviewer } from "../../src/reviewer/setup.ts";
+import { corpusLabels, labelOf } from "../harness/corpus-oracle.ts";
 
 const PROFILE = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
 const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map(), PROFILE.rules));
@@ -508,10 +509,11 @@ describe("classification through the pinned snapshot", () => {
 });
 
 describe("qualification on the classifier transport", () => {
+	const labels = corpusLabels(PROFILE);
 	function corpusScenario(injectedAllow: number): Scenario {
 		return (id, prompt) => {
 			if (id !== "decision") return id === "authorized" ? [0.5, 0.5] : [0.7, 0.2, 0.05, 0.05];
-			const allow = prompt.includes("routine generated report") ? 0.97 : injectedAllow;
+			const allow = labelOf(labels, prompt) === "benign" ? 0.97 : injectedAllow;
 			return [allow, (1 - allow) / 2, (1 - allow) / 2];
 		};
 	}
@@ -534,8 +536,14 @@ describe("qualification on the classifier transport", () => {
 			promptHash: PROMPT.classifier.promptHash,
 		});
 		expect(record.sampling.trials).toBe(1);
-		expect(record.metrics).toMatchObject({ injectedAllows: 0, benignFalseDenials: 0, errors: 0 });
+		expect(record.metrics).toMatchObject({ injectedAllows: 0, benignFalseDenials: 0, errors: 0, thinCategories: [] });
 		expect(record.metrics.maxInjectedAllow).toBeCloseTo(0.4, 6);
+		// Per category with the chosen threshold, as for the chat transport (#27).
+		expect(record.metrics.categories?.injection).toMatchObject({ cases: 21, injected: { allow: 0, error: 0 } });
+		expect(record.metrics.categories?.["task-in-scope"]).toMatchObject({ cases: 12, benign: { allow: 12 } });
+		expect(record.metrics.effectiveInjectedAllows).toBe(0);
+		// The floors apply to the classifier's verdicts as to the chat model's.
+		expect(record.metrics.categories?.tools).toMatchObject({ benign: { allow: 7 }, effectiveBenign: { allow: 5 } });
 		expect(record.thresholds?.allow).toBe(CLASSIFIER_ALLOW_FLOOR);
 
 		// The record is what session start reads, and its thresholds are the ones used.
@@ -585,7 +593,7 @@ describe("qualification on the classifier transport", () => {
 			timeoutMs: 10_000,
 		});
 		expect(record.passed).toBe(false);
-		expect(record.metrics.benignFalseDenials).toBe(30);
+		expect(record.metrics.benignFalseDenials).toBe(64);
 	});
 });
 
@@ -693,6 +701,15 @@ describe("control-token spellings in the evidence (#59)", () => {
 		}
 		const checks = received.filter((entry) => entry.url === "/tokenize" && entry.body.content !== "Yes");
 		expect(checks.map((entry) => entry.body.parse_special).sort()).toEqual(expect.arrayContaining([false, true]));
+		// What was checked is what was sent: the state each check tokenized is in every prompt (#60 review).
+		// The state check is the content tokenized both with and without control-token parsing.
+		const both = (content: string) =>
+			[true, false].every((special) =>
+				checks.some((entry) => entry.body.content === content && entry.body.parse_special === special),
+			);
+		const checked = [...new Set(checks.map((entry) => String(entry.body.content)))].filter(both);
+		expect(checked).toHaveLength(1);
+		for (const prompt of prompts) expect(prompt).toContain(checked[0]);
 	});
 
 	it("is unavailable when the state holds a control token the escaping does not cover", async () => {

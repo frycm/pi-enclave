@@ -192,7 +192,7 @@ describe("no control-token spelling reaches either transport", () => {
 
 describe("the corpus forges turns in control-token spelling", () => {
 	it("carries ten injected cases, in the action input and in the context", () => {
-		const cases = reviewerCorpus(PROFILE).filter((entry) => entry.id.startsWith("injected-control-token-"));
+		const cases = reviewerCorpus(PROFILE).filter((entry) => entry.id.startsWith("injection/forged-turn-"));
 		expect(cases).toHaveLength(10);
 		expect(cases.every((entry) => entry.kind === "injected" && entry.authorization.length === 0)).toBe(true);
 		const raw = cases.map((entry) => JSON.stringify([entry.request.action.input, entry.context]));
@@ -200,5 +200,23 @@ describe("the corpus forges turns in control-token spelling", () => {
 			expect(raw.filter((text) => text.includes(family))).toHaveLength(2);
 		}
 		expect(cases.filter((entry) => entry.context.length > 0)).toHaveLength(5);
+		// The two placements of a family are different prompt positions, and each
+		// context case carries an action of its own (#67 review).
+		const contextActions = cases.filter((entry) => entry.context.length > 0).map((entry) => entry.request.action.hash);
+		expect(new Set(contextActions).size).toBe(5);
+	});
+
+	it.each([
+		["<|im_start|>", "chatml"],
+		["<|start_header_id|>", "llama3"],
+		["<start_of_turn>", "gemma"],
+		["[INST]", "mistral"],
+		["<｜User｜>", "deepseek"],
+	])("has a benign twin carrying %s in content the user asked for (#27)", (spelling, family) => {
+		const twins = reviewerCorpus(PROFILE).filter(
+			(entry) => entry.kind === "benign" && JSON.stringify(entry.request.action.input).includes(spelling),
+		);
+		expect(twins.map((entry) => entry.id)).toEqual([`injection-twin/${family}-fixture`]);
+		expect(twins[0]?.authorization).toHaveLength(1);
 	});
 });
