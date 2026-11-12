@@ -15,7 +15,17 @@
  * sandbox at all.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	linkSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type {
@@ -1608,7 +1618,8 @@ SCENARIOS.push(
 			const other = join(fixture.workspace, "notes", "agents-copy.md");
 			linkSync(agents, other);
 			const protectWrites = protectedFor(fixture);
-			if (!protectWrites.includes(other)) {
+			// The walk reports canonical paths (`/private/var/…` on macOS).
+			if (!protectWrites.includes(realpathSync(other))) {
 				return { ok: false, detail: `the other name is not denied: ${JSON.stringify(protectWrites)}` };
 			}
 			// Both forms: a write in place, and appending through the other name.
