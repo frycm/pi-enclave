@@ -50,9 +50,9 @@ function options(transport: ReviewerCompletion) {
 }
 
 describe("reviewer qualification", () => {
-	it("ships a stable 100-case corpus", () => {
+	it("ships a stable 110-case corpus", () => {
 		const corpus = reviewerCorpus(PROFILE);
-		expect(corpus).toHaveLength(100);
+		expect(corpus).toHaveLength(110);
 		expect(corpus.filter((entry) => entry.kind === "benign")).toHaveLength(30);
 		expect(reviewerCorpusHash(corpus)).toMatch(/^sha256:[0-9a-f]{64}$/);
 	});

@@ -73,9 +73,16 @@ async function routerJson(
 	target: Endpoint<ClassifierRuntimeModel>,
 	path: string,
 	signal: AbortSignal,
+	body?: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
 	const response = await fetch(`${serverRoot(target.model.baseUrl)}${path}`, {
-		headers: target.headers,
+		...(body
+			? {
+					method: "POST",
+					headers: { ...target.headers, "content-type": "application/json" },
+					body: JSON.stringify(body),
+				}
+			: { headers: target.headers }),
 		redirect: "error",
 		signal,
 	});
@@ -352,6 +359,54 @@ function checkedFetch(nCtx: number): typeof fetch {
 	};
 }
 
+/**
+ * The state as pi-ai's classifier renders it into every question's prompt
+ * (`renderState` in `llama-cpp-classify`), without the "State:" header.
+ */
+function renderedState(state: unknown): string {
+	return JSON.stringify(state, null, 1);
+}
+
+async function tokenIds(
+	target: Endpoint<ClassifierRuntimeModel>,
+	content: string,
+	parseSpecial: boolean,
+	signal: AbortSignal,
+): Promise<number[]> {
+	const body = await routerJson(target, "/tokenize", signal, {
+		model: target.model.id,
+		content,
+		add_special: false,
+		parse_special: parseSpecial,
+	});
+	if (!Array.isArray(body.tokens) || !body.tokens.every((token) => typeof token === "number")) {
+		fail("llama.cpp returned an unexpected tokenization");
+	}
+	return body.tokens as number[];
+}
+
+/**
+ * The rendered evidence spells no control-token character (#59), but a model
+ * may have control tokens built from other characters. llama-server parses
+ * control tokens in the prompt it is given, so the state is tokenized with and
+ * without that parsing: any difference means some text in the evidence would
+ * reach the model as a control token, and the review is refused, never judged.
+ */
+async function checkStateTokens(
+	target: Endpoint<ClassifierRuntimeModel>,
+	state: unknown,
+	signal: AbortSignal,
+): Promise<void> {
+	const content = renderedState(state);
+	const [plain, special] = await Promise.all([
+		tokenIds(target, content, false, signal),
+		tokenIds(target, content, true, signal),
+	]);
+	if (plain.length !== special.length || plain.some((token, index) => token !== special[index])) {
+		fail("the reviewer evidence contains text that llama.cpp reads as control tokens");
+	}
+}
+
 async function classifySnapshot(
 	target: Endpoint<ClassifierRuntimeModel>,
 	request: ClassifyRequest,
@@ -395,6 +450,7 @@ export function resolveReviewerClassifier(registry: ModelRegistry, reference: st
 			const identity = await classifierIdentity(target, request.signal);
 			const actual = identity.digest;
 			if (actual !== expected) fail("reviewer identity changed; requalification required");
+			await checkStateTokens(target, request.state, request.signal);
 			const answers = await classifySnapshot(target, request, identity.nCtx);
 			if (
 				(await classifierDigest(target, request.signal)) !== actual ||

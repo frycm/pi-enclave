@@ -88,8 +88,9 @@ function boundedViolation(value: NonNullable<ReviewEvidence["violation"]>): NonN
 	};
 }
 
-function serializedBytes(value: unknown): number {
-	return Buffer.byteLength(JSON.stringify(value));
+/** Measured on what is sent, so the escaping of #59 counts against the bound. */
+function serializedBytes(value: ReviewEvidence): number {
+	return Buffer.byteLength(renderReviewEvidence(value));
 }
 
 /**
@@ -239,7 +240,45 @@ export function buildReviewEvidence(options: BuildEvidenceOptions, fits?: Eviden
 	return minimal;
 }
 
-/** Stable because object construction above fixes every key's order. */
+/**
+ * Characters chat-template control tokens are spelled with (#59): `<|im_end|>`,
+ * `<|eot_id|>`, `<start_of_turn>`, `</s>`, `[INST]`, `<｜User｜>`. Runtimes
+ * tokenize the rendered template with special-token parsing on, so the same
+ * spelling inside the evidence could close the user turn and open a forged one.
+ * The backslash is included so that a literal `\u003c` in the input stays
+ * distinguishable from an escaped `<`.
+ */
+const CONTROL_CHARACTERS = /[\\<>|[\]\uff5c]/gu;
+
+/** Told to the model on both transports, so it reads the escapes as the characters. */
+export const EVIDENCE_ESCAPES =
+	"Evidence strings show \\ < > | [ ] as \\u005c \\u003c \\u003e \\u007c \\u005b \\u005d.";
+
+function neutralizedText(value: string): string {
+	return value.replace(CONTROL_CHARACTERS, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/** A copy whose strings, keys included, spell no control-token character. */
+export function neutralizeEvidence(value: unknown): unknown {
+	if (typeof value === "string") return neutralizedText(value);
+	if (Array.isArray(value)) return value.map(neutralizeEvidence);
+	if (value && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value).map(([key, entry]) => [neutralizedText(key), neutralizeEvidence(entry)]),
+		);
+	}
+	return value;
+}
+
+/**
+ * The text both transports send. Stable because object construction above
+ * fixes every key's order. Every string is neutralized (#59): the characters
+ * control tokens are built from appear only as the six-character text
+ * `\u003c` and so on, which survives pi-ai's re-serialization of the
+ * classifier state, where a JSON escape would be decoded and lost. The
+ * evidence object itself, which the deterministic checks and the audit log
+ * use, keeps the original text.
+ */
 export function renderReviewEvidence(evidence: ReviewEvidence): string {
-	return JSON.stringify(evidence);
+	return JSON.stringify(neutralizeEvidence(evidence));
 }
