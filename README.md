@@ -856,7 +856,34 @@ text the agent could have written.
 `rules.protectedPaths` is the path-shaped half of L1: `{ "deny": [glob…], "ask": [glob…] }`,
 matched against every resolved path the canonical action writes to (file tools directly;
 shell commands via the write-target heuristic, with the same "unknown means mutating"
-rule as the read-only classifier). Both lists are supersets under the fold. Because no
+rule as the read-only classifier). Both lists are supersets under the fold.
+
+**Directory operands and hard links (#72).** A pattern every route to which names it
+(`**/AGENTS.md`, or `**/.husky/**` and `infra/**`, whose first segment is protected by
+itself) is held by comparing operands. A pattern with more than one segment whose first
+segment is an ordinary name (built-in `**/.github/workflows/**` and `**/.vscode/tasks.json`,
+a user-global `deploy/prod/*.yml`) is not, because a command can reach it through that name.
+For those patterns L1 also asks when:
+
+- `rm`, `mv` or a hard-linking `cp -l`/`cp -al`/`ln` names a directory that holds a match
+  (`mv .github gh2`, `rm -rf deploy`, `cp -al .github gh-backup`);
+- a `cp`, `mv` or `ln -s` would create a match, judged by whether the destination is an
+  existing directory (`mv gh2 .github` when `.github` is gone, `cp -r s/workflows .github/`,
+  `-t` and `-T` included); when the source does not exist yet, or an earlier command on the
+  same line could change it, by whether the destination could hold a match at all;
+- a write goes to a file with more than one hard link (`echo x > gh-backup/workflows/ci.yml`,
+  and the write and edit tools), since another name of it may be protected and finding the
+  other names would mean walking every root.
+
+These are asks, whichever list names the pattern. A directory too large to look through
+(200,000 entries) asks as well. The look costs about 1 µs per entry for a removal and 3 µs
+for a copy (110 ms and 270 ms for `rm -rf` and `cp -r` of a 101,000-entry `node_modules`),
+and only for those commands. A middle step of a rename sequence (`echo x >
+gh2/workflows/ci.yml` after `mv .github gh2`) is an ordinary write and stays allowed; the
+moves on either side of it ask. `rsync` and `install` already need a person, and other
+programs that move trees (`git mv`, `find -delete`, archive extraction) are judged as before.
+
+Because no
 static shell projection can see writes hidden in sourced scripts, interpreters, archives,
 project executables or build/package runners, those dispatch forms clear parse confidence
 and require a person. Inline environment assignments, shell dispatchers such as `trap` and
