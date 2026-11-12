@@ -64,6 +64,10 @@ export interface EnclaveState {
 	auditPath?: string;
 	/** True once an audit write has failed. Shown without being asked for. */
 	auditDegraded?: boolean;
+	/** Present when `audit.syslog` is set: true once the mirror has stopped. */
+	auditSyslogStopped?: boolean;
+	/** How many session logs retention kept past the size budget for holding an incident. */
+	auditKeptForIncidents?: number;
 }
 
 /** What the sandbox covers, and what it does not. Shown in `status`. */
@@ -103,6 +107,7 @@ export function renderStatusLine(state: EnclaveState): string {
 	// A log that has stopped recording is a weakened boundary, and the rule
 	// this module follows is that those appear without being asked for.
 	if (state.auditDegraded) parts.push("AUDIT FAILING");
+	else if (state.auditSyslogStopped) parts.push("AUDIT SYSLOG STOPPED");
 	if (state.breaker?.open) parts.push("BREAKER OPEN");
 	else if (state.breaker && state.breaker.consecutive > 0) {
 		parts.push(`breaker ${state.breaker.consecutive}/${state.breaker.limit}`);
@@ -174,8 +179,18 @@ export function renderStatus(state: EnclaveState): string {
 			`attended:   ${state.attendance ?? state.effective.attended.mode}`,
 			`breaker:    ${state.breaker?.open ? "OPEN -- the turn is stopped" : `${state.breaker?.consecutive ?? 0} of ${state.effective.breaker.consecutive} consecutive`}`,
 			`audit:      ${state.auditPath ?? "(not open)"}${state.auditDegraded ? `   ${state.effective.audit.required ? "NOT RECORDING -- tool calls are refused (audit.required)" : "WRITES ARE FAILING"}` : ""}`,
-			`            ${describeAudit(state.effective.audit)}`,
+			`            ${describeAudit(state.effective.audit, state.auditSyslogStopped)}`,
 		);
+		if (state.auditSyslogStopped) {
+			lines.push(
+				`            the syslog mirror STOPPED${state.effective.audit.required ? " -- tool calls are refused (audit.required)" : "; the head is kept beside the log only"}`,
+			);
+		}
+		if (state.auditKeptForIncidents) {
+			lines.push(
+				`            over retentionMb: ${state.auditKeptForIncidents} session log(s) kept because they hold incidents`,
+			);
+		}
 		if (state.sources) lines.push("sources:", renderSources(state.sources));
 	}
 	return lines.join("\n");
@@ -262,9 +277,14 @@ function renderRules(state: EnclaveState, argv: readonly string[]): CommandOutpu
 	}
 }
 
-function describeAudit(audit: EffectiveProfile["audit"]): string {
+function describeAudit(audit: EffectiveProfile["audit"], syslogStopped = false): string {
+	const syslog = !audit.syslog
+		? "; no syslog mirror"
+		: syslogStopped
+			? "; syslog mirror stopped"
+			: " and in syslog (authpriv)";
 	return [
-		`head anchor beside the log${audit.syslog ? " and in syslog (authpriv)" : "; no syslog mirror"}`,
+		`head anchor beside the log${syslog}`,
 		`${audit.sessionMaxMb} MB per session`,
 		audit.required ? "required: a failed write stops the session" : "not required",
 		`retention ${audit.retentionDays} days / ${audit.retentionMb} MB`,

@@ -203,24 +203,30 @@ async function runApprove(argv: string[]): Promise<number> {
 	// goes to its own log rather than the originating session's, which may
 	// still be open in a pi process that owns that file's chain.
 	const auditSettings = loaded.profile.audit;
+	const mirror = auditSettings.syslog
+		? createSyslogMirror((error) =>
+				process.stderr.write(`pi-enclave: the audit syslog mirror stopped: ${error.message}\n`),
+			)
+		: undefined;
 	const approvals = new AuditLog({
 		dir: ensureStateDirs().audit,
 		sessionId: "approvals",
 		readDeny: loaded.profile.sandbox.readDeny,
 		maxBytes: auditSettings.sessionMaxMb * 1024 * 1024,
-		...(auditSettings.syslog
-			? {
-					mirror: createSyslogMirror((error) =>
-						process.stderr.write(`pi-enclave: the audit syslog mirror stopped: ${error.message}\n`),
-					),
-				}
-			: {}),
+		...(mirror ? { mirror } : {}),
 		onError: (error) => process.stderr.write(`pi-enclave: audit write failed: ${error.message}\n`),
 	});
+	/** Under audit.required, an approval runs only once its record is on disk. */
+	const recordApproval = async (fields: Record<string, unknown>): Promise<boolean> => {
+		approvals.append("approval", fields);
+		if (!auditSettings.required) return true;
+		await approvals.flush();
+		return !approvals.degraded && !mirror?.stopped;
+	};
 	const rl = createInterface({ input: process.stdin, output: process.stdout });
 	try {
 		const result = await approve({
-			audit: (fields) => approvals.append("approval", fields),
+			audit: recordApproval,
 			record: read.record,
 			stateRoot: dirs.state,
 			current: loaded.profile,

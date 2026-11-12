@@ -27,13 +27,18 @@ import { anchorPathFor, readAnchor, writeAnchor } from "./audit.ts";
 
 /** Record kinds that make a session worth keeping past the size budget. */
 const INCIDENT_KINDS = ["breaker", "violation", "approval"];
+/** `audit` records that are evidence of tampering, rather than the cap being reached. */
+const INCIDENT_AUDIT_EVENTS = ["tail-missing", "tail-differs"];
 
 function holdsIncident(path: string): boolean {
 	try {
 		const text = readFileSync(path, "utf8");
 		// The record's own `kind` is serialized as-is; the same text inside a
 		// string field would be escaped (\"kind\"), so this does not match it.
-		return INCIDENT_KINDS.some((kind) => text.includes(`"kind":"${kind}"`));
+		if (INCIDENT_KINDS.some((kind) => text.includes(`"kind":"${kind}"`))) return true;
+		return (
+			text.includes(`"kind":"audit"`) && INCIDENT_AUDIT_EVENTS.some((event) => text.includes(`"event":"${event}"`))
+		);
 	} catch {
 		return false;
 	}

@@ -69,9 +69,11 @@ export interface ApproveOptions {
 	/**
 	 * Receives an `approval` audit record when execution starts and when the
 	 * command ends, however it ends (#37). The CLI writes them to the audit
-	 * directory's `approvals` log.
+	 * directory's `approvals` log. Returning `false` for the `executing` record
+	 * says it is not on disk; nothing runs and the record stays pending. The
+	 * CLI does that only under `audit.required`.
 	 */
-	audit?: (fields: Record<string, unknown>) => void;
+	audit?: (fields: Record<string, unknown>) => unknown;
 	/** Who is approving. Injected by tests. */
 	approver?: () => Record<string, unknown>;
 }
@@ -109,7 +111,7 @@ export type ApproveResult =
 	| { outcome: "unsupported"; reason: string };
 
 export async function approve(options: ApproveOptions): Promise<ApproveResult> {
-	if (!options.audit) return approveOnce(options, () => {});
+	if (!options.audit) return approveOnce(options, () => undefined);
 	const record = options.record;
 	const command = record.action.tool === "bash" ? boundedText(record.action.input.command) : {};
 	const base = {
@@ -126,6 +128,8 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 	const started = performance.now();
 	const emit = options.audit;
 	const result = await approveOnce(options, () => emit({ ...base, event: "executing" }));
+	// The outcome is recorded whatever it was; a refusal for an unrecorded
+	// approval is attempted too, and simply fails the same way.
 	emit({
 		...base,
 		event: result.outcome,
@@ -136,7 +140,11 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 	return result;
 }
 
-async function approveOnce(options: ApproveOptions, onExecuting: () => void): Promise<ApproveResult> {
+async function approveOnce(
+	options: ApproveOptions,
+	/** `false` (or a promise of it) means the executing record did not land. */
+	onExecuting: () => unknown,
+): Promise<ApproveResult> {
 	const { record, io, current } = options;
 	const initialConfigHash = configHash(current);
 	const expired = () => Date.parse(record.expiresAt) <= (options.now?.() ?? Date.now());
@@ -297,11 +305,17 @@ async function approveOnce(options: ApproveOptions, onExecuting: () => void): Pr
 		const changedAfterCompile = changedConfig();
 		if (changedAfterCompile) return changedAfterCompile;
 
+		// Recorded before the rename, so under audit.required an approval that
+		// cannot be recorded leaves the record pending and runs nothing (#37).
+		if ((await onExecuting()) === false) {
+			const reason = "the audit log could not record this approval, and audit.required is set; nothing ran";
+			io.err(`\npi-enclave: ${reason}. The record is left pending.`);
+			return { outcome: "refused", reason };
+		}
 		// Rename immediately before execution. A crash mid-run leaves visible
 		// evidence in approved/ that the action may have run, and the audit log
 		// records the same moment.
 		transition(options.stateRoot, record.sessionId, record.nonce, "pending", "approved");
-		onExecuting();
 
 		if (tool === "bash") {
 			const command = action.input.command;

@@ -746,6 +746,30 @@ describe("the approval audit record (#37)", () => {
 		expect(typeof records[1]?.durationMs).toBe("number");
 	});
 
+	it("runs nothing and leaves the record pending when the executing record does not land", async () => {
+		const backend = new RecordingBackend();
+		const records: Record<string, unknown>[] = [];
+		const result = await approve({
+			record: record("bash", { command: "git push origin main" }),
+			stateRoot,
+			current: profile(),
+			home: TEST_HOME,
+			io: io().make(true),
+			backend,
+			// What the CLI returns under audit.required when the write failed.
+			audit: async (fields) => {
+				records.push(fields);
+				return false;
+			},
+			approver: who,
+		});
+		expect(result).toMatchObject({ outcome: "refused" });
+		expect(String((result as { reason: string }).reason)).toContain("audit.required");
+		expect(backend.commands).toHaveLength(0);
+		expect(readdirSync(pendingDirs(stateRoot, SESSION).pending)).toEqual([`${NONCE}.json`]);
+		expect(records.map((entry) => entry.event)).toEqual(["executing", "refused"]);
+	});
+
 	it("records a declined approval, with nothing executed", async () => {
 		const records: Record<string, unknown>[] = [];
 		await approve({

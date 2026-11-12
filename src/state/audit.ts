@@ -64,7 +64,7 @@ import type { EffectiveProfile } from "../config/types.ts";
 import type { CanonicalAction } from "../policy/canonical.ts";
 import type { RuleMatch } from "../policy/match.ts";
 import type { ReviewerResult } from "../reviewer/types.ts";
-import { redact } from "./redact.ts";
+import { redact, redactString } from "./redact.ts";
 
 export type AuditKind =
 	| "session_start"
@@ -104,10 +104,25 @@ function hashLine(line: string): string {
 /** Longest command or reviewer text stored in one record. */
 export const MAX_AUDIT_TEXT = 8192;
 
-/** A bounded copy of free text, with a flag when it was cut. */
+/**
+ * A bounded copy of free text, with a flag when it was cut.
+ *
+ * Redacted *before* it is cut: cut first, a credential straddling the limit
+ * loses the tail the pattern needs and its prefix is stored as plain text (a
+ * `ghp_` token cut to 20 characters no longer matches). The cut also never
+ * lands inside a redaction marker, so a stored marker is always whole.
+ */
 export function boundedText(value: unknown, max = MAX_AUDIT_TEXT): { text?: string; truncated?: true } {
 	if (typeof value !== "string") return {};
-	return value.length > max ? { text: value.slice(0, max), truncated: true } : { text: value };
+	const redacted = redactString(value);
+	if (redacted.length <= max) return { text: redacted };
+	let cut = max;
+	const open = redacted.lastIndexOf("<redacted:", cut);
+	if (open !== -1 && open < cut) {
+		const close = redacted.indexOf(">", open);
+		if (close === -1 || close >= cut) cut = open;
+	}
+	return { text: redacted.slice(0, cut), truncated: true };
 }
 
 /** The newest record of a log, as the anchor and the syslog mirror keep it. */
@@ -423,16 +438,19 @@ export function userCommandFields(options: {
 	command: string;
 	cwd: string;
 	excludeFromContext: boolean;
+	/** `started` before it runs, `finished` (the default) once it has. */
+	event?: "started" | "finished";
 	exitCode?: number | null;
-	durationMs: number;
+	durationMs?: number;
 	error?: string;
 }): Record<string, unknown> {
 	return {
+		event: options.event ?? "finished",
 		...commandFields(options.command),
 		cwd: options.cwd,
 		excludeFromContext: options.excludeFromContext,
 		...(options.exitCode !== undefined ? { exitCode: options.exitCode } : {}),
-		durationMs: Math.round(options.durationMs),
+		...(options.durationMs !== undefined ? { durationMs: Math.round(options.durationMs) } : {}),
 		...(options.error !== undefined ? { error: boundedText(options.error, 1024).text } : {}),
 	};
 }
@@ -572,6 +590,7 @@ export function verifyLog(path: string, options: VerifyOptions = {}): VerifyResu
 	let expectedPrev = GENESIS;
 	let expectedSeq = 1;
 	let count = 0;
+	let anchored = false;
 
 	for (const line of complete) {
 		if (line === "") continue;
@@ -602,6 +621,18 @@ export function verifyLog(path: string, options: VerifyOptions = {}): VerifyResu
 		expectedPrev = hashLine(line);
 		expectedSeq = record.seq + 1;
 		count++;
+		if (record.kind === "session_start" && (record as { anchored?: unknown }).anchored === true) anchored = true;
+	}
+
+	// The log says it was written with an anchor; a missing one was deleted,
+	// which is exactly what someone removing the newest records would do.
+	if (anchorPath && !anchor && anchored) {
+		return {
+			ok: false,
+			records: count,
+			truncatedTail,
+			problem: `the log was written with a head anchor, but ${anchorPath} is missing -- it was deleted, so a removal of the newest records cannot be ruled out`,
+		};
 	}
 
 	if (anchor && !anchor.retired) {

@@ -176,7 +176,7 @@ describe("a session's audit trail (#37)", () => {
 			)) as { operations: { exec: (c: string, cwd: string, o: { onData: () => void }) => Promise<unknown> } };
 			await answer.operations.exec("prefix; systemctl status nginx", ws, { onData: () => {} });
 			await s.flush();
-			expect(s.records().find((entry) => entry.kind === "user_command")).toMatchObject({
+			expect(s.records().find((entry) => entry.kind === "user_command" && entry.event === "finished")).toMatchObject({
 				command: "systemctl status nginx",
 				cwd: ws,
 				excludeFromContext: true,
@@ -194,15 +194,63 @@ describe("a session's audit trail (#37)", () => {
 				profile.audit.required = true;
 			});
 			expect((await s.call("t1", "ls")).block).toBeFalsy();
+			expect(mocks.runs.map((run) => run.command)).toEqual([expect.stringContaining("ls")]);
 			// A directory where the log file was: every later append fails, even as root.
 			rmSync(s.auditPath);
 			mkdirSync(s.auditPath);
-			await s.call("t2", "ls");
-			await s.handlers.get("session_shutdown")?.({}, s.context);
-			const blocked = await s.call("t3", "ls");
+			// The call whose own decision record fails is the first one refused:
+			// nothing runs unrecorded.
+			const unrecorded = await s.call("t2", "ls second");
+			expect(unrecorded).toMatchObject({ block: true, terminate: true });
+			expect(unrecorded.reason).toContain("audit.required");
+			const blocked = await s.call("t3", "ls third");
 			expect(blocked).toMatchObject({ block: true, terminate: true });
-			expect(blocked.reason).toContain("audit.required");
+			expect(mocks.runs).toHaveLength(1);
 			expect(stderr).toHaveBeenCalledWith(expect.stringContaining("audit.required is set"));
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	it("with audit.required, records a ! command before it runs and refuses one it cannot record", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			const s = await session((profile) => {
+				profile.audit.required = true;
+			});
+			const run = async (command: string) => {
+				const answer = (await s.handlers.get("user_bash")?.(
+					{ type: "user_bash", command, cwd: ws, excludeFromContext: false },
+					s.context,
+				)) as { operations: { exec: (c: string, cwd: string, o: { onData: () => void }) => Promise<unknown> } };
+				return answer.operations.exec(command, ws, { onData: () => {} });
+			};
+			await run("uptime");
+			await s.flush();
+			const recorded = s.records().filter((entry) => entry.kind === "user_command");
+			expect(recorded.map((entry) => entry.event)).toEqual(["started", "finished"]);
+			rmSync(s.auditPath);
+			mkdirSync(s.auditPath);
+			await expect(run("uptime again")).rejects.toThrow(/audit\.required/);
+			expect(mocks.runs.map((entry) => entry.command)).toEqual([expect.stringContaining("uptime")]);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	it("records exit codes per call, so identical commands in one batch keep their own", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			const s = await session();
+			await s.call("a", "ls fails");
+			await s.call("b", "ls fails");
+			await s.flush();
+			const executed = s.records().filter((entry) => entry.kind === "executed");
+			expect(executed.map((entry) => [entry.toolCallId, entry.exitCode])).toEqual([
+				["a", 3],
+				["b", 3],
+			]);
+			expect(s.records().find((entry) => entry.kind === "session_start")).toMatchObject({ anchored: true });
 		} finally {
 			stderr.mockRestore();
 		}

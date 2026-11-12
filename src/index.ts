@@ -101,7 +101,7 @@ import {
 } from "./state/audit.ts";
 import { ensureStateDirs, StateDirError, stateDirs } from "./state/dir.ts";
 import { applyRetention } from "./state/retention.ts";
-import { createSyslogMirror } from "./state/syslog.ts";
+import { createSyslogMirror, type SyslogMirror } from "./state/syslog.ts";
 import { BASH_PROMPT_GUIDELINES, createEnclaveBashOperations } from "./tools/bash.ts";
 import {
 	createEditOperations,
@@ -337,12 +337,44 @@ export default function (pi: ExtensionAPI): void {
 	 * `executed` record that follows a `decision: allow` (#37).
 	 */
 	const executions = new Map<string, { tool: string; hash: string; turnIndex: number }>();
+	/**
+	 * By tool call id, not action hash: two identical commands in one batch
+	 * share a hash, and the second exit code would be reported for both.
+	 */
 	const exitCodes = new Map<string, number | null>();
-	/** Set when `audit.required` is on and the log stopped recording. */
-	const requiredAuditIssue = (): string | undefined =>
-		effective?.audit.required && audit?.degraded
-			? `pi-enclave: the audit log is not recording (${audit.full ? "the session reached audit.sessionMaxMb" : "a write failed"}), and audit.required is set, so nothing more may run in this session.`
+	/** The tool call each executing bash action belongs to, for its exit code. */
+	const callOfAction = new WeakMap<object, string>();
+	/** The syslog copy of the head, when `audit.syslog` is set. */
+	let syslogMirror: SyslogMirror | undefined;
+	/** Sessions retention kept past the size budget because they hold an incident. */
+	let keptForIncidents: string[] = [];
+	/**
+	 * Set when `audit.required` is on and the trail stopped recording: the log
+	 * itself, or the syslog mirror the configuration asked for.
+	 */
+	const requiredAuditIssue = (): string | undefined => {
+		if (!effective?.audit.required) return undefined;
+		const why = audit?.degraded
+			? audit.full
+				? "the session reached audit.sessionMaxMb"
+				: "a write failed"
+			: syslogMirror?.stopped
+				? "the syslog mirror stopped"
+				: undefined;
+		return why
+			? `pi-enclave: the audit log is not recording (${why}), and audit.required is set, so nothing more may run in this session.`
 			: undefined;
+	};
+	/**
+	 * Under `audit.required`, wait for the queued records to land and say
+	 * whether the trail is still recording. Without the wait the record of the
+	 * very call being allowed could fail after the call ran.
+	 */
+	const auditLanded = async (): Promise<string | undefined> => {
+		if (!effective?.audit.required) return undefined;
+		await audit?.flush();
+		return requiredAuditIssue();
+	};
 	let attendance: AttendanceState = { configured: "off", effective: "off" };
 	/** Rebuilt per escalation from the live context, so a lost channel is seen. */
 	let uiContext: ConfirmUI | undefined;
@@ -374,7 +406,9 @@ export default function (pi: ExtensionAPI): void {
 
 	const guardCommand = (command: string) => {
 		if (lockNotApplicable()) return undefined;
-		return lock.beginExecution(`bash:${command}`).action;
+		const entry = lock.beginExecution(`bash:${command}`);
+		callOfAction.set(entry.action, entry.toolCallId);
+		return entry.action;
 	};
 	const guardPath = (tool: string, path: string) => {
 		if (lockNotApplicable()) return undefined;
@@ -399,6 +433,8 @@ export default function (pi: ExtensionAPI): void {
 		...(provenance ? { provenance } : {}),
 		...(sources ? { sources } : {}),
 		...(audit ? { auditPath: audit.path, auditDegraded: audit.degraded } : {}),
+		...(syslogMirror ? { auditSyslogStopped: syslogMirror.stopped } : {}),
+		...(keptForIncidents.length > 0 ? { auditKeptForIncidents: keptForIncidents.length } : {}),
 		attendance: describeAttendance(attendance),
 		pendingRoot: stateDirs().state,
 		...(sessionId !== undefined ? { sessionId } : {}),
@@ -517,7 +553,8 @@ export default function (pi: ExtensionAPI): void {
 		onViolations: (found) => recordViolations(found, true),
 		onDeniedReadAttempt: (paths) => recordRuntimeViolation(breaker, currentTurn, paths.length, true),
 		onExit: (exitCode, action) => {
-			if (action) exitCodes.set(action.hash, exitCode);
+			const toolCallId = action ? callOfAction.get(action) : undefined;
+			if (toolCallId !== undefined) exitCodes.set(toolCallId, exitCode);
 		},
 		guard: guardCommand,
 	});
@@ -611,6 +648,20 @@ export default function (pi: ExtensionAPI): void {
 							...fields,
 						}),
 					);
+				// Recorded before it runs as well as after, so a command that never
+				// finishes (a killed session, a hung process) is still in the trail,
+				// and under audit.required one that cannot be recorded never runs.
+				audit?.append(
+					"user_command",
+					userCommandFields({
+						command: event.command,
+						cwd: event.cwd,
+						excludeFromContext: event.excludeFromContext,
+						event: "started",
+					}),
+				);
+				const unrecorded = await auditLanded();
+				if (unrecorded) throw new Error(unrecorded);
 				try {
 					const result = await userBashWithTripwire.exec(...args);
 					record({ exitCode: result.exitCode ?? null });
@@ -808,6 +859,16 @@ export default function (pi: ExtensionAPI): void {
 				reviewContext.splice(0, reviewContext.length - MAX_CONTEXT_ENTRIES);
 			}
 		}
+		if (!decision.block) {
+			// The decision record is queued inside decide(); under audit.required
+			// the call runs only once it is on disk (#37).
+			const unrecorded = await auditLanded();
+			if (unrecorded) {
+				lock.consume(event.toolCallId);
+				refreshStatusLine?.();
+				return { block: true, terminate: true, reason: unrecorded };
+			}
+		}
 		refreshStatusLine?.();
 		if (!decision.block) {
 			if (ownedTool) queuedOwnedCall = true;
@@ -910,9 +971,9 @@ export default function (pi: ExtensionAPI): void {
 		const pending = executions.get(event.toolCallId);
 		if (!pending) return;
 		executions.delete(event.toolCallId);
-		const hasExit = exitCodes.has(pending.hash);
-		const exitCode = exitCodes.get(pending.hash);
-		exitCodes.delete(pending.hash);
+		const hasExit = exitCodes.has(event.toolCallId);
+		const exitCode = exitCodes.get(event.toolCallId);
+		exitCodes.delete(event.toolCallId);
 		audit?.append(
 			"executed",
 			executedFields({
@@ -1049,13 +1110,31 @@ export default function (pi: ExtensionAPI): void {
 		try {
 			const dirs = ensureStateDirs();
 			qualifiedDir = dirs.qualified;
-			applyRetention({
+			const retention = applyRetention({
 				dir: dirs.audit,
 				retentionDays: loaded.profile.audit.retentionDays,
 				retentionMb: loaded.profile.audit.retentionMb,
 				keepSessionId: ctx.sessionManager.getSessionId(),
 			});
+			keptForIncidents = retention.keptForIncidents;
+			if (keptForIncidents.length > 0) {
+				const message =
+					`pi-enclave: the audit directory is over audit.retentionMb (${loaded.profile.audit.retentionMb} MB) ` +
+					`because ${keptForIncidents.length} session log(s) hold incidents (breaker, violation, approval or tampering) ` +
+					"and are never deleted for size. Review and archive them, or raise the budget.";
+				process.stderr.write(`${message}\n`);
+				ctx.ui.notify(message, "warning");
+			}
 			const auditSettings = loaded.profile.audit;
+			syslogMirror = auditSettings.syslog
+				? createSyslogMirror((error) => {
+						process.stderr.write(`pi-enclave: the audit syslog mirror stopped: ${error.message}\n`);
+						if (auditSettings.required) {
+							process.stderr.write("pi-enclave: audit.required is set, so no further tool call will run.\n");
+						}
+						refreshStatusLine?.();
+					})
+				: undefined;
 			const auditError = (error: Error) => {
 				process.stderr.write(`pi-enclave: audit write failed: ${error.message}\n`);
 				if (auditSettings.required) {
@@ -1068,17 +1147,18 @@ export default function (pi: ExtensionAPI): void {
 				sessionId: ctx.sessionManager.getSessionId(),
 				readDeny: loaded.profile.sandbox.readDeny,
 				maxBytes: auditSettings.sessionMaxMb * 1024 * 1024,
-				...(auditSettings.syslog
-					? {
-							mirror: createSyslogMirror((error) =>
-								process.stderr.write(`pi-enclave: the audit syslog mirror stopped: ${error.message}\n`),
-							),
-						}
-					: {}),
+				...(syslogMirror ? { mirror: syslogMirror } : {}),
 				onError: auditError,
 			});
 			audit.touch();
-			audit.append("session_start", { pi: PI_VERSION ?? null, backend: backend.name, weakened: backend.weakened });
+			audit.append("session_start", {
+				pi: PI_VERSION ?? null,
+				backend: backend.name,
+				weakened: backend.weakened,
+				// Lets verify tell a log whose anchor was deleted from one written
+				// before anchors existed.
+				...(audit.anchorPath ? { anchored: true } : {}),
+			});
 			audit.append(
 				"config",
 				configFields(

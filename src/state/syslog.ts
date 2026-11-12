@@ -23,6 +23,13 @@ export function syslogLine(head: AuditHead): string {
 	return `audit session=${head.sessionId} seq=${head.seq} kind=${head.kind} head=${head.head}`;
 }
 
+/** An `AuditLog` mirror that can say it has stopped. */
+export interface SyslogMirror {
+	(head: AuditHead): void;
+	/** True once a send failed; nothing more is sent. Shown in status, and refuses under `audit.required`. */
+	readonly stopped: boolean;
+}
+
 /**
  * A mirror for `AuditLog`. The first failure is reported and the mirror stops,
  * so a missing `logger` does not fill stderr.
@@ -30,7 +37,7 @@ export function syslogLine(head: AuditHead): string {
 export function createSyslogMirror(
 	onError: (error: Error) => void,
 	loggerPath: string | null = LOGGER_PATHS.find((path) => existsSync(path)) ?? null,
-): (head: AuditHead) => void {
+): SyslogMirror {
 	let broken = false;
 	const fail = (error: Error) => {
 		if (broken) return;
@@ -40,7 +47,7 @@ export function createSyslogMirror(
 	if (!loggerPath) {
 		fail(new Error(`audit.syslog is set but no logger was found at ${LOGGER_PATHS.join(" or ")}`));
 	}
-	return (head) => {
+	const send = (head: AuditHead) => {
 		if (broken || !loggerPath) return;
 		try {
 			const child = spawn(loggerPath, ["-p", "authpriv.info", "-t", "pi-enclave", "--", syslogLine(head)], {
@@ -55,4 +62,6 @@ export function createSyslogMirror(
 			fail(error as Error);
 		}
 	};
+	Object.defineProperty(send, "stopped", { get: () => broken, enumerable: true });
+	return send as SyslogMirror;
 }

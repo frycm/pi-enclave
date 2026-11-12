@@ -104,6 +104,37 @@ describe("what a decision record holds", () => {
 		await audit.flush();
 		expect(readFileSync(audit.path, "utf8")).not.toContain("abcdefghijklmnopqrstuvwxyz0123456789");
 	});
+
+	it("redacts before it bounds, so a secret across the cut leaves no prefix", async () => {
+		const token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+		// Placed so the 8 KiB cut falls 23 characters into the token.
+		const command = `echo ${"x".repeat(MAX_AUDIT_TEXT - 5 - 23)}${token} done`;
+		const audit = new AuditLog({ dir: root, sessionId: "straddle" });
+		const fields = decisionFields({
+			action: action(command),
+			outcome: "allow",
+			matches: [],
+			turnIndex: 1,
+			attended: "off",
+		});
+		const reviewer = reviewerVerdictFields(
+			{
+				ok: false,
+				kind: "invalid",
+				reason: `${"y".repeat(2048 - 10)}${token}`,
+			} as unknown as ReviewerResult,
+			{ action: action("ls"), trigger: "crossing" },
+		);
+		const user = userCommandFields({ command, cwd: "/work", excludeFromContext: false });
+		for (const body of [fields, reviewer, user]) audit.append("decision", body);
+		await audit.flush();
+		const text = readFileSync(audit.path, "utf8");
+		expect(text).not.toContain("ghp_A1b2C3d4E5f6G7h8I9j");
+		expect(text).not.toContain("ghp_A1b2");
+		expect(fields.commandTruncated).toBe(true);
+		// The cut never splits a marker.
+		expect(String(fields.command)).not.toMatch(/<redacted:[^>]*$/);
+	});
 });
 
 describe("records that follow a decision", () => {
@@ -138,6 +169,7 @@ describe("records that follow a decision", () => {
 				durationMs: 40,
 			}),
 		).toEqual({
+			event: "finished",
 			command: "systemctl status nginx",
 			cwd: "/srv",
 			excludeFromContext: true,
@@ -274,6 +306,28 @@ describe("the head anchor", () => {
 		mirror({ sessionId: "s", seq: 2, head: "sha256:y", kind: "decision", ts: "t" });
 		expect(errors).toHaveLength(1);
 		expect(errors[0]?.message).toContain("no logger was found");
+		// Stopped is visible, so status and audit.required can act on it.
+		expect(mirror.stopped).toBe(true);
+	});
+
+	it("starts a working mirror as not stopped", () => {
+		const mirror = createSyslogMirror(() => {}, "/bin/true");
+		expect(mirror.stopped).toBe(false);
+	});
+
+	it("fails verify when a log that was written with an anchor has lost it", async () => {
+		const audit = new AuditLog({ dir: root, sessionId: "anchored" });
+		audit.append("session_start", { anchored: true });
+		audit.append("decision", { i: 1 });
+		await audit.flush();
+		unlinkSync(anchorPathFor(audit.path));
+		const result = verifyLog(audit.path);
+		expect(result.ok).toBe(false);
+		expect(result.problem).toContain("was written with a head anchor");
+		// A log from before anchors existed is still only warned about.
+		const legacy = await written(2, "legacy");
+		unlinkSync(anchorPathFor(legacy.path));
+		expect(verifyLog(legacy.path).ok).toBe(true);
 	});
 });
 
@@ -311,6 +365,19 @@ describe("retention", () => {
 		expect(result.deleted).toEqual(["plain.jsonl"]);
 		expect(result.keptForIncidents).toEqual(["incident.jsonl"]);
 		expect(existsSync(incident.path)).toBe(true);
+	});
+
+	it("keeps a session whose chain records tampering", async () => {
+		const audit = await written(3, "tampered");
+		const lines = readFileSync(audit.path, "utf8").trim().split("\n");
+		writeFileSync(audit.path, `${lines.slice(0, 1).join("\n")}\n`);
+		const resumed = new AuditLog({ dir: root, sessionId: "tampered" });
+		await resumed.flush();
+		age(audit.path, 2);
+		writeFileSync(join(root, "big.jsonl"), "x".repeat(2 * 1024 * 1024));
+		const result = applyRetention({ dir: root, retentionDays: 30, retentionMb: 1, keepSessionId: "big" });
+		expect(result.keptForIncidents).toEqual(["tampered.jsonl"]);
+		expect(existsSync(audit.path)).toBe(true);
 	});
 
 	it("does not mistake the text of a record for its kind", async () => {
