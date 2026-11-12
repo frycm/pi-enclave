@@ -84,8 +84,105 @@ export function defaultReadDeny(
 			// Sibling agents' stored credentials, for the same reason.
 			join(home, ".claude", ".credentials.json"),
 			...configRoots.map((root) => join(root, "claude")),
+			// What a server keeps besides SSH keys (#23). A deny-list is always one
+			// entry short, which is why `sandbox.readMode: "allowlist"` exists; this
+			// list is what `open` mode can still do.
+			...credentialStores(home, configRoots),
+			// pi's own records: other projects' transcripts, the trust store, and the
+			// policy itself, which is the first thing an adversary would read.
+			join(agentDir, "sessions"),
+			join(agentDir, "trust.json"),
+			join(agentDir, "enclave.json"),
+			join(home, ".pi", "agent", "sessions"),
+			// Secrets a server exposes outside any home directory.
+			...SERVER_READ_DENY,
 		]),
 	];
+}
+
+/** Server-side material readable by the agent's uid more often than it should be. */
+const SERVER_READ_DENY = [
+	"/etc/letsencrypt",
+	"/etc/ssl/private",
+	"/run/secrets",
+	"/var/run/secrets",
+	"/run/credentials",
+];
+
+/** Credential, history and other-agent files under a home directory (#23). */
+function credentialStores(home: string, configRoots: readonly string[]): string[] {
+	const inHome = [
+		// Git and forge credentials.
+		".git-credentials",
+		// Cloud CLIs and secret managers.
+		".azure",
+		".oci",
+		".terraform.d/credentials.tfrc.json",
+		".terraformrc",
+		".vault-token",
+		".password-store",
+		// Package registries.
+		".pypirc",
+		".cargo/credentials.toml",
+		".cargo/credentials",
+		".gem/credentials",
+		".m2/settings.xml",
+		".gradle/gradle.properties",
+		".composer/auth.json",
+		".yarnrc.yml",
+		// Databases and services.
+		".pgpass",
+		".my.cnf",
+		".mylogin.cnf",
+		".redis-cli-auth",
+		// Keyrings and keychains.
+		".local/share/keyrings",
+		"Library/Keychains",
+		// Shell and REPL histories: commands typed with secrets in them.
+		".bash_history",
+		".zsh_history",
+		".histfile",
+		".local/share/fish/fish_history",
+		".python_history",
+		".psql_history",
+		".mysql_history",
+		".sqlite_history",
+		".node_repl_history",
+		".rediscli_history",
+		".lesshst",
+		// Other agents and editors, which keep their own tokens and transcripts.
+		".codex",
+		".gemini",
+		".cursor",
+		".continue",
+		".aider",
+		// Browser profiles: cookies are sessions.
+		".mozilla",
+		".config/google-chrome",
+		".config/chromium",
+		".config/BraveSoftware",
+		"Library/Application Support/Google/Chrome",
+		"Library/Application Support/Firefox",
+		"Library/Cookies",
+		"Library/Safari",
+	].map((path) => join(home, path));
+	const inConfig = [
+		"git/credentials",
+		"glab-cli",
+		"hub",
+		"tea",
+		"gcloud",
+		"doctl",
+		"hcloud",
+		"sops",
+		"age",
+		"rclone",
+		"pip",
+		"op",
+		"github-copilot",
+		"Code/User/globalStorage",
+	];
+	return [...inHome, ...configRoots.flatMap((root) => inConfig.map((path) => join(root, path)))];
 }
 
 /**
@@ -437,6 +534,8 @@ export function defaultProfile(options: DefaultProfileOptions): EffectiveProfile
 			readDeny: [...defaultReadDeny(home, agentDir, env), join(cwd, ".pi", "mcp.json")],
 			grantableReadDeny: [],
 			grantableWriteRoots: [],
+			readMode: "open",
+			readableRoots: [],
 			protectedWrite: protectedWriteTargets(home, agentDir, env),
 			network: { mode: "off", allowHosts: [] },
 			capabilities: "reviewed",
@@ -489,6 +588,8 @@ export function defaultListFor(listPath: string, options: DefaultProfileOptions)
 			return base.sandbox.network.allowHosts;
 		case "sandbox.grantableWriteRoots":
 			return base.sandbox.grantableWriteRoots;
+		case "sandbox.readableRoots":
+			return base.sandbox.readableRoots;
 		case "rules.deny":
 			return base.rules.deny;
 		case "rules.ask":

@@ -28,11 +28,10 @@ export const SANDBOX_TMPDIR = "/tmp/claude";
 /**
  * What the sandbox permits. Phase 1 ships exactly one mode.
  *
- * Note the asymmetry, which is SRT's model and therefore ours (see
- * docs/step-0-srt-findings.md): **writes are an allow-list** -- only
- * `writableRoots` are writable -- while **reads are a deny-list** -- everything
- * is readable except `readDeny`. There is no way to express "the agent may only
- * read the workspace" on either backend.
+ * **Writes are an allow-list**: only `writableRoots` are writable. Reads are a
+ * deny-list by default -- everything is readable except `readDeny` -- and an
+ * allow-list in `readMode: "allowlist"` (#23), where only `readAllow` and the
+ * writable roots are readable and `readDeny` still applies inside them.
  */
 export interface Profile {
 	/** Container-only explicit host read mounts. */
@@ -61,8 +60,16 @@ export interface Profile {
 	 * for `/enclave status`.
 	 */
 	selfHosted?: readonly string[];
-	/** Absolute paths that may not be read, even though reads are otherwise open. */
+	/** Absolute paths that may not be read, in either read mode. */
 	readDeny: readonly string[];
+	/**
+	 * `allowlist`: nothing is readable but the system runtime, the writable
+	 * roots, the toolchain, pi-enclave's own code and `readAllow` (#23).
+	 * Absent means `open`. The container backends always behave this way.
+	 */
+	readMode?: "open" | "allowlist";
+	/** Configured extra readable roots for `allowlist` mode (`sandbox.readableRoots`). */
+	readAllow?: readonly string[];
 	/**
 	 * User-global roots below which a one-shot write capability may be granted
 	 * (#21). Absent or empty: nothing outside the workspace.

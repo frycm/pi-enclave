@@ -174,6 +174,7 @@ exposes everything required: built-in tool overrides with pluggable operations, 
 | Prompt injection via repo files, tool output, or fetched content steering the agent to run `curl … \| sh`, read `~/.ssh`, or push secrets | Sandbox: filesystem deny-read on secrets, no network except the proxy allowlist | Pattern `deny` rules; reviewer |
 | Injection aimed at the **reviewer** (text in arguments or messages telling it to allow) | Reviewer sees structured, provenance-labelled evidence only; only direct TUI/RPC input can carry authorization | A reviewer `allow` can only widen the sandbox by one declared capability for one action — it can never produce unsandboxed host execution, so the sandbox still bounds a wrong allow |
 | Agent tampers with pi-enclave's own state (approval records, config) from inside the sandbox | All extension state lives outside every writable root, mode `0600`, written atomically; project-local config is tighten-only | Session-bound nonces and expiry on approval records |
+| Agent reads a secret nobody listed (another project's `.env`, a database dump, a credential store with a new name) into the model's context | `sandbox.readMode: "allowlist"`: only the system runtime, the workspace, the toolchain and `readableRoots` are readable — see [read modes](#read-modes) | In `open` mode, the default `readDeny` list (credential stores, histories, other agents, pi's own sessions and policy, server secret directories) |
 | Exfiltration to an **allowed** host (`network.allowHosts` contains `github.com`; the agent pushes secrets to any repo there) | Not prevented by a domain allowlist — see [residual risks](#residual-risks) | `readDeny` on secrets; brokered substitution for compatible TLS-terminating clients; `network.mode: "off"` by default |
 | Honest agent mistake (`rm -rf` on the wrong path, `git push --force`) | Pattern `ask` rule → L4; otherwise the reviewer's prose `soft_deny` rulebook | Sandbox write roots |
 | Workaround loops after a denial (same goal, different command) | Circuit breaker: `block` + `terminate` after N equivalent denials | Audit log |
@@ -202,7 +203,7 @@ third-party tools are the documented exception because pi exposes no execution w
 | Layer | Name | What it does |
 |---|---|---|---|
 | **L1** | Deterministic rules | Pattern rules on tool and arguments with exactly two verbs: `deny` (never runs, nothing below can override) and `ask` (always a human decision, the reviewer cannot auto-approve it), plus protected paths. Never touches a model. Runs before everything else in under a millisecond. |
-| **L2** | **OS enforcement** | Every shell command **and every file/search operation** executes inside a Seatbelt / bwrap / Docker boundary: explicit writable roots (everything else read-only), declared paths and secrets denied for reading, network only via the egress proxy. Note the asymmetry, which the backends impose and pi-enclave inherits: **writes are an allow-list, reads are a deny-list.** There is no way to say "the agent may only read the workspace"; anything absent from the read-deny list is readable. An L3 `allow` still lands here; so does a `skipReview` match. Sandbox denials are returned to the agent as a structured violation, which is the only way a request can *widen* the profile (via an L3-reviewed capability retry). |
+| **L2** | **OS enforcement** | Every shell command **and every file/search operation** executes inside a Seatbelt / bwrap / Docker boundary: explicit writable roots (everything else read-only), declared paths and secrets denied for reading, network only via the egress proxy. Writes are always an allow-list. Reads are a deny-list in the default `open` [read mode](#read-modes): anything absent from the read-deny list is readable. In `allowlist` mode reads are an allow-list too: the system runtime, the writable roots, the toolchain and `sandbox.readableRoots`, with the deny list still applied inside them. An L3 `allow` still lands here; so does a `skipReview` match. Sandbox denials are returned to the agent as a structured violation, which is the only way a request can *widen* the profile (via an L3-reviewed capability retry). |
 | **L3** | Isolated model reviewer | For every action L1 did not decide that is either selected by `review.trigger` (`mutating` by default; `all` selects read-only actions too; `boundary` selects none) or a request to widen the sandbox by one declared capability (`allow_write`, `allow_read`, and later `allow_host`) for one action. Judges it against a **prose rulebook** (`review.environment` / `hard_deny` / `soft_deny` / `allow`) and the user's direct authorization. Fresh completion, own system prompt, structured evidence, strict JSON output with `allow` / `deny` / `ask`. **An L3 `allow` never grants unsandboxed authority**: owned actions remain in L2, and any third-party tool L3 sees still requires L4 after a model allow. |
 | **L4** | Human escalation | Attended: `ctx.ui.confirm` with the exact canonical action. Unattended: `ask` means deny, stop the turn, and write a resumable "needs approval" record outside the workspace. v1 has no unsandboxed host-execution path; a future one would require a separate canonical action and this verified human channel. |
 
@@ -297,7 +298,8 @@ interface SandboxProfile {
   readDeny: string[];        // ~/.ssh, ~/.aws, ~/.gnupg, ~/.pi/**/auth*, keychains…
   grantableReadDeny: string[]; // user-global subset eligible for one-shot allow_read
   grantableWriteRoots: string[]; // user-global roots below which allow_write is grantable outside the workspace (#21)
-  readAllow?: string[];      // custom mode only
+  readMode: "open" | "allowlist"; // #23: reads are a deny-list, or an allow-list
+  readableRoots: string[];   // allowlist mode: extra readable roots; user-global only
   network: { mode: "off" | "proxy"; allowHosts: string[]; allowLocalPorts: number[] };
   capabilities: "none" | "reviewed";  // may the agent request a one-shot Capability (→ L3)?
   hostExec: "never" | "human";        // "human" is reserved and rejected throughout v1
@@ -321,6 +323,71 @@ built-in credential/state list is the derived immutable set; it is deliberately 
 user-configurable field. A
 capability is bound to the locked action hash and the concrete denied operation; a request
 cannot be used as a free-standing way to widen the profile.
+
+### Read modes
+
+`sandbox.readMode` decides what a sandboxed command can read (#23).
+
+- **`open`** (the default). Everything the user can read is readable except `readDeny`. The
+  built-in list covers credential stores (SSH, cloud CLIs, forge and registry tokens,
+  database client files, keyrings, password stores), shell and REPL histories, other agents'
+  and editors' state, browser profiles, pi's own sessions, trust file and user-global policy,
+  and server secret directories (`/etc/ssl/private`, `/etc/letsencrypt`, `/run/secrets`,
+  `/run/credentials`). A deny-list is always one entry short: whatever nobody thought to
+  list, such as a sibling project's `.env` or a dump in `~/Downloads`, is readable.
+  Some listed files are configuration that build tools read even offline: `~/.m2/settings.xml`,
+  `~/.gradle/gradle.properties`, `~/.config/pip` and `~/.yarnrc.yml` hold registry
+  credentials as often as mirrors. On bwrap a denied file reads as empty, so Maven, for one,
+  stops on an empty `settings.xml`. Built-in entries cannot be taken off the list by
+  configuration, so point the tool at a file in the workspace instead (`mvn -s
+  ./settings.xml`, `GRADLE_USER_HOME`, `PIP_CONFIG_FILE`, `YARN_RC_FILENAME`).
+- **`allowlist`**. The whole filesystem is denied and only these are readable: the system
+  runtime (`/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, `/nix` on Linux; `/System`, `/usr`,
+  `/Library`, `/private/etc`, `/opt/homebrew` and the rest on macOS), the writable roots
+  (workspace and session scratch), the toolchain (the Node running pi-enclave, the probed
+  `rg`, `fd` and seccomp helper, every absolute `PATH` entry and the install root above a
+  `bin` directory), pi-enclave's file helper, and `sandbox.readableRoots`. The home
+  directory, its parent and `/` are never added, however they are reached: a `PATH` entry
+  of `~/bin` exposes `~/bin`, and `~/.local/bin` does not expose `~/.local`. `readDeny`
+  still applies inside every readable root, and a readable root on or below a `readDeny`
+  entry is refused, because the sandbox would otherwise let it lift the deny. Each of these
+  rules is judged on the root's canonical location, so a home or a deny entry reached
+  through a link is kept out as well. The install root above a `bin` directory is never a
+  top-level directory (`/opt` for `/opt/bin`) nor a store every application shares
+  (`~/.config`, `~/.local`, `~/.cache`, `~/Library`, the `XDG_*_HOME` directories).
+  `/enclave status` lists every readable root.
+
+`allowlist` is the recommended mode for unattended runs and for servers, where most secrets
+live outside the paths a laptop deny-list names; it will be the read mode of the
+[ops profile](#server-ops-profile). A tool installed somewhere the list does not reach
+(a language runtime under `/opt`, a version manager whose shims are on `PATH` but whose
+installs are elsewhere) fails as if the files were missing; add its root to
+`sandbox.readableRoots`. Changing from `allowlist` to `open`, and adding readable roots,
+are user-global only; a project may switch to `allowlist`.
+
+Git runs without the user's global configuration in `allowlist` mode (`GIT_CONFIG_GLOBAL` is
+set to `/dev/null`), because the home directory is not readable and git refuses to start on a
+configuration file it can see but not read. Commits then need an identity in the repository's
+own config, or `~/.gitconfig` (or `~/.config/git`) in `sandbox.readableRoots`, which turns the
+override off. On macOS the `/var` and `/tmp` links are readable by name, so paths spelled
+through them (the workspace under `$TMPDIR`, for one) resolve; what they point at is not
+opened by this.
+
+```json
+{ "sandbox": { "readMode": "allowlist", "readableRoots": ["/opt/toolchains", "/srv/app/shared"] } }
+```
+
+A refused read outside the allowlist is reported as a violation, as a denied read is in
+`open` mode. A reviewed `allow_read` capability lifts its exact `grantableReadDeny` entry and,
+in `allowlist` mode, adds that path to the allowlist for the one action. `/enclave status`
+shows the mode on its own line, and says `OPEN` in capitals when reads are a deny-list. The
+container backends only ever see what is mounted, so they behave as `allowlist` whatever is
+configured; `sandbox.readableRoots` is mounted read-only alongside
+`sandbox.backend.readableRoots`.
+
+Other processes' environments: on Linux, bwrap gives the sandbox its own PID namespace and
+`/proc`, so `/proc/<pid>/environ` of the user's other processes is not visible in either
+mode; conformance row C20 checks it. Seatbelt has no `/proc`.
 
 ### The child environment is built, not inherited
 
@@ -453,7 +520,9 @@ unsandboxed control fails L1 to L5.
 Codex's `seatbelt_base_policy.sbpl` (process-exec/fork, a sysctl allowlist, PTY access,
 POSIX semaphores and shared memory for Python multiprocessing).
 
-- **Filesystem** — `(allow file-read*)` minus `readDeny` subpaths; `(allow file-write*)`
+- **Filesystem** — `(allow file-read*)` minus `readDeny` subpaths (in `allowlist` mode,
+  reads denied from `/` with the allowlist re-allowed and `readDeny` denied again inside it);
+  `(allow file-write*)`
   only on `writableRoots`, `/dev/null` and scratch.
 - **Network** — denied entirely; in `proxy` mode, `network-outbound` to
   `localhost:<proxyPort>` only, plus the minimal mach-lookups needed for DNS and trust
@@ -471,7 +540,9 @@ POSIX semaphores and shared memory for Python multiprocessing).
 when proxying.
 
 - **Filesystem** — same profile semantics; deny-read is implemented by masking with an
-  empty tmpfs rather than by returning an error.
+  empty tmpfs rather than by returning an error. In `allowlist` mode every top-level
+  directory not on the allowlist is masked, and the allowed roots and writable roots are
+  bound back in.
 - **Network** — the network namespace is removed. In `proxy` mode a Unix domain socket is
   bound into the sandbox and bridged by `socat` to the host proxy (Claude Code's layout).
 - **Unix sockets** — the `AF_UNIX` block comes from sandbox-runtime's vendored
@@ -1386,6 +1457,8 @@ Behaviour under failure, for `attended: off`:
   one refused, and an approval stays pending.
 - With `audit.syslog: true`, a mirror that stops (no `logger`, or `logger` failing) prints to
   stderr and shows `AUDIT SYSLOG STOPPED`. Under `audit.required` it counts as not recording.
+  `logger` reports a failure when it exits, after the call it was sent for, so the refusal
+  starts with the next call.
 - `audit.sessionMaxMb` (default 100) bounds one session's file. At the cap the log writes one
   last `audit` record saying so and stops, which counts as a failure for `audit.required`.
 - Retention's size budget never deletes a session holding a `breaker`, `violation` or
@@ -1434,7 +1507,9 @@ rather than widen the sandbox**.
 - Mode `custom`: `writableRoots` contain only the workspace and an unprivileged staging
   directory. Host configuration and service-state trees (`/etc/nginx`,
   `/etc/systemd/system`, `/var/lib/app`) are read-only or absent inside the sandbox.
-- `readDeny` keeps `/etc/shadow`, `/root`, key material, and other services' secrets out.
+- `sandbox.readMode: "allowlist"` (#23), so only the system runtime, the workspace, staging
+  and the configuration trees the runner manages are readable; `readDeny` keeps
+  `/etc/shadow`, key material, and other services' secrets out of those.
 - `network.mode: "proxy"` with `allowHosts` set to the hosts this runner manages; `off` when
   operating on a single host.
 - `capabilities: "none"`, `hostExec: "never"`, `attended.mode: "off"`.

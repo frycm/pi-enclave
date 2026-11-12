@@ -214,7 +214,15 @@ export class ContainerBackend implements SandboxBackend {
 		this.assertAlive();
 		if (input.network !== "off") throw new Error("pi-enclave: containers support network off only");
 		const profile = structuredClone(input);
-		profile.readableRoots = [...(input.readableRoots ?? this.settings.readableRoots)];
+		// The container only ever sees what is mounted, so it is in allowlist
+		// mode whatever was configured; sandbox.readableRoots (#23) are mounted
+		// read-only alongside the backend's own readableRoots. A readable root on
+		// or below a deny entry is left out, as the native backend leaves it out:
+		// the deny list is never loosened by one.
+		const readAllow = (input.readAllow ?? []).filter(
+			(root) => !input.readDeny.some((deny) => isUnder(canonical(root), canonical(deny))),
+		);
+		profile.readableRoots = [...new Set([...(input.readableRoots ?? this.settings.readableRoots), ...readAllow])];
 		profile.tmpDir = "/tmp/claude";
 		// Linux devpts permits allocation, as on bwrap. Report the effective setting.
 		profile.allowPty = true;

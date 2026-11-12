@@ -696,6 +696,8 @@ export function toBackendProfile(
 		materializeWriteDeny: [...new Set(materializeWriteDeny)],
 		materializeWriteDenyFiles: [...new Set(materializeWriteDenyFiles)],
 		readDeny: [...effective.sandbox.readDeny],
+		readMode: effective.sandbox.readMode,
+		readAllow: [...effective.sandbox.readableRoots],
 		grantableWriteRoots: [...effective.sandbox.grantableWriteRoots],
 		protectedWrite: effective.sandbox.protectedWrite.map((entry) => ({ ...entry })),
 		limits: { ...effective.sandbox.limits, container: { ...effective.sandbox.limits.container } },
