@@ -14,11 +14,13 @@
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_CONTAINER_LIMITS } from "../backend/limits.ts";
 import type {
 	AttendedSettings,
 	AuditSettings,
 	BreakerSettings,
 	EffectiveProfile,
+	LimitsSettings,
 	ProtectedWriteTarget,
 	ReviewerSettings,
 	ToolsSettings,
@@ -360,6 +362,26 @@ export function defaultTools(): ToolsSettings {
 	};
 }
 
+/**
+ * Resource limits (#24). Chosen so ordinary development work (tsc, cargo,
+ * npm ci, test runners) is not affected, while a hung command, a fork loop,
+ * a runaway write or a memory hog stops well before it hurts the host. The
+ * container values are the ones the container backend has always used.
+ */
+export function defaultLimits(): LimitsSettings {
+	return {
+		defaultTimeoutSec: 120,
+		maxTimeoutSec: 1800,
+		maxOutputMb: 64,
+		fileSizeMb: 4096,
+		openFiles: 8192,
+		processes: 1024,
+		memoryMb: 8192,
+		minFreeDiskMb: 1024,
+		container: { ...DEFAULT_CONTAINER_LIMITS },
+	};
+}
+
 export const DEFAULT_REVIEWER: ReviewerSettings = { model: "none", timeoutMs: 30_000, fallback: "none" };
 
 /** Guardian's numbers, which are the only ones with field evidence behind them. */
@@ -422,6 +444,7 @@ export function defaultProfile(options: DefaultProfileOptions): EffectiveProfile
 			// Loaded code below a writable root refuses auto mode (#36).
 			allowSelfHosting: false,
 			env: { passthrough: [], envDeny: [...DEFAULT_ENV_DENY] },
+			limits: defaultLimits(),
 		},
 		rules: {
 			deny: [...DEFAULT_RULES_DENY],

@@ -106,6 +106,52 @@ export interface SandboxSettings {
 	 */
 	allowSelfHosting: boolean;
 	env: EnvSettings;
+	limits: LimitsSettings;
+}
+
+/**
+ * Resource limits for every sandboxed shell command (#24).
+ *
+ * Availability is part of the safety story on a server: none of these is a
+ * boundary, but a command that hangs, fills the disk or takes the host's memory
+ * hurts the services an unattended agent is there to manage. Every number is
+ * a ceiling, so a less trusted source may lower it and never raise it.
+ */
+export interface LimitsSettings {
+	/** Wall-clock limit when the model passes no timeout. */
+	defaultTimeoutSec: number;
+	/** Larger requested timeouts are clamped to this. */
+	maxTimeoutSec: number;
+	/** Command output past this is discarded and the command is killed. */
+	maxOutputMb: number;
+	/** RLIMIT_FSIZE: the largest file one process may write. */
+	fileSizeMb: number;
+	/** RLIMIT_NOFILE. */
+	openFiles: number;
+	/**
+	 * RLIMIT_NPROC on the native Linux backend. Set only on kernel 5.14+ when
+	 * the sandbox has a user namespace of its own, where the kernel counts it
+	 * there; otherwise it would count every task of the uid, and it is skipped.
+	 */
+	processes: number;
+	/** RLIMIT_DATA on the native Linux backend: private writable memory per process. */
+	memoryMb: number;
+	/**
+	 * Below this much free space on a writable root (or 5% of that filesystem,
+	 * when that is less), shell commands run with a file size limit of zero:
+	 * they can delete and inspect, not grow anything.
+	 */
+	minFreeDiskMb: number;
+	/** The container backend's cgroup and tmpfs limits. */
+	container: ContainerLimits;
+}
+
+export interface ContainerLimits {
+	pids: number;
+	memoryMb: number;
+	cpus: number;
+	shmMb: number;
+	tmpMb: number;
 }
 
 export interface BackendSettings {
@@ -222,9 +268,10 @@ export interface EffectiveProfile {
 
 /** A partially-specified contribution from one file. */
 export interface ProfilePatch {
-	sandbox?: Partial<Omit<SandboxSettings, "network" | "env" | "protectedWrite">> & {
+	sandbox?: Partial<Omit<SandboxSettings, "network" | "env" | "protectedWrite" | "limits">> & {
 		network?: Partial<NetworkSettings>;
 		env?: Partial<EnvSettings>;
+		limits?: Partial<Omit<LimitsSettings, "container">> & { container?: Partial<ContainerLimits> };
 	};
 	rules?: Partial<Omit<RulesSettings, "protectedPaths">> & { protectedPaths?: Partial<ProtectedPaths> };
 	review?: Partial<ReviewSettings>;

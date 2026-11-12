@@ -150,6 +150,30 @@ export function narrowerOrEqual(a: EffectiveProfile, b: EffectiveProfile): Order
 		fail("sandbox.hostExec", `cannot widen from "${b.sandbox.hostExec}" to "${a.sandbox.hostExec}"`);
 	}
 	if (a.sandbox.allowPty && !b.sandbox.allowPty) fail("sandbox.allowPty", "cannot enable PTY allocation");
+	// Resource limits are ceilings (#24): a less trusted source may lower any of
+	// them, never raise one. `minFreeDiskMb` is a floor, so it may only rise.
+	for (const key of [
+		"defaultTimeoutSec",
+		"maxTimeoutSec",
+		"maxOutputMb",
+		"fileSizeMb",
+		"openFiles",
+		"processes",
+		"memoryMb",
+	] as const) {
+		if (a.sandbox.limits[key] > b.sandbox.limits[key]) {
+			fail(`sandbox.limits.${key}`, `cannot raise ${key} above ${b.sandbox.limits[key]}`);
+		}
+	}
+	if (a.sandbox.limits.minFreeDiskMb < b.sandbox.limits.minFreeDiskMb) {
+		fail("sandbox.limits.minFreeDiskMb", `cannot lower the free-space floor below ${b.sandbox.limits.minFreeDiskMb}`);
+	}
+	for (const key of ["pids", "memoryMb", "cpus", "shmMb", "tmpMb"] as const) {
+		if (a.sandbox.limits.container[key] > b.sandbox.limits.container[key]) {
+			fail(`sandbox.limits.container.${key}`, `cannot raise ${key} above ${b.sandbox.limits.container[key]}`);
+		}
+	}
+
 	if (a.sandbox.allowSelfHosting && !b.sandbox.allowSelfHosting) {
 		fail("sandbox.allowSelfHosting", "only the user-global file can accept loaded code below a writable root");
 	}
@@ -358,6 +382,14 @@ export function applyPatch(base: EffectiveProfile, patch: ProfilePatch, options:
 		if (sandbox.hostExec !== undefined) next.sandbox.hostExec = sandbox.hostExec;
 		if (sandbox.allowPty !== undefined) next.sandbox.allowPty = sandbox.allowPty;
 		if (sandbox.allowSelfHosting !== undefined) next.sandbox.allowSelfHosting = sandbox.allowSelfHosting;
+		if (sandbox.limits) {
+			const { container, ...scalars } = sandbox.limits;
+			next.sandbox.limits = {
+				...next.sandbox.limits,
+				...scalars,
+				container: { ...next.sandbox.limits.container, ...(container ?? {}) },
+			};
+		}
 		if (sandbox.env) {
 			if (sandbox.env.passthrough) {
 				track("sandbox.env.passthrough", sandbox.env.passthrough);

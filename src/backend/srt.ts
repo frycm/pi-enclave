@@ -22,7 +22,8 @@
  *    missed line degrades reporting and never enforcement.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { closeSync, lstatSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, lstatSync, mkdirSync, openSync, readlinkSync } from "node:fs";
+import { release } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getDefaultWritePaths, SandboxManager } from "@anthropic-ai/sandbox-runtime";
@@ -31,6 +32,16 @@ import { HelperFsClient } from "../fs/client.ts";
 import type { BackendName } from "../probe.ts";
 import { hostExecutableSafety, hostRuntimeSafety, resolveSeccompHelper, whichSync } from "../probe-host.ts";
 import { shellCapabilityIssue, validateReadCapability, validateWriteCapability } from "./capability.ts";
+import {
+	effectiveTimeout,
+	freeSpaceIssue,
+	kernelCountsNprocPerUserNamespace,
+	limitPrefix,
+	OutputCap,
+	type ProcessLimitDecision,
+	processLimitDecision,
+	timeoutNote,
+} from "./limits.ts";
 import { canonical, isUnder } from "./paths.ts";
 import { SessionScratch } from "./scratch.ts";
 import { checkUnixSocketBlocking } from "./self-test.ts";
@@ -46,6 +57,15 @@ import {
 	type Violation,
 } from "./types.ts";
 import { dedupeViolations, parseViolations } from "./violations.ts";
+
+/** pi's own user namespace, as `readlink /proc/self/ns/user` prints it ("user:[4026531837]"). */
+function readUserNamespace(): string | undefined {
+	try {
+		return readlinkSync("/proc/self/ns/user");
+	} catch {
+		return undefined;
+	}
+}
 
 /**
  * Absolute paths for the search tools, for the helper to use instead of a PATH
@@ -662,8 +682,17 @@ export class SrtBackend implements SandboxBackend {
 			? toSrtConfig(customProfile, this.weakened, process.platform, this.hostTools)
 			: undefined;
 
+		// Resource limits (#24): set by the sandboxed shell before the command,
+		// a default and a maximum wall-clock limit, and an output cap.
+		const limits = compiled.profile.limits;
+		const writable = [...compiled.profile.writableRoots, ...(this.scratch ? [this.scratch.path] : [])];
+		const lowDisk = freeSpaceIssue(writable, limits);
+		const processes = limits && process.platform === "linux" ? (await this.decideProcessLimit(request)).applies : false;
+		const prefix = limitPrefix(limits, process.platform, lowDisk !== undefined, processes);
+		const timeout = effectiveTimeout(request.timeout, limits);
+
 		const { argv } = await SandboxManager.wrapWithSandboxArgv(
-			request.command,
+			`${prefix}${request.command}`,
 			"/bin/bash",
 			customConfig as never,
 			request.signal,
@@ -671,9 +700,103 @@ export class SrtBackend implements SandboxBackend {
 			{ commandId: request.commandId, commandText: request.command },
 		);
 
-		const exitCode = await this.spawnSandboxed(argv, request);
+		const cap = new OutputCap(limits?.maxOutputMb, request.onData);
+		const stop = new AbortController();
+		const onOuterAbort = () => stop.abort();
+		if (request.signal?.aborted) stop.abort();
+		request.signal?.addEventListener("abort", onOuterAbort, { once: true });
+		let exitCode: number | null;
+		try {
+			exitCode = await this.spawnSandboxed(argv, {
+				...request,
+				signal: stop.signal,
+				onData: (chunk) => {
+					if (!cap.push(chunk)) stop.abort();
+				},
+				...(timeout ? { timeout: timeout.seconds } : {}),
+			});
+		} catch (error) {
+			const message = (error as Error).message;
+			if (cap.exceeded && !request.signal?.aborted && message === "aborted") {
+				exitCode = null;
+			} else {
+				if (timeout && limits && message.startsWith("timeout:")) {
+					const note = timeoutNote(timeout, limits);
+					if (note) request.onData?.(Buffer.from(note, "utf8"));
+				}
+				throw error;
+			}
+		} finally {
+			request.signal?.removeEventListener("abort", onOuterAbort);
+		}
+		if (cap.exceeded && limits) request.onData?.(Buffer.from(cap.note(limits.maxOutputMb), "utf8"));
+		if (lowDisk) request.onData?.(Buffer.from(`\n${lowDisk}\n`, "utf8"));
 		const violations = await this.drainViolations(request.commandId);
 		return { exitCode, violations };
+	}
+
+	/** Known after the first command of the session; shown in `/enclave status`. */
+	get processLimit(): ProcessLimitDecision | undefined {
+		return this.processLimitValue;
+	}
+
+	private processLimitValue: ProcessLimitDecision | undefined;
+	private processLimitPending: Promise<ProcessLimitDecision> | undefined;
+
+	/**
+	 * Decide once whether RLIMIT_NPROC bounds only the sandboxed command: the
+	 * kernel must count it per user namespace (5.14+) and the sandbox must be
+	 * in a user namespace other than pi's, which a sandboxed `readlink` shows.
+	 * Until both hold the limit is not set, because on a busy server it would
+	 * refuse the command's first fork.
+	 */
+	private decideProcessLimit(request: RunRequest): Promise<ProcessLimitDecision> {
+		this.processLimitPending ??= (async () => {
+			const host = readUserNamespace();
+			let sandbox: string | undefined;
+			let failed = false;
+			if (host && kernelCountsNprocPerUserNamespace(release())) {
+				const commandId = `${request.commandId}-userns`;
+				const probe = "readlink /proc/self/ns/user";
+				try {
+					const { argv } = await SandboxManager.wrapWithSandboxArgv(
+						probe,
+						"/bin/bash",
+						undefined,
+						request.signal,
+						request.cwd,
+						{
+							commandId,
+							commandText: probe,
+						},
+					);
+					const chunks: Buffer[] = [];
+					const code = await this.spawnSandboxed(argv, {
+						...request,
+						commandId,
+						onData: (chunk) => chunks.push(chunk),
+						timeout: 10,
+					});
+					if (code === 0) sandbox = Buffer.concat(chunks).toString("utf8").trim();
+				} catch {
+					failed = true;
+				} finally {
+					await this.drainViolations(commandId);
+				}
+			}
+			const decision = processLimitDecision({
+				platform: "linux",
+				kernelRelease: release(),
+				hostUserNamespace: host,
+				sandboxUserNamespace: sandbox,
+			});
+			// An aborted or failed probe is not an answer: this command runs
+			// without the limit, and the next one asks again.
+			if (failed) this.processLimitPending = undefined;
+			else this.processLimitValue = decision;
+			return decision;
+		})();
+		return this.processLimitPending;
 	}
 
 	/**

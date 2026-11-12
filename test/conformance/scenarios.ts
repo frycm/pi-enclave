@@ -14,9 +14,9 @@
  * every `denied` scenario reports `ok: false` against a backend that does not
  * sandbox at all.
  */
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { CompiledProfile, SandboxBackend, ViolationKind } from "../../src/backend/types.ts";
+import type { CompiledProfile, ResourceLimits, SandboxBackend, ViolationKind } from "../../src/backend/types.ts";
 import { SandboxDenied } from "../../src/backend/types.ts";
 import { buildChildEnv } from "../../src/env/child-env.ts";
 import { createReadOperations } from "../../src/tools/file-ops.ts";
@@ -970,6 +970,203 @@ SCENARIOS.push({
 		};
 	},
 });
+
+/**
+ * Resource limits for the L rows (#24): small enough that each row ends in
+ * seconds, so the falsifiability control (which enforces none of them) shows
+ * the difference without hurting the host running it.
+ */
+export const TEST_LIMITS: ResourceLimits = {
+	defaultTimeoutSec: 2,
+	maxTimeoutSec: 30,
+	maxOutputMb: 1,
+	fileSizeMb: 8,
+	openFiles: 256,
+	processes: 64,
+	memoryMb: 256,
+	minFreeDiskMb: 0,
+	container: { pids: 64, memoryMb: 256, cpus: 1, shmMb: 8, tmpMb: 16 },
+};
+
+interface LimitedRun {
+	exitCode: number | null;
+	output: string;
+	error?: string;
+	ms: number;
+}
+
+/** Run one command under {@link TEST_LIMITS}, bounded by the scenario itself as well. */
+async function runLimited(
+	{ backend, fixture }: ScenarioContext,
+	command: string,
+	options: { timeout?: number; maxMs?: number } = {},
+): Promise<LimitedRun> {
+	const compiled = await backend.compile({ ...fixture.profile, limits: TEST_LIMITS });
+	const chunks: Buffer[] = [];
+	const started = Date.now();
+	// The control backend enforces no limit, so the row bounds itself: a row
+	// that hangs is a failure, not a pass.
+	const signal = AbortSignal.timeout(options.maxMs ?? 25_000);
+	try {
+		const result = await backend.run(compiled, {
+			command,
+			cwd: fixture.workspace,
+			env: scenarioEnv(fixture),
+			commandId: `limits-${Math.random().toString(36).slice(2)}`,
+			onData: (chunk) => chunks.push(chunk),
+			signal,
+			...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
+		});
+		return { exitCode: result.exitCode, output: Buffer.concat(chunks).toString("utf8"), ms: Date.now() - started };
+	} catch (error) {
+		return {
+			exitCode: null,
+			output: Buffer.concat(chunks).toString("utf8"),
+			error: (error as Error).message,
+			ms: Date.now() - started,
+		};
+	}
+}
+
+SCENARIOS.push(
+	{
+		id: "L1",
+		title: "a command with no timeout ends at the default timeout",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run(ctx) {
+			const r = await runLimited(ctx, "sleep 100000", { maxMs: 10_000 });
+			const ended = r.error === `timeout:${TEST_LIMITS.defaultTimeoutSec}` && r.ms < 15_000;
+			const noted = r.output.includes("sandbox.limits.defaultTimeoutSec");
+			return {
+				ok: ended && noted,
+				detail: ended
+					? `ended after ${r.ms} ms${noted ? " with the default-timeout note" : " WITHOUT the note"}`
+					: `RAN PAST THE DEFAULT (${r.ms} ms, ${r.error ?? `exit ${r.exitCode}`})`,
+			};
+		},
+	},
+	{
+		id: "L2",
+		title: "output past the cap is discarded and the command is killed",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run(ctx) {
+			const r = await runLimited(ctx, "head -c 16777216 /dev/zero | tr '\\0' x", { timeout: 20 });
+			const bytes = Buffer.byteLength(r.output);
+			const capped = bytes <= TEST_LIMITS.maxOutputMb * 1024 * 1024 + 4096;
+			return {
+				ok: capped && r.output.includes("sandbox.limits.maxOutputMb"),
+				detail: capped ? `forwarded ${bytes} bytes, then stopped` : `FORWARDED ${bytes} bytes past a 1 MB cap`,
+			};
+		},
+	},
+	{
+		id: "L3",
+		title: "a runaway write stops at the file size limit",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: true,
+		async run(ctx) {
+			const target = join(ctx.fixture.workspace, "big.bin");
+			await runLimited(ctx, `head -c 67108864 /dev/zero > ${JSON.stringify(target)}`, { timeout: 20 });
+			let size = 0;
+			try {
+				size = statSync(target).size;
+			} catch {
+				size = 0;
+			}
+			const bounded = size <= TEST_LIMITS.fileSizeMb * 1024 * 1024;
+			return {
+				ok: bounded,
+				detail: bounded ? `file stopped at ${size} bytes` : `WROTE ${size} bytes past an 8 MB limit`,
+			};
+		},
+	},
+	{
+		id: "L4",
+		title: "a fork loop ends with a bounded process count",
+		surface: "bash",
+		expectation: "denied",
+		// macOS counts RLIMIT_NPROC across all of the user's processes, so the
+		// native backend does not set it there; the row is Linux (and container) only.
+		falsifiableByNoop: process.platform === "linux",
+		falsifiabilityNote:
+			"The native backend limits processes only on Linux 5.14+ when the sandbox has its own user " +
+			"namespace, where RLIMIT_NPROC is counted there. Elsewhere it skips the limit and the row " +
+			"reports 'not applicable' for that backend; the containers use the cgroup pids limit.",
+		async run(ctx) {
+			if (process.platform !== "linux" && ctx.backend.name !== "docker" && ctx.backend.name !== "podman") {
+				return { ok: true, detail: "processes are not limited by the native backend on this platform" };
+			}
+			const count = join(ctx.fixture.workspace, "count");
+			const r = await runLimited(
+				ctx,
+				`for i in $(seq 1 400); do sleep 5 & echo $i > ${JSON.stringify(count)}; done 2>/dev/null; echo done`,
+				{ timeout: 25, maxMs: 40_000 },
+			);
+			let started = 0;
+			try {
+				started = Number(readFileSync(count, "utf8").trim());
+			} catch {
+				started = 0;
+			}
+			// Decided by the backend at its first command: an older kernel, or a
+			// sandbox in pi's own user namespace, would count the host's processes.
+			const decision = ctx.backend.processLimit;
+			if (decision && !decision.applies) {
+				return { ok: true, detail: `processes are not limited by this backend here: ${decision.reason}` };
+			}
+			const bounded = started > 0 && started < 400;
+			return {
+				ok: bounded,
+				detail: bounded
+					? `started ${started} of 400 background processes before the limit (${r.ms} ms)`
+					: `STARTED ${started} of 400 background processes with a limit of ${TEST_LIMITS.processes}`,
+			};
+		},
+	},
+	{
+		id: "L5",
+		title: "a memory hog is stopped without affecting the pi process",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: process.platform === "linux",
+		falsifiabilityNote:
+			"macOS does not enforce RLIMIT_DATA, so the native backend does not limit memory there and " +
+			"the row reports 'not applicable' for every backend.",
+		async run(ctx) {
+			if (process.platform !== "linux" && ctx.backend.name !== "docker" && ctx.backend.name !== "podman") {
+				return { ok: true, detail: "memory is not limited by the native backend on this platform" };
+			}
+			// `tail -n 1` keeps a whole line in memory, and /dev/zero has no newline.
+			const r = await runLimited(ctx, "head -c 1073741824 /dev/zero | tail -n 1 | wc -c", { timeout: 25 });
+			const grew = r.output.includes("1073741824");
+			return {
+				ok: !grew && process.memoryUsage().rss > 0,
+				detail: grew ? "HELD 1 GB with a 256 MB limit" : `the hog was stopped: ${r.output.trim().slice(0, 120)}`,
+			};
+		},
+	},
+	{
+		id: "L6",
+		title: "stdin is empty, so a program waiting for input ends at once",
+		surface: "bash",
+		expectation: "denied",
+		falsifiableByNoop: false,
+		falsifiabilityNote:
+			"The control backend also spawns with stdin ignored, so it passes for the same reason a real " +
+			"backend does. The row guards against a backend that hands the command a pipe nobody writes to " +
+			"(the container supervisor keeps one open as its control channel).",
+		async run(ctx) {
+			const r = await runLimited(ctx, "read line; echo read-exit:$?", { timeout: 10, maxMs: 15_000 });
+			const ended = r.output.includes("read-exit:1") && r.ms < 8_000;
+			return { ok: ended, detail: ended ? `read hit EOF after ${r.ms} ms` : `WAITED ON STDIN (${r.ms} ms)` };
+		},
+	},
+);
 
 /** A valid 1x1 PNG, for the image-detection row. */
 const PNG_1X1 = Buffer.from(

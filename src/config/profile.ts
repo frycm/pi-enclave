@@ -698,6 +698,7 @@ export function toBackendProfile(
 		readDeny: [...effective.sandbox.readDeny],
 		grantableWriteRoots: [...effective.sandbox.grantableWriteRoots],
 		protectedWrite: effective.sandbox.protectedWrite.map((entry) => ({ ...entry })),
+		limits: { ...effective.sandbox.limits, container: { ...effective.sandbox.limits.container } },
 		network: effective.sandbox.network.mode,
 		allowPty: effective.sandbox.allowPty,
 		envPassthrough: [...effective.sandbox.env.passthrough],

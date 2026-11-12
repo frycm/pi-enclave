@@ -13,6 +13,8 @@
  * not started, an unsupported host: each shows in the one-line summary, not just
  * in the detailed report nobody opens.
  */
+
+import { describeLimits, type ProcessLimitDecision } from "../backend/limits.ts";
 import type { BackendName, CompiledProfile, Profile, Violation } from "../backend/types.ts";
 import { OWNED_TOOLS } from "../config/defaults.ts";
 import { renderConfig, renderDefaults } from "../config/render.ts";
@@ -30,6 +32,8 @@ export interface EnclaveState {
 	backendName: BackendName;
 	/** True when running in sandbox-runtime's weaker nested mode. */
 	weakened: boolean;
+	/** Whether the backend sets RLIMIT_NPROC (#24), once its first command has run. */
+	processLimit?: ProcessLimitDecision;
 	profile: Profile;
 	/** Undefined until the profile is compiled at session start. */
 	compiled: CompiledProfile | undefined;
@@ -125,6 +129,7 @@ export function renderStatus(state: EnclaveState): string {
 		`profile:    ${profile.mode}, network ${profile.network}, pty ${profile.allowPty ? "on" : "off"}`,
 		`writable:   ${profile.writableRoots.join(", ") || "(nothing)"}`,
 		`read-deny:  ${profile.readDeny.length} path(s)`,
+		`limits:     ${describeLimits(profile.limits, state.backendName, process.platform, state.processLimit)}`,
 		`violations: ${state.violations.length} this session`,
 		`coverage:   ${COVERAGE_NOTE}`,
 	);

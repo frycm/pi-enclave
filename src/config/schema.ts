@@ -81,6 +81,7 @@ const SANDBOX_KEYS = [
 	"hostExec",
 	"allowPty",
 	"allowSelfHosting",
+	"limits",
 	"env",
 ] as const;
 const RULES_KEYS = ["deny", "ask", "skipReview", "protectedPaths"] as const;
@@ -469,6 +470,10 @@ class ParseContext {
 			const allowPty = this.boolean(join(prefix, "allowPty"), body.allowPty);
 			if (allowPty !== undefined) out.allowPty = allowPty;
 		}
+		if ("limits" in body) {
+			const limits = this.limits(join(prefix, "limits"), body.limits);
+			if (limits) out.limits = limits;
+		}
 		if ("allowSelfHosting" in body) {
 			const allow = this.boolean(join(prefix, "allowSelfHosting"), body.allowSelfHosting);
 			if (allow !== undefined) out.allowSelfHosting = allow;
@@ -578,6 +583,49 @@ class ParseContext {
 			parsed[name] = grant;
 		}
 		return { allow: parsed };
+	}
+
+	private limits(prefix: string, raw: unknown): NonNullable<ProfilePatch["sandbox"]>["limits"] | undefined {
+		const body = this.object(prefix, raw);
+		if (!body) return undefined;
+		const scalar = {
+			defaultTimeoutSec: [1, 2_147_483],
+			maxTimeoutSec: [1, 2_147_483],
+			maxOutputMb: [1, 1_048_576],
+			fileSizeMb: [1, 1_048_576],
+			openFiles: [16, 1_048_576],
+			processes: [16, 4_194_304],
+			memoryMb: [64, 1_048_576],
+			minFreeDiskMb: [0, 1_048_576],
+		} as const;
+		this.rejectUnknown(prefix, body, [...Object.keys(scalar), "container"]);
+		const out: NonNullable<NonNullable<ProfilePatch["sandbox"]>["limits"]> = {};
+		for (const [key, [min, max]] of Object.entries(scalar) as [keyof typeof scalar, readonly [number, number]][]) {
+			if (!(key in body)) continue;
+			const value = this.integer(join(prefix, key), body[key], min, max);
+			if (value !== undefined) out[key] = value;
+		}
+		if ("container" in body) {
+			const container = this.object(join(prefix, "container"), body.container);
+			if (container) {
+				const bounds = {
+					pids: [16, 4_194_304],
+					memoryMb: [64, 1_048_576],
+					cpus: [1, 1024],
+					shmMb: [1, 1_048_576],
+					tmpMb: [1, 1_048_576],
+				} as const;
+				this.rejectUnknown(join(prefix, "container"), container, Object.keys(bounds));
+				const parsed: NonNullable<NonNullable<NonNullable<ProfilePatch["sandbox"]>["limits"]>["container"]> = {};
+				for (const [key, [min, max]] of Object.entries(bounds) as [keyof typeof bounds, readonly [number, number]][]) {
+					if (!(key in container)) continue;
+					const value = this.integer(join(prefix, `container.${key}`), container[key], min, max);
+					if (value !== undefined) parsed[key] = value;
+				}
+				out.container = parsed;
+			}
+		}
+		return out;
 	}
 
 	private reviewer(prefix: string, raw: unknown): ProfilePatch["reviewer"] | undefined {

@@ -304,6 +304,7 @@ interface SandboxProfile {
   pty: boolean;
   allowSelfHosting: boolean;  // loaded code below a writable root is write-denied, not refused (#36); user-global only
   env?: { passthrough?: string[] };  // extra host vars to forward, by exact name; user-global only
+  limits: ResourceLimits;     // timeout, output, file size, processes, memory, free-space floor (#24)
 }
 ```
 
@@ -412,6 +413,39 @@ The cost is one extra process per session (the helper is long-lived, one per com
 profile), not one per call. A reviewed read capability is the exception: it gets an uncached
 helper for that tool call and the helper is disposed even if the operation fails. Read
 latency is measured in Phase 1.
+
+### Resource limits
+
+The sandbox stops a command reading secrets or writing outside its roots. It does not, by
+itself, stop a command that never ends, prints gigabytes, fills the disk, forks without
+end or takes all the memory. Each of those can stall an unattended session or the host,
+so every backend enforces `sandbox.limits` (#24):
+
+| Limit | Default | How it is enforced |
+|---|---|---|
+| `defaultTimeoutSec` | 120 | Applied when the model gives no `timeout`. The output says so and how to ask for more. |
+| `maxTimeoutSec` | 1800 | A larger `timeout` is clamped. A command typed with `!` in pi gets this maximum, not the default. |
+| `maxOutputMb` | 64 | Output past the cap is discarded and the command is killed, because pi keeps the whole output in a temporary file. |
+| `fileSizeMb` | 4096 | `RLIMIT_FSIZE`: a write past the size fails and the writer gets `SIGXFSZ`. |
+| `openFiles` | 8192 | `RLIMIT_NOFILE`. |
+| `processes` | 1024 | `RLIMIT_NPROC`, Linux only, and only where it covers just the command: the kernel counts it per user namespace from 5.14, and the sandbox must be in a user namespace other than pi's (checked once per session with a sandboxed `readlink /proc/self/ns/user`). On an older kernel (RHEL 8, Ubuntu 20.04, Debian 11) or with bubblewrap in pi's namespace it would count every process of the uid on the host and refuse the command's first fork on a busy server, so it is skipped, and `/enclave status` says so and why. |
+| `memoryMb` | 8192 | `RLIMIT_DATA` per process, Linux only. `RLIMIT_AS` would break V8 and other runtimes that reserve large address ranges. |
+| `minFreeDiskMb` | 1024 | Below this much free space on a writable root or the scratch directory, a shell command still runs but with a file size limit of zero, so it can delete and inspect files but not grow them. The floor is at most 5% of the filesystem it is measured on, so a small one (the scratch tmpfs under `$XDG_RUNTIME_DIR` is 10% of RAM by default) is not below it while empty. The `write` and `edit` tools are not affected. |
+| `container.{pids,memoryMb,cpus,shmMb,tmpMb}` | 256, 512, 2, 32, 128 | The Docker/Podman cgroup and tmpfs flags. The rlimits above apply inside the container too, except `processes`: the container runs as the host uid without its own user namespace, so `RLIMIT_NPROC` would count the user's host processes, and the cgroup `pids` limit covers it instead. |
+
+The rlimits are set by plain `ulimit` in the sandboxed shell before the command, which sets
+the hard limit as well, so the command cannot raise them again; if one cannot be set, the
+command does not run. A limit that is already lower is left alone. Standard input is empty
+on every backend, so a command that reads stdin gets end of file at once instead of hanging
+until the timeout.
+
+On macOS only the timeout, output, file size and open-file limits apply: the kernel counts
+`RLIMIT_NPROC` across all of the user's processes and does not enforce `RLIMIT_DATA`, so
+setting either would harm the rest of the session without containing the command.
+`/enclave status` says which limits are in force on the current backend. Every value is a
+ceiling a project file may lower but not raise; `minFreeDiskMb` is a floor it may raise.
+Conformance rows **L1** to **L6** check each limit against every backend, and the
+unsandboxed control fails L1 to L5.
 
 ### macOS — Seatbelt
 
@@ -673,6 +707,7 @@ the result must satisfy `effective ⊑ incoming` under a partial order defined p
 | `sandbox.network.allowHosts` | Subset; `mode` may go `proxy → off`, never the reverse |
 | `sandbox.capabilities` / `hostExec` | `none ⊑ reviewed`, `never ⊑ human`; may only move left. `human` is reserved and rejected throughout v1. |
 | `sandbox.allowSelfHosting` | `false ⊑ true`; only the user-global file can turn it on (#36) |
+| `sandbox.limits` | Every value may only go down, except `minFreeDiskMb`, which may only go up (#24) |
 | `rules.deny` / `rules.ask` / `rules.protectedPaths.*` | Superset |
 | `rules.skipReview` | Subset — user-global only; any project-file entry rejects the file |
 | `review.environment` / `hard_deny` / `soft_deny` / `allow` (the four prose lists) | **Immutable below user-global.** Prose has no partial order a merge can check: "append only" is a syntactic superset, not a semantic tightening, and a project-supplied string inside the reviewer prompt is the repo-to-reviewer injection path the threat model excludes. A project file that contains any of these four keys is rejected whole. `review.trigger` is the only `review` key a project may set. |
