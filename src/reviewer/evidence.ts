@@ -1,3 +1,4 @@
+import { type EvidenceFits, ReviewerBudgetError } from "./budget.ts";
 import type { BuildEvidenceOptions, ReviewContextEntry, ReviewEvidence } from "./types.ts";
 
 /** Bounds keep injected context from crowding direct authorization out of a local model's prompt. */
@@ -137,9 +138,13 @@ function minimalEvidence(evidence: ReviewEvidence): ReviewEvidence {
 	};
 }
 
-export function buildReviewEvidence(options: BuildEvidenceOptions): ReviewEvidence {
+export const ACTION_INPUT_CHARS = 8_192;
+const MIN_ACTION_INPUT_CHARS = 256;
+
+/** Every field bounded, before anything is cut to fit; the tests compare the cut against it. */
+export function fullEvidence(options: BuildEvidenceOptions, inputChars: number): ReviewEvidence {
 	const { action } = options;
-	const input = boundedRecord(action.input, 8_192);
+	const input = boundedRecord(action.input, inputChars);
 	const detailBudget: Budget = { remaining: 4_096, truncated: false };
 	const argv = action.shell?.commands
 		.slice(0, MAX_COLLECTION_ENTRIES)
@@ -182,15 +187,54 @@ export function buildReviewEvidence(options: BuildEvidenceOptions): ReviewEviden
 		context: boundedContext(options.context ?? []),
 		profile: { name: action.profileName, attended: options.attended },
 	};
-	// Context is least trusted and least important. Remove oldest entries if
-	// structural JSON overhead still exceeds the hard evidence bound.
-	while (evidence.context.length > 0 && serializedBytes(evidence) > MAX_EVIDENCE_JSON_BYTES) {
+	return evidence;
+}
+
+/**
+ * Bounded evidence that also fits the model's context (#17), cut in order of
+ * least importance: context oldest first, then older direct authorization
+ * (the newest stays), then a smaller display of the action input (its hash
+ * still binds the whole input, and action.truncated raises the risk floor),
+ * then the minimal form. If even that does not fit, there is no review: the
+ * caller treats the error as an unavailable reviewer, never as a verdict.
+ */
+export function buildReviewEvidence(options: BuildEvidenceOptions, fits?: EvidenceFits): ReviewEvidence {
+	const ok = (candidate: ReviewEvidence) =>
+		serializedBytes(candidate) <= MAX_EVIDENCE_JSON_BYTES && (!fits || fits(renderReviewEvidence(candidate)));
+	let evidence = fullEvidence(options, ACTION_INPUT_CHARS);
+	while (evidence.context.length > 0 && !ok(evidence)) {
 		evidence.context.shift();
+		evidence.contextTruncated = true;
 	}
-	if (serializedBytes(evidence) <= MAX_EVIDENCE_JSON_BYTES) return evidence;
+	while (evidence.authorization.length > 1 && !ok(evidence)) {
+		evidence.authorization.shift();
+		evidence.authorizationTruncated = true;
+	}
+	for (let chars = ACTION_INPUT_CHARS / 2; chars >= MIN_ACTION_INPUT_CHARS && !ok(evidence); chars /= 2) {
+		const smaller = fullEvidence(options, chars);
+		smaller.action.truncated = true;
+		smaller.context = evidence.context;
+		smaller.authorization = evidence.authorization;
+		if (evidence.contextTruncated) smaller.contextTruncated = true;
+		if (evidence.authorizationTruncated) smaller.authorizationTruncated = true;
+		evidence = smaller;
+	}
+	if (ok(evidence)) return evidence;
 	const minimal = minimalEvidence(evidence);
+	if (options.context?.length) minimal.contextTruncated = true;
+	const kept = evidence.authorization.slice(-minimal.authorization.length);
+	if (
+		evidence.authorizationTruncated ||
+		minimal.authorization.length < evidence.authorization.length ||
+		minimal.authorization.some((entry, index) => entry.text !== kept[index]?.text)
+	) {
+		minimal.authorizationTruncated = true;
+	}
 	if (serializedBytes(minimal) > MAX_EVIDENCE_JSON_BYTES) {
 		throw new Error("pi-enclave: internal error: minimal reviewer evidence exceeds its hard byte bound");
+	}
+	if (!ok(minimal)) {
+		throw new ReviewerBudgetError("reviewer evidence does not fit the model context even in its minimal form");
 	}
 	return minimal;
 }

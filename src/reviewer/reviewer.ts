@@ -1,5 +1,6 @@
 import type { ClassifierAnswer, ClassifierQuestion, JsonObject } from "@earendil-works/pi-ai";
 import type { EffectiveProfile } from "../config/types.ts";
+import { chatFits, classifierFits, ReviewerBudgetError } from "./budget.ts";
 import { buildReviewEvidence, renderReviewEvidence } from "./evidence.ts";
 import { parseReviewerOutput, ReviewerOutputError } from "./output.ts";
 import { parseReviewProbabilities, reviewFromProbabilities } from "./probabilities.ts";
@@ -20,7 +21,8 @@ export const REVIEWER_MAX_ATTEMPTS = 3;
 export const REVIEWER_MAX_TOKENS = 256;
 export const REVIEWER_TEMPERATURE = 0;
 export const REVIEWER_SEED = 31_337;
-export const REVIEWER_NUM_CTX = 4_096;
+/** The default Ollama context (`reviewer.numCtx`), in tokens (#17). */
+export const REVIEWER_NUM_CTX = 8_192;
 
 export interface CompletionRequest {
 	system: string;
@@ -57,8 +59,8 @@ export interface ClassifyRequest {
 export interface ReviewerClassifier {
 	readonly kind: "classifier";
 	readonly name: string;
-	/** The server's context is bound through the model identity, not a request setting. */
-	readonly numCtx: null;
+	/** The server's slot context, as its identity reported and binds it; evidence is sized to it (#17). */
+	readonly numCtx: number;
 	/** From the qualification record; qualification itself runs with provisional values. */
 	readonly thresholds: ClassifierThresholds;
 	classify(request: ClassifyRequest): Promise<Record<string, ClassifierAnswer>>;
@@ -135,10 +137,29 @@ export class IsolatedReviewer implements ActionReviewer {
 			typeof this.options.evidence === "function" ? this.options.evidence(request) : this.options.evidence;
 		// Keep trusted full records separate from the bounded model representation.
 		const authorization = structuredClone(suppliedEvidence.authorization ?? []);
-		const evidence = buildReviewEvidence({
-			...suppliedEvidence,
-			...request,
-		});
+		const transports = this.options.fallback ? [this.options.primary, this.options.fallback] : [this.options.primary];
+		const fits = transports.map((transport) =>
+			isClassifier(transport)
+				? classifierFits(this.options.prompt, transport.numCtx)
+				: typeof transport.numCtx === "number"
+					? chatFits(this.options.prompt, transport.numCtx)
+					: undefined,
+		);
+		let evidence: ReturnType<typeof buildReviewEvidence>;
+		try {
+			// One document for every attempt, so it must fit each transport that may get it.
+			evidence = buildReviewEvidence({ ...suppliedEvidence, ...request }, (rendered) =>
+				fits.every((check) => !check || check(rendered)),
+			);
+		} catch (error) {
+			if (!(error instanceof ReviewerBudgetError)) throw error;
+			return {
+				ok: false,
+				kind: "unavailable",
+				reason: error.message,
+				evidence: buildReviewEvidence({ ...suppliedEvidence, ...request }),
+			};
+		}
 		const rendered = renderReviewEvidence(evidence);
 		let lastError = "reviewer unavailable";
 		const maxAttempts = this.options.maxAttempts ?? REVIEWER_MAX_ATTEMPTS;
@@ -223,7 +244,7 @@ export class IsolatedReviewer implements ActionReviewer {
 					maxTokens: 1,
 					temperature: REVIEWER_TEMPERATURE,
 					seed: seed + attempt,
-					numCtx: REVIEWER_NUM_CTX,
+					numCtx: completion.numCtx ?? REVIEWER_NUM_CTX,
 					onFirstOutput,
 				}),
 			),
@@ -241,7 +262,7 @@ export class IsolatedReviewer implements ActionReviewer {
 					maxTokens: REVIEWER_MAX_TOKENS,
 					temperature: REVIEWER_TEMPERATURE,
 					seed: seed + attempt,
-					numCtx: REVIEWER_NUM_CTX,
+					numCtx: completion.numCtx ?? REVIEWER_NUM_CTX,
 					onFirstOutput,
 				}),
 			),

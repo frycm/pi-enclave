@@ -239,6 +239,12 @@ export interface ReviewerSettings {
 	fallback: string;
 	/** One transport for the primary and the fallback. User-global only. */
 	transport: ReviewerTransportKind;
+	/**
+	 * Ollama's context window for the chat transport, in tokens (#17). Bound
+	 * into the model identity; evidence is sized to fit it. The classifier
+	 * transport uses the llama.cpp slot context instead, which its identity binds.
+	 */
+	numCtx: number;
 }
 
 export interface BreakerSettings {

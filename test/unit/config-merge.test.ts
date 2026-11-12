@@ -323,6 +323,14 @@ describe("fold", () => {
 			expect(fields(narrowerOrEqual(changed, ceiling))).toEqual(["reviewer"]);
 		});
 
+		it("keeps the context immutable below user-global (#17)", () => {
+			const ceiling = base();
+			ceiling.reviewer = { ...ceiling.reviewer, model: "ollama/reviewer", numCtx: 16_384 };
+			const changed = structuredClone(ceiling);
+			changed.reviewer.numCtx = 8_192;
+			expect(fields(narrowerOrEqual(changed, ceiling))).toEqual(["reviewer"]);
+		});
+
 		it("rejects a named fallback without a named primary", () => {
 			const result = fold(
 				[{ source: "builtin" }, doc("user_global", { reviewer: { fallback: "ollama/fallback" } })],

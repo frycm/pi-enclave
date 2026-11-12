@@ -48,6 +48,10 @@ export interface ReviewEvidence {
 	authorization: ReviewAuthorization[];
 	context: ReviewContextEntry[];
 	profile: { name: string; attended: AttendedMode };
+	/** Context entries were dropped to fit the model's context (#17). */
+	contextTruncated?: true;
+	/** Older direct authorization entries were dropped to fit; the newest is always kept. */
+	authorizationTruncated?: true;
 }
 
 export interface ModelReview {

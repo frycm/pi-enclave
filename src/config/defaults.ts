@@ -484,6 +484,7 @@ export const DEFAULT_REVIEWER: ReviewerSettings = {
 	timeoutMs: 30_000,
 	fallback: "none",
 	transport: "chat",
+	numCtx: 8_192,
 };
 
 /** Guardian's numbers, which are the only ones with field evidence behind them. */

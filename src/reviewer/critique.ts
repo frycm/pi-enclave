@@ -206,7 +206,7 @@ export async function critiqueRulebook(options: {
 					maxTokens: REVIEWER_MAX_TOKENS * 4,
 					temperature: REVIEWER_TEMPERATURE,
 					seed: REVIEWER_SEED,
-					numCtx: REVIEWER_NUM_CTX,
+					numCtx: completion.numCtx ?? REVIEWER_NUM_CTX,
 				}),
 				timeout,
 			]);

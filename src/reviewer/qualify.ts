@@ -1,12 +1,9 @@
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { EffectiveProfile, Provenance } from "../config/types.ts";
 import { evalReviewer } from "./eval.ts";
-import { bindReviewerClassifier, resolveReviewerClassifier, reviewerClassifierDigest } from "./llama.ts";
-import { bindReviewerCompletion, resolveReviewerModel, reviewerModelDigest } from "./model.ts";
-import { CLASSIFIER_DENY_THRESHOLD, CLASSIFIER_TEMPERATURE } from "./probabilities.ts";
 import { buildReviewerPrompt, reviewerRulebook } from "./prompt.ts";
 import { type QualificationRecord, writeQualification } from "./qualification.ts";
-import type { ReviewerTransport } from "./reviewer.ts";
+import { reviewerTarget } from "./setup.ts";
 
 export interface QualificationRun {
 	model: string;
@@ -35,11 +32,7 @@ export async function qualifyConfiguredReviewers(options: {
 
 	const runs: QualificationRun[] = [];
 	for (const reference of references) {
-		const { modelDigest, completion } = await qualificationTarget(
-			options.registry,
-			reference,
-			options.profile.reviewer.transport === "classifier",
-		);
+		const { modelDigest, completion } = await reviewerTarget(options.registry, reference, options.profile, prompt);
 		const record = await evalReviewer({
 			model: reference,
 			modelDigest,
@@ -55,23 +48,6 @@ export async function qualifyConfiguredReviewers(options: {
 		runs.push({ model: reference, record, path });
 	}
 	return runs;
-}
-
-async function qualificationTarget(
-	registry: ModelRegistry,
-	reference: string,
-	classifier: boolean,
-): Promise<{ modelDigest: string; completion: ReviewerTransport }> {
-	if (classifier) {
-		const resolved = resolveReviewerClassifier(registry, reference);
-		const modelDigest = await reviewerClassifierDigest(resolved.model, registry);
-		// The evaluation replaces these with provisional values and chooses the real ones.
-		const thresholds = { allow: 1, deny: CLASSIFIER_DENY_THRESHOLD, temperature: CLASSIFIER_TEMPERATURE };
-		return { modelDigest, completion: bindReviewerClassifier(resolved, modelDigest, thresholds) };
-	}
-	const resolved = resolveReviewerModel(registry, reference);
-	const modelDigest = await reviewerModelDigest(resolved.model, registry);
-	return { modelDigest, completion: bindReviewerCompletion(resolved, modelDigest) };
 }
 
 export function formatQualificationRuns(runs: readonly QualificationRun[]): string {

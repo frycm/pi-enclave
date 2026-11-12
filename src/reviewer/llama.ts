@@ -18,7 +18,6 @@ import { realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import type { ClassifierAnswer, ClassifierApi, ClassifierModel, ClassifierResult } from "@earendil-works/pi-ai";
 import { classify as llamaCppClassify } from "@earendil-works/pi-ai/api/llama-cpp-classify";
-import { classify as systemOneClassify } from "@earendil-works/pi-ai/api/typesafe-system-one";
 import { type ModelRegistry, VERSION } from "@earendil-works/pi-coding-agent";
 import { parseReviewerModelReference } from "../config/reviewer-model.ts";
 import { digest, type Endpoint, endpoint, isLoopback } from "./model.ts";
@@ -28,8 +27,14 @@ import type { ClassifierThresholds } from "./types.ts";
 export type ClassifierRuntimeModel = ClassifierModel<ClassifierApi>;
 
 export const LLAMA_PROVIDER = "llama.cpp";
-/** Chat GGUFs read through next-token label probabilities, and native decision models. */
-export const LLAMA_CLASSIFIER_APIS = ["llama-cpp-classify", "typesafe-system-one"] as const;
+/**
+ * Chat GGUFs read through next-token label probabilities. Native decision
+ * models (`typesafe-system-one`, llama.cpp's `/v1/systemone`) are refused for
+ * now (#17): the server builds their prompt, so pi-enclave can neither size the
+ * evidence to it nor check that the server read it whole. Its `usage` is a sum
+ * over a number of tasks the client does not know.
+ */
+export const LLAMA_CLASSIFIER_APIS = ["llama-cpp-classify"] as const;
 
 /** Values the router changes on every spawn of the same model; everything else is bound. */
 const VOLATILE_ARGS = new Set(["--port", "--log-colors"]);
@@ -216,13 +221,22 @@ function requireLlamaClassifier(model: ClassifierRuntimeModel): void {
 			`the classifier reviewer transport supports ${LLAMA_PROVIDER} models only; ${model.provider} is not supported`,
 		);
 	}
+	if (model.api === "typesafe-system-one") {
+		fail(
+			`llama.cpp model ${model.id} is a decision model (System One); a reviewer must be a chat GGUF read through llama-cpp-classify, ` +
+				"because pi-enclave cannot size the evidence to a prompt the server builds or check that it was read whole",
+		);
+	}
 	if (!(LLAMA_CLASSIFIER_APIS as readonly string[]).includes(model.api)) {
 		fail(`unsupported llama.cpp classifier API ${JSON.stringify(model.api)}`);
 	}
 }
 
 /** The router's own report of what serves this model, plus a hash of the weights it loaded. */
-async function classifierDigest(target: Endpoint<ClassifierRuntimeModel>, signal: AbortSignal): Promise<string> {
+async function classifierIdentity(
+	target: Endpoint<ClassifierRuntimeModel>,
+	signal: AbortSignal,
+): Promise<{ digest: string; nCtx: number }> {
 	const model = target.model;
 	requireLlamaClassifier(model);
 	if (!isLoopback(model.baseUrl)) {
@@ -252,7 +266,7 @@ async function classifierDigest(target: Endpoint<ClassifierRuntimeModel>, signal
 		fail(`llama.cpp did not report the context size of ${model.id}`);
 	}
 	const gguf = await ggufDigest(props.model_path);
-	return `llama.cpp:sha256:${digest({
+	const identity = `llama.cpp:sha256:${digest({
 		transport: "classifier",
 		// Catalog fields such as contextWindow come from pi's cached refreshes and
 		// vary without the server changing; the server's own report is bound below.
@@ -269,33 +283,91 @@ async function classifierDigest(target: Endpoint<ClassifierRuntimeModel>, signal
 		args: stableArgs(args),
 		architecture: isRecord(entry.architecture) ? entry.architecture : null,
 	})}`;
+	return { digest: identity, nCtx };
+}
+
+async function classifierDigest(target: Endpoint<ClassifierRuntimeModel>, signal: AbortSignal): Promise<string> {
+	return (await classifierIdentity(target, signal)).digest;
+}
+
+/** The digest and the slot context it binds; the context sizes the evidence (#17). */
+export async function reviewerClassifierIdentity(
+	model: ClassifierRuntimeModel,
+	registry?: ModelRegistry,
+): Promise<{ digest: string; nCtx: number }> {
+	return classifierIdentity(await endpoint(model, registry), AbortSignal.timeout(120_000));
 }
 
 export async function reviewerClassifierDigest(
 	model: ClassifierRuntimeModel,
 	registry?: ModelRegistry,
 ): Promise<string> {
-	return classifierDigest(await endpoint(model, registry), AbortSignal.timeout(120_000));
+	return (await reviewerClassifierIdentity(model, registry)).digest;
 }
 
 // --- requests ----------------------------------------------------------------
 
+/**
+ * Real text does not average this many bytes a token, so a count below it
+ * means part of the prompt was not read. A long run of one repeated character
+ * can tokenize more densely; that fails closed as an unavailable reviewer.
+ */
+const MAX_BYTES_PER_TOKEN = 16;
+
+/**
+ * llama-server's own report on a `/completion` prompt (#17). The evidence is
+ * sized so the prompt fits the slot, and llama-server refuses one that does
+ * not (400 exceed_context_size_error). A build or setting that truncates
+ * instead answers 200 with `truncated: true`, which pi-ai does not read; the
+ * label probabilities would then come from a cut prompt. That, a missing
+ * report, or a token count that cannot cover the prompt is an error, never a
+ * verdict.
+ */
+export function checkCompletionReport(body: unknown, prompt: unknown, nCtx: number): void {
+	if (!isRecord(body)) fail("llama.cpp returned no completion report");
+	if (body.truncated !== false) fail("llama.cpp truncated the classifier prompt");
+	const evaluated = body.tokens_evaluated;
+	if (typeof evaluated !== "number" || !Number.isSafeInteger(evaluated) || evaluated <= 0) {
+		fail("llama.cpp did not report how many prompt tokens it evaluated");
+	}
+	const bytes = typeof prompt === "string" ? Buffer.byteLength(prompt) : 0;
+	if (evaluated >= nCtx || evaluated * MAX_BYTES_PER_TOKEN < bytes) {
+		fail(`llama.cpp evaluated ${evaluated} prompt tokens for a ${bytes}-byte prompt in a ${nCtx}-token slot`);
+	}
+}
+
+/** Pinned to the snapshot: no redirects, and every label read checked against the bound slot context. */
+function checkedFetch(nCtx: number): typeof fetch {
+	return async (input, init) => {
+		const response = await fetch(input, { ...init, redirect: "error" });
+		const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+		if (!response.ok || !new URL(url).pathname.endsWith("/completion")) return response;
+		const sent = typeof init?.body === "string" ? (JSON.parse(init.body) as { prompt?: unknown }) : {};
+		const body: unknown = await response
+			.clone()
+			.json()
+			.catch(() => undefined);
+		checkCompletionReport(body, sent.prompt, nCtx);
+		return response;
+	};
+}
+
 async function classifySnapshot(
 	target: Endpoint<ClassifierRuntimeModel>,
 	request: ClassifyRequest,
+	nCtx: number,
 ): Promise<Record<string, ClassifierAnswer>> {
-	const run = target.model.api === "typesafe-system-one" ? systemOneClassify : llamaCppClassify;
-	const result: ClassifierResult = await run(
+	const result: ClassifierResult = await llamaCppClassify(
 		target.model,
 		{ state: request.state, questions: request.questions },
 		{
-			// System One requires a key; llama.cpp ignores one it was not started with.
+			// llama.cpp ignores a key it was not started with.
 			apiKey: target.apiKey ?? "local",
 			headers: target.headers,
 			signal: request.signal,
 			temperature: request.temperature,
 			maxRetries: 0,
-			fetch: (url, init) => fetch(url, { ...init, redirect: "error" }),
+			fetch: checkedFetch(nCtx),
 		},
 	);
 	if (result.stopReason !== "stop") fail(result.errorMessage ?? `classifier stopped with ${result.stopReason}`);
@@ -320,9 +392,10 @@ export function resolveReviewerClassifier(registry: ModelRegistry, reference: st
 		model,
 		classifyBound: async (request, expected) => {
 			const target = await endpoint(model, registry);
-			const actual = await classifierDigest(target, request.signal);
+			const identity = await classifierIdentity(target, request.signal);
+			const actual = identity.digest;
 			if (actual !== expected) fail("reviewer identity changed; requalification required");
-			const answers = await classifySnapshot(target, request);
+			const answers = await classifySnapshot(target, request, identity.nCtx);
 			if (
 				(await classifierDigest(target, request.signal)) !== actual ||
 				(await reviewerClassifierDigest(model, registry)) !== actual
@@ -337,13 +410,14 @@ export function resolveReviewerClassifier(registry: ModelRegistry, reference: st
 /** Identity and thresholds travel together: a threshold is only meaningful for the model it was chosen on. */
 export function bindReviewerClassifier(
 	resolved: ResolvedReviewerClassifier,
-	expected: string,
+	identity: { digest: string; nCtx: number },
 	thresholds: ClassifierThresholds,
 ): ReviewerClassifier {
+	const expected = identity.digest;
 	return {
 		kind: "classifier",
 		name: `${resolved.model.provider}/${resolved.model.id}`,
-		numCtx: null,
+		numCtx: identity.nCtx,
 		thresholds,
 		classify: (request) => resolved.classifyBound(request, expected),
 	};
