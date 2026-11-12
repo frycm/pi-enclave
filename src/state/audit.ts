@@ -78,6 +78,8 @@ export type AuditKind =
 	| "refusal"
 	/** An allowed tool call finished: exit code, duration, error (#37). */
 	| "executed"
+	/** A gated call stopped at the moment it would run, so it did not (#29). */
+	| "execution_refused"
 	/** A `!`/`!!` command the person typed. */
 	| "user_command"
 	/** `pi-enclave approve` ran, declined or refused a pending action. */
@@ -431,6 +433,34 @@ export function executedFields(options: {
 		// null is "killed or timed out without an exit code", which is not the
 		// same as "not a shell command" (absent).
 		...(options.exitCode !== undefined ? { exitCode: options.exitCode } : {}),
+		turnIndex: options.turnIndex,
+	};
+}
+
+/**
+ * A call the execution check stopped before its tool ran (#29): which check
+ * (`refusal`: a lock violation kind, `unavailable` or `aborted`), and the
+ * action hash when the call had passed the gate.
+ */
+export function executionRefusedFields(options: {
+	toolCallId: string;
+	toolName: string;
+	parentToolCallId?: string;
+	hash?: string;
+	kind: string;
+	reason: string;
+	turnIndex: number;
+}): Record<string, unknown> {
+	const reason = boundedText(options.reason);
+	return {
+		toolCallId: options.toolCallId,
+		tool: options.toolName,
+		...(options.parentToolCallId !== undefined ? { parentToolCallId: options.parentToolCallId } : {}),
+		...(options.hash !== undefined ? { hash: options.hash } : {}),
+		// `refusal`, not `kind`: the record's own kind is "execution_refused".
+		refusal: options.kind,
+		reason: reason.text,
+		...(reason.truncated ? { reasonTruncated: true } : {}),
 		turnIndex: options.turnIndex,
 	};
 }

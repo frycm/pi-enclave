@@ -13,9 +13,9 @@
  *
  * Two refinements for unattended servers (#37):
  *
- * - The size budget never deletes a session that holds a breaker, violation
- *   or approval record. Those are the sessions an incident review needs, and
- *   the oldest-first order would otherwise pick them. Only age removes them,
+ * - The size budget never deletes a session that holds a breaker, violation,
+ *   approval or execution_refused record. Those are the sessions an incident
+ *   review needs, and the oldest-first order would otherwise pick them. Only age removes them,
  *   which is a period the user chose; the budget can be exceeded meanwhile.
  * - A deleted log's head anchor is kept and marked retired, so `audit verify`
  *   can tell a log retention removed from one that disappeared. The marker is
@@ -26,7 +26,7 @@ import { join } from "node:path";
 import { anchorPathFor, readAnchor, writeAnchor } from "./audit.ts";
 
 /** Record kinds that make a session worth keeping past the size budget. */
-const INCIDENT_KINDS = ["breaker", "violation", "approval"];
+const INCIDENT_KINDS = ["breaker", "violation", "approval", "execution_refused"];
 /** `audit` records that are evidence of tampering, rather than the cap being reached. */
 const INCIDENT_AUDIT_EVENTS = ["tail-missing", "tail-differs"];
 

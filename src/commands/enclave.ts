@@ -64,6 +64,11 @@ export interface EnclaveState {
 	 * (#36), so a later check on trusted code has the list.
 	 */
 	loadedCode?: readonly string[];
+	/**
+	 * True when pi offers `pi.wrapToolExecution` (#29), so third-party tools
+	 * are re-checked at the moment they run, not only when they are admitted.
+	 */
+	executionCheck?: boolean;
 	auditPath?: string;
 	/** True once an audit write has failed. Shown without being asked for. */
 	auditDegraded?: boolean;
@@ -160,6 +165,11 @@ export function renderStatus(state: EnclaveState): string {
 		`limits:     ${describeLimits(profile.limits, state.backendName, process.platform, state.processLimit)}`,
 		`violations: ${state.violations.length} this session`,
 		`coverage:   ${COVERAGE_NOTE}`,
+		`execution:  ${
+			state.executionCheck
+				? "every tool is re-checked when it runs (pi.wrapToolExecution)"
+				: "third-party tools are checked when admitted only; one is kept out of a batch an earlier call could stop"
+		}`,
 	);
 	try {
 		const ledger = state.tripwireLedger?.state();

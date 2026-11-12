@@ -664,6 +664,7 @@ evaluation on top of one.
 | Persistence | Session entries, `session_start` / `session_shutdown` | The per-session approval table and breaker state survive resume; a bypass never does. |
 | Offer only what the gate allows | `getActiveTools`, `setActiveTools` | In auto mode, tools outside `tools.allow` (or registered by a source other than the grant's pin) are taken out of the set declared to the model at session start and before every prompt, which is when an MCP server that connected in the meantime has its tools judged (#28). Not on `mcp_servers_change`: handling that event makes an extension the one that connects MCP servers, and would silence pi's report that nothing does. A small model then does not call `codemode` or an MCP tool only to be refused, and three such refusals do not trip the breaker. The gate still enforces; a tool pi-enclave hid is put back when a later policy allows it, and one pi or the user deactivated stays off. |
 | Project trust | `on("project_trust")` | In auto mode, a headless run (print, json, or rpc before any handshake) answers **no** for a project not listed in the user-global `attended.headlessTrust`, whatever pi's trust store says: its `.pi` settings, MCP servers, extensions, skills and prompts would run in or configure the pi process outside the sandbox, in a directory the agent can write. A "no" also means pi-enclave's own project files (`.pi/enclave.json`, `.pi/enclave.local.json`) are not applied, so a project file that narrows the policy or picks a profile has no effect in a headless run unless the project is listed. The TUI leaves the question to pi's prompt and warns, on stderr above that prompt at startup, with the list of what trusting would load. If deciding fails, a headless run answers no rather than fall back to the trust store. Only a user-global pi-enclave sees the question. `--approve` and `--no-approve` decide before any extension is asked, and the first extension to answer yes or no wins, so a user-global extension loaded earlier outranks this one. |
+| Re-check at execution (**fork only**) | `pi.wrapToolExecution`, prototyped in [`frycm/pi#1`](https://github.com/frycm/pi/pull/1); not in pi 1.5.2 | Found by a feature probe. A third-party call runs inside the lock's invocation check: the executed input must equal the gated action, the breaker is asked again, and the call runs once. Without it, a third-party call is withheld from a batch an earlier call could stop. See [core changes](#core-changes-to-propose-to-pi), item 1. |
 | Turn bookkeeping | `on("turn_start")`, `on("turn_end")` | The tool registry is read once per turn instead of per call. At turn end the lock table is swept: an entry for a call a later extension's `tool_call` handler blocked never gets a `tool_result`, and would otherwise wait for the next direct message. |
 | Commands and status | `registerCommand`, status line | `/enclave status\|backend\|violations\|rules\|audit\|pending`, plus the `pi-enclave` binary for anything that happens outside a session. The footer shows backend, mode, attendance in force, breaker state and counts. There is deliberately **no** runtime `on`/`off` toggle: a switch that changes the trust model mid-session is exactly what the lock and the audit log exist to prevent. |
 
@@ -1746,7 +1747,7 @@ A client that does not know about the handshake sees an `input` prompt it cannot
 times out, which is the safe outcome. The per-escalation `ctx.ui.confirm` is then only sent
 to a client that proved it is a console. This binds *the channel*, not each confirm; binding
 each confirm would need per-request MACs inside `confirm`'s boolean response, which the
-baseline cannot carry — that is item 4 in the [core changes](#core-changes-to-propose-to-pi).
+baseline cannot carry — that is item 3 in the [core changes](#core-changes-to-propose-to-pi).
 
 Two rules apply regardless of mode:
 
@@ -1918,6 +1919,7 @@ a server, the log is meant to answer "what did it run, and what happened?" (#37)
 |---|---|
 | `decision` | The gate's outcome, the action hash, and the **command as bash received it** (redacted, at most 8 KiB, with `commandTruncated` when cut) next to the tokenizer's reading in `commands`. The raw text is what lets an investigator re-run or re-hash the action, and what shows a tokenizer mistake instead of repeating it. |
 | `executed` | For every call the gate allowed, once pi has run it: tool call id, hash, `isError`, duration and, for bash, the exit code (`null` when the command was killed or timed out). |
+| `execution_refused` | Only on a pi with `pi.wrapToolExecution` ([frycm/pi#1](https://github.com/frycm/pi/pull/1)): a call the gate admitted but the execution check stopped before the tool ran. Tool, call id (and the parent's for a nested call), the action hash when the call passed the gate, which check stopped it (`refusal`: `breaker-open`, `ambiguous` for arguments that differ, `not-locked` for a call nobody gated, `already-consumed` for a second run, `unavailable` when the session may run nothing, `aborted`) and the reason. Such a call gets no `executed` record. |
 | `user_command` | Each `!`/`!!` command the person typed: a `started` record before it runs (command, cwd) and a `finished` one after (exit code, duration). It is sandboxed but not gated, and on a shared server it belongs in the trail too. |
 | `reviewer` | Each verdict: the model's decision, risk and reason next to the enforced decision, the deterministic minimum risk, and whether a direct instruction covered the action; failures say which kind. Timing is recorded separately. |
 | `approval` | `pi-enclave approve` and `decline`, in their own `approvals` log: an `executing` record when it starts and one with the outcome (`executed`, `declined`, `refused`, `unsupported`), or `queue-approved` and `declined` for a [queued](#the-approval-queue) request, with nonce, hash, originating session, both configuration hashes, uid, user, tty, SSH client address, exit code and duration. It is a separate log because the originating session may still be open and own its own chain. |
@@ -1960,8 +1962,8 @@ Behaviour under failure, for `attended: off`:
   starts with the next call.
 - `audit.sessionMaxMb` (default 100) bounds one session's file. At the cap the log writes one
   last `audit` record saying so and stops, which counts as a failure for `audit.required`.
-- Retention's size budget never deletes a session holding a `breaker`, `violation` or
-  `approval` record, or an `audit` record of a missing or replaced tail: those are the ones an
+- Retention's size budget never deletes a session holding a `breaker`, `violation`,
+  `approval` or `execution_refused` record, or an `audit` record of a missing or replaced tail: those are the ones an
   incident review needs, and oldest-first would pick them. Only the age limit removes them,
   and the budget may be exceeded until then; session start warns when it is, and status says
   how many logs are kept for that reason. A log
@@ -2314,8 +2316,8 @@ sandbox's, so a green row on a restricted host is not read as stronger evidence 
 | Spawn a PTY (`vim`, `less`), Python multiprocessing, `git worktree` outside cwd | Works / violation as configured. **Linux:** bubblewrap cannot deny PTYs, so `allowPty: false` is not enforceable there and the compiled profile reports `pty on` | 1 | C6 |
 | Script that calls `sudo` / `su` / `systemctl` | Violation, not a policy denial | 1 | C7 |
 | **IPC sockets**: connect to `/var/run/docker.sock`, `~/.gnupg/S.gpg-agent`, `$SSH_AUTH_SOCK`, the broker socket, an X11/Wayland socket | Violation; `allowUnixSockets` is not exposed in the dev profile | 1 | C8 |
-| **Tool ownership**: another extension provides `bash` or a file tool. pi keeps the **first** extension's registration, so the hazard is one loaded *before* pi-enclave, not after | Auto mode refuses to start, naming the extension that owns the tool. A handler loaded *after* pi-enclave cannot mutate a frozen input; one loaded before is inside the trusted-extension boundary, and `tool_call_final` is tracked in [core changes](#core-changes-to-propose-to-pi) | 2 | P1 |
-| **Parallel batch termination**: three tool calls in one batch, the second trips the breaker | No owned call from that batch executes after the trip, `terminate` fires once, and the audit log shows one batch outcome. pi prepares every call before execution, so owned operations re-check at execution time; a non-owned sibling is withheld during preparation when a preceding owned call could trip the breaker only at runtime | 2 | P2 + unit batch-risk regressions |
+| **Tool ownership**: another extension provides `bash` or a file tool. pi keeps the **first** extension's registration, so the hazard is one loaded *before* pi-enclave, not after | Auto mode refuses to start, naming the extension that owns the tool. A handler loaded *after* pi-enclave cannot mutate a frozen input; one loaded before is inside the trusted-extension boundary; a hook at execution is item 1 of the [core changes](#core-changes-to-propose-to-pi) | 2 | P1 |
+| **Parallel batch termination**: three tool calls in one batch, the second trips the breaker | No owned call from that batch executes after the trip, `terminate` fires once, and the audit log shows one batch outcome. pi prepares every call before execution, so owned operations re-check at execution time; a non-owned sibling is withheld during preparation when a preceding owned call could trip the breaker only at runtime. On a pi with `pi.wrapToolExecution` (the fork prototype, #29) it is admitted and re-checked when it runs instead | 2 | P2 + unit batch-risk regressions |
 | **Crash / recovery**: kill pi mid-action, resume the session | The breaker state is restored from session entries; a half-written pending record is invisible (atomic rename); the audit chain verifies up to the last complete line; the helper and any container are reaped (`--die-with-parent`, `--rm`) | 2 | P3 |
 | Project-local config that selects a wider profile / adds `rules.skipReview` or `review.allow` / adds a trust entry to `review.environment` / changes the reviewer | Whole file rejected, auto mode refuses to start, diagnostic names the field | 2 | P4 |
 | Project-shared or project-local config contains any of `review.environment` / `hard_deny` / `soft_deny` / `allow` (even an empty list, and even a `soft_deny` that reads as tightening) | Whole file rejected, auto mode refuses to start, diagnostic names the key; presence is the test, and the value is never examined | 2 | P5 |
@@ -2711,29 +2713,111 @@ human-only decisions remain authoritative.
 
 ## Core changes to propose to pi
 
-All of the above works as an extension, but four core changes would make any
-reviewer or sandbox extension *robust* rather than merely careful:
+Everything above works on unpatched pi. This list is what pi-enclave cannot do well as an
+extension, re-assessed in #29 against pi 1.5.2 and upstream `main` at
+[`9b88b94`](https://github.com/earendil-works/pi/tree/9b88b94) (November 12, 2026). Each patch
+the fork carries is re-tested on every release, so the list is short, every item names what
+pi-enclave does today instead and what code it would delete, and pi-enclave keeps working
+without any of them: a fork-only API is found by a feature probe, never by version, and
+the fallback below stays.
 
-1. **Ordered or final `tool_call` handlers.** Today handlers run in extension load order,
-   and later handlers may mutate `event.input` with no re-validation — pi's own
-   `types.ts` documents this. Either a `priority` option, or a post-mutation
-   `tool_call_final` event that sees the exact input about to execute.
-2. **`ask` as a first-class `ToolCallEventResult`**, with a defined unattended fallback, so
-   every mode (TUI, RPC, print) behaves identically.
-3. **An execution-boundary hook for custom tools** — or a "run this tool through this
-   wrapper" option — so MCP and custom tools can be sandboxed instead of merely allowlisted.
-4. **An authenticated `confirm` for RPC clients** — an optional `challenge` field on the
-   `confirm` request and a matching `proof` on the response — so each approval, not just
-   the channel, can be bound to a secret the client holds.
+The upstream discussion texts are drafted in [docs/pi-core-proposals.md](docs/pi-core-proposals.md).
+None has been posted yet; each item links its discussion here once it is open.
 
-These are proposals for [`frycm/pi`](https://github.com/frycm/pi), with pi-enclave as the
-motivating use case. The fork matches the exact stable upstream v1.5.2 tag and
-contains no prototype patches. The fork's policy is fixed: it is **always rebased
-onto the latest stable upstream release** and carries *only* the patches above as discrete
-commits on top — no divergent features, no long-lived branch. pi-enclave itself targets
-upstream pi at the [baseline](#api-baseline); the fork exists to prove the patches, and
-anything that only works on the fork is marked as such in this document until it lands
-upstream.
+| # | Proposal | State |
+| --- | --- | --- |
+| 1 | Execution-boundary hook for tools | **Prototyped** in [`frycm/pi#1`](https://github.com/frycm/pi/pull/1) (open; not on the fork's `main`); used by pi-enclave when present |
+| 2 | Provenance on stored user messages | Draft |
+| 3 | A typed permission request, with an optional challenge and proof | Draft; design together with pi-huginn |
+| 4 | A spawn hook for stdio MCP servers | Draft |
+| 5 | When the occasion arises: a batch-level stop, pinned-endpoint model calls, trust over context files | Notes only |
+
+**1. Execution-boundary hook for tools.** `pi.wrapToolExecution((call, next, ctx) => …)`
+runs after every `tool_call` handler allowed a call, immediately before the tool, for every
+tool and for calls tools make through `ctx.executeTool()`. It receives the tool name, call id,
+parent call id, `sourceInfo`, and a deep-frozen copy of the arguments that is also the object
+the tool's `execute` receives, and decides whether `next()` runs. It is a decision point, not
+isolation: an in-process tool still runs with pi's privileges.
+- *Today instead:* a parallel batch is admitted call by call before any of it runs, and nothing
+  asks again. pi-enclave's own tools re-check from inside `execute` (`bindOwnedTool`,
+  `ActionLock.runInvocation`); a third-party tool cannot be re-checked, so the gate withholds
+  one from any batch where an earlier call could open the breaker
+  (`shouldWithholdNonOwnedSibling`, outcome `batch-withheld`). The arguments are protected by
+  deep-freezing `event.input` (`freezeToolInput`), and operations that receive no call id find
+  their entry by command or path (`executionKeys`, `beginExecution`, `beginPathExecution`).
+- *With the prototype (fork only):* `src/gate/execution.ts` runs every third-party call inside
+  `lock.runInvocation`, which compares the complete gated action with what executes, asks the
+  breaker again and runs the call once; the batch withholding is not applied, and
+  `/enclave status` says which of the two is in force.
+- *Would delete once upstream:* the withholding (`shouldWithholdNonOwnedSibling`,
+  `wouldOpenOnAdverse`, `batch-withheld`); `freezeToolInput` as the argument guard, since the
+  executed input is compared with the gated one at execution; and, by binding owned tools in
+  the wrapper too, the keyed lookup that reconnects an operation with its call. The turn-end
+  sweep of lock entries for calls a later handler blocked stays: such a call never reaches
+  the wrapper either.
+- *Replaces the old item 1, ordered or final `tool_call` handlers.* A `priority` option would
+  delete nothing here, and "who runs last" between two security extensions has no good answer;
+  the missing piece is a hook at execution. Compatibility note that stays true: because
+  pi-enclave freezes `event.input`, an extension loaded after it that rewrites arguments in
+  `tool_call` throws, and the call fails closed.
+
+**2. Provenance on stored user messages.** A `source` (`interactive`, `rpc`, `extension`) and
+the pre-expansion text on the stored user message.
+- *Today instead:* `ProvenanceTracker` (`src/gate/provenance.ts`) stitches `input`,
+  `before_agent_start` and `message_start` together, and assumes that the newest pending input
+  is the one that expanded. Provenance decides whether a message can carry authorization and
+  whether it may reset the breaker.
+- *Would delete:* the tracker and its matching heuristics; any permission extension gets the
+  same evidence for free. pi-huginn needs the same distinction one level finer: an RPC message
+  a person typed is not the same as one its manager generated.
+
+**3. A typed permission request** (the old items 2 and 4, merged). A UI and RPC request for
+"may this tool call run": tool, canonical description, action hash, timeout and default
+answer, with an optional `challenge` on the request and `proof` on the answer, and a defined
+answer in print and json modes.
+- *Today instead:* the attendance contract, `ctx.ui.confirm` with
+  `blocked: { kind: "permission" }` in the TUI, pending records and `pi-enclave approve`, the
+  approval queue (#30), and the HMAC handshake over `ctx.ui.input`, which binds the channel
+  but not each answer. An RPC client cannot tell a permission request from any other `confirm`.
+- *Would delete:* the handshake's one-shot channel binding in favour of a MAC over each action
+  hash, and pi-enclave's own unattended fallback per mode. Design it with pi-huginn's needs,
+  since it is the client that would render and answer these. Upstream's new durable harness
+  (`packages/durable`, not used by the coding agent in 1.5.x) already parks a call at a
+  `beforeTool` gate until a signal arrives; a proposal should fit that shape.
+
+**4. A spawn hook for stdio MCP servers.** Let an extension wrap a stdio server's command,
+arguments and environment, as `spawnHook` does for `bash`.
+- *Today instead:* MCP tools are allowlisted, never sandboxed: the server process runs as a
+  child of pi (`packages/mcp/src/transports/stdio.ts` spawns it directly) and its tools run in
+  the pi process. `pi.registerMcpServer` cannot help, because a server of the same name in
+  `mcp.json` takes precedence.
+- *Would delete:* nothing yet; it would add the first MCP servers that run inside the L2
+  profile (workspace-only writes, no network, filtered environment). HTTP servers are a
+  network-policy question and belong with Phase 4b.
+
+**5. When the occasion arises.**
+- *A batch-level stop from `tool_call`* (`{ block: true, abortBatch: true }`). Today the breaker
+  calls `ctx.abort()` and sends a follow-up message, because `terminate` ends the run only when
+  every result in the batch sets it. Item 1 already stops the rest of a batch from executing,
+  so this only tidies the turn end. Upstream's durable harness has the same idea as an
+  `afterTools` task that ends the run.
+- *Pinned-endpoint model calls and model identity.* The chat reviewer calls Ollama on a
+  snapshot of the resolved endpoint (`completeSnapshot` in `src/reviewer/model.ts`) because
+  `ModelRegistry` re-resolves the base URL and auth after the identity check; the llama.cpp
+  classifier transport (#26) hashes the GGUF file itself because the server reports no digest. A registry call against a
+  resolved endpoint, and a stable identity for local models (weights digest, runtime version,
+  context size), would remove both. Raise it with any classifier-related change upstream.
+- *Trust over context files.* `AGENTS.md`, `CLAUDE.md` and `AGENTS.override.md` load whatever
+  the project trust answer is (`loadProjectContextFiles` in 1.5.2). An extension veto over
+  context files, or a `project_trust` event that lists what is about to load, would address
+  part of the workspace-persistence problem (#19) at the source.
+
+The fork policy is unchanged: [`frycm/pi`](https://github.com/frycm/pi) is rebased onto every
+stable upstream release and carries only the patches listed here, one commit each. None is
+on the fork's `main` yet, which is still exactly `v1.5.2`: item 1 is prototyped in
+[frycm/pi#1](https://github.com/frycm/pi/pull/1), an open pull request. pi-enclave targets
+upstream pi at the [baseline](#api-baseline) and is tested there; what only works on the fork
+is marked as such in this document until it lands upstream.
 
 ---
 

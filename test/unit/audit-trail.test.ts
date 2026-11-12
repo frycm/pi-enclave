@@ -356,17 +356,23 @@ describe("retention", () => {
 		utimesSync(path, when, when);
 	};
 
-	it("keeps sessions with a breaker, violation or approval record past the size budget", async () => {
+	it("keeps sessions with a breaker, violation, approval or execution_refused record past the size budget", async () => {
 		const plain = await written(1, "plain");
 		const incident = new AuditLog({ dir: root, sessionId: "incident" });
 		incident.append("breaker", { event: "opened" });
 		await incident.flush();
+		// A call stopped at execution (#29): another extension changed its
+		// arguments, or the breaker opened while it was queued.
+		const refused = new AuditLog({ dir: root, sessionId: "refused" });
+		refused.append("execution_refused", { refusal: "ambiguous" });
+		await refused.flush();
 		age(plain.path, 2);
 		age(incident.path, 3);
+		age(refused.path, 4);
 		writeFileSync(join(root, "big.jsonl"), "x".repeat(2 * 1024 * 1024));
 		const result = applyRetention({ dir: root, retentionDays: 30, retentionMb: 1, keepSessionId: "big" });
 		expect(result.deleted).toEqual(["plain.jsonl"]);
-		expect(result.keptForIncidents).toEqual(["incident.jsonl"]);
+		expect([...result.keptForIncidents].sort()).toEqual(["incident.jsonl", "refused.jsonl"]);
 		expect(existsSync(incident.path)).toBe(true);
 	});
 

@@ -79,7 +79,8 @@ export class CircuitBreaker {
 	/**
 	 * Would one runtime-only adverse outcome in this turn open the breaker?
 	 *
-	 * Non-owned tools have no execute wrapper where pendingOpen can be checked.
+	 * Non-owned tools have no execute wrapper where pendingOpen can be checked
+	 * on upstream pi (on a pi with `wrapToolExecution` they do: gate/execution.ts).
 	 * The gate uses this projection to withhold a later non-owned batch sibling
 	 * when an earlier owned call could be the runtime event that opens it.
 	 */
