@@ -88,7 +88,7 @@ import { critiqueRulebook, formatCritique } from "./reviewer/critique.ts";
 import { MAX_AUTHORIZATION_ENTRIES } from "./reviewer/evidence.ts";
 import { rememberReviewContext, restoreReviewHistory } from "./reviewer/history.ts";
 import { formatQualificationRuns, qualifyConfiguredReviewers } from "./reviewer/qualify.ts";
-import { IsolatedReviewer } from "./reviewer/reviewer.ts";
+import { IsolatedReviewer, isClassifier, REVIEWER_WARM_TIMEOUT_MS } from "./reviewer/reviewer.ts";
 import { prepareQualifiedReviewer } from "./reviewer/setup.ts";
 import type { ActionReviewer, ReviewAuthorization, ReviewContextEntry } from "./reviewer/types.ts";
 import {
@@ -402,6 +402,8 @@ export default function (pi: ExtensionAPI): void {
 	let sessionFile: string | undefined;
 	let actionReviewer: ActionReviewer | undefined;
 	let reviewerSetup: Awaited<ReturnType<typeof prepareQualifiedReviewer>>;
+	/** The reviewer model's warm-up request at session start (#25). */
+	let warming: AbortController | undefined;
 	const reviewAuthorization: ReviewAuthorization[] = [];
 	let authorizationGeneration = 0;
 	const reviewContext: ReviewContextEntry[] = [];
@@ -1388,6 +1390,16 @@ export default function (pi: ExtensionAPI): void {
 					};
 				},
 			});
+			// Load the model now, so the first review's timeout is not spent on
+			// loading it (#25). Nothing is read from the answer; a failure here
+			// shows up in the first review, which checks identity as always.
+			// Aborted at shutdown, so a load never keeps a finished run alive.
+			warming?.abort();
+			warming = new AbortController();
+			const warmSignal = AbortSignal.any([warming.signal, AbortSignal.timeout(REVIEWER_WARM_TIMEOUT_MS)]);
+			for (const transport of [reviewerSetup.primary, reviewerSetup.fallback]) {
+				if (transport && !isClassifier(transport)) transport.warm?.(warmSignal).catch(() => {});
+			}
 			// Every verdict is recorded, not only its timing: the model's own
 			// decision and reason next to what the deterministic floor made of
 			// them is what a later tuning pass needs (#37).
@@ -1445,6 +1457,7 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		warming?.abort();
 		// Flush, then dispose, then flush once more: tearing the backend down can
 		// deliver a last `onFsViolation` (a denial during teardown), which queues
 		// an audit append that the first flush has already passed. The second

@@ -13,7 +13,7 @@
  *
  *   system bytes + evidence bytes + template reserve + output tokens <= context
  *
- * for every stage. It is pessimistic (real text runs 3 to 4 bytes a token),
+ * for the one chat request. It is pessimistic (real text runs 3 to 4 bytes a token),
  * which is the price of a bound that does not depend on a tokenizer.
  */
 import type { ClassifierQuestion, JsonObject } from "@earendil-works/pi-ai";
@@ -46,16 +46,10 @@ function bytes(text: string): number {
 
 /** Bytes of evidence the chat transport can send at `numCtx` without the bound failing. */
 export function chatEvidenceBytes(prompt: ReviewerPrompt, numCtx: number): number {
-	const authorization = numCtx - TEMPLATE_RESERVE_TOKENS - 1 - bytes(prompt.authorizationSystem);
-	const decision =
-		numCtx -
-		TEMPLATE_RESERVE_TOKENS -
-		REVIEWER_MAX_TOKENS -
-		Math.max(bytes(prompt.decisionSystem["0"]), bytes(prompt.decisionSystem["1"]));
-	return Math.min(authorization, decision);
+	return numCtx - TEMPLATE_RESERVE_TOKENS - REVIEWER_MAX_TOKENS - bytes(prompt.system);
 }
 
-/** The worst-case token count of one chat stage, as the Ollama post-check compares it. */
+/** The worst-case token count of one chat request, as the Ollama post-check compares it. */
 export function chatPromptBound(system: string, user: string): number {
 	return bytes(system) + bytes(user) + TEMPLATE_RESERVE_TOKENS;
 }

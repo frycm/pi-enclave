@@ -71,7 +71,6 @@ export function formatQualificationRuns(runs: readonly QualificationRun[]): stri
 			);
 		}
 		for (const [label, value] of [
-			["authorization", metrics.p95AuthorizationMs],
 			["decision", metrics.p95DecisionMs],
 			["first output", metrics.p95FirstOutputMs],
 		] as const) {

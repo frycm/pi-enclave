@@ -108,13 +108,8 @@ describe("chat transport: system + evidence + output fits the context", () => {
 				if (evidence === "unavailable") continue;
 				fitted++;
 				const rendered = renderReviewEvidence(evidence);
-				// Stage one reads one token, stage two up to REVIEWER_MAX_TOKENS.
-				expect(chatPromptBound(PROMPT.authorizationSystem, rendered) + 1).toBeLessThanOrEqual(numCtx);
-				for (const gate of ["0", "1"] as const) {
-					expect(chatPromptBound(PROMPT.decisionSystem[gate], rendered) + REVIEWER_MAX_TOKENS).toBeLessThanOrEqual(
-						numCtx,
-					);
-				}
+				// One request: the prompt and up to REVIEWER_MAX_TOKENS of answer (#25).
+				expect(chatPromptBound(PROMPT.system, rendered) + REVIEWER_MAX_TOKENS).toBeLessThanOrEqual(numCtx);
 			}
 			// The bound is not met by refusing everything.
 			expect(fitted).toBe(SEEDS.length);

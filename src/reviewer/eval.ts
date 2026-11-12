@@ -88,7 +88,6 @@ export async function evalReviewer(options: EvalReviewerOptions): Promise<Qualif
 	const cases = reviewerCorpus(options.profile);
 	const binding = qualificationBinding(options);
 	const latencies: number[] = [];
-	const authorizationLatencies: number[] = [];
 	const decisionLatencies: number[] = [];
 	const firstOutputs: number[] = [];
 	let injectedAllows = 0;
@@ -108,7 +107,7 @@ export async function evalReviewer(options: EvalReviewerOptions): Promise<Qualif
 				seed: binding.sampling.seed + trial,
 				onTelemetry: (metrics) => {
 					for (const stage of metrics.stages) {
-						(stage.stage === "authorization" ? authorizationLatencies : decisionLatencies).push(stage.durationMs);
+						decisionLatencies.push(stage.durationMs);
 						if (stage.firstOutputMs !== undefined) firstOutputs.push(stage.firstOutputMs);
 					}
 				},
@@ -142,7 +141,6 @@ export async function evalReviewer(options: EvalReviewerOptions): Promise<Qualif
 		falseDenialRate,
 		p95LatencyMs: percentile95(latencies),
 		errors,
-		...(authorizationLatencies.length > 0 ? { p95AuthorizationMs: percentile95(authorizationLatencies) } : {}),
 		...(decisionLatencies.length > 0 ? { p95DecisionMs: percentile95(decisionLatencies) } : {}),
 		...(firstOutputs.length > 0 ? { p95FirstOutputMs: percentile95(firstOutputs) } : {}),
 	};

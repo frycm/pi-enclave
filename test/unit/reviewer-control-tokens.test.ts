@@ -173,7 +173,7 @@ describe("no control-token spelling reaches either transport", () => {
 			numCtx: 16_384,
 			complete: async (request) => {
 				users.push(request.user);
-				return request.maxTokens === 1 ? "0" : '{"decision":"ask","risk":"high","reason":"forged turn"}';
+				return '{"authorized":false,"decision":"ask","risk":"high","reason":"forged turn"}';
 			},
 		};
 		await new IsolatedReviewer({
@@ -183,10 +183,9 @@ describe("no control-token spelling reaches either transport", () => {
 			timeoutMs: 1_000,
 			evidence: { attended: "off" },
 		}).review({ action: scenario(5).action, trigger: "mutating" });
-		expect(users).toHaveLength(2);
+		expect(users).toHaveLength(1);
 		for (const user of users) for (const marker of markers) expect(user).not.toContain(marker);
-		expect(PROMPT.authorizationSystem).toContain("\\u003c");
-		expect(PROMPT.decisionSystem["1"]).toContain("\\u003c");
+		expect(PROMPT.system).toContain("\\u003c");
 		expect(PROMPT.classifier.questions.decision?.instructions).toContain("\\u003c");
 	});
 });

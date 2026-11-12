@@ -133,6 +133,7 @@ describe("classifier answers are validated before they become a verdict", () => 
 			primary: classifier(result),
 			timeoutMs: 1_000,
 			evidence: { attended: "off" },
+			delay: async () => {},
 		}).review({ action: ACTION, trigger: "mutating" });
 		expect(review).toMatchObject({ ok: false, kind: "invalid-output" });
 	});

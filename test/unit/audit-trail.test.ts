@@ -196,7 +196,7 @@ describe("records that follow a decision", () => {
 				minimumRisk: "high",
 				authorizationCovers: false,
 			},
-			modelReview: { decision: "allow", risk: "low", reason: "cleans build output" },
+			modelReview: { authorized: true, decision: "allow", risk: "low", reason: "cleans build output" },
 			evidence: {},
 		} as unknown as ReviewerResult;
 		expect(reviewerVerdictFields(result, { action, trigger: "mutating" })).toMatchObject({
@@ -209,6 +209,9 @@ describe("records that follow a decision", () => {
 			modelRisk: "low",
 			minimumRisk: "high",
 			modelReason: "cleans build output",
+			// The chat reviewer's own authorization answer (#25), beside authorizationCovers.
+			modelAuthorized: true,
+			authorizationCovers: false,
 		});
 		const failed = { ok: false, kind: "unavailable", reason: "timeout", evidence: {} } as unknown as ReviewerResult;
 		expect(reviewerVerdictFields(failed, { action, trigger: "mutating" })).toMatchObject({

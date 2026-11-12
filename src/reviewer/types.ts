@@ -55,6 +55,11 @@ export interface ReviewEvidence {
 }
 
 export interface ModelReview {
+	/**
+	 * The chat reviewer's answer to "does a direct entry authorize this?",
+	 * given before its decision (#25). Recorded, never used in the verdict.
+	 */
+	authorized?: boolean;
 	decision: ReviewDecision;
 	risk: ReviewRisk;
 	reason: string;
@@ -79,10 +84,9 @@ export interface ReviewerRulebook {
 }
 
 export interface ReviewerPrompt {
-	authorizationSystem: string;
+	/** The chat transport's one system prompt (#25). */
 	system: string;
-	decisionSystem: { "0": string; "1": string };
-	/** Binds the chat transport. */
+	/** Binds the chat transport: the system prompt and the output schema. */
 	promptHash: string;
 	/** The classifier transport's questions and their own hash (#26). */
 	classifier: { questions: Record<string, ClassifierQuestion>; promptHash: string };
