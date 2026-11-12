@@ -2,18 +2,34 @@
  * The approval queue and the notify hook (#30).
  */
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { approveQueued, decline } from "../../src/cli/decide.ts";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { approveQueued, decline, locateUndecided } from "../../src/cli/decide.ts";
 import { defaultProfile, OWNED_TOOLS } from "../../src/config/defaults.ts";
 import type { EffectiveProfile } from "../../src/config/types.ts";
 import { resolveAttendance } from "../../src/escalate/attendance.ts";
 import { createConfirmEscalator } from "../../src/escalate/confirm.ts";
-import { createNotifier, type NotifySpawn, notificationText, SUMMARY_LIMIT } from "../../src/escalate/notify.ts";
-import { dirFor, type PendingRecord, readPending, writePending } from "../../src/escalate/pending.ts";
+import {
+	checkNotifyProgram,
+	createNotifier,
+	envToolName,
+	type NotifySpawn,
+	notificationText,
+	SUMMARY_LIMIT,
+} from "../../src/escalate/notify.ts";
+import { dirFor, type PendingRecord, readPending, transition, writePending } from "../../src/escalate/pending.ts";
 import { claimQueued, createQueueEscalation, waiterAlive, waitForDecision } from "../../src/escalate/queue.ts";
 import { DENY_ESCALATOR, decide, type Escalator } from "../../src/gate/gate.ts";
 import { ActionLock } from "../../src/gate/lock.ts";
@@ -97,7 +113,11 @@ describe("waiting for a decision", () => {
 			await waitForDecision({ stateRoot, sessionId: SESSION, nonce: NONCE, until: Date.now() + 40, pollMs: 5 }),
 		).toBe("timeout");
 		expect(at("queued")).toBe(false);
-		expect(readPending({ stateRoot, sessionId: SESSION, nonce: NONCE }).ok).toBe(true);
+		const pending = readPending({ stateRoot, sessionId: SESSION, nonce: NONCE });
+		expect(pending.ok).toBe(true);
+		// Without its waiter: an out-of-session approval of it is not a queue
+		// approval a later lookup may take back.
+		expect(pending.ok && pending.record.waiter).toBeUndefined();
 		// A decision that arrives after the session gave up has nothing to claim.
 		expect(claimQueued(stateRoot, SESSION, NONCE, "approved")).toBe(false);
 		expect(at("approved")).toBe(false);
@@ -392,6 +412,109 @@ describe("answering from another terminal", () => {
 		expect(at("queued")).toBe(true);
 	});
 
+	// Review of #69: a decision that lost the rename was logged as if it had
+	// taken effect.
+	it("logs an approval that lost the race with the session giving up", async () => {
+		const { record } = queue();
+		const audit: Record<string, unknown>[] = [];
+		const { io: terminal, err } = io();
+		const result = await approveQueued({
+			record,
+			stateRoot,
+			current: profile(),
+			home: HOME,
+			io: terminal,
+			audit: (fields) => {
+				audit.push(fields);
+				// The session times out between the log line and the claim.
+				if (fields.event === "queue-approved") claimQueued(stateRoot, SESSION, NONCE, "pending");
+			},
+			pickupMs: 0,
+		});
+		expect(result).toEqual({ outcome: "not-waiting" });
+		expect(audit.map((entry) => entry.event)).toEqual(["queue-approved", "queue-approved-lost"]);
+		expect(err.join("\n")).toContain("Nothing was decided");
+	});
+
+	it("logs a decline that lost the race, and says the record is pending now", async () => {
+		const { record } = queue();
+		const audit: Record<string, unknown>[] = [];
+		const { io: terminal, err } = io();
+		const result = await decline({
+			record,
+			state: "queued",
+			stateRoot,
+			current: profile(),
+			home: HOME,
+			io: terminal,
+			audit: (fields) => {
+				audit.push(fields);
+				if (fields.event === "declined") claimQueued(stateRoot, SESSION, NONCE, "pending");
+			},
+		});
+		expect(result).toEqual({ outcome: "not-waiting" });
+		expect(audit.map((entry) => entry.event)).toEqual(["declined", "declined-lost"]);
+		expect(err.join("\n")).toContain("the record is pending now");
+		expect(err.join("\n")).toContain(`pi-enclave decline ${NONCE}\` again`);
+		expect(at("pending")).toBe(true);
+	});
+
+	it("says a narrowed configuration may be refused, not that it will be", async () => {
+		const { record } = queue();
+		const { io: terminal, out } = io();
+		await approveQueued({
+			record,
+			stateRoot,
+			current: profile((p) => p.sandbox.readDeny.push("/work/secrets")),
+			home: HOME,
+			io: terminal,
+			pickupMs: 0,
+		});
+		expect(out.join("\n")).toContain("so it may refuse this");
+	});
+
+	// Review of #69: an approved record its session never took up could not be
+	// found by approve, decline or pending.
+	describe("an approval whose session ended before running it", () => {
+		const approveFor = async () => {
+			const { record } = queue();
+			await approveQueued({ record, stateRoot, current: profile(), home: HOME, io: io().io, pickupMs: 0 });
+			expect(at("approved")).toBe(true);
+		};
+
+		it("goes back to pending without its waiter, where approve and decline find it", async () => {
+			await approveFor();
+			// Still waited on: left where it is, for the session to take up.
+			expect(locateUndecided(stateRoot, NONCE, Date.now, () => true)).toBeUndefined();
+			expect(at("approved")).toBe(true);
+			const located = locateUndecided(stateRoot, NONCE, Date.now, () => false);
+			expect(located).toMatchObject({ state: "pending", recovered: true });
+			expect(located?.record.waiter).toBeUndefined();
+			expect(at("approved")).toBe(false);
+			expect(at("pending")).toBe(true);
+		});
+
+		it("is not taken back once the session has consumed it", async () => {
+			await approveFor();
+			transition(stateRoot, SESSION, NONCE, "approved", "consumed");
+			expect(locateUndecided(stateRoot, NONCE, Date.now, () => false)).toBeUndefined();
+			expect(at("consumed")).toBe(true);
+			expect(at("pending")).toBe(false);
+		});
+
+		it("leaves an out-of-session approval alone, even of a record that once waited", async () => {
+			// Queued, timed out (back to pending), then approved out of session:
+			// that one may have run, so nothing may take it back.
+			queue();
+			expect(
+				await waitForDecision({ stateRoot, sessionId: SESSION, nonce: NONCE, until: Date.now() + 20, pollMs: 5 }),
+			).toBe("timeout");
+			transition(stateRoot, SESSION, NONCE, "pending", "approved");
+			expect(locateUndecided(stateRoot, NONCE, Date.now, () => false)).toBeUndefined();
+			expect(at("approved")).toBe(true);
+		});
+	});
+
 	it("declines a waiting request, and retires a pending one", async () => {
 		const { record } = queue();
 		expect(
@@ -418,11 +541,17 @@ describe("answering from another terminal", () => {
 
 describe("the notify hook", () => {
 	function fakeSpawn() {
-		const calls: { file: string; args: readonly string[]; env: NodeJS.ProcessEnv; stdin: string; shell: unknown }[] =
-			[];
+		const calls: {
+			file: string;
+			args: readonly string[];
+			env: NodeJS.ProcessEnv;
+			stdin: string;
+			shell: unknown;
+			cwd: string;
+		}[] = [];
 		const spawn: NotifySpawn = (file, args, options) => {
 			const stdin = new PassThrough();
-			const call = { file, args, env: options.env, stdin: "", shell: options.shell };
+			const call = { file, args, env: options.env, stdin: "", shell: options.shell, cwd: options.cwd };
 			stdin.on("data", (chunk: Buffer) => {
 				call.stdin += chunk.toString("utf8");
 			});
@@ -473,28 +602,151 @@ describe("the notify hook", () => {
 		]);
 	});
 
-	it("notifies at most once per interval, and says how many it held back", async () => {
+	it("notifies at most once per interval, and says how many came with the held one", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"], now: 0 });
+		try {
+			const { spawn, calls } = fakeSpawn();
+			const events: Record<string, unknown>[] = [];
+			const notify = createNotifier({
+				argv: () => ["/usr/bin/true"],
+				spawn,
+				env: {},
+				now: () => Date.now(),
+				minIntervalMs: 30_000,
+				onEvent: (fields) => events.push(fields),
+			});
+			notify(recordFor("echo one"));
+			vi.setSystemTime(1_000);
+			notify(recordFor("echo two"));
+			const three = recordFor("echo three");
+			notify(three);
+			expect(calls).toHaveLength(1);
+			// The end of the interval announces the newest, with the count.
+			await vi.advanceTimersByTimeAsync(29_000);
+			expect(calls).toHaveLength(2);
+			expect(calls[1]?.env.ENCLAVE_NONCE).toBe(three.nonce);
+			expect(calls[1]?.stdin).toContain("(and 1 other request(s) since the last notification");
+			// The next one inside the new interval waits for its end, too.
+			vi.setSystemTime(31_000);
+			notify(recordFor("echo four"));
+			expect(calls).toHaveLength(2);
+			await vi.advanceTimersByTimeAsync(30_000);
+			expect(calls).toHaveLength(3);
+			expect(calls[2]?.stdin).not.toContain("other request(s)");
+			expect(events.filter((event) => event.event === "notify-deferred")).toHaveLength(3);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	// Review of #69: a request inside the interval was never announced, and the
+	// session waited its whole timeout with nobody told.
+	it("announces a request held by the rate limit with no further ask", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"], now: 0 });
+		try {
+			const { spawn, calls } = fakeSpawn();
+			const notify = createNotifier({ argv: () => ["/usr/bin/true"], spawn, env: {}, now: () => Date.now() });
+			notify(recordFor("echo first"));
+			vi.setSystemTime(20_000);
+			const second = recordFor("echo second");
+			notify(second);
+			await vi.advanceTimersByTimeAsync(10_000);
+			expect(calls.map((call) => call.env.ENCLAVE_NONCE)).toContain(second.nonce);
+			await vi.advanceTimersByTimeAsync(3_600_000);
+			expect(calls).toHaveLength(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("sends a held request at once on flush, as at session shutdown", () => {
 		const { spawn, calls } = fakeSpawn();
 		let clock = 0;
-		const events: Record<string, unknown>[] = [];
-		const notify = createNotifier({
-			argv: () => ["/usr/bin/true"],
-			spawn,
-			env: {},
-			now: () => clock,
-			minIntervalMs: 30_000,
-			onEvent: (fields) => events.push(fields),
-		});
-		notify(recordFor("echo one"));
-		clock = 1_000;
-		notify(recordFor("echo two"));
-		notify(recordFor("echo three"));
-		clock = 31_000;
-		notify(recordFor("echo four"));
-		await new Promise((resolve) => setImmediate(resolve));
+		const notify = createNotifier({ argv: () => ["/usr/bin/true"], spawn, env: {}, now: () => clock });
+		notify(recordFor("echo first"));
+		clock = 5_000;
+		const second = recordFor("echo second");
+		notify(second);
+		expect(calls).toHaveLength(1);
+		notify.flush();
 		expect(calls).toHaveLength(2);
-		expect(calls[1]?.stdin).toContain("(2 earlier request(s) were not notified");
-		expect(events.filter((event) => event.event === "notify-suppressed")).toHaveLength(2);
+		expect(calls[1]?.env.ENCLAVE_NONCE).toBe(second.nonce);
+		notify.flush();
+		expect(calls).toHaveLength(2);
+	});
+
+	it("runs the hook in /, never in the workspace", () => {
+		const { spawn, calls } = fakeSpawn();
+		createNotifier({ argv: () => ["/usr/bin/true"], spawn, env: {} })(recordFor("echo one"));
+		expect(calls[0]?.cwd).toBe("/");
+	});
+
+	// Review of #69: `python3 -m notifymod` loaded a module the agent wrote in
+	// the workspace, outside the sandbox.
+	it.skipIf(!existsSync("/usr/bin/python3"))(
+		"does not load a module from the process's working directory (real spawn)",
+		async () => {
+			const workspace = join(stateRoot, "workspace");
+			const marker = join(stateRoot, "marker");
+			mkdirSync(workspace);
+			writeFileSync(join(workspace, "notifymod.py"), `open(${JSON.stringify(marker)}, "w").write("ran")\n`);
+			const before = process.cwd();
+			process.chdir(workspace);
+			try {
+				const done = new Promise<Record<string, unknown>>((resolve) => {
+					const notify = createNotifier({
+						argv: () => ["/usr/bin/python3", "-m", "notifymod"],
+						onEvent: (fields) => {
+							if (fields.event !== "notify-deferred") resolve(fields);
+						},
+					});
+					notify(recordFor("echo one"));
+				});
+				const event = await done;
+				expect(event.event).toBe("notify-sent");
+				expect(event.exitCode).not.toBe(0);
+				expect(existsSync(marker)).toBe(false);
+			} finally {
+				process.chdir(before);
+			}
+		},
+	);
+
+	it("puts the tool name in the environment only when it is a plain identifier", () => {
+		expect(envToolName("bash")).toBe("bash");
+		expect(envToolName("mcp__github__get_file")).toBe("mcp__github__get_file");
+		expect(envToolName("mcp__x\n$(id)")).toBe("other");
+		expect(envToolName("x".repeat(65))).toBe("other");
+		const { spawn, calls } = fakeSpawn();
+		const p = profile();
+		const odd = canonicalize({
+			tool: "mcp__x\n$(id)",
+			input: { path: "a" },
+			cwd: "/work",
+			home: HOME,
+			profileName: "dev",
+		});
+		const record = writePending({
+			stateRoot,
+			sessionId: SESSION,
+			action: odd,
+			profile: p,
+			configHash: configHash(p),
+			reason: "needs a person",
+		}).record;
+		createNotifier({ argv: () => ["/usr/bin/true"], spawn, env: {} })(record);
+		expect(calls[0]?.env.ENCLAVE_TOOL).toBe("other");
+	});
+
+	it("warns at session start when the program is missing or cannot run", () => {
+		expect(checkNotifyProgram([])).toBeUndefined();
+		expect(checkNotifyProgram(["/bin/sh"])).toBeUndefined();
+		expect(checkNotifyProgram([join(stateRoot, "missing")])).toContain("which does not exist");
+		const plain = join(stateRoot, "plain");
+		writeFileSync(plain, "#!/bin/sh\n");
+		chmodSync(plain, 0o600);
+		expect(checkNotifyProgram([plain])).toContain("which is not executable");
+		expect(checkNotifyProgram([stateRoot])).toContain("which is not a file");
 	});
 
 	it("does nothing without a configured command", () => {

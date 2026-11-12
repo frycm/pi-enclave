@@ -31,7 +31,7 @@ import type { EffectiveProfile } from "../config/types.ts";
 import type { CanonicalAction } from "../policy/canonical.ts";
 import { configHash } from "../state/audit.ts";
 import type { EscalationOutcome } from "./confirm.ts";
-import { dirFor, type PendingRecord, readPending, transition, writePending } from "./pending.ts";
+import { dirFor, type PendingRecord, readPending, returnToPending, transition, writePending } from "./pending.ts";
 import { checkResume } from "./resume.ts";
 
 export type QueueOutcome = "approved" | "declined" | "timeout" | "aborted";
@@ -46,6 +46,8 @@ export function claimQueued(
 	nonce: string,
 	to: "approved" | "declined" | "pending",
 ): boolean {
+	// Back to pending without the waiter: see returnToPending.
+	if (to === "pending") return returnToPending(stateRoot, sessionId, nonce, "queued");
 	try {
 		transition(stateRoot, sessionId, nonce, "queued", to);
 		return true;
@@ -69,6 +71,20 @@ export function processAlive(pid: number): boolean {
  * Whether a queued record's session is still waiting for it. A reused pid can
  * make a dead session look alive; its `until` still bounds how long.
  */
+/**
+ * An approved record that a waiting session never took up: it still carries
+ * its waiter, and that session is gone. Nothing ran it, so it can go back to
+ * pending; the rename races the session's own `approved → consumed`, and only
+ * one of them wins.
+ */
+export function strandedApproval(
+	record: PendingRecord,
+	now = Date.now(),
+	alive: (pid: number) => boolean = processAlive,
+): boolean {
+	return record.waiter !== undefined && !waiterAlive(record, now, alive);
+}
+
 export function waiterAlive(
 	record: PendingRecord,
 	now = Date.now(),
@@ -234,9 +250,9 @@ export function createQueueEscalation(deps: QueueEscalationDeps) {
 			// Nothing ran. Back to pending, so the record is not read as "may
 			// have run", with the reason in the trail and on stderr.
 			try {
-				transition(stateRoot, sessionId, nonce, "approved", "pending");
+				returnToPending(stateRoot, sessionId, nonce, "approved");
 			} catch {
-				// Already gone; the refusal stands either way.
+				// The refusal stands either way.
 			}
 			deps.audit?.("pending", { event: "resume-refused", nonce, hash: action.hash, reason: refusal });
 			stderr(`pi-enclave: approved, but not run: ${refusal}\n`);

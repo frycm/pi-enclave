@@ -1753,7 +1753,14 @@ or when the turn is aborted, the session moves the record back to `pending/` and
 gets the denial; `pi-enclave approve` then runs it out of session exactly as before. The
 record names the waiting process and its deadline, so `pi-enclave pending` shows which
 records a live session is waiting on, and `approve` on a record whose session has gone moves
-it to `pending/` first and treats it as an ordinary one.
+it to `pending/` first and treats it as an ordinary one. A record that returns to `pending/`
+loses that waiter, which is how an approval the session never took up (it still names its
+waiter, and that session is gone) is told apart from an out-of-session approval that may
+have run: `pending` lists the first as not run, and `approve` or `decline` takes it back to
+`pending/`, with one rename that races the session's own and only one of them wins.
+
+If a decision loses the rename, the `approvals` log has a second record saying so
+(`queue-approved-lost`, `declined-lost`), and the person is told where the record went.
 
 A project file may keep `"queue"` or turn it `"off"`, and may shorten `queueTimeoutMs`, never
 lengthen it.
@@ -1767,15 +1774,30 @@ a LAN ntfy or Gotify server through `curl`, `tmux display-message`, a file drop.
 - The first element must be an absolute path; at most 32 elements, no NUL. There is no shell,
   and the argv is exactly the configured one: nothing the agent influenced is ever an
   argument.
+- **The hook runs outside the sandbox, as the user, so it is trusted code.** It runs in `/`,
+  never in the workspace, so a program that reads its working directory (`python3 -m`, a
+  dotfile, a relative path) does not pick up what the agent wrote there. The program is a
+  [loaded code root](#loaded-code-below-a-writable-root-36): below a writable root, auto mode refuses to start,
+  and it is never grantable as a write capability. An argument that names a script, a
+  module or a configuration file is the operator's to keep outside the writable roots;
+  pi-enclave cannot tell which arguments a program loads. A program that does not exist or
+  is not executable is reported at session start.
 - What the agent influenced arrives on **stdin**: a few lines naming the session, the tool,
   the two commands and the deadline, with the action summarized in one line of at most 200
   characters in the same JSON-string spelling the approval prompt uses, so it cannot add a
-  line or a terminal escape. `ENCLAVE_NONCE`, `ENCLAVE_SESSION`, `ENCLAVE_TOOL` and
-  `ENCLAVE_EXPIRES` are in its environment.
+  line or a terminal escape. That summary is still text the agent chose, and it goes
+  wherever the hook sends it; on a host where nothing the agent wrote may leave, have the
+  hook ignore stdin and use the environment instead.
+- The environment carries `ENCLAVE_NONCE` (32 hex digits), `ENCLAVE_SESSION` (pi's session
+  id), `ENCLAVE_EXPIRES` (an ISO time pi-enclave wrote) verbatim, and `ENCLAVE_TOOL`, the
+  tool name when it is a plain identifier (`A–Z a–z 0–9 _ . : -`, at most 64 characters)
+  and `other` when it is not.
 - **At most one notification every 30 seconds**, because the agent decides how often an
-  `ask` happens. The next one says how many were held back. The hook is killed after 10 s,
-  and a failure is logged (`notify-sent`, `notify-failed`, `notify-suppressed`) but never
-  blocks the gate.
+  `ask` happens. A request inside the interval is held, not dropped: when the interval
+  ends, one notification names the newest request and says how many others came with it,
+  and anything still held is sent at session shutdown. The hook is killed after 10 s, and
+  a failure is logged (`notify-sent`, `notify-failed`, `notify-deferred`) but never blocks
+  the gate.
 
 ### Pending-approval records
 
@@ -1826,7 +1848,7 @@ for the check, not an execution input. Every resumed action remains sandboxed.
 
 | Event | Attended (`tui`, or `rpc` with a completed handshake) | Unattended (`off`, failed handshake, or preconditions lost) |
 |---|---|---|---|
-| Reviewer returns `ask` | `ctx.ui.confirm` showing the canonical action and reason, raced against `confirmTimeoutMs`; timeout = deny | Deny, `terminate`, write a [pending-approval record](#pending-approval-records). With `queue`: hold the call for `queueTimeoutMs`; approve runs it in session, decline or timeout denies and leaves the record for `pi-enclave approve` ([the approval queue](#the-approval-queue)) |
+| Reviewer returns `ask` | `ctx.ui.confirm` showing the canonical action and reason, raced against `confirmTimeoutMs`; timeout = deny | Deny, `terminate`, write a [pending-approval record](#pending-approval-records). With `queue`: hold the call for `queueTimeoutMs`; approve runs it in session, decline denies and retires the record; timeout or abort denies and leaves it pending for `pi-enclave approve` ([the approval queue](#the-approval-queue)) |
 | Reviewer returns `allow` on a capability request | Re-run the locked hash once under the extended profile, still sandboxed | Same |
 | Agent requests host execution | Refused: v1 accepts only `hostExec: "never"` and defines no host-execution action | Same |
 | Reviewer timeout or error | Retry ×3 with backoff, then treat as `ask` | Retry ×3, then deny and terminate (counts as adverse for the breaker) |
@@ -2402,7 +2424,9 @@ At `session_start`, after the ownership check, pi-enclave collects the code it h
 - the target of every symlinked package (top level and `@scope/*`) in any of those
   `node_modules` directories, transitively, so a sibling package an npm workspace or `npm link`
   resolves to elsewhere is collected too;
-- the Node binary and the seccomp helper.
+- the Node binary and the seccomp helper;
+- the `attended.notify` program (#30), which the pi process runs whenever it writes an
+  approval record.
 
 A `package.json` directly in your home directory or at `/` does not count as a package root.
 All of it is compared canonically against the writable roots.
@@ -2419,7 +2443,8 @@ All of it is compared canonically against the writable roots.
   checkout you are editing; denying it would deny the whole workspace), a symlink below a
   writable root that the configured path runs through (the agent could point it at other
   code; load the extension by its real path; a symlinked `node_modules` above a code root is
-  refused the same way), and a Node binary below a writable root. A project that was
+  refused the same way), and a Node binary or `attended.notify` program below a writable
+  root. A project that was
   `npm link`-ed into the global `node_modules` pi is installed in falls under the first case:
   that `node_modules` becomes a code root containing the workspace, and the start refuses with
   "contains the writable root". `npm unlink -g <package>` resolves it.

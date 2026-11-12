@@ -52,7 +52,7 @@ import {
 } from "./escalate/attendance.ts";
 import { type ConfirmUI, createConfirmEscalator } from "./escalate/confirm.ts";
 import { describeHandshakeFailure, runHandshake } from "./escalate/handshake.ts";
-import { createNotifier } from "./escalate/notify.ts";
+import { checkNotifyProgram, createNotifier } from "./escalate/notify.ts";
 import { writePending } from "./escalate/pending.ts";
 import { createQueueEscalation } from "./escalate/queue.ts";
 import {
@@ -1253,6 +1253,7 @@ export default function (pi: ExtensionAPI): void {
 				extensionPaths: extensionSourcePaths(pi),
 				execPath: process.execPath,
 				seccompHelper: process.platform === "linux" ? resolveSeccompHelper() : null,
+				...(loaded.profile.attended.notify[0] ? { notifyProgram: loaded.profile.attended.notify[0] } : {}),
 				cwd,
 			},
 			profile.writableRoots,
@@ -1267,6 +1268,13 @@ export default function (pi: ExtensionAPI): void {
 			return;
 		}
 		if (loaded.profile.sandbox.allowSelfHosting) profile = applySelfHosting(profile, codeCheck);
+		// A notify command that cannot run is said now, not in an audit line
+		// nobody reads while a session waits for a person who was never told.
+		const notifyProblem = checkNotifyProgram(loaded.profile.attended.notify);
+		if (notifyProblem) {
+			process.stderr.write(`${notifyProblem}\n`);
+			ctx.ui.notify(notifyProblem, "warning");
+		}
 		// Every loaded code root is a trust root for write capabilities too
 		// (#21): a one-shot write to pi-enclave's package, its node_modules or
 		// pi's own package runs the agent's code in the pi process next start.
@@ -1521,6 +1529,9 @@ export default function (pi: ExtensionAPI): void {
 		// How often each layer settled a decision (#18): the only way to tell
 		// from the log whether a reviewer reduced interruptions.
 		if (effective?.auto) audit?.append("summary", { layers: { ...layers }, description: describeTally(layers) });
+		// A request held by the notify rate limit is announced before exit: in
+		// "off" mode nobody else will say it is there.
+		notify.flush();
 		// Flush, then dispose, then flush once more: tearing the backend down can
 		// deliver a last `onFsViolation` (a denial during teardown), which queues
 		// an audit append that the first flush has already passed. The second

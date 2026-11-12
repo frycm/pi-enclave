@@ -21,13 +21,13 @@ import { ContainerBackend } from "../src/backend/container/backend.ts";
 import { qualifyContainer } from "../src/backend/container/qualification.ts";
 import { selectBackend } from "../src/backend/select.ts";
 import { approve } from "../src/cli/approve.ts";
-import { approveQueued, decline } from "../src/cli/decide.ts";
+import { approveQueued, decline, locateUndecided } from "../src/cli/decide.ts";
 import { renderConfig, renderDefaults } from "../src/config/render.ts";
 import { loadConfig } from "../src/config/sources.ts";
 import type { EffectiveProfile } from "../src/config/types.ts";
 import { provisionSecret } from "../src/escalate/handshake.ts";
-import { describeRecord, listPending, listSessions, readPending } from "../src/escalate/pending.ts";
-import { claimQueued, waiterAlive } from "../src/escalate/queue.ts";
+import { describeRecord, listPending, listSessions } from "../src/escalate/pending.ts";
+import { strandedApproval } from "../src/escalate/queue.ts";
 import { formatProbeReport } from "../src/probe.ts";
 import { AuditLog, formatVerifyResult, verifyLog } from "../src/state/audit.ts";
 import { ensureStateDirs, stateDirs } from "../src/state/dir.ts";
@@ -161,12 +161,17 @@ function pending(argv: string[]): number {
 
 	for (const sessionId of sessions) {
 		for (const entry of listPending(dirs.state, sessionId)) {
-			if (!showAll && entry.state !== "pending" && entry.state !== "queued") continue;
+			// Approved for a session that ended before running it: not run, and
+			// `approve` takes it back to pending.
+			const stranded = entry.state === "approved" && strandedApproval(entry.record);
+			if (!showAll && entry.state !== "pending" && entry.state !== "queued" && !stranded) continue;
 			found++;
 			const waiting =
 				entry.state === "queued" && entry.record.waiter
 					? ` (the session waits until ${entry.record.waiter.until})`
-					: "";
+					: stranded
+						? " (approved, but its session ended before running it; it did not run)"
+						: "";
 			process.stdout.write(`\n[${entry.state}] session ${sessionId}${waiting}\n${describeRecord(entry.record)}\n`);
 		}
 	}
@@ -177,27 +182,6 @@ function pending(argv: string[]): number {
 		process.stdout.write(`\nApprove one with: pi-enclave approve <nonce>\n`);
 	}
 	return 0;
-}
-
-/**
- * Find a record that is waiting for a decision: queued for a live session
- * (#30), or pending. A queued record whose session has stopped waiting -- it
- * died, or its time ran out without it noticing -- is moved to pending first,
- * by the same single rename the session would use, and handled as pending.
- */
-function locateUndecided(stateRoot: string, nonce: string) {
-	// A nonce is unique across sessions, so the session does not have to be
-	// named -- but the record is still validated against the session it claims.
-	for (const sessionId of listSessions(stateRoot)) {
-		const queued = readPending({ stateRoot, sessionId, nonce, state: "queued" });
-		if (queued.ok) {
-			if (waiterAlive(queued.record)) return { state: "queued" as const, record: queued.record };
-			claimQueued(stateRoot, sessionId, nonce, "pending");
-		}
-		const pending = readPending({ stateRoot, sessionId, nonce });
-		if (pending.ok) return { state: "pending" as const, record: pending.record };
-	}
-	return undefined;
 }
 
 /** The approvals log, shared by approve and decline. */

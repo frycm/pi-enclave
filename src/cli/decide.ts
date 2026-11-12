@@ -10,8 +10,15 @@
  * effect.
  */
 import type { EffectiveProfile } from "../config/types.ts";
-import { describeRecordForApproval, type PendingRecord, readPending, transition } from "../escalate/pending.ts";
-import { claimQueued, waiterAlive } from "../escalate/queue.ts";
+import {
+	describeRecordForApproval,
+	listSessions,
+	type PendingRecord,
+	readPending,
+	returnToPending,
+	transition,
+} from "../escalate/pending.ts";
+import { claimQueued, strandedApproval, waiterAlive } from "../escalate/queue.ts";
 import { checkResume, describeNarrowing, formatResumeFailure } from "../escalate/resume.ts";
 import { boundedText, configHash } from "../state/audit.ts";
 import { type ApproveIO, approverIdentity } from "./approve.ts";
@@ -57,6 +64,44 @@ function auditBase(options: DecideOptions) {
 	};
 }
 
+export interface Located {
+	state: "queued" | "pending";
+	record: PendingRecord;
+	/** It was approved for a session that ended before running it. */
+	recovered?: true;
+}
+
+/**
+ * Find a record that is waiting for a decision: queued for a live session, or
+ * pending. A queued record whose session stopped waiting, and an approved one
+ * whose session ended before taking it up, go back to `pending/` first and are
+ * found there, so neither is stranded where no command reaches it.
+ */
+export function locateUndecided(
+	stateRoot: string,
+	nonce: string,
+	now: () => number = Date.now,
+	alive?: (pid: number) => boolean,
+): Located | undefined {
+	// A nonce is unique across sessions, so the session does not have to be
+	// named -- but the record is still validated against the session it claims.
+	for (const sessionId of listSessions(stateRoot)) {
+		let recovered = false;
+		const queued = readPending({ stateRoot, sessionId, nonce, state: "queued" });
+		if (queued.ok) {
+			if (waiterAlive(queued.record, now(), alive)) return { state: "queued", record: queued.record };
+			claimQueued(stateRoot, sessionId, nonce, "pending");
+		}
+		const approved = readPending({ stateRoot, sessionId, nonce, state: "approved" });
+		if (approved.ok && strandedApproval(approved.record, now(), alive)) {
+			recovered = returnToPending(stateRoot, sessionId, nonce, "approved");
+		}
+		const pending = readPending({ stateRoot, sessionId, nonce });
+		if (pending.ok) return { state: "pending", record: pending.record, ...(recovered ? { recovered: true } : {}) };
+	}
+	return undefined;
+}
+
 /** `pi-enclave approve <nonce>` for a request a live session is waiting on. */
 export async function approveQueued(options: DecideOptions): Promise<DecideResult> {
 	const { record, io, current } = options;
@@ -68,7 +113,10 @@ export async function approveQueued(options: DecideOptions): Promise<DecideResul
 	if (narrowing.length > 0) {
 		io.out("\nThe configuration has narrowed since this was recorded:");
 		for (const note of narrowing) io.out(`  ${note}`);
-		io.out("  The waiting session runs under the configuration it started with, so it will refuse this.");
+		io.out(
+			"  The waiting session checks again against the configuration it started with before running it, " +
+				"so it may refuse this.",
+		);
 	}
 	const check = checkResume({ record, current, home: options.home });
 	if (!check.ok) {
@@ -94,6 +142,8 @@ export async function approveQueued(options: DecideOptions): Promise<DecideResul
 		return { outcome: "refused", reason };
 	}
 	if (!claimQueued(options.stateRoot, record.sessionId, record.nonce, "approved")) {
+		// The yes above is in the log; so is that it decided nothing.
+		await options.audit?.({ ...auditBase(options), event: "queue-approved-lost" });
 		return notWaiting(io, record);
 	}
 	io.out(`Approved. Session ${record.sessionId} runs it and continues.`);
@@ -149,7 +199,20 @@ export async function decline(
 	}
 	if (options.state === "queued") {
 		if (!claimQueued(options.stateRoot, record.sessionId, record.nonce, "declined")) {
-			io.err(`\npi-enclave: session ${record.sessionId} is no longer waiting for this request.`);
+			await options.audit?.({ ...auditBase(options), event: "declined-lost" });
+			const nowPending = readPending({
+				stateRoot: options.stateRoot,
+				sessionId: record.sessionId,
+				nonce: record.nonce,
+			}).ok;
+			io.err(
+				nowPending
+					? `\npi-enclave: session ${record.sessionId} stopped waiting for this request before the decline landed. ` +
+							"It gave the agent a refusal, and the record is pending now.\n" +
+							`  Run \`pi-enclave decline ${record.nonce}\` again to retire it.`
+					: `\npi-enclave: this request was decided by someone else before the decline landed. Nothing was declined; ` +
+							"`pi-enclave pending --all` shows where it is.",
+			);
 			return { outcome: "not-waiting" };
 		}
 		io.out(`Declined. Session ${record.sessionId} gets a refusal.`);

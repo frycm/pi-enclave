@@ -305,6 +305,53 @@ export function transition(
 	return destination;
 }
 
+/**
+ * Move a queued or approved record back to `pending/` without its `waiter`
+ * (#30), if it is still where it was; `false` means another party moved it
+ * first.
+ *
+ * Dropping the waiter is what separates the two ways a record reaches
+ * `approved/`: from `queued/` by a person's decision for a waiting session,
+ * which still carries the waiter, or from `pending/` by an out-of-session
+ * `approve`, which may have run. Only the first may be taken back once its
+ * session is gone.
+ *
+ * The claim is still one rename, into a name nothing lists; the record
+ * appears in `pending/` only once it is rewritten, so nobody can approve the
+ * copy with a stale waiter, or see the record twice. A crash in between
+ * leaves it in that name, where nothing runs it.
+ */
+export function returnToPending(
+	stateRoot: string,
+	sessionId: string,
+	nonce: string,
+	from: "queued" | "approved",
+): boolean {
+	const target = dirFor(stateRoot, sessionId, "pending");
+	mkdirSync(target, { recursive: true, mode: 0o700 });
+	const source = join(dirFor(stateRoot, sessionId, from), `${nonce}.json`);
+	const claimed = join(target, `${nonce}.json.returning`);
+	try {
+		renameSync(source, claimed);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+	const record = JSON.parse(readFileSync(claimed, "utf8")) as PendingRecord;
+	delete record.waiter;
+	const tmp = join(target, `${nonce}.json.tmp`);
+	writeFileSync(tmp, `${executionSerialize(record)}\n`, { mode: 0o600 });
+	const fd = openSync(tmp, "r");
+	try {
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	renameSync(tmp, join(target, `${nonce}.json`));
+	unlinkSync(claimed);
+	return true;
+}
+
 export interface ListedRecord {
 	nonce: string;
 	state: PendingState;
