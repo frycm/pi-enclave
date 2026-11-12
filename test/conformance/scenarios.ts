@@ -15,7 +15,8 @@
  * sandbox at all.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type {
 	CompiledProfile,
@@ -1294,8 +1295,27 @@ SCENARIOS.push(
 				ctx.fixture.deniedHome,
 				join(ctx.fixture.deniedHome, ".ssh"),
 			]);
+			// The same root spelled through a link (review of #55): the sandbox
+			// resolves an allow entry's parents, so it lands on the denied place
+			// unless the root is judged on its canonical location.
+			const links = mkdtempSync(join(tmpdir(), "enclave-link-"));
+			let viaLink: LimitedRun;
+			try {
+				symlinkSync(ctx.fixture.deniedHome, join(links, "home"));
+				viaLink = await runAllowlisted(ctx, `cat ${JSON.stringify(key)}`, [join(links, "home", ".ssh")]);
+			} finally {
+				rmSync(links, { recursive: true, force: true });
+			}
 			const leakedKey = leaked(r.output);
-			return { ok: !leakedKey, detail: leakedKey ? "SECRET LEAKED: a readable root lifted a deny" : "deny kept" };
+			const leakedViaLink = leaked(viaLink.output);
+			return {
+				ok: !leakedKey && !leakedViaLink,
+				detail: leakedKey
+					? "SECRET LEAKED: a readable root lifted a deny"
+					: leakedViaLink
+						? "SECRET LEAKED: a readable root spelled through a link lifted a deny"
+						: "deny kept, also through a link",
+			};
 		},
 	},
 	{

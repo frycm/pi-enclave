@@ -101,6 +101,72 @@ describe("the read allowlist", () => {
 		expect(out).toContain("/srv/data");
 	});
 
+	describe("judges every exclusion on the canonical location (review of #55)", () => {
+		// /home/u is a link to /data/home/u, as with a home on a data disk, an
+		// automounted home or /home -> var/home.
+		const linked = (path: string) => path.replace(/^\/home\/u(?=\/|$)/, "/data/home/u");
+		const base = { writableRoots: ["/srv/work/app"], readAllow: [] as string[], readDeny: [] as string[] };
+
+		it("does not open a home reached through a link because rg sits in ~/bin", () => {
+			const out = roots({
+				profile: base,
+				path: "/usr/bin",
+				hostTools: ["/home/u/bin/rg"],
+				resolve: linked,
+			});
+			expect(out).toContain("/data/home/u/bin");
+			expect(out).not.toContain("/data/home/u");
+			expect(out).not.toContain("/home/u");
+		});
+
+		it("does not open ~/.local through the link for fd in ~/.local/bin", () => {
+			const out = roots({ profile: base, path: "/usr/bin", hostTools: ["/home/u/.local/bin/fd"], resolve: linked });
+			expect(out).not.toContain("/data/home/u/.local");
+			expect(out).not.toContain("/home/u/.local");
+		});
+
+		it("does not open the home for a PATH entry spelled through the link when home is canonical", () => {
+			const out = roots({ profile: base, home: "/data/home/u", path: "/home/u/bin", resolve: linked });
+			expect(out).not.toContain("/home/u");
+			expect(out).not.toContain("/data/home/u");
+			expect(out).toContain("/data/home/u/bin");
+		});
+
+		it("does not let a PATH entry spelled through a link lift a deny entry", () => {
+			const out = roots({
+				profile: { ...base, readDeny: ["/data/home/u/.docker"] },
+				home: "/data/home/u",
+				path: "/home/u/.docker/bin",
+				resolve: linked,
+			});
+			expect(out.filter((root) => root.includes(".docker"))).toEqual([]);
+		});
+
+		it("does not climb from a shallow bin into a shared store or a top-level directory", () => {
+			const out = roots({
+				profile: base,
+				path: "/home/u/.config/bin:/home/u/Library/bin:/opt/bin:/var/bin:/home/u/.cache/bin",
+				resolve: (path) => path,
+			});
+			for (const root of ["/home/u/.config", "/home/u/Library", "/opt", "/var", "/home/u/.cache"]) {
+				expect(out).not.toContain(root);
+			}
+			expect(out).toContain("/home/u/.config/bin");
+			expect(out).toContain("/opt/bin");
+		});
+
+		it("does not climb into a custom XDG directory either", () => {
+			const out = roots({
+				profile: base,
+				path: "/srv/xdg/config/bin",
+				env: { XDG_CONFIG_HOME: "/srv/xdg/config" },
+				resolve: (path) => path,
+			});
+			expect(out).not.toContain("/srv/xdg/config");
+			expect(out).toContain("/srv/xdg/config/bin");
+		});
+	});
+
 	it("leaves out paths that do not exist", () => {
 		const out = roots({ exists: (path) => path !== "/nix" && path !== "/run/current-system" });
 		expect(out).not.toContain("/nix");
@@ -219,6 +285,12 @@ describe("classifying a refused read in allowlist mode", () => {
 	it("is unchanged in open mode", () => {
 		expect(classify("/home/u/notes.txt", "ENOENT", { ...profile, readMode: "open" })).toBeNull();
 	});
+
+	it("passes through a missing file under /proc, /sys or /dev, which the sandbox always mounts", () => {
+		expect(classify("/proc/12345/status", "ENOENT")).toBeNull();
+		expect(classify("/sys/class/missing", "ENOENT")).toBeNull();
+		expect(classify("/dev/missing", "ENOENT")).toBeNull();
+	});
 });
 
 describe("configuring the read mode", () => {
@@ -261,6 +333,16 @@ describe("configuring the read mode", () => {
 
 	it("refuses / as a readable root", () => {
 		expect(folded({ sandbox: { readMode: "allowlist", readableRoots: ["/"] } }).ok).toBe(false);
+	});
+
+	it("refuses the home directory or its parent as a readable root, which the backend would drop", () => {
+		for (const root of ["~", "/home/u", "/home"]) {
+			const result = folded({ sandbox: { readMode: "allowlist", readableRoots: [root] } });
+			expect(result.ok).toBe(false);
+			if (result.ok) continue;
+			expect(result.errors.map((error) => error.message).join()).toContain("home directory");
+		}
+		expect(folded({ sandbox: { readMode: "allowlist", readableRoots: ["/home/u/data"] } }).ok).toBe(true);
 	});
 
 	it("refuses a readable root on or below a read-deny path", () => {

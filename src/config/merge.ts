@@ -697,6 +697,16 @@ export function fold(documents: readonly ConfigDocument[], options: FoldOptions)
 			});
 			continue;
 		}
+		// The home directory or anything containing it would be dropped by the
+		// backend; say so here rather than accept a root that does nothing.
+		if (options.home !== undefined && isUnder(canonical(options.home), canonical(root))) {
+			errors.push({
+				source: "user_global",
+				field: "sandbox.readableRoots",
+				message: `"${root}" is the home directory or contains it; list the directories under it that should be readable instead.`,
+			});
+			continue;
+		}
 		// The sandbox would let the readable root lift the deny it sits in.
 		const deny = current.sandbox.readDeny.find((entry) => isUnder(canonical(root), canonical(entry)));
 		if (deny) {

@@ -135,6 +135,13 @@ describe("renderStatus", () => {
 		expect(text).toContain("2 path(s)");
 	});
 
+	it("lists every readable root in allowlist mode, not only a count (review of #55)", () => {
+		const allowlisted = { ...PROFILE, readMode: "allowlist" as const, readAllow: ["/usr", "/home/u/.cargo"] };
+		const text = renderStatus(state({ compiled: { ...COMPILED, profile: allowlisted } }));
+		expect(text).toContain("readable:   /usr, /home/u/.cargo");
+		expect(renderStatus(state())).not.toContain("readable:");
+	});
+
 	it("states what the sandbox does NOT cover", () => {
 		// Someone reading this needs to know MCP and third-party tools are
 		// outside the boundary; leaving it out would imply total coverage.

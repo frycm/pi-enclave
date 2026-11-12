@@ -335,6 +335,12 @@ cannot be used as a free-standing way to widen the profile.
   and server secret directories (`/etc/ssl/private`, `/etc/letsencrypt`, `/run/secrets`,
   `/run/credentials`). A deny-list is always one entry short: whatever nobody thought to
   list, such as a sibling project's `.env` or a dump in `~/Downloads`, is readable.
+  Some listed files are configuration that build tools read even offline: `~/.m2/settings.xml`,
+  `~/.gradle/gradle.properties`, `~/.config/pip` and `~/.yarnrc.yml` hold registry
+  credentials as often as mirrors. On bwrap a denied file reads as empty, so Maven, for one,
+  stops on an empty `settings.xml`. Built-in entries cannot be taken off the list by
+  configuration, so point the tool at a file in the workspace instead (`mvn -s
+  ./settings.xml`, `GRADLE_USER_HOME`, `PIP_CONFIG_FILE`, `YARN_RC_FILENAME`).
 - **`allowlist`**. The whole filesystem is denied and only these are readable: the system
   runtime (`/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, `/nix` on Linux; `/System`, `/usr`,
   `/Library`, `/private/etc`, `/opt/homebrew` and the rest on macOS), the writable roots
@@ -344,7 +350,12 @@ cannot be used as a free-standing way to widen the profile.
   directory, its parent and `/` are never added, however they are reached: a `PATH` entry
   of `~/bin` exposes `~/bin`, and `~/.local/bin` does not expose `~/.local`. `readDeny`
   still applies inside every readable root, and a readable root on or below a `readDeny`
-  entry is refused, because the sandbox would otherwise let it lift the deny.
+  entry is refused, because the sandbox would otherwise let it lift the deny. Each of these
+  rules is judged on the root's canonical location, so a home or a deny entry reached
+  through a link is kept out as well. The install root above a `bin` directory is never a
+  top-level directory (`/opt` for `/opt/bin`) nor a store every application shares
+  (`~/.config`, `~/.local`, `~/.cache`, `~/Library`, the `XDG_*_HOME` directories).
+  `/enclave status` lists every readable root.
 
 `allowlist` is the recommended mode for unattended runs and for servers, where most secrets
 live outside the paths a laptop deny-list names; it will be the read mode of the

@@ -80,6 +80,9 @@ export const DARWIN_SYSTEM_READ_ROOTS = [
  */
 export const DARWIN_SYSTEM_READ_LINKS = ["/var", "/tmp"] as const;
 
+/** Readable inside the sandbox whatever the read mode: sandbox-runtime skips them when it denies `/`. */
+const ALWAYS_MOUNTED = ["/proc", "/sys", "/dev"] as const;
+
 export interface ReadAllowlistInput {
 	profile: Pick<Profile, "writableRoots" | "readAllow" | "readDeny">;
 	platform: NodeJS.Platform;
@@ -92,6 +95,8 @@ export interface ReadAllowlistInput {
 	/** Host tools the sandbox runs: rg, fd, the seccomp helper. */
 	hostTools?: readonly (string | undefined)[];
 	home?: string;
+	/** For the XDG base directories; `process.env` by default. */
+	env?: NodeJS.ProcessEnv;
 	/** Injected for tests. */
 	exists?: (path: string) => boolean;
 	resolve?: (path: string) => string;
@@ -99,65 +104,94 @@ export interface ReadAllowlistInput {
 
 /**
  * The directory that holds a binary, and the install root above it when the
- * binary sits in a `bin` directory. Never the home directory or `/`.
+ * binary sits in a `bin` directory. Whether either may be added is decided
+ * later, on its canonical location.
  */
-function toolchainRoots(dir: string, home: string): string[] {
-	const out = [dir];
-	if (basename(dir) === "bin") {
-		const root = dirname(dir);
-		// ~/.local holds keyrings and every XDG application's data; its bin is
-		// enough for the tools installed there.
-		if (root !== "/" && root !== home && root !== dirname(home) && root !== join(home, ".local")) out.push(root);
-	}
+function toolchainRoots(dir: string): { path: string; installRoot: boolean }[] {
+	const out = [{ path: dir, installRoot: false }];
+	if (basename(dir) === "bin") out.push({ path: dirname(dir), installRoot: true });
 	return out;
+}
+
+/**
+ * The directories an install-root climb must not reach, as canonical paths:
+ * the stores of every application's configuration, data and caches, which a
+ * `bin` directory inside them (`~/.config/bin`, `~/Library/bin`) would
+ * otherwise expose whole.
+ */
+function sharedStores(home: string, env: NodeJS.ProcessEnv, resolve: (path: string) => string): string[] {
+	const xdg = ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"]
+		.map((name) => env[name])
+		.filter((value): value is string => Boolean(value) && isAbsolute(value as string));
+	return [".local", ".local/share", ".local/state", ".config", ".cache", "Library", ...xdg].map((entry) =>
+		resolve(isAbsolute(entry) ? entry : join(home, entry)),
+	);
 }
 
 /**
  * The roots that stay readable in allowlist mode, in a stable order and
  * without duplicates. Paths that do not exist are left out, because bwrap
  * cannot bind a missing source.
+ *
+ * Every exclusion is judged on the candidate's canonical location, because
+ * that is what the sandbox binds: sandbox-runtime resolves the parents of an
+ * allow entry, so a spelling through a link that passes by name would land
+ * on the very place it was meant to keep out (a home reached through a link,
+ * a `PATH` entry spelled through one into a denied directory). A candidate
+ * that fails is dropped in every spelling.
  */
 export function allowlistReadRoots(input: ReadAllowlistInput): string[] {
 	const exists = input.exists ?? existsSync;
 	const resolve = input.resolve ?? canonical;
 	const home = input.home ?? homedir();
+	const homes = [...new Set([home, resolve(home)])];
 	const system = input.platform === "darwin" ? DARWIN_SYSTEM_READ_ROOTS : LINUX_SYSTEM_READ_ROOTS;
-	const candidates: string[] = [...system, ...input.profile.writableRoots];
+	const stores = new Set(homes.flatMap((h) => sharedStores(h, input.env ?? process.env, resolve)));
+	const candidates: { path: string; installRoot: boolean }[] = [
+		...[...system, ...input.profile.writableRoots].map((path) => ({ path, installRoot: false })),
+	];
 
 	const binaries = [input.execPath, ...(input.hostTools ?? [])].filter((p): p is string => Boolean(p));
 	for (const binary of binaries) {
-		candidates.push(...toolchainRoots(dirname(binary), home));
+		candidates.push(...toolchainRoots(dirname(binary)));
 		// A symlinked binary (nvm, Homebrew, a version manager shim) needs its
 		// real home readable too, not only the link.
 		const real = resolve(binary);
-		if (real !== binary) candidates.push(...toolchainRoots(dirname(real), home));
+		if (real !== binary) candidates.push(...toolchainRoots(dirname(real)));
 	}
-	candidates.push(dirname(input.helperPath));
+	candidates.push({ path: dirname(input.helperPath), installRoot: false });
 	for (const entry of input.path.split(":")) {
 		if (!entry || !isAbsolute(entry)) continue;
-		candidates.push(...toolchainRoots(entry, home));
+		candidates.push(...toolchainRoots(entry));
 	}
-	candidates.push(...(input.profile.readAllow ?? []));
+	candidates.push(...(input.profile.readAllow ?? []).map((path) => ({ path, installRoot: false })));
 
 	// sandbox-runtime lets an allow entry override a deny at or above it, so
 	// a root at or below a deny entry would lift that deny. Such a root is
 	// left out: the deny list is the one thing allowlist mode never loosens.
-	const denied = (input.profile.readDeny ?? []).flatMap((entry) => [entry, resolve(entry)]);
+	const denied = [...new Set((input.profile.readDeny ?? []).flatMap((entry) => [entry, resolve(entry)]))];
+	const excluded = (real: string, installRoot: boolean): boolean =>
+		real === "/" ||
+		// The home directory, and anything that contains it (`/home`, `/Users`),
+		// which would expose every other user's home too.
+		homes.some((h) => isUnder(h, real)) ||
+		denied.some((entry) => isUnder(real, entry)) ||
+		// An install root is a guess; never let it be a top-level directory or
+		// a store every application shares.
+		(installRoot && (dirname(real) === "/" || stores.has(real)));
+
 	const out: string[] = [];
 	const seen = new Set<string>();
 	for (const candidate of candidates) {
-		if (!isAbsolute(candidate)) continue;
-		const path = candidate.replace(/\/+$/, "") || "/";
-		if (path === "/" || path === home) continue;
+		if (!isAbsolute(candidate.path)) continue;
+		const path = candidate.path.replace(/\/+$/, "") || "/";
 		if (!exists(path)) continue;
+		const real = resolve(path);
+		if (excluded(real, candidate.installRoot) || excluded(path, candidate.installRoot)) continue;
 		// The canonical form too: bwrap and Seatbelt both match the resolved path,
 		// so an allow spelled through a link would otherwise allow nothing.
-		for (const spelling of new Set([path, resolve(path)])) {
-			if (spelling === "/" || spelling === home || seen.has(spelling)) continue;
-			// A root that would expose the home directory's parent (`/home`,
-			// `/Users`) exposes every other user's home too.
-			if (isUnder(home, spelling)) continue;
-			if (denied.some((entry) => isUnder(spelling, entry))) continue;
+		for (const spelling of new Set([path, real])) {
+			if (seen.has(spelling)) continue;
 			seen.add(spelling);
 			out.push(spelling);
 		}
@@ -206,7 +240,13 @@ export function outsideReadAllowlist(
 	// macOS link names: `/var` lets the link be followed, it does not make
 	// `/var/folders/...` readable.
 	const links: readonly string[] = DARWIN_SYSTEM_READ_LINKS;
-	const roots = [...(profile.readAllow ?? []), ...profile.writableRoots].filter((root) => !links.includes(root));
+	const roots = [
+		...(profile.readAllow ?? []),
+		...profile.writableRoots,
+		// Mounted by sandbox-runtime itself and never denied, so a missing file
+		// there is an ordinary error, not a refusal.
+		...ALWAYS_MOUNTED,
+	].filter((root) => !links.includes(root));
 	return !isUnderAny(canonical(path), roots);
 }
 

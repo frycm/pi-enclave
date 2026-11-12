@@ -148,6 +148,11 @@ export function renderStatus(state: EnclaveState): string {
 		`profile:    ${profile.mode}, network ${profile.network}, pty ${profile.allowPty ? "on" : "off"}`,
 		`writable:   ${profile.writableRoots.join(", ") || "(nothing)"}`,
 		`reads:      ${describeReadMode(profile, state.backendName)}`,
+		// Every root, as the writable ones are: a count alone would hide a root
+		// that exposes more than its name suggests.
+		...(profile.readMode === "allowlist" && state.backendName !== "docker" && state.backendName !== "podman"
+			? [`readable:   ${(profile.readAllow ?? []).join(", ") || "(nothing)"}`]
+			: []),
 		`read-deny:  ${profile.readDeny.length} path(s)`,
 		`limits:     ${describeLimits(profile.limits, state.backendName, process.platform, state.processLimit)}`,
 		`violations: ${state.violations.length} this session`,
