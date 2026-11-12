@@ -12,7 +12,7 @@
  * plan: not that drift cannot happen, but that it cannot happen silently.
  */
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
@@ -89,5 +89,76 @@ describe("upstream grep drift", () => {
 				"(`path:line: text`, `path-line- text`, truncation notices) and the default " +
 				"limit are duplicated there -- then update PINNED_GREP_SHA256.",
 		).toBe(PINNED_GREP_SHA256);
+	});
+});
+
+/**
+ * GHSA-mrhx-c7xc-m3w5 (#38): sandbox-runtime depends on a Zod with an
+ * oversized-collection validation advisory and no fixed 3.x release. It is
+ * recorded as not reachable in docs/dependency-upgrade.md because nothing
+ * pi-enclave calls validates with Zod: the schemas are only re-exported by the
+ * package index, and parsed by the `srt` CLI's settings loader and the
+ * `srt-proxy` decider client, neither of which pi-enclave starts.
+ *
+ * These checks make that conclusion fail loudly instead of going stale. An
+ * SRT release that starts validating inside the manager, or a pi-enclave
+ * change that imports a schema, reopens the question.
+ */
+describe("sandbox-runtime does not validate with Zod on pi-enclave's path (#38)", () => {
+	const srtRoot = join(findPiRoot(), "..", "..", "@anthropic-ai", "sandbox-runtime");
+	const ZOD_MODULES = ["sandbox-config.js", "config-loader.js", "decider-client.js"];
+
+	/** Every module `entry` loads, by relative specifier, and every bare specifier it names. */
+	function importClosure(entry: string): { files: Set<string>; packages: Set<string> } {
+		const files = new Set<string>();
+		const packages = new Set<string>();
+		const pending = [entry];
+		const specifier =
+			/(?:import|export)\s[^'"]*?from\s*['"]([^'"]+)['"]|import\s*\(\s*['"]([^'"]+)['"]\s*\)|^\s*import\s*['"]([^'"]+)['"]|require\(\s*['"]([^'"]+)['"]\s*\)/gm;
+		while (pending.length > 0) {
+			const file = pending.pop() as string;
+			if (files.has(file)) continue;
+			files.add(file);
+			for (const match of readFileSync(file, "utf8").matchAll(specifier)) {
+				const name = (match[1] ?? match[2] ?? match[3] ?? match[4]) as string;
+				if (name.startsWith(".")) pending.push(join(dirname(file), name));
+				else packages.add(name);
+			}
+		}
+		return { files, packages };
+	}
+
+	it("loads no Zod schema or parser from SandboxManager", () => {
+		const { files, packages } = importClosure(join(srtRoot, "dist", "sandbox", "sandbox-manager.js"));
+		// A sanity floor, so a resolver that silently found nothing cannot pass.
+		expect(files.size).toBeGreaterThan(10);
+		const reached = [...files].filter((file) => ZOD_MODULES.some((name) => file.endsWith(`/${name}`)));
+		expect(
+			reached,
+			"sandbox-runtime's manager now loads a Zod-validating module. Re-check GHSA-mrhx-c7xc-m3w5 " +
+				"reachability (docs/dependency-upgrade.md) before upgrading.",
+		).toEqual([]);
+		expect([...packages].filter((name) => name === "zod" || name.startsWith("zod/"))).toEqual([]);
+	});
+
+	it("is used by pi-enclave only through SandboxManager and getDefaultWritePaths", () => {
+		const src = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "src");
+		const names: string[] = [];
+		for (const entry of readdirSync(src, { recursive: true, withFileTypes: true })) {
+			if (!entry.isFile() || !/\.(ts|mjs|js)$/.test(entry.name)) continue;
+			const text = readFileSync(join(entry.parentPath, entry.name), "utf8");
+			for (const match of text.matchAll(/import\s+([^;]*?)\s+from\s*"@anthropic-ai\/sandbox-runtime[^"]*"/g)) {
+				const clause = match[1] as string;
+				const named = /^(?:type\s+)?\{([^}]*)\}$/.exec(clause.trim());
+				// A namespace or default import could reach the schemas; list it as such.
+				if (!named) names.push(`${entry.name}: ${clause.trim()}`);
+				else names.push(...(named[1] as string).split(",").map((name) => name.replace(/^\s*type\s+/, "").trim()));
+			}
+		}
+		expect(
+			names.filter(Boolean).sort(),
+			"pi-enclave imports more of sandbox-runtime than SandboxManager and getDefaultWritePaths; " +
+				"check whether the new import validates with Zod (GHSA-mrhx-c7xc-m3w5, docs/dependency-upgrade.md)",
+		).toEqual(["SandboxManager", "getDefaultWritePaths"]);
 	});
 });
