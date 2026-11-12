@@ -709,3 +709,96 @@ describe("approval execution parity", () => {
 		expect(backend.writes).toEqual([{ path: expected, content: "hello" }]);
 	});
 });
+
+describe("the approval audit record (#37)", () => {
+	const who = () => ({ uid: 1000, user: "ops", tty: "/dev/pts/3", ssh: "192.0.2.7" });
+
+	it("records who ran the action, when it started, and how it ended", async () => {
+		const backend = new RecordingBackend();
+		const records: Record<string, unknown>[] = [];
+		const pending = record("bash", { command: "git push origin main" });
+		const result = await approve({
+			record: pending,
+			stateRoot,
+			current: profile(),
+			home: TEST_HOME,
+			io: io().make(true),
+			backend,
+			audit: (fields) => records.push(fields),
+			approver: who,
+		});
+		expect(result).toEqual({ outcome: "executed", exitCode: 0 });
+		expect(records.map((entry) => entry.event)).toEqual(["executing", "executed"]);
+		expect(records[1]).toMatchObject({
+			nonce: NONCE,
+			hash: pending.action.hash,
+			originSession: SESSION,
+			tool: "bash",
+			command: "git push origin main",
+			exitCode: 0,
+			uid: 1000,
+			user: "ops",
+			tty: "/dev/pts/3",
+			ssh: "192.0.2.7",
+			configHash: configHash(profile()),
+			recordedConfigHash: pending.configHash,
+		});
+		expect(typeof records[1]?.durationMs).toBe("number");
+	});
+
+	it("runs nothing and leaves the record pending when the executing record does not land", async () => {
+		const backend = new RecordingBackend();
+		const records: Record<string, unknown>[] = [];
+		const result = await approve({
+			record: record("bash", { command: "git push origin main" }),
+			stateRoot,
+			current: profile(),
+			home: TEST_HOME,
+			io: io().make(true),
+			backend,
+			// What the CLI returns under audit.required when the write failed.
+			audit: async (fields) => {
+				records.push(fields);
+				return false;
+			},
+			approver: who,
+		});
+		expect(result).toMatchObject({ outcome: "refused" });
+		expect(String((result as { reason: string }).reason)).toContain("audit.required");
+		expect(backend.commands).toHaveLength(0);
+		expect(readdirSync(pendingDirs(stateRoot, SESSION).pending)).toEqual([`${NONCE}.json`]);
+		expect(records.map((entry) => entry.event)).toEqual(["executing", "refused"]);
+	});
+
+	it("records a declined approval, with nothing executed", async () => {
+		const records: Record<string, unknown>[] = [];
+		await approve({
+			record: record("bash", { command: "git push origin main" }),
+			stateRoot,
+			current: profile(),
+			home: TEST_HOME,
+			io: io().make(false),
+			backend: new RecordingBackend(),
+			audit: (fields) => records.push(fields),
+			approver: who,
+		});
+		expect(records.map((entry) => entry.event)).toEqual(["declined"]);
+	});
+
+	it("records a refusal and its reason", async () => {
+		const records: Record<string, unknown>[] = [];
+		await approve({
+			record: record("edit", { path: "/work/a", oldText: "a", newText: "b" }),
+			stateRoot,
+			current: profile(),
+			home: TEST_HOME,
+			io: io().make(true),
+			backend: new RecordingBackend(),
+			audit: (fields) => records.push(fields),
+			approver: who,
+		});
+		expect(records).toHaveLength(1);
+		expect(records[0]).toMatchObject({ event: "unsupported", tool: "edit" });
+		expect(String(records[0]?.reason)).toContain("only bash and write actions");
+	});
+});

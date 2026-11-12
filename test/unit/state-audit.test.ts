@@ -177,13 +177,24 @@ describe("the audit log", () => {
 			expect(result.brokenAt).toBe(3);
 		});
 
-		it("detects truncation from the end", async () => {
-			// Removing trailing records leaves a chain that still verifies -- and
-			// says so. Only the record count reveals it, which is why the count is
-			// reported rather than just a boolean.
+		it("detects truncation from the end against the head anchor (#37)", async () => {
+			// Removing trailing records leaves a chain that still verifies on its
+			// own; the head anchor written beside the log is what reveals it.
 			const result = await corrupt((lines) => lines.slice(0, 2));
-			expect(result.ok).toBe(true);
+			expect(result.ok).toBe(false);
 			expect(result.records).toBe(2);
+			expect(result.problem).toContain("the newest 2 record(s) were removed");
+		});
+
+		it("cannot see truncation from the end without an anchor", async () => {
+			const audit = new AuditLog({ dir: root, sessionId: "unanchored", anchorPath: false });
+			for (let i = 0; i < 4; i++) audit.append("decision", { i });
+			await audit.flush();
+			const lines = readFileSync(audit.path, "utf8").trim().split("\n");
+			writeFileSync(audit.path, `${lines.slice(0, 2).join("\n")}\n`);
+			const result = verifyLog(audit.path, { anchorPath: false });
+			expect(result.ok).toBe(true);
+			expect(formatVerifyResult(audit.path, result)).toContain("no head anchor");
 		});
 
 		// A crash mid-write and an edit mean different things and are reported

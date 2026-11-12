@@ -95,6 +95,15 @@ export function writeCapabilityBoundaryIssue(target: string, boundary: WriteCapa
  * built-in never-grantable write targets and anything outside the workspace
  * and the user-global grantable write roots (#21).
  */
+/**
+ * A write capability no approval can lift: a never-grantable target, or one
+ * outside every grantable root (#21). A type, not a phrase, so the gate can
+ * tell it from an ordinary refusal without matching the message text.
+ */
+export class WriteBoundaryError extends Error {
+	override readonly name = "WriteBoundaryError";
+}
+
 export function validateWriteCapability(profile: Profile, cwd: string, value: string): string {
 	const target = resolveCapabilityTarget(cwd, value);
 	// First, so a refusal names why the target is sensitive rather than only
@@ -104,7 +113,7 @@ export function validateWriteCapability(profile: Profile, cwd: string, value: st
 		grantableRoots: profile.grantableWriteRoots ?? [],
 		protectedTargets: profile.protectedWrite ?? [],
 	});
-	if (boundaryIssue) throw new Error(boundaryIssue);
+	if (boundaryIssue) throw new WriteBoundaryError(boundaryIssue);
 	const denied = [...profile.readDeny, ...(profile.writeDeny ?? [])];
 	const overlap = capabilityIntersects(target, denied);
 	if (overlap) {

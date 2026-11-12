@@ -20,6 +20,8 @@
  * refused with that explanation and left pending, so the user re-runs the task
  * with the rule relaxed instead.
  */
+import { readlinkSync } from "node:fs";
+import { userInfo } from "node:os";
 import { dirname } from "node:path";
 import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import {
@@ -38,7 +40,7 @@ import type { EffectiveProfile } from "../config/types.ts";
 import { buildChildEnv } from "../env/child-env.ts";
 import { describeRecordForApproval, type PendingRecord, transition } from "../escalate/pending.ts";
 import { checkResume, describeNarrowing, formatResumeFailure } from "../escalate/resume.ts";
-import { configHash } from "../state/audit.ts";
+import { boundedText, configHash } from "../state/audit.ts";
 import { validateBashTimeout } from "../tools/bash.ts";
 
 export interface ApproveIO {
@@ -64,6 +66,42 @@ export interface ApproveOptions {
 	now?: () => number;
 	/** Host platform, injected only by cross-platform refusal tests. */
 	platform?: NodeJS.Platform;
+	/**
+	 * Receives an `approval` audit record when execution starts and when the
+	 * command ends, however it ends (#37). The CLI writes them to the audit
+	 * directory's `approvals` log. Returning `false` for the `executing` record
+	 * says it is not on disk; nothing runs and the record stays pending. The
+	 * CLI does that only under `audit.required`.
+	 */
+	audit?: (fields: Record<string, unknown>) => unknown;
+	/** Who is approving. Injected by tests. */
+	approver?: () => Record<string, unknown>;
+}
+
+/**
+ * Who ran `pi-enclave approve`, as far as the process can tell: the uid and
+ * user name, the terminal on stdin, and the SSH client address on a server.
+ */
+export function approverIdentity(): Record<string, unknown> {
+	let tty: string | undefined;
+	try {
+		const target = readlinkSync("/proc/self/fd/0");
+		if (target.startsWith("/dev/")) tty = target;
+	} catch {
+		// No /proc (macOS): only whether stdin is a terminal is known.
+	}
+	let user: string | undefined;
+	try {
+		user = userInfo().username;
+	} catch {
+		user = undefined;
+	}
+	return {
+		uid: process.getuid?.(),
+		user,
+		tty: tty ?? (process.stdin.isTTY ? "tty" : "none"),
+		...(process.env.SSH_CONNECTION ? { ssh: process.env.SSH_CONNECTION.split(" ")[0] } : {}),
+	};
 }
 
 export type ApproveResult =
@@ -73,6 +111,40 @@ export type ApproveResult =
 	| { outcome: "unsupported"; reason: string };
 
 export async function approve(options: ApproveOptions): Promise<ApproveResult> {
+	if (!options.audit) return approveOnce(options, () => undefined);
+	const record = options.record;
+	const command = record.action.tool === "bash" ? boundedText(record.action.input.command) : {};
+	const base = {
+		nonce: record.nonce,
+		hash: record.action.hash,
+		recordedConfigHash: record.configHash,
+		originSession: record.sessionId,
+		tool: record.action.tool,
+		configHash: configHash(options.current),
+		...(command.text !== undefined ? { command: command.text } : {}),
+		...(command.truncated ? { commandTruncated: true } : {}),
+		...(options.approver ?? approverIdentity)(),
+	};
+	const started = performance.now();
+	const emit = options.audit;
+	const result = await approveOnce(options, () => emit({ ...base, event: "executing" }));
+	// The outcome is recorded whatever it was; a refusal for an unrecorded
+	// approval is attempted too, and simply fails the same way.
+	emit({
+		...base,
+		event: result.outcome,
+		durationMs: Math.round(performance.now() - started),
+		...(result.outcome === "executed" ? { exitCode: result.exitCode } : {}),
+		...("reason" in result ? { reason: boundedText(result.reason, 2048).text } : {}),
+	});
+	return result;
+}
+
+async function approveOnce(
+	options: ApproveOptions,
+	/** `false` (or a promise of it) means the executing record did not land. */
+	onExecuting: () => unknown,
+): Promise<ApproveResult> {
 	const { record, io, current } = options;
 	const initialConfigHash = configHash(current);
 	const expired = () => Date.parse(record.expiresAt) <= (options.now?.() ?? Date.now());
@@ -233,8 +305,16 @@ export async function approve(options: ApproveOptions): Promise<ApproveResult> {
 		const changedAfterCompile = changedConfig();
 		if (changedAfterCompile) return changedAfterCompile;
 
+		// Recorded before the rename, so under audit.required an approval that
+		// cannot be recorded leaves the record pending and runs nothing (#37).
+		if ((await onExecuting()) === false) {
+			const reason = "the audit log could not record this approval, and audit.required is set; nothing ran";
+			io.err(`\npi-enclave: ${reason}. The record is left pending.`);
+			return { outcome: "refused", reason };
+		}
 		// Rename immediately before execution. A crash mid-run leaves visible
-		// evidence in approved/ that the action may have run.
+		// evidence in approved/ that the action may have run, and the audit log
+		// records the same moment.
 		transition(options.stateRoot, record.sessionId, record.nonce, "pending", "approved");
 
 		if (tool === "bash") {
