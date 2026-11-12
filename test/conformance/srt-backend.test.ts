@@ -110,6 +110,17 @@ describe.skipIf(!supported)("conformance: sandbox-runtime backend", () => {
 		expect(row?.detail).toMatch(/HOLDS CAPABILITIES/);
 	});
 
+	// #64: the W rows hold because of the per-call deny. Without it, under the
+	// same real sandbox, each of them must change its file; a row that still
+	// passes is protected by something else and proves nothing about the deny.
+	it("fails the protected-write rows without the per-call deny (falsifiability, #64)", async () => {
+		const ids = SCENARIOS.filter((s) => /^W\d+$/.test(s.id) && s.expectation === "denied").map((s) => s.id);
+		expect(ids.length).toBeGreaterThanOrEqual(5);
+		const without = await runConformance(backend, createFixture, { only: ids, dropProtectWrites: true });
+		const stillPassing = without.filter((row) => row.ok);
+		expect(stillPassing, `\n${formatRows(without)}`).toEqual([]);
+	}, 120_000);
+
 	it("runs every scenario, including the filesystem helper", () => {
 		expect(rows.map((r) => r.id)).toEqual(SCENARIOS.map((s) => s.id));
 	});

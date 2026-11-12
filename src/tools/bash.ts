@@ -137,6 +137,12 @@ export interface EnclaveBashOptions {
 	 */
 	guard?: (command: string) => CanonicalAction | undefined;
 	/**
+	 * For the action the guard returned: the existing protected paths to
+	 * write-deny for this call, when nobody judged it (#64). Throwing refuses
+	 * the command.
+	 */
+	protectWrites?: (action: CanonicalAction) => readonly string[] | undefined;
+	/**
 	 * A command a person typed (`!`/`!!`), rather than the agent's tool call.
 	 * The default timeout is for a model that forgot one (#24); a person who
 	 * starts `!npm run dev` is there to stop it, so it gets the maximum instead.
@@ -167,6 +173,9 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 			validateBashTimeout(execOptions.timeout);
 			const action = options.guard?.(command);
 			const compiled = getCompiled();
+			// Walked now, not at the gate: a protected file created since then is
+			// denied too.
+			const protectWrites = action ? options.protectWrites?.(action) : undefined;
 			// The compiled profile's env settings are the configured ones and win;
 			// the static options remain only as a fallback for callers (tests, the
 			// benchmark) that build operations without a folded config. Passing
@@ -188,6 +197,7 @@ export function createEnclaveBashOperations(options: EnclaveBashOptions): BashOp
 				commandId: nextCommandId(),
 				...(action?.capability?.kind === "write" ? { writeCapability: action.capability.value } : {}),
 				...(action?.capability?.kind === "read" ? { readCapability: action.capability.value } : {}),
+				...(protectWrites && protectWrites.length > 0 ? { protectWrites } : {}),
 				onData: execOptions.onData,
 				...(execOptions.signal ? { signal: execOptions.signal } : {}),
 				...(execOptions.timeout !== undefined

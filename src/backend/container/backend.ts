@@ -22,7 +22,7 @@ import { HelperFsClient } from "../../fs/client.ts";
 import { hostExecutableSafety } from "../../probe-host.ts";
 import { ensureSecureDir } from "../../state/dir.ts";
 import { validateBashTimeout } from "../../tools/bash.ts";
-import { validateReadCapability, validateWriteCapability } from "../capability.ts";
+import { validateReadCapability, validateWriteCapability, withProtectedWrites } from "../capability.ts";
 import {
 	DEFAULT_CONTAINER_LIMITS,
 	effectiveTimeout,
@@ -418,8 +418,8 @@ export class ContainerBackend implements SandboxBackend {
 		if (request.writeCapability && request.readCapability)
 			throw new Error("pi-enclave: only one capability is allowed per invocation");
 		if (request.signal?.aborted) return { exitCode: null, violations: [] };
-		if (request.writeCapability || request.readCapability) {
-			const profile = structuredClone(prepared.profile);
+		if (request.writeCapability || request.readCapability || request.protectWrites?.length) {
+			let profile = structuredClone(prepared.profile);
 			if (request.writeCapability)
 				profile.writableRoots = [
 					...profile.writableRoots,
@@ -430,6 +430,7 @@ export class ContainerBackend implements SandboxBackend {
 				profile.readDeny = profile.readDeny.filter((path) => canonical(path) !== target);
 				profile.readableRoots = [...(profile.readableRoots ?? []), target];
 			}
+			if (request.protectWrites?.length) profile = withProtectedWrites(profile, request.protectWrites);
 			prepared = this.prepared(await this.compile(profile));
 		}
 		const child = this.start(

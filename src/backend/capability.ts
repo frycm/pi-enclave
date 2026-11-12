@@ -1,4 +1,5 @@
 /** Validation for invocation-scoped filesystem capabilities. */
+import { lstatSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { hostRuntimeSafety } from "../probe-host.ts";
 import { canonical, isUnder } from "./paths.ts";
@@ -141,4 +142,33 @@ export function validateReadCapability(profile: Profile, cwd: string, value: str
 		throw new Error(`pi-enclave: refusing read capability ${target}: it is not an exact read-deny entry`);
 	}
 	return target;
+}
+
+/**
+ * The profile with `paths` write-denied for one invocation (#64). Only
+ * narrows: each path must be an existing, real file or directory inside a
+ * writable root, as the walk that found it saw it. Anything else is refused,
+ * because a deny the backend silently skipped would leave the call
+ * unprotected while the trail says otherwise.
+ */
+export function withProtectedWrites(profile: Profile, paths: readonly string[]): Profile {
+	const roots = profile.writableRoots.map(canonical);
+	for (const path of paths) {
+		if (!isAbsolute(path) || canonical(path) !== path) {
+			throw new Error(`pi-enclave: a protected write target must be canonical: ${path}`);
+		}
+		let stats: ReturnType<typeof lstatSync>;
+		try {
+			stats = lstatSync(path);
+		} catch (error) {
+			throw new Error(`pi-enclave: cannot protect ${path}: ${(error as Error).message}`);
+		}
+		if (!stats.isFile() && !stats.isDirectory()) {
+			throw new Error(`pi-enclave: a protected write target is not a file or directory: ${path}`);
+		}
+		if (!roots.some((root) => isUnder(path, root))) {
+			throw new Error(`pi-enclave: a protected write target is outside the writable roots: ${path}`);
+		}
+	}
+	return { ...profile, writeDeny: [...new Set([...(profile.writeDeny ?? []), ...paths])] };
 }

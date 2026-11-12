@@ -95,6 +95,12 @@ export interface PersistenceSurfaceOptions {
 	 * large `.pi` (pi started in a home directory) costs nothing to watch.
 	 */
 	isProtected?(path: string): boolean;
+	/**
+	 * Every `rules.protectedPaths` pattern, as an entry matcher (#64): what the
+	 * sandbox cannot deny before it exists is at least reported. Matches are
+	 * project files, unless they are agent configuration by name.
+	 */
+	isProtectedPath?(path: string, kind: EntryKind): boolean;
 }
 
 /**
@@ -166,7 +172,9 @@ export function persistenceSurface(
 	const also: ScanMatch[] = [];
 	const git = gitPersistenceSurface(roots, {
 		...(options.maxEntries !== undefined ? { maxEntries: options.maxEntries } : {}),
-		alsoMatch: isAgentSurfaceEntry,
+		// Git metadata never reaches alsoMatch: the Git surface takes `.git` first.
+		alsoMatch: (name, kind, path) =>
+			isAgentSurfaceEntry(name, kind, path) || options.isProtectedPath?.(path, kind) === true,
 		also,
 	});
 	const surface = new Map<string, string>();

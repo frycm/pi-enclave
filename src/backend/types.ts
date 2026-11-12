@@ -199,6 +199,13 @@ export interface RunRequest {
 	/** One reviewed read-deny entry lifted for this invocation only. */
 	readCapability?: string;
 	/**
+	 * Existing paths below the writable roots to write-deny for this
+	 * invocation only (#64): the protected paths of a command nobody judged.
+	 * Each must be inside a writable root and exist; anything else refuses
+	 * the invocation.
+	 */
+	protectWrites?: readonly string[];
+	/**
 	 * Correlation key for violations from this invocation. Use the tool-use id,
 	 * never the command text: sandbox-runtime compares only the first 100
 	 * characters, so two long commands sharing a prefix cross-attribute.

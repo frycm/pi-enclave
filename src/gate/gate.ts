@@ -70,6 +70,12 @@ export interface GateDecision {
 	matches: RuleMatch[];
 	/** True when the decision counts against the circuit breaker. */
 	adverse: boolean;
+	/**
+	 * A bash command no rule could read runs without anyone having judged it
+	 * (`sandboxed-uncertain`, or a reviewer allow of an unparsed command, #18).
+	 * Its protected paths are write-denied for the call (#64).
+	 */
+	unjudged?: true;
 }
 
 /**
@@ -112,6 +118,12 @@ export interface GateDeps {
 	) => string | { message: string; boundary: true } | undefined;
 	/** Backend-aware last check that a read capability can be isolated. */
 	readCapabilityIssue?: (value: string, cwd: string, tool: string) => string | undefined;
+	/**
+	 * Why the protected paths an unjudged command could change cannot all be
+	 * write-denied for it (#64): the walk went past its bound, or a protected
+	 * file has another name. A reason means a person decides instead.
+	 */
+	unjudgedWriteIssue?: (action: CanonicalAction) => string | undefined;
 	/** Last admission check for boundaries that have no execute-time guard. */
 	withholdBeforeExecution?: (action: CanonicalAction) => string | undefined;
 	onDecision?: (decision: GateDecision) => void;
@@ -400,8 +412,11 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 	const askReason = needsHumanWithoutReview(action, disposition.reviewed, deps.reviewer !== undefined);
 	if (askReason) {
 		if (uncertainRunsSandboxed(action, disposition.reviewed, profile)) {
+			const issue = deps.unjudgedWriteIssue?.(action);
+			if (issue) return escalate(action, event, deps, evaluation, toolSource, `${askReason}; ${unprotectable(issue)}`);
 			return finish(action, event, deps, {
 				outcome: "sandboxed-uncertain",
+				unjudged: true,
 				block: false,
 				reason: `${askReason}; rules.onUncertain is "sandbox", so it runs with the sandbox (no network, workspace-only writes) as the boundary`,
 				matches: evaluation.matches,
@@ -524,8 +539,16 @@ async function reviewDecision(
 			`${explanation}; "${action.tool}" runs outside the sandbox and requires human approval`,
 		);
 	}
+	// An allow of a command L1 could not read is the model's alone; what it
+	// writes is held to the protected paths at L2 (#64).
+	const unjudged = action.tool === "bash" && !action.confident;
+	if (unjudged) {
+		const issue = deps.unjudgedWriteIssue?.(action);
+		if (issue) return escalate(action, event, deps, evaluation, toolSource, `${explanation}; ${unprotectable(issue)}`);
+	}
 	return finish(action, event, deps, {
 		outcome: "review-allow",
+		...(unjudged ? { unjudged: true as const } : {}),
 		block: false,
 		reason: explanation,
 		matches: evaluation.matches,
@@ -559,6 +582,10 @@ async function escalate(
 		matches: evaluation.matches,
 		adverse: false,
 	});
+}
+
+function unprotectable(issue: string): string {
+	return `the protected paths it could change cannot all be write-denied for it (${issue}), so a person decides`;
 }
 
 /** Register the already-frozen action. Only reached on a permit. */

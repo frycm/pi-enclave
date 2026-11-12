@@ -18,7 +18,18 @@ const mocks = vi.hoisted(() => ({
 	runs: [] as RunRequest[],
 	/** What the fake sandbox does for a command, for tests that need an effect. */
 	onRun: undefined as ((request: RunRequest) => void) | undefined,
+	/** When set, the #64 walk fails with this reason. */
+	protectedFail: undefined as string | undefined,
 }));
+
+vi.mock("../../src/gate/protected-writes.ts", async (original) => {
+	const actual = await original<typeof import("../../src/gate/protected-writes.ts")>();
+	return {
+		...actual,
+		protectedWriteTargets: (...args: Parameters<typeof actual.protectedWriteTargets>) =>
+			mocks.protectedFail ? { ok: false, reason: mocks.protectedFail } : actual.protectedWriteTargets(...args),
+	};
+});
 
 vi.mock("../../src/probe-host.ts", async (original) => ({
 	...(await original<typeof import("../../src/probe-host.ts")>()),
@@ -81,6 +92,7 @@ beforeEach(() => {
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	mocks.runs.length = 0;
 	mocks.onRun = undefined;
+	mocks.protectedFail = undefined;
 });
 afterEach(() => {
 	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -165,7 +177,9 @@ async function session(edit: (profile: EffectiveProfile) => void = () => {}) {
 			.trim()
 			.split("\n")
 			.map((line) => JSON.parse(line) as Record<string, unknown>);
-	return { handlers, context, call, flush, records, auditPath };
+	const execute = (id: string, command: string) =>
+		tools.get("bash")?.execute(id, { command }, undefined, undefined, context) ?? Promise.resolve();
+	return { handlers, context, call, flush, records, auditPath, execute };
 }
 
 describe("a session's audit trail (#37)", () => {
@@ -384,6 +398,134 @@ describe("a session's audit trail (#37)", () => {
 			await s.handlers.get("session_shutdown")?.({}, s.context);
 			expect((await s.call("t2", "ls")).block).toBeFalsy();
 			expect(stderr).toHaveBeenCalledWith(expect.stringContaining("audit write failed"));
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+});
+
+describe("an unjudged command's protected paths (#64)", () => {
+	const plant = () => {
+		writeFileSync(join(ws, "AGENTS.md"), "original\n");
+		mkdirSync(join(ws, ".husky"));
+		writeFileSync(join(ws, ".husky", "pre-commit"), "original\n");
+	};
+	const unparsed = `f=AGENTS.md; echo x > "$f"`;
+
+	it.each([
+		[
+			"rules.onUncertain: sandbox",
+			(profile: EffectiveProfile) => {
+				profile.rules.onUncertain = "sandbox";
+			},
+		],
+		[
+			"an always-allow reviewer",
+			(profile: EffectiveProfile) => {
+				profile.reviewer.model = "ollama/reviewer";
+				profile.review.trigger = "mutating";
+			},
+		],
+	])("are write-denied for the call under %s", async (_name, edit) => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			plant();
+			const s = await session(edit);
+			const gate = await s.call("t1", unparsed);
+			expect(gate?.block).not.toBe(true);
+			expect(mocks.runs).toHaveLength(1);
+			expect(mocks.runs[0]?.protectWrites).toEqual(expect.arrayContaining([join(ws, "AGENTS.md"), join(ws, ".husky")]));
+			await s.flush();
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	it("are not denied for a command L1 could read", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			plant();
+			const s = await session((profile) => {
+				profile.rules.onUncertain = "sandbox";
+			});
+			await s.call("t1", "ls");
+			expect(mocks.runs).toHaveLength(1);
+			expect(mocks.runs[0]?.protectWrites).toBeUndefined();
+			await s.flush();
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	it("ask a person instead when they cannot all be denied", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			plant();
+			const s = await session((profile) => {
+				profile.rules.onUncertain = "sandbox";
+			});
+			mocks.protectedFail = "the writable roots hold more than 200000 entries";
+			const gate = await s.call("t1", unparsed);
+			expect(gate?.block).toBe(true);
+			expect(gate?.reason).toContain("cannot all be write-denied for it");
+			expect(mocks.runs).toEqual([]);
+			await s.flush();
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	it("refuse the command at execution when the walk fails after the gate", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			plant();
+			const s = await session((profile) => {
+				profile.rules.onUncertain = "sandbox";
+			});
+			const gate = (await s.handlers.get("tool_call")?.(
+				{ toolName: "bash", toolCallId: "t1", input: { command: unparsed } },
+				s.context,
+			)) as { block?: boolean } | undefined;
+			expect(gate?.block).not.toBe(true);
+			mocks.protectedFail = "a protected file has 2 hard links";
+			await expect(s.execute("t1", unparsed)).rejects.toThrow(/not judged by anyone.*it does not run/s);
+			expect(mocks.runs).toEqual([]);
+			await s.flush();
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	// What L2 cannot deny before it exists: the tripwire watches every
+	// protected pattern, the configured ones too, and counts a hit after an
+	// unjudged command.
+	it("that do not exist yet are reported and counted by the tripwire, user-global entries included", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			const s = await session((profile) => {
+				profile.rules.onUncertain = "sandbox";
+				profile.rules.protectedPaths.ask.push("infra/**");
+			});
+			mocks.onRun = () => {
+				mkdirSync(join(ws, ".github", "workflows"), { recursive: true });
+				writeFileSync(join(ws, ".github", "workflows", "deploy.yml"), "on: push\n");
+				mkdirSync(join(ws, "infra"));
+				writeFileSync(join(ws, "infra", "main.tf"), "x\n");
+			};
+			await s.handlers.get("turn_start")?.({ turnIndex: 1 }, s.context);
+			await s.call("t1", unparsed);
+			await s.handlers.get("turn_end")?.({ turnIndex: 1 }, { ...s.context, abort: () => {} });
+			await s.flush();
+			const hits = s
+				.records()
+				.filter((entry) => entry.kind === "violation" && entry.source === "tripwire")
+				.map((entry) => [entry.path, entry.op, entry.adverse]);
+			expect(hits).toEqual(
+				expect.arrayContaining([
+					[join(ws, ".github", "workflows"), "created", true],
+					[join(ws, "infra"), "created", true],
+				]),
+			);
 		} finally {
 			stderr.mockRestore();
 		}
