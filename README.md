@@ -1121,15 +1121,20 @@ and the refusal says why the target is sensitive:
   `extensions/`, `packages/`, `skills/`, `prompts/`;
 - every code root the pi process loaded (#36): pi, pi-enclave, its `node_modules`, other
   extensions;
-- shell and login startup files (`~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zshrc`,
-  `~/.zshenv`, `~/.zprofile`, the csh/ksh/X session files, `~/.pam_environment`,
-  `~/.envrc`, `$XDG_CONFIG_HOME/fish`, `$XDG_CONFIG_HOME/environment.d`);
+- shell and login startup files (`~/.bashrc`, `~/.bash_profile`, `~/.bash_aliases`,
+  `~/.bashrc.d`, `~/.profile`, `~/.zshrc`, `~/.zshenv`, `~/.zprofile`, `~/.zsh`,
+  `~/.oh-my-zsh`, the csh/ksh/X session files, `~/.pam_environment`, `~/.envrc`,
+  `~/.tmux.conf`, `~/.pythonrc`, `~/.gdbinit`, and `fish`, `zsh`, `direnv`, `tmux`,
+  `environment.d` under `$XDG_CONFIG_HOME`);
 - Git's user configuration (`~/.gitconfig`, `$XDG_CONFIG_HOME/git`);
 - user services and autostart (`$XDG_CONFIG_HOME/systemd`, `~/.local/share/systemd`,
-  `$XDG_CONFIG_HOME/autostart`, `~/Library/LaunchAgents`) and the crontab spools;
+  `$XDG_CONFIG_HOME/autostart`, `~/.local/share/applications`, `~/Library/LaunchAgents`)
+  and the crontab spools;
 - conventional user `PATH` directories whether or not they are on `PATH` now
-  (`~/.local/bin`, `~/bin`, `~/.cargo/bin`, `~/go/bin`, `~/.npm-global`, `~/.deno/bin`,
-  `~/.bun/bin`);
+  (`~/.local/bin`, `~/bin`, `~/go/bin`, `~/.npm-global`, `~/.deno/bin`, `~/.bun/bin`,
+  `~/.yarn/bin`, `~/.local/share/pnpm`), and toolchains and version managers
+  (`~/.cargo`, `~/.local/lib`, `$XDG_CONFIG_HOME/pip`, `~/.nvm`, `~/.pyenv`, `~/.rbenv`,
+  `~/.asdf`, `~/.volta`);
 - editor startup files (`~/.vimrc`, `~/.vim`, `$XDG_CONFIG_HOME/nvim`, `~/.emacs`,
   `~/.emacs.d`).
 
@@ -1140,8 +1145,12 @@ built in and not configurable, and the write-side risk floor is `critical` for a
 the working directory or below a user-global `sandbox.grantableWriteRoots` entry. With the
 list empty, which is the default, no write capability outside the workspace is grantable at
 all: the right default for an unattended server. Project files cannot mention the field, a
-less trusted source can only remove entries, and `"/"` or an entry on or below a
-never-grantable target is refused at load. Independently, no writable root may overlap pi's
+less trusted source can only remove entries, and an entry that intersects a
+never-grantable target in either direction is refused at load: `"/"`, `~`, `/home`,
+`~/.config` or `/var` would contain one, so list the specific data or build directories a
+capability may write instead. That keeps the built-in list a backstop rather than the
+boundary: no list of dotfiles is ever complete, and the validator still checks every
+target against it as defence in depth. Independently, no writable root may overlap pi's
 agent directory, and `enclave.json` and `trust.json` there are write-denied in L2 by name.
 
 Widening is invocation-scoped: SRT receives a `customConfig` on the one shell

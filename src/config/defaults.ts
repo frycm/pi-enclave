@@ -113,6 +113,7 @@ export function protectedWriteTargets(
 	const service = "the user's service manager or desktop session starts what it lists, outside any sandbox";
 	const bin = "it is a conventional user PATH directory, so a file there runs as a command outside the sandbox";
 	const editor = "the editor runs it when the user next opens a file";
+	const toolchain = "a language toolchain or version manager outside the sandbox loads or runs code from it";
 	const targets: ProtectedWriteTarget[] = [
 		// pi's agent directory as a whole: enclave.json, settings.json, trust.json,
 		// models.json, extensions/, packages/, skills/, prompts/, themes/.
@@ -141,6 +142,13 @@ export function protectedWriteTargets(
 			".pam_environment",
 			".envrc",
 			".inputrc",
+			".bash_aliases",
+			".bashrc.d",
+			".oh-my-zsh",
+			".zsh",
+			".tmux.conf",
+			".pythonrc",
+			".gdbinit",
 		].map((name) => ({ path: join(home, name), reason: shell })),
 		...configRoots.flatMap((root) => [
 			{ path: join(root, "fish"), reason: shell },
@@ -149,17 +157,26 @@ export function protectedWriteTargets(
 			{ path: join(root, "systemd"), reason: service },
 			{ path: join(root, "autostart"), reason: service },
 			{ path: join(root, "nvim"), reason: editor },
+			{ path: join(root, "zsh"), reason: shell },
+			{ path: join(root, "direnv"), reason: shell },
+			{ path: join(root, "tmux"), reason: shell },
+			{ path: join(root, "pip"), reason: toolchain },
 		]),
 		{ path: join(home, ".gitconfig"), reason: git },
 		{ path: join(home, "Library", "LaunchAgents"), reason: service },
 		{ path: join(home, ".local", "share", "systemd"), reason: service },
 		{ path: join(home, ".local", "bin"), reason: bin },
 		{ path: join(home, "bin"), reason: bin },
-		{ path: join(home, ".cargo", "bin"), reason: bin },
+		{ path: join(home, ".cargo"), reason: toolchain },
 		{ path: join(home, "go", "bin"), reason: bin },
 		{ path: join(home, ".npm-global"), reason: bin },
 		{ path: join(home, ".deno", "bin"), reason: bin },
 		{ path: join(home, ".bun", "bin"), reason: bin },
+		{ path: join(home, ".yarn", "bin"), reason: bin },
+		{ path: join(home, ".local", "share", "pnpm"), reason: bin },
+		{ path: join(home, ".local", "lib"), reason: toolchain },
+		{ path: join(home, ".local", "share", "applications"), reason: service },
+		...[".nvm", ".pyenv", ".rbenv", ".asdf", ".volta"].map((name) => ({ path: join(home, name), reason: toolchain })),
 		{ path: join(home, ".vimrc"), reason: editor },
 		{ path: join(home, ".vim"), reason: editor },
 		{ path: join(home, ".emacs"), reason: editor },

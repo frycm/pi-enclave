@@ -601,24 +601,41 @@ export function fold(documents: readonly ConfigDocument[], options: FoldOptions)
 		}
 	}
 
-	// Write capabilities outside the workspace are opt-in (#21). An entry on
-	// or below a never-grantable target can never grant anything, and "/" would
-	// make everything else grantable; both are configuration mistakes.
+	// Write capabilities outside the workspace are opt-in (#21). An entry that
+	// intersects a never-grantable target either way is a configuration mistake:
+	// one on or below it can never grant anything, and one that contains it
+	// (`~`, `/home`, `~/.config`, `/var`, `/`) would leave the built-in list as
+	// the only thing between an approval and the trust roots. The list is a
+	// backstop -- the validator still checks every target -- not the boundary.
 	for (const grantable of current.sandbox.grantableWriteRoots ?? []) {
 		const target = canonical(grantable);
-		const protectedEntry = current.sandbox.protectedWrite.find(
-			(entry) => isUnder(target, canonical(entry.path)) || isUnder(grantable, entry.path),
-		);
-		if (target === "/" || protectedEntry) {
+		if (target === "/") {
 			errors.push({
 				source: "user_global",
 				field: "sandbox.grantableWriteRoots",
-				message:
-					target === "/"
-						? '"/" can never be a grantable write root.'
-						: `"${grantable}" is on or below never-grantable write target ${protectedEntry?.path}: ${protectedEntry?.reason}.`,
+				message: '"/" can never be a grantable write root.',
 			});
+			continue;
 		}
+		const protectedEntry = current.sandbox.protectedWrite.find((entry) => {
+			const path = canonical(entry.path);
+			return (
+				isUnder(target, path) ||
+				isUnder(grantable, entry.path) ||
+				isUnder(path, target) ||
+				isUnder(entry.path, grantable)
+			);
+		});
+		if (!protectedEntry) continue;
+		const below = isUnder(target, canonical(protectedEntry.path)) || isUnder(grantable, protectedEntry.path);
+		errors.push({
+			source: "user_global",
+			field: "sandbox.grantableWriteRoots",
+			message: below
+				? `"${grantable}" is on or below never-grantable write target ${protectedEntry.path}: ${protectedEntry.reason}.`
+				: `"${grantable}" contains never-grantable write target ${protectedEntry.path} (${protectedEntry.reason}). ` +
+					"List the specific directories a capability may write instead, such as a data or build directory.",
+		});
 	}
 
 	// The same kind of invariant for the per-user scratch base. Configuration

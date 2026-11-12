@@ -76,9 +76,42 @@ describe("the never-grantable write list (#21)", () => {
 			},
 		);
 		expect(decision.outcome).toBe("deny");
-		expect(decision.reason).toContain("not grantable by approval");
+		expect(decision.reason).toContain("no approval can");
 		expect(decision.reason).toContain("never-grantable");
 		expect(asked).toBe(false);
+	});
+
+	it.each([
+		"/home/u/.bash_aliases",
+		"/home/u/.bashrc.d/x.sh",
+		"/home/u/.oh-my-zsh/custom/x.zsh",
+		"/home/u/.zsh/x",
+		"/home/u/.config/zsh/.zshrc",
+		"/home/u/.config/direnv/direnvrc",
+		"/home/u/.tmux.conf",
+		"/home/u/.config/tmux/tmux.conf",
+		"/home/u/.nvm/nvm.sh",
+		"/home/u/.pyenv/shims/python",
+		"/home/u/.rbenv/shims/ruby",
+		"/home/u/.asdf/shims/x",
+		"/home/u/.volta/bin/node",
+		"/home/u/.local/share/pnpm/pnpm",
+		"/home/u/.yarn/bin/x",
+		"/home/u/.cargo/config.toml",
+		"/home/u/.local/lib/python3.12/site-packages/x.pth",
+		"/home/u/.config/pip/pip.conf",
+		"/home/u/.pythonrc",
+		"/home/u/.gdbinit",
+		"/home/u/.local/share/applications/x.desktop",
+	])("also refuses %s (review of #52)", (target) => {
+		const backend = toBackendProfile(
+			profile((p) => {
+				p.sandbox.grantableWriteRoots = [HOME];
+			}),
+			"/work",
+			AGENT,
+		);
+		expect(() => validateWriteCapability(backend, "/work", target)).toThrow(/never-grantable/);
 	});
 
 	it("says why the target is sensitive", () => {
@@ -180,7 +213,7 @@ describe("grantable write roots (#21)", () => {
 			},
 		);
 		expect(decision.outcome).toBe("deny");
-		expect(decision.reason).toContain("not grantable by approval");
+		expect(decision.reason).toContain("no approval can");
 	});
 
 	it("grants a target below the workspace or below a configured root", async () => {
@@ -236,6 +269,10 @@ describe("grantable write roots (#21)", () => {
 
 	it.each([
 		["/", '"/" can never be'],
+		["/home/u", "contains never-grantable write target"],
+		["/home", "contains never-grantable write target"],
+		["/home/u/.config", "contains never-grantable write target"],
+		["/var", "contains never-grantable write target"],
 		["/home/u/.pi/agent/extensions", "never-grantable write target"],
 		["/home/u/.config/systemd/user", "never-grantable write target"],
 	])("refuses %s as a grantable write root", (root, message) => {

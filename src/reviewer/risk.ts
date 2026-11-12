@@ -1,5 +1,5 @@
-import { capabilityIntersects, resolveCapabilityTarget } from "../backend/capability.ts";
-import { canonical, isUnderAny, normalizePath } from "../backend/paths.ts";
+import { resolveCapabilityTarget } from "../backend/capability.ts";
+import { canonical, isUnder, isUnderAny, normalizePath } from "../backend/paths.ts";
 import type { EffectiveProfile } from "../config/types.ts";
 import type { CanonicalAction } from "../policy/canonical.ts";
 import type { EffectiveReview, ModelReview, ReviewAuthorization, ReviewEvidence, ReviewRisk } from "./types.ts";
@@ -36,13 +36,22 @@ function criticalWriteTarget(path: string, profile: EffectiveProfile): boolean {
 	const normalized = normalizePath(path);
 	if (normalized === "/" || canonical(normalized) === "/") return true;
 	if (isUnderAny(normalized, CRITICAL_TREES)) return true;
-	// The never-grantable write list (#21): the trust boundary itself.
-	return (
-		capabilityIntersects(
-			normalized,
-			profile.sandbox.protectedWrite.map((entry) => entry.path),
-		) !== undefined
-	);
+	// The never-grantable write list (#21): the trust boundary itself. Matched
+	// as written and canonical, both ways; the canonical spellings are resolved
+	// once per profile, because this runs for every write path of every action.
+	return protectedSpellings(profile).some((entry) => isUnder(normalized, entry) || isUnder(entry, normalized));
+}
+
+const SPELLINGS = new WeakMap<object, readonly string[]>();
+
+function protectedSpellings(profile: EffectiveProfile): readonly string[] {
+	const list = profile.sandbox.protectedWrite;
+	let spellings = SPELLINGS.get(list);
+	if (!spellings) {
+		spellings = [...new Set(list.flatMap((entry) => [normalizePath(entry.path), canonical(entry.path)]))];
+		SPELLINGS.set(list, spellings);
+	}
+	return spellings;
 }
 
 /**

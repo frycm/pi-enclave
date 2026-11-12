@@ -68,7 +68,7 @@ export function writeCapabilityBoundaryIssue(target: string, boundary: WriteCapa
 		if (capabilityIntersects(resolvedTarget, [entry.path])) {
 			return (
 				`pi-enclave: refusing write capability ${resolvedTarget}: it intersects ${entry.path}, and ${entry.reason}.\n` +
-				"  This target is on the built-in never-grantable write list; no approval can lift it"
+				"  It is on the built-in never-grantable write list, so no approval can lift it."
 			);
 		}
 	}
@@ -79,7 +79,7 @@ export function writeCapabilityBoundaryIssue(target: string, boundary: WriteCapa
 		return (
 			`pi-enclave: refusing write capability ${resolvedTarget}: it is outside the workspace and outside every ` +
 			`sandbox.grantableWriteRoots entry (${boundary.grantableRoots.join(", ") || "none configured"}).\n` +
-			"  Only the user-global configuration can make a path outside the workspace grantable"
+			"  Only the user-global configuration can make a path outside the workspace grantable; no approval can."
 		);
 	}
 	return undefined;

@@ -334,7 +334,8 @@ describe.skipIf(!supported)("invocation-scoped write capability", () => {
 			const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
 			const fixture = createFixture();
 			try {
-				const compiled = await backend.compile(fixture.profile);
+				// Outside the workspace, a write capability needs a grantable root (#21).
+				const compiled = await backend.compile({ ...fixture.profile, grantableWriteRoots: [fixture.outside] });
 				await backend.run(compiled, {
 					command: `printf capability > ${JSON.stringify(fixture.outsideFile)}`,
 					cwd: fixture.workspace,
@@ -351,6 +352,34 @@ describe.skipIf(!supported)("invocation-scoped write capability", () => {
 					commandId: "write-capability-base-sibling",
 				});
 				expect(readFileSync(fixture.outsideFile, "utf8")).toBe("capability");
+			} finally {
+				await backend.dispose();
+				fixture.cleanup();
+			}
+		},
+		60_000,
+	);
+
+	// The control for the row above (#21): the same target and the same call,
+	// with no grantable root, is refused before anything is wrapped or run.
+	it.skipIf(process.platform === "darwin")(
+		"refuses a write capability outside the workspace when no grantable root covers it",
+		async () => {
+			const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
+			const fixture = createFixture();
+			try {
+				const compiled = await backend.compile({ ...fixture.profile, grantableWriteRoots: [] });
+				const before = readFileSync(fixture.outsideFile, "utf8");
+				await expect(
+					backend.run(compiled, {
+						command: `printf capability > ${JSON.stringify(fixture.outsideFile)}`,
+						cwd: fixture.workspace,
+						env: { PATH: process.env.PATH ?? "" },
+						commandId: "write-capability-not-grantable",
+						writeCapability: fixture.outsideFile,
+					}),
+				).rejects.toThrow(/outside every sandbox.grantableWriteRoots entry/);
+				expect(readFileSync(fixture.outsideFile, "utf8")).toBe(before);
 			} finally {
 				await backend.dispose();
 				fixture.cleanup();
@@ -392,7 +421,12 @@ describe.skipIf(!supported)("invocation-scoped write capability", () => {
 			const backend = new SrtBackend({ weakerNestedSandbox: weakerNested });
 			const fixture = createFixture();
 			try {
-				const compiled = await backend.compile(fixture.profile);
+				// Both targets below a grantable root (#21), so the read-deny overlap
+				// is what refuses them.
+				const compiled = await backend.compile({
+					...fixture.profile,
+					grantableWriteRoots: [dirname(fixture.deniedHome)],
+				});
 				for (const target of [join(fixture.deniedHome, "out"), dirname(fixture.deniedHome)]) {
 					await expect(
 						backend.run(compiled, {

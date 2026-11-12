@@ -266,7 +266,7 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 			return {
 				outcome: "deny",
 				block: true,
-				reason: `${boundaryIssue}\n  This boundary is not grantable by approval.`,
+				reason: boundaryIssue,
 				matches: evaluation.matches,
 				adverse: true,
 				action,
@@ -290,7 +290,8 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 			return {
 				outcome: "deny",
 				block: true,
-				reason: `${issue}\n  This boundary is not grantable by approval.`,
+				// The trust-root refusals (#21) already say no approval can lift them.
+				reason: issue.includes("no approval can") ? issue : `${issue}\n  This boundary is not grantable by approval.`,
 				matches: evaluation.matches,
 				adverse: true,
 				action,
