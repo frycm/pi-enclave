@@ -83,7 +83,9 @@ export type AuditKind =
 	/** `pi-enclave approve` ran, declined or refused a pending action. */
 	| "approval"
 	/** The log's own events: a missing tail found at resume, the session cap. */
-	| "audit";
+	| "audit"
+	/** At session shutdown: which layer settled each gate decision (#18). */
+	| "summary";
 
 export interface AuditRecord {
 	seq: number;

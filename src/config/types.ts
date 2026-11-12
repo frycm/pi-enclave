@@ -189,7 +189,15 @@ export interface RulesSettings {
 	/** An allow verdict that skips L3. User-global only. */
 	skipReview: string[];
 	protectedPaths: ProtectedPaths;
+	/**
+	 * What deterministic mode does with a command L1 could not parse (#18).
+	 * `ask`: a person decides. `sandbox`: it runs, with L2 as the boundary,
+	 * recorded as such; only while the network is off. User-global only.
+	 */
+	onUncertain: UncertainMode;
 }
+
+export type UncertainMode = "ask" | "sandbox";
 
 /**
  * The prose rulebook rendered into the isolated reviewer's prompt. Nothing

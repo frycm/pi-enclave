@@ -42,8 +42,11 @@ vi.mock("../../src/reviewer/setup.ts", async (original) => {
 	const { buildReviewerPrompt, reviewerRulebook } = await import("../../src/reviewer/prompt.ts");
 	return {
 		...actual,
-		prepareQualifiedReviewer: async (profile: { review: Parameters<typeof reviewerRulebook>[0] }) => ({
-			prompt: buildReviewerPrompt(reviewerRulebook(profile.review, new Map())),
+		prepareQualifiedReviewer: async (profile: {
+			review: Parameters<typeof reviewerRulebook>[0];
+			rules: Parameters<typeof reviewerRulebook>[2];
+		}) => ({
+			prompt: buildReviewerPrompt(reviewerRulebook(profile.review, new Map(), profile.rules)),
 			primary: {
 				name: "ollama/reviewer",
 				numCtx: 8_192,

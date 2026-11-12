@@ -1,12 +1,19 @@
+import { relative, resolve, sep } from "node:path";
 import { resolveCapabilityTarget } from "../backend/capability.ts";
 import { canonical, isUnder, isUnderAny, normalizePath } from "../backend/paths.ts";
 import type { EffectiveProfile } from "../config/types.ts";
 import type { CanonicalAction } from "../policy/canonical.ts";
+import { matchesPathPattern } from "../policy/paths.ts";
 import type { EffectiveReview, ModelReview, ReviewAuthorization, ReviewEvidence, ReviewRisk } from "./types.ts";
 
 const RISK_RANK: Record<ReviewRisk, number> = { low: 0, medium: 1, high: 2, critical: 3 };
 
-const HIGH_RISK_COMMANDS = new Set(["chmod", "chown", "dd", "kill", "pkill", "rm", "truncate"]);
+/** Commands that destroy or change what their path arguments name. */
+const PATH_DESTRUCTIVE_COMMANDS = new Set(["chmod", "chown", "dd", "rm", "truncate"]);
+/** Commands whose targets are not paths the sandbox bounds. */
+const UNBOUNDED_DESTRUCTIVE_COMMANDS = new Set(["kill", "pkill", "killall"]);
+/** Git subcommands that discard work in the repository at the working directory. */
+const GIT_DISCARDING = new Set(["reset", "clean", "checkout", "restore"]);
 const CRITICAL_TREES = ["/etc", "/bin", "/sbin", "/usr", "/System", "/Library"];
 
 export function maxRisk(a: ReviewRisk, b: ReviewRisk): ReviewRisk {
@@ -18,18 +25,131 @@ function broadCapability(value: string): boolean {
 	return normalized === "/" || normalized.split("/").filter(Boolean).length <= 1;
 }
 
-function destructiveShell(action: CanonicalAction): boolean {
+/**
+ * The floor a destructive shell command sets (#18), or undefined for none.
+ *
+ * `high` used to apply wherever the command pointed, so `rm -f build/x` and
+ * `git checkout -b feature` needed a person although the sandbox bounds them
+ * exactly. Now a destructive command whose every write lands inside the
+ * writable roots, run from inside them, is `medium`: L2 is the boundary, and
+ * the reviewer may clear it. It stays `high` when a target is outside the
+ * writable roots, is a writable root or contains one (`rm -rf .`), is or
+ * contains a protected path (`rules.protectedPaths`: `.git`, `.pi`,
+ * `.github/workflows` and the rest), or is not a path at all (`dd of=`, a
+ * process, a remote), and for `git push`. The never-grantable trees are
+ * `critical` separately.
+ */
+function destructiveShellRisk(action: CanonicalAction, profile: EffectiveProfile): ReviewRisk | undefined {
+	const commands = action.shell?.commands ?? [];
+	let destructive = false;
+	let bounded = true;
+	const roots = profile.sandbox.writableRoots;
+	const inRoots = (path: string) => isUnderAny(normalizePath(path), roots);
+	const protectedPatterns = [...profile.rules.protectedPaths.deny, ...profile.rules.protectedPaths.ask];
+	const writes = action.paths.filter((path) => path.writes);
+	const boundedTarget = (resolved: string) =>
+		inRoots(resolved) &&
+		!isOrContainsRoot(resolved, roots) &&
+		!matchesPathPattern(protectedPatterns, resolved, action.cwd) &&
+		!containsProtected(resolved, protectedPatterns, [...roots, action.cwd]);
+	const writesBounded = writes.every((path) => boundedTarget(path.resolved));
+	for (const command of commands) {
+		const name = command.name.slice(command.name.lastIndexOf("/") + 1).toLowerCase();
+		if (UNBOUNDED_DESTRUCTIVE_COMMANDS.has(name)) {
+			destructive = true;
+			bounded = false;
+		} else if (PATH_DESTRUCTIVE_COMMANDS.has(name)) {
+			destructive = true;
+			// Only a command that names its targets as paths is bounded by them:
+			// `dd of=x` and `rm` with no operand are not.
+			if (name === "dd" || writes.length === 0 || !writesBounded) bounded = false;
+		} else if (name === "git" && command.args[0] === "push") {
+			destructive = true;
+			bounded = false;
+		} else if (name === "git" && GIT_DISCARDING.has(command.args[0] ?? "")) {
+			destructive = true;
+			// The parser does not read every operand of these as a path
+			// (`git checkout -- AGENTS.md`), so each operand is checked as one too:
+			// `git checkout .` discards the whole workspace.
+			const operands = command.args.slice(1).filter((arg) => arg !== "--" && !arg.startsWith("-"));
+			// `git checkout -f` discards every local change, with or without an
+			// operand; a pathspec with magic (`:/`, `:(top)`) is not a path at all.
+			const forced =
+				command.args[0] === "checkout" &&
+				command.args.slice(1).some((arg) => arg === "--force" || /^-[a-zA-Z]*f/.test(arg));
+			if (
+				!inRoots(action.cwd) ||
+				!writesBounded ||
+				forced ||
+				operands.some((operand) => operand.startsWith(":")) ||
+				!operands.every((operand) => boundedTarget(resolve(action.cwd, operand)))
+			)
+				bounded = false;
+		} else if (name === "gh" && command.args.some((arg) => ["-X", "--method=DELETE", "DELETE"].includes(arg))) {
+			destructive = true;
+			bounded = false;
+		}
+	}
+	if (!destructive) return undefined;
+	return bounded ? "medium" : "high";
+}
+
+/** A writable root itself, or a directory above one: deleting it deletes the whole root. */
+function isOrContainsRoot(path: string, roots: readonly string[]): boolean {
+	const target = normalizePath(path);
+	return roots.some((root) => isUnder(root, target) || isUnder(canonical(root), target));
+}
+
+/** True when `[a..]` is a non-empty prefix of `b`, compared case-insensitively. */
+function segmentPrefix(a: readonly string[], b: readonly string[]): boolean {
 	return (
-		action.shell?.commands.some((command) => {
-			const name = command.name.slice(command.name.lastIndexOf("/") + 1).toLowerCase();
-			if (HIGH_RISK_COMMANDS.has(name)) return true;
-			if (name === "git" && ["push", "reset", "clean", "checkout", "restore"].includes(command.args[0] ?? "")) {
-				return true;
-			}
-			if (name === "gh" && command.args.some((arg) => ["-X", "--method=DELETE", "DELETE"].includes(arg))) return true;
-			return false;
-		}) ?? false
+		a.length > 0 &&
+		a.length <= b.length &&
+		a.every((segment, index) => segment.toLowerCase() === b[index]?.toLowerCase())
 	);
+}
+
+/**
+ * Whether a directory target may hold a path a protected pattern names (#18):
+ * `rm -rf .github` removes `.github/workflows/**` although the directory
+ * itself matches nothing. Decided from the pattern's literal leading segments,
+ * up to the first wildcard: the target contains a match when it ends with (for
+ * a `**`/ pattern) or is (anchored, relative to a root or the cwd) a leading
+ * part of them. A pattern with no literal segment (`**`/`docker-compose*.yml`)
+ * names no directory and is not counted, so `rm -rf dist` stays bounded.
+ */
+function containsProtected(path: string, patterns: readonly string[], bases: readonly string[]): boolean {
+	const target = normalizePath(path).split(sep).filter(Boolean);
+	const relatives = bases
+		.filter((base) => isUnder(path, base))
+		.map((base) => relative(normalizePath(base), normalizePath(path)).split(sep).filter(Boolean));
+	return patterns.some((pattern) => {
+		const floating = pattern.startsWith("**/");
+		const segments = (floating ? pattern.slice(3) : pattern.replace(/^\/+/, "")).split("/");
+		const literal: string[] = [];
+		for (const segment of segments) {
+			if (/[*?[]/.test(segment)) break;
+			literal.push(segment);
+		}
+		if (literal.length === 0) return false;
+		if (floating) {
+			// Some suffix of the target is a leading part of the literal segments.
+			for (let start = 0; start < target.length; start++) {
+				if (segmentPrefix(target.slice(start), literal)) return true;
+			}
+			return false;
+		}
+		return segmentPrefix(target, literal) || relatives.some((rel) => segmentPrefix(rel, literal));
+	});
+}
+
+/**
+ * Whether the sandbox alone bounds what an unreadable command can do (#18):
+ * no network, and no capability widening it. Then a non-confident parse is a
+ * judgement for the reviewer, not a crossing that needs a person.
+ */
+export function sandboxContains(action: CanonicalAction, profile: EffectiveProfile): boolean {
+	return profile.sandbox.network.mode === "off" && !action.capability;
 }
 
 function criticalWriteTarget(path: string, profile: EffectiveProfile): boolean {
@@ -88,11 +208,14 @@ export function minimumRisk(action: CanonicalAction, profile: EffectiveProfile):
 		raise(critical ? "critical" : "high");
 	}
 	if (action.paths.some((path) => path.writes && criticalWriteTarget(path.resolved, profile))) raise("critical");
-	if (destructiveShell(action)) raise("high");
+	const destructive = destructiveShellRisk(action, profile);
+	if (destructive) raise(destructive);
 	if (action.tool === "write" || action.tool === "edit" || action.paths.some((path) => path.writes)) raise("medium");
-	// An opaque or otherwise non-confident command needs a person or an exact
-	// direct instruction, whatever else it carries.
-	if (action.tool === "bash" && !action.confident) raise("high");
+	// A non-confident command: L1 matched its patterns against a guess. Inside
+	// a sandbox with no network that is the reviewer's judgement, at medium
+	// (#18); where the sandbox does not contain it, it needs a person or an
+	// exact direct instruction, whatever else it carries.
+	if (action.tool === "bash" && !action.confident) raise(sandboxContains(action, profile) ? "medium" : "high");
 	return floor;
 }
 

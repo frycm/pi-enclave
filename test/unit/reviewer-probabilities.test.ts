@@ -29,7 +29,7 @@ import type { ReviewProbabilities } from "../../src/reviewer/types.ts";
 import { reviewerVerdictFields } from "../../src/state/audit.ts";
 
 const PROFILE = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
-const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map()));
+const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map(), PROFILE.rules));
 const THRESHOLDS = { allow: 0.9, deny: 0.5, temperature: 1 };
 const directories: string[] = [];
 
@@ -158,6 +158,7 @@ describe("classifier answers are validated before they become a verdict", () => 
 		const rulebook = reviewerRulebook(
 			{ ...PROFILE.review, hard_deny: ["Never touch production databases"] },
 			new Map([["review.hard_deny", new Map([["Never touch production databases", "user_global"]])]]),
+			PROFILE.rules,
 		);
 		const prompt = buildReviewerPrompt(rulebook);
 		expect(prompt.classifier.questions.decision?.instructions).toContain("Never touch production databases");

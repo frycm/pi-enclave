@@ -36,6 +36,11 @@ export interface ReviewActionEvidence {
 	confident: boolean;
 	/** Display evidence was bounded; the hash still binds the complete executor input. */
 	truncated: boolean;
+	/**
+	 * A write or edit body longer than 2,048 characters is shown as
+	 * `{chars, sha256, head, tail}` (#18). Not truncation: the path decides.
+	 */
+	summarized?: true;
 	toolSource?: string;
 }
 
@@ -81,6 +86,17 @@ export interface ReviewerRulebook {
 	hard_deny: SourcedReviewRule[];
 	soft_deny: SourcedReviewRule[];
 	allow: SourcedReviewRule[];
+	/** Trusted bash `rules.deny`/`rules.ask` patterns, the argument only (#18). */
+	shell: { deny: SourcedReviewRule[]; ask: SourcedReviewRule[] };
+	/** Trusted `rules.protectedPaths` patterns, deny and ask together (#18). */
+	protectedPaths: SourcedReviewRule[];
+}
+
+/** The pattern lists the shell section of the rulebook is built from. */
+export interface ShellRules {
+	deny: readonly string[];
+	ask: readonly string[];
+	protectedPaths: { deny: readonly string[]; ask: readonly string[] };
 }
 
 export interface ReviewerPrompt {

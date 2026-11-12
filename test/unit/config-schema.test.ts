@@ -137,6 +137,7 @@ describe("parseDocument", () => {
 			["sandbox.grantableReadDeny", { sandbox: { grantableReadDeny: [] } }],
 			["sandbox.grantableWriteRoots", { sandbox: { grantableWriteRoots: [] } }],
 			["rules.skipReview", { rules: { skipReview: [] } }],
+			["rules.onUncertain", { rules: { onUncertain: "ask" } }],
 			["review.environment", { review: { environment: ["x"] } }],
 			["review.hard_deny", { review: { hard_deny: ["x"] } }],
 			["review.soft_deny", { review: { soft_deny: ["x"] } }],
@@ -165,6 +166,14 @@ describe("parseDocument", () => {
 				sandbox: { writableRoots: ["build"] },
 			});
 			expect(errorKeys(result)).toEqual([]);
+		});
+
+		it("parses rules.onUncertain in a user-global file and rejects other values (#18)", () => {
+			const result = parse({ rules: { onUncertain: "sandbox" } });
+			if (!result.ok) throw new Error("expected success");
+			expect(result.document.patch?.rules?.onUncertain).toBe("sandbox");
+			expect(errorKeys(parse({ rules: { onUncertain: "allow" } }))).toEqual(["rules.onUncertain"]);
+			expect(errorKeys(parse({ rules: { onUncertain: true } }))).toEqual(["rules.onUncertain"]);
 		});
 
 		it("lets a user-global file set everything a project may not", () => {

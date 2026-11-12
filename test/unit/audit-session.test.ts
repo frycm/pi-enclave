@@ -4,7 +4,7 @@
  * `executed` record follows each allowed call, a `!` command is recorded, and
  * `audit.required` stops the session when the log stops.
  */
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -16,6 +16,8 @@ import type { EffectiveProfile } from "../../src/config/types.ts";
 const mocks = vi.hoisted(() => ({
 	loadConfig: vi.fn(),
 	runs: [] as RunRequest[],
+	/** What the fake sandbox does for a command, for tests that need an effect. */
+	onRun: undefined as ((request: RunRequest) => void) | undefined,
 }));
 
 vi.mock("../../src/probe-host.ts", async (original) => ({
@@ -31,6 +33,7 @@ vi.mock("../../src/backend/select.ts", () => ({
 				({ profile, backend: "fake", describe: () => "" }) as unknown as CompiledProfile,
 			run: async (_compiled: CompiledProfile, request: RunRequest) => {
 				mocks.runs.push(request);
+				mocks.onRun?.(request);
 				return { exitCode: request.command.includes("fails") ? 3 : 0, violations: [] };
 			},
 			fs: () => ({}),
@@ -39,6 +42,25 @@ vi.mock("../../src/backend/select.ts", () => ({
 		report: { ok: true, platform: "linux", backend: "bwrap", piVersion: "1.5.2", checks: [] },
 	}),
 }));
+// A named reviewer answers allow/low to everything; with "none" the real setup runs.
+vi.mock("../../src/reviewer/setup.ts", async (original) => {
+	const actual = await original<typeof import("../../src/reviewer/setup.ts")>();
+	const { buildReviewerPrompt, reviewerRulebook } = await import("../../src/reviewer/prompt.ts");
+	return {
+		...actual,
+		prepareQualifiedReviewer: async (profile: EffectiveProfile, ...rest: unknown[]) =>
+			profile.reviewer.model === "none"
+				? (actual.prepareQualifiedReviewer as (...args: unknown[]) => unknown)(profile, ...rest)
+				: {
+						prompt: buildReviewerPrompt(reviewerRulebook(profile.review, new Map(), profile.rules)),
+						primary: {
+							name: "always-allow",
+							numCtx: 8_192,
+							complete: async () => '{"authorized":false,"decision":"allow","risk":"low","reason":"fine"}',
+						},
+					},
+	};
+});
 // The code-root check reads pi's real install; this suite is about the log.
 vi.mock("../../src/gate/code-roots.ts", async (original) => ({
 	...(await original<typeof import("../../src/gate/code-roots.ts")>()),
@@ -58,6 +80,7 @@ beforeEach(() => {
 	previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	mocks.runs.length = 0;
+	mocks.onRun = undefined;
 });
 afterEach(() => {
 	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -160,6 +183,101 @@ describe("a session's audit trail (#37)", () => {
 			expect(executed).toEqual([
 				expect.objectContaining({ toolCallId: "t1", hash: decision?.hash, exitCode: 0, isError: false, durationMs: 7 }),
 				expect.objectContaining({ toolCallId: "t2", exitCode: 3 }),
+			]);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	// #18: the decision names what ran with the sandbox as its only boundary,
+	// and shutdown records which layer settled each decision.
+	it("records sandboxed-uncertain decisions and a layer summary at shutdown", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			const s = await session((profile) => {
+				profile.rules.onUncertain = "sandbox";
+			});
+			await s.call("t1", "ls");
+			await s.call("t2", "npm test");
+			await s.call("t3", "sudo ls");
+			await s.call("t4", "git push origin main");
+			await s.flush();
+			const all = s.records();
+			expect(all.find((entry) => entry.kind === "decision" && entry.command === "npm test")).toMatchObject({
+				outcome: "sandboxed-uncertain",
+			});
+			expect(all.filter((entry) => entry.kind === "summary")).toEqual([
+				expect.objectContaining({
+					layers: { L1: 3, L3: 0, L4: 1, askDenied: 1, sandboxedUncertain: 1, other: 0 },
+					description: "L1 3 (75%), L3 0 (0%), L4 1 (25%), ask-denied 1, sandboxed-uncertain 1",
+				}),
+			]);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	// #18 review: an unparsed command that ran with nobody asked may write a
+	// project file no protected-path rule saw, so the tripwire counts it.
+	it("counts a changed project file against a turn that ran an unjudged command", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			const s = await session((profile) => {
+				profile.rules.onUncertain = "sandbox";
+			});
+			const turn = async (index: number, id: string, command: string, content: string) => {
+				mocks.onRun = () => writeFileSync(join(ws, "AGENTS.md"), content);
+				await s.handlers.get("turn_start")?.({ turnIndex: index }, s.context);
+				await s.call(id, command);
+				await s.handlers.get("turn_end")?.({ turnIndex: index }, { ...s.context, abort: () => {} });
+			};
+			// Control: a command L1 read, so the protected-path ask rule saw it.
+			await turn(1, "t1", "ls", "one");
+			await turn(2, "t2", "npm test", "two");
+			await s.flush();
+			const hits = s
+				.records()
+				.filter((entry) => entry.kind === "violation" && entry.source === "tripwire")
+				.map((entry) => [entry.op, entry.adverse]);
+			expect(hits).toEqual([
+				["created", false],
+				["modified", true],
+			]);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
+	// The reviewer half of the same backstop: a reviewer allow of an unparsed
+	// command is unjudged by any rule; one of a command L1 read is not.
+	it("counts a changed project file after a reviewer allowed an unparsed command", async () => {
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			const s = await session((profile) => {
+				profile.reviewer.model = "ollama/reviewer";
+				profile.review.trigger = "mutating";
+			});
+			const turn = async (index: number, id: string, command: string, content: string) => {
+				mocks.onRun = () => writeFileSync(join(ws, "AGENTS.md"), content);
+				await s.handlers.get("turn_start")?.({ turnIndex: index }, s.context);
+				await s.call(id, command);
+				await s.handlers.get("turn_end")?.({ turnIndex: index }, { ...s.context, abort: () => {} });
+			};
+			// Control: the reviewer allows a command L1 read (confident).
+			await turn(1, "t1", "rm -f build/x", "one");
+			await turn(2, "t2", "npm test", "two");
+			await s.flush();
+			const all = s.records();
+			expect(all.filter((entry) => entry.kind === "decision").map((entry) => [entry.command, entry.outcome])).toEqual([
+				["rm -f build/x", "review-allow"],
+				["npm test", "review-allow"],
+			]);
+			const hits = all
+				.filter((entry) => entry.kind === "violation" && entry.source === "tripwire")
+				.map((entry) => [entry.op, entry.adverse]);
+			expect(hits).toEqual([
+				["created", false],
+				["modified", true],
 			]);
 		} finally {
 			stderr.mockRestore();

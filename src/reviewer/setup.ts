@@ -91,7 +91,7 @@ export async function prepareQualifiedReviewer(
 	qualifiedDir: string,
 ): Promise<QualifiedReviewerSetup | undefined> {
 	if (!profile.auto || profile.reviewer.model === "none") return undefined;
-	const prompt = buildReviewerPrompt(reviewerRulebook(profile.review, provenance));
+	const prompt = buildReviewerPrompt(reviewerRulebook(profile.review, provenance, profile.rules));
 	const primary = await qualifiedCompletion(profile.reviewer.model, profile, prompt, registry, qualifiedDir);
 	const fallback =
 		profile.reviewer.fallback === "none"

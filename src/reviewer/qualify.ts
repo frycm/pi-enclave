@@ -21,7 +21,9 @@ export async function qualifyConfiguredReviewers(options: {
 	if (options.profile.reviewer.model === "none") {
 		throw new Error('reviewer.model is "none"; configure an explicit provider/model-id before qualification');
 	}
-	const prompt = buildReviewerPrompt(reviewerRulebook(options.profile.review, options.provenance));
+	const prompt = buildReviewerPrompt(
+		reviewerRulebook(options.profile.review, options.provenance, options.profile.rules),
+	);
 	const references = [options.profile.reviewer.model];
 	if (
 		options.profile.reviewer.fallback !== "none" &&

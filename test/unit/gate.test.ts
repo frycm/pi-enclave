@@ -404,21 +404,16 @@ describe("the gate", () => {
 			expect(frozen).toBe(true);
 		});
 
-		// #16, end to end: a reviewer that always answers allow/low, unattended.
-		// A non-confident command needs a person or an exact direct instruction,
-		// so the high floor turns the allow into an ask, whether or not the
-		// command mentions a path.
-		it.each([
-			"npm test",
-			"npm test -- ./x",
-			"python3 scripts/check.py",
-			"node scripts/gen.js",
-			"cat > notes.txt <<'EOF'\nhello\nEOF",
-		])("does not let a model allow clear the high floor for %j", async (command) => {
-			const configured = reviewProfile();
-			const reviewer = new IsolatedReviewer({
+		// #16 and #18, end to end: a reviewer that always answers allow/low,
+		// unattended. A command L1 could not read runs in a sandbox with no
+		// network and workspace-only writes, so its floor is medium and the
+		// reviewer's allow stands (#18). Where the sandbox would not contain it
+		// (a profile with network, which no shipped profile has yet), the high
+		// floor still turns the allow into an ask, path argument or not (#16).
+		const alwaysAllow = (configured: ReturnType<typeof reviewProfile>) =>
+			new IsolatedReviewer({
 				profile: configured,
-				prompt: buildReviewerPrompt(reviewerRulebook(configured.review, new Map())),
+				prompt: buildReviewerPrompt(reviewerRulebook(configured.review, new Map(), configured.rules)),
 				primary: {
 					name: "always-allow",
 					async complete() {
@@ -429,15 +424,33 @@ describe("the gate", () => {
 				evidence: { attended: "off" },
 				delay: async () => {},
 			});
-			const decision = await gate("bash", { command }, { profile: configured, reviewer });
-			expect(decision.outcome).toBe("ask-denied");
+		const UNREADABLE = [
+			"npm test",
+			"npm test -- ./x",
+			"python3 scripts/check.py",
+			"node scripts/gen.js",
+			"cat > notes.txt <<'EOF'\nhello\nEOF",
+		];
+		it.each(UNREADABLE)("lets a model allow clear the in-sandbox medium floor for %j (#18)", async (command) => {
+			const configured = reviewProfile();
+			const decision = await gate("bash", { command }, { profile: configured, reviewer: alwaysAllow(configured) });
+			expect(decision.outcome).toBe("review-allow");
 		});
+		it.each(UNREADABLE)(
+			"does not let a model allow clear the high floor for %j outside the sandbox",
+			async (command) => {
+				const configured = reviewProfile();
+				(configured.sandbox.network as { mode: string }).mode = "on";
+				const decision = await gate("bash", { command }, { profile: configured, reviewer: alwaysAllow(configured) });
+				expect(decision.outcome).toBe("ask-denied");
+			},
+		);
 
 		it("still lets a model allow a confident write", async () => {
 			const configured = reviewProfile();
 			const reviewer = new IsolatedReviewer({
 				profile: configured,
-				prompt: buildReviewerPrompt(reviewerRulebook(configured.review, new Map())),
+				prompt: buildReviewerPrompt(reviewerRulebook(configured.review, new Map(), configured.rules)),
 				primary: {
 					name: "always-allow",
 					async complete() {

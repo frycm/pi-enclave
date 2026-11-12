@@ -238,7 +238,7 @@ it("escalates instead of allowing when Ollama reports fewer prompt tokens than i
 	const profile = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
 	profile.reviewer.model = "ollama/reviewer";
 	profile.review.trigger = "mutating";
-	const prompt = buildReviewerPrompt(reviewerRulebook(profile.review, new Map()));
+	const prompt = buildReviewerPrompt(reviewerRulebook(profile.review, new Map(), profile.rules));
 	const run = async () => {
 		let asked = false;
 		const decision = await decide(
@@ -279,7 +279,7 @@ describe("one constrained request per review (#25)", () => {
 	const profile = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
 	profile.reviewer.model = "ollama/reviewer";
 	profile.review.trigger = "mutating";
-	const prompt = buildReviewerPrompt(reviewerRulebook(profile.review, new Map()));
+	const prompt = buildReviewerPrompt(reviewerRulebook(profile.review, new Map(), profile.rules));
 	const proposed = {
 		toolName: "bash",
 		toolCallId: "c1",

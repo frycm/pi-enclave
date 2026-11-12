@@ -35,7 +35,7 @@ import { IsolatedReviewer } from "../../src/reviewer/reviewer.ts";
 import { prepareQualifiedReviewer } from "../../src/reviewer/setup.ts";
 
 const PROFILE = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
-const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map()));
+const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map(), PROFILE.rules));
 const THRESHOLDS = { allow: 0.9, deny: 0.5, temperature: 1 };
 
 /** The probabilities the fake model gives, per question, from the rendered prompt. */

@@ -40,14 +40,17 @@ export interface TripwireHit {
  * Whether a hit counts against the agent's turn, like a denial.
  *
  * Project files are edited in ordinary work, often after an L1 approval, so
- * they never count. An entry too large to fingerprint is reported at every
+ * they count only when `unjudged`: the turn ran a command no rule could read
+ * that nobody asked about (`sandboxed-uncertain`, or a reviewer allow of an
+ * unparsed command, #18), so no protected-path rule saw what it wrote. An
+ * entry too large to fingerprint is reported at every
  * check, so it counts only when it first appears; otherwise padding a
  * planted `.pi` with files would avoid the strike a small one gets, and an
  * existing one would trip the breaker by itself. A surface that cannot be
  * read at all (no kind) always counts.
  */
-export function countsAgainstTurn(hit: TripwireHit): boolean {
-	if (hit.kind === "project") return false;
+export function countsAgainstTurn(hit: TripwireHit, unjudged = false): boolean {
+	if (hit.kind === "project") return unjudged;
 	if (hit.change === "unverifiable" && hit.kind !== undefined) return hit.appeared === true;
 	return true;
 }

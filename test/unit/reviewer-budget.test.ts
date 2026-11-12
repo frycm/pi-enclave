@@ -33,7 +33,7 @@ import { IsolatedReviewer, REVIEWER_MAX_TOKENS, type ReviewerCompletion } from "
 import type { BuildEvidenceOptions, ReviewEvidence } from "../../src/reviewer/types.ts";
 
 const PROFILE = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
-const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map()));
+const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map(), PROFILE.rules));
 
 /** Deterministic, so a failure reproduces. */
 function prng(seed: number): () => number {
@@ -117,7 +117,7 @@ describe("chat transport: system + evidence + output fits the context", () => {
 	}
 
 	it("cuts in order: context oldest first, then older authorization, then the action input", () => {
-		const stages = { context: 0, authorization: 0, input: 0, minimal: 0 };
+		const stages = { context: 0, authorization: 0, input: 0, minimal: 0, writeSummaryOnly: 0 };
 		for (const seed of SEEDS) {
 			const options = scenario(seed);
 			const full = fullEvidence(options, ACTION_INPUT_CHARS);
@@ -129,8 +129,15 @@ describe("chat transport: system + evidence + output fits the context", () => {
 			const minimal = (evidence.action.input as { truncated?: unknown }).truncated !== undefined;
 			const newest = full.authorization.at(-1);
 			if (newest) {
-				// The minimal form shortens the newest authorization rather than dropping it.
-				expect(evidence.authorization.at(-1)?.text).toBe(minimal ? newest.text.slice(0, 512) : newest.text);
+				// The minimal form shortens the newest authorization rather than
+				// dropping it: to 512 characters, and further only when even that
+				// does not fit beside the #18 prompt rules (never under 64).
+				const kept = evidence.authorization.at(-1)?.text ?? "";
+				if (minimal) {
+					expect(newest.text.startsWith(kept)).toBe(true);
+					expect(kept.length).toBeGreaterThanOrEqual(Math.min(64, newest.text.length));
+					expect(kept.length).toBeLessThanOrEqual(512);
+				} else expect(kept).toBe(newest.text);
 			}
 			const shortened = evidence.authorization.some((entry) => !full.authorization.some((f) => f.text === entry.text));
 			expect(evidence.authorizationTruncated === true).toBe(
@@ -141,7 +148,19 @@ describe("chat transport: system + evidence + output fits the context", () => {
 			if (JSON.stringify(evidence.action.input) !== JSON.stringify(full.action.input)) {
 				expect(evidence.context).toEqual([]);
 				expect(evidence.authorization.length).toBeLessThanOrEqual(1);
-				expect(evidence.action.truncated).toBe(true);
+				// A write body is summarized at every size, so a shorter head and
+				// tail are not truncation (#18); cutting anything else is.
+				// The generator also gives write a bash-shaped input; only a real
+				// write input (path and content) is a body summary and nothing else.
+				const writeShaped = Object.keys(options.action.input).sort().join() === "content,path";
+				if (options.action.tool !== "write" || minimal) expect(evidence.action.truncated).toBe(true);
+				else if (writeShaped && String(options.action.input.content).length > 2_048) {
+					expect(evidence.action.summarized).toBe(true);
+					const shownPath = (evidence.action.input as { path?: unknown }).path;
+					expect(evidence.action.truncated).toBe(shownPath !== options.action.input.path);
+					if (!evidence.action.truncated) stages.writeSummaryOnly++;
+				} else if (writeShaped) expect(evidence.action.truncated).toBe(true);
+				else expect(evidence.action.summarized === true || evidence.action.truncated).toBe(true);
 			}
 			// The hash binds the complete action whatever is displayed.
 			expect(evidence.action.hash).toBe(options.action.hash);
@@ -217,6 +236,7 @@ describe("a configuration without room for evidence", () => {
 					soft_deny: Array.from({ length: 200 }, (_, i) => `Rule ${i}: ${"never do this ".repeat(4)}`),
 				},
 				new Map(),
+				PROFILE.rules,
 			),
 		);
 		expect(() => assertEvidenceRoom(chatEvidenceBytes(long, 8_192), "reviewer.numCtx 8192")).toThrow(

@@ -14,7 +14,7 @@ import {
 import { ReviewerTelemetry, type ReviewerTelemetrySummary } from "../../src/reviewer/telemetry.ts";
 
 const PROFILE = defaultProfile({ cwd: "/work", home: "/home/u", tmp: "/tmp", agentDir: "/home/u/.pi/agent" });
-const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map()));
+const PROMPT = buildReviewerPrompt(reviewerRulebook(PROFILE.review, new Map(), PROFILE.rules));
 
 function action(command = "touch output.txt") {
 	return canonicalize({
