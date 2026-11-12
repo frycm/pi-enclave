@@ -465,7 +465,10 @@ export function applyPatch(base: EffectiveProfile, patch: ProfilePatch, options:
 		if (patch.breaker.consecutive !== undefined) next.breaker.consecutive = patch.breaker.consecutive;
 		if (patch.breaker.window) next.breaker.window = [...patch.breaker.window];
 	}
-	if (patch.attended) next.attended = { ...next.attended, ...patch.attended };
+	if (patch.attended) {
+		next.attended = { ...next.attended, ...patch.attended };
+		if (patch.attended.headlessTrust) next.attended.headlessTrust = patch.attended.headlessTrust.map(expand);
+	}
 	if (patch.audit) next.audit = { ...next.audit, ...patch.audit };
 
 	return next;

@@ -75,9 +75,10 @@ import {
 import { decide, type GateDecision } from "./gate/gate.ts";
 import { ActionLock } from "./gate/lock.ts";
 import { checkOwnership, formatOwnershipProblems } from "./gate/ownership.ts";
+import { answerProjectTrust } from "./gate/project-trust.ts";
 import { PROVENANCE_ENTRY_TYPE, ProvenanceTracker } from "./gate/provenance.ts";
 import { toolReachability } from "./gate/reachability.ts";
-import { describeDeclaredHints, grantWarnings } from "./gate/tools.ts";
+import { checkTool, describeDeclaredHints, grantWarnings } from "./gate/tools.ts";
 import { persistenceSurface, protectedByProfile } from "./persistence/agent.ts";
 import { formatPendingHits, TripwireLedger } from "./persistence/ledger.ts";
 import { countsAgainstTurn, formatTripwireHits, PersistenceTripwire } from "./persistence/tripwire.ts";
@@ -244,6 +245,21 @@ export default function (pi: ExtensionAPI): void {
 	const violations: Violation[] = [];
 
 	/**
+	 * pi's tool registry, read once per turn (#28). The gate asks for a tool's
+	 * source, its reachability and its declared hints on every call, and each
+	 * was a fresh `getAllTools()` walk. Dropped at every point the registry
+	 * can change under us: a new turn, a new prompt and a session start (an
+	 * MCP server that connects in between is picked up by the next of these).
+	 */
+	let toolRegistry: ReturnType<NonNullable<typeof pi.getAllTools>> | undefined;
+	const registeredTools = () => (toolRegistry ??= pi.getAllTools?.() ?? []);
+	const forgetToolRegistry = () => {
+		toolRegistry = undefined;
+	};
+	/** Tools pi-enclave took out of the declared set, so a later wider policy can put them back. */
+	const hiddenTools = new Set<string>();
+
+	/**
 	 * The lock table, and the execute-time guards that read it.
 	 *
 	 * The guards are wired into every operations object below rather than only
@@ -269,8 +285,8 @@ export default function (pi: ExtensionAPI): void {
 	 * "is anyone there?" must be the one that is true now.
 	 */
 	const escalator = createConfirmEscalator({
-		reachability: (action) => toolReachability(pi.getAllTools?.() ?? [], action.tool, action.input),
-		declaredHints: (action) => describeDeclaredHints(action.tool, pi.getAllTools?.() ?? [], OWNED_TOOLS),
+		reachability: (action) => toolReachability(registeredTools(), action.tool, action.input),
+		declaredHints: (action) => describeDeclaredHints(action.tool, registeredTools(), OWNED_TOOLS),
 		ui: () => uiContext,
 		attendance: () => attendance,
 		confirmTimeoutMs: () => effective?.attended.confirmTimeoutMs ?? 300_000,
@@ -782,7 +798,8 @@ export default function (pi: ExtensionAPI): void {
 				owned: OWNED_TOOLS,
 				escalator,
 				...(actionReviewer ? { reviewer: actionReviewer } : {}),
-				toolSource: (tool) => pi.getAllTools?.().find((entry) => entry.name === tool)?.sourceInfo?.path,
+				toolSource: (tool) => registeredTools().find((entry) => entry.name === tool)?.sourceInfo?.path,
+				toolAnnotations: (tool) => registeredTools().find((entry) => entry.name === tool)?.annotations,
 				writeCapabilityIssue: (value, actionCwd, tool) => {
 					try {
 						const lifetimeIssue = tool === "bash" ? shellWriteCapabilityIssue() : undefined;
@@ -826,7 +843,7 @@ export default function (pi: ExtensionAPI): void {
 						});
 						return;
 					}
-					const reachability = toolReachability(pi.getAllTools?.() ?? [], result.action.tool, result.action.input);
+					const reachability = toolReachability(registeredTools(), result.action.tool, result.action.input);
 					audit?.append("decision", {
 						...decisionFields({
 							action: result.action,
@@ -889,11 +906,18 @@ export default function (pi: ExtensionAPI): void {
 	// ---------------------------------------------------------------------
 
 	pi.on("turn_start", (event) => {
+		forgetToolRegistry();
 		currentTurn = event.turnIndex;
 		queuedOwnedCall = false;
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
+		// Every call of the turn has run or been refused by now. A lock entry
+		// still here belongs to a call a later extension's tool_call handler
+		// blocked, for which pi emits no tool_result; it would otherwise wait
+		// for the next direct message to be cleared (#28).
+		lock.reset();
+		for (const [id, pending] of executions) if (pending.turnIndex < event.turnIndex) executions.delete(id);
 		// Before the breaker closes the turn, so a persistence path created in
 		// this turn is a strike against it.
 		checkTripwire(true);
@@ -928,6 +952,10 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", (event) => {
+		// Tools registered since the last prompt (an extension's late
+		// registration, an MCP server that finished connecting) are judged now.
+		forgetToolRegistry();
+		applyActiveTools();
 		// Changes made while the agent was idle are reported now, and then
 		// belong to the baseline, so the user's own edits are never counted
 		// against the next turn.
@@ -988,6 +1016,68 @@ export default function (pi: ExtensionAPI): void {
 		);
 	});
 
+	/**
+	 * Declare to the model only the tools the gate would let run (#28).
+	 *
+	 * In auto mode a tool outside `tools.allow` is refused at call time, and
+	 * each refusal is an adverse outcome for the breaker: a small model that
+	 * sees `codemode` or an MCP tool in its list calls it, is denied, and three
+	 * such turns end the session for no reason to do with intent. The gate
+	 * still enforces; this only stops offering what it will refuse. Tools are
+	 * only ever removed from pi's active set (never added that pi or the user
+	 * did not activate), and put back if a later policy allows them.
+	 */
+	const applyActiveTools = () => {
+		if (!pi.getActiveTools || !pi.setActiveTools) return;
+		const active = pi.getActiveTools();
+		const registered = registeredTools();
+		const names = new Set(registered.map((tool) => tool.name));
+		// Hidden tools that are still registered are candidates again.
+		const candidates = [...new Set([...active, ...[...hiddenTools].filter((name) => names.has(name))])];
+		const enforcing = effective?.auto === true && !configError && !ownershipError;
+		const permitted = (name: string) => {
+			if (!enforcing || !effective) return true;
+			const source = registered.find((tool) => tool.name === name)?.sourceInfo?.path;
+			return checkTool({
+				tool: name,
+				tools: effective.tools,
+				owned: OWNED_TOOLS,
+				...(source !== undefined ? { source } : {}),
+			}).allowed;
+		};
+		const keep = candidates.filter((name) => {
+			if (permitted(name)) {
+				// Back only if it was ours to hide; a tool pi or the user deactivated stays off.
+				if (hiddenTools.delete(name) || active.includes(name)) return true;
+				return false;
+			}
+			if (active.includes(name)) hiddenTools.add(name);
+			return false;
+		});
+		if (keep.length === active.length && keep.every((name, index) => name === active[index])) return;
+		pi.setActiveTools(keep);
+	};
+	// Not on `mcp_servers_change`: handling that event marks an extension as
+	// the one that connects MCP servers, which would silence pi's report that
+	// nothing does. It also fires on registration, before a server's tools
+	// exist. A server's tools are judged at the next prompt instead.
+
+	// Before anything is loaded from the project: a headless run does not
+	// trust project resources the user-global policy does not list (#28).
+	pi.on("project_trust", (event, ctx) => {
+		const answer = answerProjectTrust({
+			cwd: event.cwd,
+			mode: ctx.mode,
+			hasUI: ctx.hasUI,
+			config: loadConfig({ cwd: event.cwd, projectTrusted: false }),
+		});
+		if (answer.message) {
+			if (answer.trusted === "no") process.stderr.write(`${answer.message}\n`);
+			else ctx.ui.notify(answer.message, "warning");
+		}
+		return { trusted: answer.trusted };
+	});
+
 	const restoreBranch = (ctx: ExtensionContext) => {
 		authorizationGeneration++;
 		directInput.reset();
@@ -999,6 +1089,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_tree", (_event, ctx) => restoreBranch(ctx));
 
 	pi.on("session_start", async (_event, ctx) => {
+		forgetToolRegistry();
 		compiled = undefined;
 		executions.clear();
 		exitCodes.clear();
@@ -1067,9 +1158,15 @@ export default function (pi: ExtensionAPI): void {
 
 		// Grants on tools outside the sandbox that are worth a second look (#22):
 		// a readOnly grant the tool itself contradicts, and an unpinned name.
-		for (const warning of grantWarnings(loaded.profile.tools, pi.getAllTools?.() ?? [], OWNED_TOOLS)) {
+		for (const warning of grantWarnings(
+			loaded.profile.tools,
+			registeredTools(),
+			OWNED_TOOLS,
+			loaded.profile.sandbox.network.mode,
+		)) {
 			ctx.ui.notify(warning, "warning");
 		}
+		applyActiveTools();
 
 		// Loaded code below a writable root would run the agent's changes outside
 		// the sandbox at the next start (#36). Refused, or with the user-global
@@ -1268,7 +1365,7 @@ export default function (pi: ExtensionAPI): void {
 										isUnder(canonicalPath(entry.path), target),
 								)
 						: undefined;
-					const reachability = toolReachability(pi.getAllTools?.() ?? [], request.action.tool, request.action.input);
+					const reachability = toolReachability(registeredTools(), request.action.tool, request.action.input);
 					return {
 						attended: attendance.effective,
 						...(reachability ? { toolReachability: reachability } : {}),

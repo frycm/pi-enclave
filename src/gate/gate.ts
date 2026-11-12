@@ -25,7 +25,7 @@ import { matchesPathPattern } from "../policy/paths.ts";
 import { reviewerTrigger } from "../reviewer/classifier.ts";
 import type { ActionReviewer, EffectiveReview, ReviewerResult, ReviewerTrigger } from "../reviewer/types.ts";
 import { ActionLock, freezeToolInput } from "./lock.ts";
-import { checkTool } from "./tools.ts";
+import { checkTool, type DeclaredHints } from "./tools.ts";
 
 /** What the gate is asked about. Mirrors pi's `ToolCallEvent`. */
 export interface GateEvent {
@@ -93,6 +93,8 @@ export interface GateDeps {
 	breakerOpen?: () => boolean;
 	/** Where a tool came from, for grant pinning. */
 	toolSource?: (tool: string) => string | undefined;
+	/** What a tool declares about itself (#28). Only ever narrows: see {@link narrowByDeclaredHints}. */
+	toolAnnotations?: (tool: string) => DeclaredHints | undefined;
 	/** Backend-aware last check that a write capability is structurally grantable. */
 	/**
 	 * Why a write capability cannot be granted, if it cannot. `boundary: true`
@@ -324,12 +326,18 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 	// a linear scan, and it ran twice per gated call for the `!== undefined` test
 	// and then the value.
 	const toolSource = deps.toolSource?.(action.tool);
-	const disposition = checkTool({
-		tool: action.tool,
-		tools: profile.tools,
-		owned: deps.owned,
-		...(toolSource !== undefined ? { source: toolSource } : {}),
-	});
+	const disposition = narrowByDeclaredHints(
+		checkTool({
+			tool: action.tool,
+			tools: profile.tools,
+			owned: deps.owned,
+			...(toolSource !== undefined ? { source: toolSource } : {}),
+		}),
+		action.tool,
+		deps.owned,
+		profile.sandbox.network.mode,
+		deps.toolAnnotations?.(action.tool),
+	);
 	if (!disposition.allowed) {
 		return {
 			outcome: "deny",
@@ -395,6 +403,28 @@ async function run(event: GateEvent, deps: GateDeps): Promise<GateDecision> {
 		matches: evaluation.matches,
 		adverse: false,
 	});
+}
+
+/**
+ * A `readOnly` grant on a tool that declares `openWorldHint: true` is
+ * reviewed instead while the network is off (#28).
+ *
+ * Such a tool reaches the web or another open system from the pi process,
+ * which is exactly the path `network.mode: "off"` exists to close, and a
+ * read-only grant would let it run with no one looking. The hint is the
+ * tool author's unverified claim, so it is used only in this direction:
+ * nothing a tool declares makes a grant wider.
+ */
+export function narrowByDeclaredHints(
+	disposition: ReturnType<typeof checkTool>,
+	tool: string,
+	owned: readonly string[],
+	networkMode: string,
+	hints: DeclaredHints | undefined,
+): ReturnType<typeof checkTool> {
+	if (!disposition.allowed || disposition.reviewed || owned.includes(tool)) return disposition;
+	if (networkMode === "off" && hints?.openWorldHint === true) return { ...disposition, reviewed: true };
+	return disposition;
 }
 
 function triggerForReviewer(
