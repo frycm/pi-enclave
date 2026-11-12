@@ -126,6 +126,14 @@ describe("the read allowlist", () => {
 		expect(out).not.toContain("/private/var");
 		expect(out).not.toContain("/private/tmp");
 		expect(roots()).not.toContain("/var");
+		// The link name does not count as a readable root when a refusal is classified.
+		expect(
+			outsideReadAllowlist("/var/folders/x/T/outside/secret", {
+				readMode: "allowlist",
+				readAllow: ["/usr", "/var", "/tmp"],
+				writableRoots: [],
+			}),
+		).toBe(true);
 	});
 });
 

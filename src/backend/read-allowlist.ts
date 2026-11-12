@@ -202,7 +202,12 @@ export function outsideReadAllowlist(
 	profile: Pick<Profile, "readMode" | "readAllow" | "writableRoots">,
 ): boolean {
 	if (profile.readMode !== "allowlist") return false;
-	return !isUnderAny(path, [...(profile.readAllow ?? []), ...profile.writableRoots]);
+	// Judged on the canonical path, as the kernel judges it, and without the
+	// macOS link names: `/var` lets the link be followed, it does not make
+	// `/var/folders/...` readable.
+	const links: readonly string[] = DARWIN_SYSTEM_READ_LINKS;
+	const roots = [...(profile.readAllow ?? []), ...profile.writableRoots].filter((root) => !links.includes(root));
+	return !isUnderAny(canonical(path), roots);
 }
 
 /**
