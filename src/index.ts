@@ -52,7 +52,9 @@ import {
 } from "./escalate/attendance.ts";
 import { type ConfirmUI, createConfirmEscalator } from "./escalate/confirm.ts";
 import { describeHandshakeFailure, runHandshake } from "./escalate/handshake.ts";
+import { createNotifier } from "./escalate/notify.ts";
 import { writePending } from "./escalate/pending.ts";
+import { createQueueEscalation } from "./escalate/queue.ts";
 import {
 	BREAKER_ENTRY_TYPE,
 	CircuitBreaker,
@@ -295,7 +297,30 @@ export default function (pi: ExtensionAPI): void {
 	 * terminal can be lost and an RPC client can disconnect, and the answer to
 	 * "is anyone there?" must be the one that is true now.
 	 */
+	/** `attended.notify`, rate-limited per session (#30). */
+	const notify = createNotifier({
+		argv: () => effective?.attended.notify ?? [],
+		onEvent: (fields) => audit?.append("pending", fields),
+	});
+	const queue = createQueueEscalation({
+		stateRoot: () => stateDirs().state,
+		sessionId: () => sessionId,
+		sessionFile: () => sessionFile,
+		profile: () => effective,
+		// Folded exactly as session start folds it, so an unchanged
+		// configuration hashes the same.
+		reload: () => {
+			const loaded = loadConfig({ cwd, projectTrusted });
+			return loaded.ok ? loaded.profile : undefined;
+		},
+		home: homedir(),
+		timeoutMs: () => effective?.attended.queueTimeoutMs ?? 3_600_000,
+		signal: () => toolCallSignal,
+		audit: (kind, fields) => audit?.append(kind, fields),
+		onQueued: (record) => notify(record),
+	});
 	const escalator = createConfirmEscalator({
+		queue,
 		reachability: (action) => toolReachability(registeredTools(), action.tool, action.input),
 		declaredHints: (action) => describeDeclaredHints(action.tool, registeredTools(), OWNED_TOOLS),
 		ui: () => uiContext,
@@ -329,6 +354,7 @@ export default function (pi: ExtensionAPI): void {
 					...(toolSource !== undefined ? { toolSource } : {}),
 				});
 				audit?.append("pending", { event: "written", nonce: record.nonce, hash: action.hash, path });
+				notify(record);
 				process.stderr.write(
 					`pi-enclave: an action needs approval. Run:\n  pi-enclave approve ${record.nonce}\n${path}\n`,
 				);
@@ -409,6 +435,10 @@ export default function (pi: ExtensionAPI): void {
 	let piMode: "tui" | "rpc" | "json" | "print" = "print";
 	let sessionId: string | undefined;
 	let sessionFile: string | undefined;
+	/** Whether session start folded the project files in; the queue reloads the same way. */
+	let projectTrusted = false;
+	/** The abort signal of the tool call being gated; an aborted turn stops a queue wait. */
+	let toolCallSignal: AbortSignal | undefined;
 	let actionReviewer: ActionReviewer | undefined;
 	let reviewerSetup: Awaited<ReturnType<typeof prepareQualifiedReviewer>>;
 	/** The reviewer model's warm-up request at session start (#25). */
@@ -793,7 +823,8 @@ export default function (pi: ExtensionAPI): void {
 	 * gated by anything, and permitting it would be the one case the whole layer
 	 * exists to prevent.
 	 */
-	pi.on("tool_call", async (event) => {
+	pi.on("tool_call", async (event, ctx) => {
+		toolCallSignal = ctx?.signal;
 		if (configError) return { block: true, reason: configError };
 		if (!report.ok) return { block: true, reason: formatProbeReport(report) };
 		if (ownershipError) return { block: true, reason: ownershipError };
@@ -1151,7 +1182,8 @@ export default function (pi: ExtensionAPI): void {
 		// context. Refusals still go to stderr as well as to notify: in --print
 		// mode the notify is delivered and returns cleanly but never reaches the
 		// user, and unattended is where a silent fail-closed does most damage.
-		const loaded = loadConfig({ cwd, projectTrusted: ctx.isProjectTrusted() });
+		projectTrusted = ctx.isProjectTrusted();
+		const loaded = loadConfig({ cwd, projectTrusted });
 		sources = loaded.sources;
 		if (!loaded.ok) {
 			configError = loaded.message;

@@ -255,6 +255,9 @@ export function narrowerOrEqual(a: EffectiveProfile, b: EffectiveProfile): Order
 	if (a.attended.confirmTimeoutMs > b.attended.confirmTimeoutMs) {
 		fail("attended.confirmTimeoutMs", "cannot lengthen the confirmation timeout");
 	}
+	if (a.attended.queueTimeoutMs > b.attended.queueTimeoutMs) {
+		fail("attended.queueTimeoutMs", "cannot lengthen the approval-queue timeout");
+	}
 
 	if (a.audit.retentionDays < b.audit.retentionDays) fail("audit.retentionDays", "cannot shorten audit retention");
 	if (a.audit.retentionMb < b.audit.retentionMb) fail("audit.retentionMb", "cannot shrink the audit budget");
@@ -478,6 +481,7 @@ export function applyPatch(base: EffectiveProfile, patch: ProfilePatch, options:
 	if (patch.attended) {
 		next.attended = { ...next.attended, ...patch.attended };
 		if (patch.attended.headlessTrust) next.attended.headlessTrust = patch.attended.headlessTrust.map(expand);
+		if (patch.attended.notify) next.attended.notify = [...patch.attended.notify];
 	}
 	if (patch.audit) next.audit = { ...next.audit, ...patch.audit };
 

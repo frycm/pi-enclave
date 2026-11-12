@@ -205,7 +205,7 @@ third-party tools are the documented exception because pi exposes no execution w
 | **L1** | Deterministic rules | Pattern rules on tool and arguments with exactly two verbs: `deny` (never runs, nothing below can override) and `ask` (always a human decision, the reviewer cannot auto-approve it), plus protected paths. Never touches a model. Runs before everything else in under a millisecond. |
 | **L2** | **OS enforcement** | Every shell command **and every file/search operation** executes inside a Seatbelt / bwrap / Docker boundary: explicit writable roots (everything else read-only), declared paths and secrets denied for reading, network only via the egress proxy. Writes are always an allow-list. Reads are a deny-list in the default `open` [read mode](#read-modes): anything absent from the read-deny list is readable. In `allowlist` mode reads are an allow-list too: the system runtime, the writable roots, the toolchain and `sandbox.readableRoots`, with the deny list still applied inside them. An L3 `allow` still lands here; so does a `skipReview` match. Sandbox denials are returned to the agent as a structured violation, which is the only way a request can *widen* the profile (via an L3-reviewed capability retry). |
 | **L3** | Isolated model reviewer | For every action L1 did not decide that is either selected by `review.trigger` (`mutating` by default; `all` selects read-only actions too; `boundary` selects none) or a request to widen the sandbox by one declared capability (`allow_write`, `allow_read`, and later `allow_host`) for one action. Judges it against a **prose rulebook** (`review.environment` / `hard_deny` / `soft_deny` / `allow`) and the user's direct authorization. Fresh completion, own system prompt, structured evidence, strict JSON output with `allow` / `deny` / `ask`. **An L3 `allow` never grants unsandboxed authority**: owned actions remain in L2, and any third-party tool L3 sees still requires L4 after a model allow. |
-| **L4** | Human escalation | Attended: `ctx.ui.confirm` with the exact canonical action. Unattended: `ask` means deny, stop the turn, and write a resumable "needs approval" record outside the workspace. v1 has no unsandboxed host-execution path; a future one would require a separate canonical action and this verified human channel. |
+| **L4** | Human escalation | Attended: `ctx.ui.confirm` with the exact canonical action. Queue (#30): the session holds the call while a person answers `pi-enclave approve` or `decline` in another terminal, then runs it in session. Unattended: `ask` means deny, stop the turn, and write a resumable "needs approval" record outside the workspace. v1 has no unsandboxed host-execution path; a future one would require a separate canonical action and this verified human channel. |
 
 Three cross-cutting mechanisms: the **action lock** (canonical snapshot, hashed, frozen,
 executed once), the **circuit breaker** (per-turn and sliding-window denial counters), and
@@ -812,6 +812,9 @@ the result must satisfy `effective ⊑ incoming` under a partial order defined p
 | `rules.deny` / `rules.ask` / `rules.protectedPaths.*` | Superset |
 | `rules.skipReview` | Subset — user-global only; any project-file entry rejects the file |
 | `rules.onUncertain` | `ask ⊑ sandbox` — user-global only; a project file that sets it is rejected (#18) |
+| `attended.mode` | May be kept or turned `off`, never switched to another mode |
+| `attended.confirmTimeoutMs` / `queueTimeoutMs` | May only go down (#30) |
+| `attended.notify` / `headlessTrust` | User-global only; a project file that sets either is rejected (#28, #30) |
 | `review.environment` / `hard_deny` / `soft_deny` / `allow` (the four prose lists) | **Immutable below user-global.** Prose has no partial order a merge can check: "append only" is a syntactic superset, not a semantic tightening, and a project-supplied string inside the reviewer prompt is the repo-to-reviewer injection path the threat model excludes. A project file that contains any of these four keys is rejected whole. `review.trigger` is the only `review` key a project may set. |
 | `review.trigger` | `boundary ⊑ mutating ⊑ all`; a project file may move it right (review more), never left |
 | `tools.allow` | Subset; `readOnly` may become `reviewed`, never the reverse |
@@ -1076,7 +1079,8 @@ not: the decision must happen outside the session the agent is driving.
 | `pi-enclave rules defaults [--readonly]` | Prints the built-in lists as JSON |
 | `pi-enclave rules config` | Prints the *effective* rulebook after the monotonic fold, with `"$defaults"` expanded and each entry tagged with its source |
 | `pi-enclave pending [--all]` | Lists approval records awaiting a decision |
-| `pi-enclave approve <nonce>` | Shows an action in full, asks in *that* terminal, and runs it once under the profile in force now |
+| `pi-enclave approve <nonce>` | Shows an action in full, asks in *that* terminal, and runs it once under the profile in force now; for a [queued](#the-approval-queue) request, lets the waiting session run it |
+| `pi-enclave decline <nonce>` | Refuses a queued request (the waiting session gets a denial) or retires a pending record (#30) |
 | `pi-enclave audit [verify]` | Reads or re-chains the audit log |
 | `pi-enclave attend-secret` | Provisions the RPC attendance secret |
 | `/enclave tripwire [ack]` | Lists changes to files loaded outside the sandbox that the tripwire found and nobody has acknowledged, across sessions; `ack` clears them (#19) |
@@ -1651,8 +1655,10 @@ an **explicit contract**:
 
 ```ts
 attended: {
-  mode: "tui" | "rpc" | "off";   // no "auto"
+  mode: "tui" | "rpc" | "queue" | "off";  // no "auto"
   confirmTimeoutMs: number;      // default 300 000; 0 is not allowed
+  queueTimeoutMs: number;        // #30: how long "queue" holds a call; default 3 600 000, 1 000 to 86 400 000
+  notify: string[];              // #30: argv run when a record is written; user-global only
   headlessTrust: string[];       // #28: projects a headless run may load pi resources from; user-global only
 }
 ```
@@ -1661,6 +1667,7 @@ attended: {
 |---|---|---|---|
 | `"tui"` | A person is at the terminal | `ctx.mode === "tui"` and the process has a controlling TTY; otherwise auto mode refuses to start |
 | `"rpc"` | A person is behind an RPC client that has opted in | The client must complete the **approval-channel handshake** below, built only from `ctx.ui.input` / `ctx.ui.confirm`. No handshake → treated as `"off"` for this session, and the status line says so. |
+| `"queue"` | Nobody is at *this* terminal, but someone can answer from another one (#30) | None: it works in every pi mode, because the answer never travels through the session's own UI. See [the approval queue](#the-approval-queue). |
 | `"off"` | Nobody is there (CI, ops runner, print mode) | Every `ask` is a deny; no dialog is ever attempted |
 
 **The RPC handshake, on pinned pi.** pi 1.5.2 gives an extension exactly the fixed
@@ -1704,6 +1711,72 @@ Two rules apply regardless of mode:
 `PI_ENCLAVE_ATTENDED=off` is the only environment override and can only turn attendance
 *off*, consistent with the [monotonic rule](#monotonic-configuration-rule).
 
+### The approval queue
+
+With `attended.mode: "queue"` (#30), a headless session that reaches an `ask` does not end
+the turn. It writes the record into `queued/` instead of `pending/`, prints the two commands
+on stderr, runs the notify hook, and holds the tool call open for up to `queueTimeoutMs`:
+
+```
+pi-enclave: an action needs approval; this session waits until 2026-11-12T10:41:07.000Z for:
+  pi-enclave approve 3f9c…
+  pi-enclave decline 3f9c…
+```
+
+A person runs one of them in another terminal, as the same user:
+
+- **`pi-enclave approve <nonce>`** shows the full action, runs the resume checks below
+  against the configuration on disk, and asks "Let the waiting session run this action now?"
+  in that terminal. A yes is written to the `approvals` log (event `queue-approved`, with the
+  approver's uid, user, tty and SSH client address) before anything moves, and with
+  `audit.required` a yes that cannot be logged decides nothing. Then the record moves to
+  `approved/`, and the CLI waits a few seconds to report that the session took it up.
+- **`pi-enclave decline <nonce>`** logs `declined` and moves the record to `declined/`. The
+  agent gets the same denial an unanswered request gets today, so a refusal looks the same
+  to it whichever way it came. `decline` also retires an ordinary pending record, so nobody
+  approves it later by mistake.
+
+The session then runs the call **itself**, in session and still sandboxed, so the agent gets
+the tool's real result and carries on with its task. Approval records a decision and nothing
+else: before the call runs, the session reads the approved record back, checks that its hash
+is the action it is holding, reloads the configuration the way session start loads it, and
+applies the same `checkResume` checks an out-of-session approval gets. It also refuses if the
+reloaded configuration is not the one the session runs under: a session cannot apply a
+narrower profile to itself mid-turn, and nobody approved a wider one. A refused approval
+moves the record back to `pending/`, with the reason on stderr and in the audit log, and the
+agent gets the denial. Otherwise the record moves to `consumed/` before the call runs, so one
+decision is one run.
+
+Every move out of `queued/` is a single `rename`, so a person's decision and the session
+giving up cannot both happen; whoever loses learns it from the rename failing. On timeout,
+or when the turn is aborted, the session moves the record back to `pending/` and the agent
+gets the denial; `pi-enclave approve` then runs it out of session exactly as before. The
+record names the waiting process and its deadline, so `pi-enclave pending` shows which
+records a live session is waiting on, and `approve` on a record whose session has gone moves
+it to `pending/` first and treats it as an ordinary one.
+
+A project file may keep `"queue"` or turn it `"off"`, and may shorten `queueTimeoutMs`, never
+lengthen it.
+
+#### The notify hook
+
+`attended.notify` is an argv, user-global only, that the session runs whenever it writes a
+pending or queued record: `["/usr/bin/wall"]`, `["/usr/bin/mail", "-s", "pi-enclave", "ops"]`,
+a LAN ntfy or Gotify server through `curl`, `tmux display-message`, a file drop.
+
+- The first element must be an absolute path; at most 32 elements, no NUL. There is no shell,
+  and the argv is exactly the configured one: nothing the agent influenced is ever an
+  argument.
+- What the agent influenced arrives on **stdin**: a few lines naming the session, the tool,
+  the two commands and the deadline, with the action summarized in one line of at most 200
+  characters in the same JSON-string spelling the approval prompt uses, so it cannot add a
+  line or a terminal escape. `ENCLAVE_NONCE`, `ENCLAVE_SESSION`, `ENCLAVE_TOOL` and
+  `ENCLAVE_EXPIRES` are in its environment.
+- **At most one notification every 30 seconds**, because the agent decides how often an
+  `ask` happens. The next one says how many were held back. The hook is killed after 10 s,
+  and a failure is logged (`notify-sent`, `notify-failed`, `notify-suppressed`) but never
+  blocks the gate.
+
 ### Pending-approval records
 
 When an unattended session hits an `ask`, the turn is denied and terminated, and a record is
@@ -1722,7 +1795,7 @@ in the workspace, which the sandboxed agent can write to.
 | Expiry | `expiresAt`, default 24 h from creation. Expired records are refused and deleted; freshness is checked again after an interactive prompt and after sandbox compilation, immediately before execution. |
 | Policy freshness | The effective configuration is reloaded after the prompt and after sandbox compilation. If it changed or cannot be loaded, nothing executes and the record remains pending for a fresh review. |
 | Single use | On resume the record is atomically renamed to `approved/` before execution, then to `consumed/` after. A second resume with the same nonce is a no-op with an audit entry. |
-| Approval | `pi-enclave approve <nonce>` displays the canonical action and asks for confirmation *in that terminal*. `/enclave pending` is deliberately read-only, and no RPC approval method exists yet. There is no way to approve by editing the file. |
+| Approval | `pi-enclave approve <nonce>` displays the canonical action and asks for confirmation *in that terminal*; `pi-enclave decline <nonce>` refuses it. `/enclave pending` is deliberately read-only, and no RPC approval method exists yet. There is no way to approve by editing the file. A [queued](#the-approval-queue) record lives in `queued/` beside `pending/`, with the same protections. |
 
 On resume, the action is re-canonicalized from the record and the hash is compared. Then
 the **current** effective profile is loaded from the recorded action's working directory
@@ -1753,7 +1826,7 @@ for the check, not an execution input. Every resumed action remains sandboxed.
 
 | Event | Attended (`tui`, or `rpc` with a completed handshake) | Unattended (`off`, failed handshake, or preconditions lost) |
 |---|---|---|---|
-| Reviewer returns `ask` | `ctx.ui.confirm` showing the canonical action and reason, raced against `confirmTimeoutMs`; timeout = deny | Deny, `terminate`, write a [pending-approval record](#pending-approval-records) |
+| Reviewer returns `ask` | `ctx.ui.confirm` showing the canonical action and reason, raced against `confirmTimeoutMs`; timeout = deny | Deny, `terminate`, write a [pending-approval record](#pending-approval-records). With `queue`: hold the call for `queueTimeoutMs`; approve runs it in session, decline or timeout denies and leaves the record for `pi-enclave approve` ([the approval queue](#the-approval-queue)) |
 | Reviewer returns `allow` on a capability request | Re-run the locked hash once under the extended profile, still sandboxed | Same |
 | Agent requests host execution | Refused: v1 accepts only `hostExec: "never"` and defines no host-execution action | Same |
 | Reviewer timeout or error | Retry ×3 with backoff, then treat as `ask` | Retry ×3, then deny and terminate (counts as adverse for the breaker) |
@@ -1775,7 +1848,7 @@ a server, the log is meant to answer "what did it run, and what happened?" (#37)
 | `executed` | For every call the gate allowed, once pi has run it: tool call id, hash, `isError`, duration and, for bash, the exit code (`null` when the command was killed or timed out). |
 | `user_command` | Each `!`/`!!` command the person typed: a `started` record before it runs (command, cwd) and a `finished` one after (exit code, duration). It is sandboxed but not gated, and on a shared server it belongs in the trail too. |
 | `reviewer` | Each verdict: the model's decision, risk and reason next to the enforced decision, the deterministic minimum risk, and whether a direct instruction covered the action; failures say which kind. Timing is recorded separately. |
-| `approval` | `pi-enclave approve`, in its own `approvals` log: an `executing` record when it starts and one with the outcome (`executed`, `declined`, `refused`, `unsupported`), with nonce, hash, originating session, both configuration hashes, uid, user, tty, SSH client address, exit code and duration. It is a separate log because the originating session may still be open and own its own chain. |
+| `approval` | `pi-enclave approve` and `decline`, in their own `approvals` log: an `executing` record when it starts and one with the outcome (`executed`, `declined`, `refused`, `unsupported`), or `queue-approved` and `declined` for a [queued](#the-approval-queue) request, with nonce, hash, originating session, both configuration hashes, uid, user, tty, SSH client address, exit code and duration. It is a separate log because the originating session may still be open and own its own chain. |
 | `audit` | The log's own events: a missing tail found when a session resumes, and the per-session cap. |
 | `summary` | At session shutdown, in auto mode: how many gate decisions each layer settled (`L1`, `L3`, `L4`), how many asks nobody approved, and how many unreadable commands ran under `rules.onUncertain: "sandbox"` (#18). |
 
@@ -2477,7 +2550,10 @@ quietly absorbs its own corrections teaches nobody anything.
   already accepts as a residual risk.
 - **The RPC handshake has no client.** `attended.mode: "rpc"` behaves as `"off"` until some
   client implements it, which is the safe direction but means the mode is currently
-  theoretical.
+  theoretical. `"queue"` is the working way to answer a headless session today.
+- **A queued call holds its turn.** While a session waits, its turn does not move on. A request approved out of session after
+  the session gave up still runs only from the CLI; its result does not reach the agent (#30
+  follow-up).
 - **`reviewed: true` remains human-authorized.** With a qualified named reviewer it goes to
   L3 for a veto or recommendation, but a model `allow` still escalates because the tool is
   outside L2. With `reviewer.model: "none"` it goes directly to L4; an unattended session

@@ -720,3 +720,26 @@ describe("the monotonic property", () => {
 		expect(rejected).toBeGreaterThan(20);
 	});
 });
+
+describe("the approval queue (#30)", () => {
+	it("a project may keep queue mode or turn it off, not turn it on", () => {
+		const queue = patched({ attended: { mode: "queue" } });
+		const off = patched({ attended: { mode: "off" } });
+		const tui = patched({ attended: { mode: "tui" } });
+		expect(narrowerOrEqual(off, queue)).toEqual([]);
+		expect(narrowerOrEqual(queue, queue)).toEqual([]);
+		expect(fields(narrowerOrEqual(queue, off))).toEqual(["attended.mode"]);
+		expect(fields(narrowerOrEqual(queue, tui))).toEqual(["attended.mode"]);
+	});
+
+	it("a project may shorten the queue timeout, not lengthen it", () => {
+		const long = patched({ attended: { queueTimeoutMs: 600_000 } });
+		const short = patched({ attended: { queueTimeoutMs: 60_000 } });
+		expect(narrowerOrEqual(short, long)).toEqual([]);
+		expect(fields(narrowerOrEqual(long, short))).toEqual(["attended.queueTimeoutMs"]);
+	});
+
+	it("defaults to off, an hour's wait and no notify command", () => {
+		expect(base().attended).toMatchObject({ mode: "off", queueTimeoutMs: 3_600_000, notify: [] });
+	});
+});

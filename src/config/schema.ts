@@ -74,6 +74,7 @@ const PROJECT_FORBIDDEN: Record<string, string> = {
 	audit: "audit settings are immutable below user-global.",
 	"attended.headlessTrust":
 		"headlessTrust decides which projects' pi resources an unattended run loads and is therefore user-global only.",
+	"attended.notify": "the notification command runs in the trusted parent and is therefore user-global only.",
 	"sandbox.env": "the child environment is user-global only: a project cannot add a variable.",
 	profiles: "only a user-global file may define profiles; a project file may select one.",
 };
@@ -743,11 +744,14 @@ class ParseContext {
 	private attended(prefix: string, raw: unknown): ProfilePatch["attended"] | undefined {
 		const body = this.object(prefix, raw);
 		if (!body) return undefined;
-		this.rejectUnknown(prefix, body, ["mode", "confirmTimeoutMs", "headlessTrust"]);
+		this.rejectUnknown(prefix, body, ["mode", "confirmTimeoutMs", "queueTimeoutMs", "notify", "headlessTrust"]);
+		// headlessTrust and notify are user-global only. This section never
+		// checked, so a project file's headlessTrust was accepted (#30).
+		this.rejectForbidden(prefix, body);
 
 		const out: NonNullable<ProfilePatch["attended"]> = {};
 		if ("mode" in body) {
-			const mode = this.enum<AttendedMode>(join(prefix, "mode"), body.mode, ["tui", "rpc", "off"]);
+			const mode = this.enum<AttendedMode>(join(prefix, "mode"), body.mode, ["tui", "rpc", "queue", "off"]);
 			if (mode) out.mode = mode;
 		}
 		if ("confirmTimeoutMs" in body) {
@@ -756,11 +760,47 @@ class ParseContext {
 			const timeout = this.integer(join(prefix, "confirmTimeoutMs"), body.confirmTimeoutMs, 1_000, 3_600_000);
 			if (timeout !== undefined) out.confirmTimeoutMs = timeout;
 		}
+		if ("queueTimeoutMs" in body) {
+			const timeout = this.integer(join(prefix, "queueTimeoutMs"), body.queueTimeoutMs, 1_000, 86_400_000);
+			if (timeout !== undefined) out.queueTimeoutMs = timeout;
+		}
+		if ("notify" in body) {
+			const argv = this.argv(join(prefix, "notify"), body.notify);
+			if (argv) out.notify = argv;
+		}
 		if ("headlessTrust" in body) {
 			const projects = this.list(join(prefix, "headlessTrust"), body.headlessTrust, "attended.headlessTrust");
 			if (projects) out.headlessTrust = projects;
 		}
 		return out;
+	}
+
+	/**
+	 * A command as an argv (#30): run without a shell, so no element is ever
+	 * split or expanded. Unlike `list`, order and repeats are kept and
+	 * `"$defaults"` means nothing. The program is an absolute path, so it does
+	 * not depend on the PATH the parent inherited.
+	 */
+	private argv(key: string, value: unknown): string[] | undefined {
+		if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+			this.error(key, `expected an array of strings, got ${describe(value)}`);
+			return undefined;
+		}
+		const argv = value as string[];
+		if (argv.length === 0) return [];
+		if (argv.length > 32) {
+			this.error(key, "at most 32 elements");
+			return undefined;
+		}
+		if (!argv[0]?.startsWith("/")) {
+			this.error(`${key}[0]`, "must be an absolute path to the program");
+			return undefined;
+		}
+		if (argv.some((entry) => entry.includes("\0"))) {
+			this.error(key, "an element contains a NUL byte");
+			return undefined;
+		}
+		return [...argv];
 	}
 
 	private audit(prefix: string, raw: unknown): ProfilePatch["audit"] | undefined {

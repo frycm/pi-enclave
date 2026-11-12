@@ -57,7 +57,7 @@ export interface ProtectedWriteTarget {
 
 export type CapabilityMode = "none" | "reviewed";
 export type HostExecMode = "never" | "human";
-export type AttendedMode = "tui" | "rpc" | "off";
+export type AttendedMode = "tui" | "rpc" | "queue" | "off";
 export type NetworkMode = "off";
 
 export interface EnvSettings {
@@ -274,6 +274,18 @@ export interface BreakerSettings {
 export interface AttendedSettings {
 	mode: AttendedMode;
 	confirmTimeoutMs: number;
+	/**
+	 * How long a `queue` session holds a call that needs a person, waiting for
+	 * `pi-enclave approve` or `decline` from another terminal (#30). No decision
+	 * within it is a refusal, as an unanswered dialog is.
+	 */
+	queueTimeoutMs: number;
+	/**
+	 * A command the trusted parent runs when a pending record is written (#30):
+	 * an argv, never a shell string. It gets no agent-controlled text in its
+	 * argv; the bounded summary arrives on stdin. User-global only.
+	 */
+	notify: string[];
 	/**
 	 * Project directories whose pi resources (`.pi` settings, MCP servers,
 	 * extensions, skills, prompts) a headless run may load (#28). Elsewhere
